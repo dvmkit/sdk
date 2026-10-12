@@ -1,0 +1,79 @@
+{
+  "protocol_version": "1",
+  "headers": {
+    "client": "DVM-Client",
+    "protocol_version": "DVM-Protocol-Version",
+    "capabilities": "DVM-Client-Capabilities"
+  },
+  "server_response_headers": { "DVM-Protocol-Version": "1" },
+  "cases": [
+    {
+      "name": "absent",
+      "request_headers": {},
+      "valid": { "client": true, "protocol_version": true, "capabilities": true },
+      "capabilities": []
+    },
+    {
+      "name": "current",
+      "request_headers": {
+        "DVM-Client": "dvm/0.1.0",
+        "DVM-Protocol-Version": "1",
+        "DVM-Client-Capabilities": "credit-recovery,request-resume"
+      },
+      "valid": { "client": true, "protocol_version": true, "capabilities": true },
+      "client_version": "0.1.0",
+      "protocol_version": 1,
+      "capabilities": ["credit-recovery", "request-resume"]
+    },
+    {
+      "name": "future-protocol",
+      "request_headers": {
+        "DVM-Client": "dvm/0.2.0-next.1",
+        "DVM-Protocol-Version": "2",
+        "DVM-Client-Capabilities": "request-resume"
+      },
+      "valid": { "client": true, "protocol_version": true, "capabilities": true },
+      "client_version": "0.2.0-next.1",
+      "protocol_version": 2,
+      "capabilities": ["request-resume"]
+    },
+    {
+      "name": "malformed-version",
+      "request_headers": {
+        "DVM-Client": "dvm/latest",
+        "DVM-Protocol-Version": "1",
+        "DVM-Client-Capabilities": "request-resume"
+      },
+      "valid": { "client": false, "protocol_version": true, "capabilities": true },
+      "protocol_version": 1,
+      "capabilities": ["request-resume"]
+    },
+    {
+      "name": "missing-capability",
+      "request_headers": {
+        "DVM-Client": "dvm/0.1.0",
+        "DVM-Protocol-Version": "1",
+        "DVM-Client-Capabilities": "credit-recovery"
+      },
+      "valid": { "client": true, "protocol_version": true, "capabilities": true },
+      "client_version": "0.1.0",
+      "protocol_version": 1,
+      "capabilities": ["credit-recovery"],
+      "requirement": {
+        "required_capabilities": ["credit-recovery", "request-resume"],
+        "minimum_client_version": "0.1.0"
+      },
+      "response": {
+        "status": 426,
+        "body": {
+          "error": "client_upgrade_required",
+          "required_capabilities": ["credit-recovery", "request-resume"],
+          "minimum_client_version": "0.1.0",
+          "current_client_version": "0.1.0",
+          "display": "This request needs a newer dvm client.",
+          "hint": "Upgrade or reinstall dvm with support for capabilities credit-recovery, request-resume and dvm 0.1.0 or newer, then retry this request."
+        }
+      }
+    }
+  ]
+}

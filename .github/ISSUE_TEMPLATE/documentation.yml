@@ -1,0 +1,37 @@
+name: Documentation problem
+description: Something in the SDK documentation is wrong, missing, or misleading. Typos included.
+title: "Docs: "
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not open a pull request for a typo. Point at it here and we will fix it; that is faster for both of us than a review cycle.
+
+        For a defect in the SDK itself, use the bug report form instead.
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: The documentation URL, or the path to the file in this repository.
+      placeholder: https://dvmkit.ai/docs/build
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong
+      description: Quote the passage and say what it made you believe.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: What it should say
+      description: Optional. If you know the correct behaviour, say how you established it.
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version you were using
+      placeholder: 0.0.1-alpha.8

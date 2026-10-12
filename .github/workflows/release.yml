@@ -1,0 +1,322 @@
+name: Release package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed vX.Y.Z or vX.Y.Z-rc.N tag to build without publishing
+        required: true
+        type: string
+      github_release_recovery:
+        description: After an exact tag build, create or verify release notes and release pull request labels without publishing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: verify signed release tag
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      dist_tag: ${{ steps.release.outputs.dist_tag }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag shape, package binding, and signature
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_tag="$INPUT_TAG"
+          else
+            release_tag="$REF_NAME"
+          fi
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release tag must be vX.Y.Z or vX.Y.Z-rc.N" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$release_tag"; then
+            echo "requested tag was not fetched from origin" >&2
+            exit 1
+          fi
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signers"
+          git verify-tag "$release_tag"
+          release_commit="$(git rev-parse "$release_tag^{commit}")"
+          git checkout --detach "$release_commit"
+          if [ "$release_commit" != "$(git rev-parse HEAD)" ]; then
+            echo "checkout is not the requested tag commit" >&2
+            exit 1
+          fi
+          version="$(node --input-type=module -e 'import manifest from "./package.json" with { type: "json" }; process.stdout.write(manifest.version)')"
+          if [ "$release_tag" != "v$version" ]; then
+            echo "tag and package version differ" >&2
+            exit 1
+          fi
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            dist_tag=latest
+          elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            dist_tag=next
+          else
+            echo "package version must be stable or rc" >&2
+            exit 1
+          fi
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build immutable package artifact
+    needs: prepare
+    runs-on: ubuntu-latest
+    # Verify's limit. A passing build takes about eight minutes, so a stalled build fails with its
+    # log uploaded instead of holding a runner for Actions' six-hour default.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: dvmkit_test
+          POSTGRES_USER: sdk_verify
+          POSTGRES_PASSWORD: sdk_verify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username sdk_verify --dbname sdk_verify"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://sdk_verify:sdk_verify@localhost:5432/dvmkit_test
+    steps:
+      - name: Check out the verified release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # The gate this job runs includes the public-safety commit scan, which needs real history.
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Start local Cashu mint
+        run: node scripts/start-cashu-mint.mjs
+      - name: Run full verification gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          npm run verify -- --require-database 2>&1 | tee .artifacts/verify.log
+      - name: Save Cashu mint log
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .artifacts
+          docker logs sdk-cashu-mint > .artifacts/cashu-mint.log 2>&1 || true
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-verify-log-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/verify.log
+            .artifacts/cashu-mint.log
+            .artifacts/public-safety-report.json
+            .artifacts/public-safety-packed-report.json
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Pack twice and bind the artifact digest
+        shell: bash
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/sdk-release"
+          first="$artifact_root/first"
+          second="$artifact_root/second"
+          output="$artifact_root/output"
+          mkdir -p "$first" "$second" "$output"
+          npm pack --ignore-scripts --json --pack-destination "$first" > "$first/pack.json"
+          npm pack --ignore-scripts --json --pack-destination "$second" > "$second/pack.json"
+          first_archive="$first/$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8"))[0].filename)' "$first/pack.json")"
+          second_archive="$second/$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8"))[0].filename)' "$second/pack.json")"
+          cp "$first_archive" "$output/$(basename "$first_archive")"
+          node scripts/release-artifact.mjs create --first "$first_archive" --second "$second_archive" --output "$output/release-digest.json" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG"
+          rm -rf -- "$first" "$second"
+      - name: Upload immutable package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sdk-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/sdk-release/output
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish immutable package artifact
+    timeout-minutes: 75
+    if: github.event_name == 'push'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the verified release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - name: Use release Node.js without caches
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download immutable package artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: sdk-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/sdk-release/input
+      - name: Verify downloaded artifact binding
+        shell: bash
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/release-artifact.mjs verify --directory "$RUNNER_TEMP/sdk-release/input" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG" > "$RUNNER_TEMP/sdk-release/archive-path"
+      - name: Publish through npm trusted publishing or recover the exact release
+        shell: bash
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          archive="$(cat "$RUNNER_TEMP/sdk-release/archive-path")"
+          node scripts/publish-release.mjs --archive "$archive" --dist-tag "$DIST_TAG"
+      - name: Verify published package in a clean consumer directory
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/sdk-release/consumer"
+          mkdir -p "$consumer"
+          printf '%s\n' '{ "name": "sdk-release-consumer", "version": "0.0.0", "private": true, "type": "module" }' > "$consumer/package.json"
+          npm run install-published-release -- --version "$VERSION" --prefix "$consumer"
+          cat > "$consumer/probe.mjs" <<'PROBE'
+          import { readFileSync } from "node:fs";
+
+          import * as sdk from "@dvmkit/sdk";
+          // `./internal` carries no stability promise, but the dvmkit platform imports it from the
+          // published package, so a release that cannot resolve it is broken for its only consumer.
+          import * as internal from "@dvmkit/sdk/internal";
+          import * as server from "@dvmkit/sdk/server";
+          import * as testing from "@dvmkit/sdk/testing";
+
+          const manifest = JSON.parse(readFileSync("node_modules/@dvmkit/sdk/package.json", "utf8"));
+          const expected = process.env.VERSION;
+          if (manifest.version !== expected) throw new Error(`installed ${manifest.version}, expected ${expected}`);
+          for (const [name, value] of [
+            ["configureDVM", sdk.configureDVM],
+            ["createDVMHost", server.createDVMHost],
+            ["createTestContext", testing.createTestContext],
+            ["verifyJobReceipt", internal.verifyJobReceipt],
+          ]) {
+            if (typeof value !== "function") throw new Error(`${name} is missing from the published package`);
+          }
+          process.stdout.write(`published @dvmkit/sdk@${manifest.version} imports through every declared entry point\n`);
+          PROBE
+          ( cd "$consumer" && node probe.mjs )
+          cp scripts/fixtures/payment-diagnostics.mjs "$consumer/payment-diagnostics.mjs"
+          archive="$(cat "$RUNNER_TEMP/sdk-release/archive-path")"
+          ( cd "$consumer" && node payment-diagnostics.mjs "$archive" "$VERSION" )
+
+  github-release:
+    name: create GitHub release notes
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && needs.publish.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.github_release_recovery == true && needs.prepare.result == 'success' && needs.build.result == 'success')
+      )
+    needs: [prepare, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      # Recovery uses reviewed bookkeeping code without changing the tag-bound package build.
+      - name: Check out release bookkeeping with tag history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Create or verify notes for the existing tag
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          expected_prerelease=false
+          if [[ "$TAG" == *-rc.* ]]; then
+            prerelease_flag=(--prerelease)
+            expected_prerelease=true
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --generate-notes "${prerelease_flag[@]}"
+          fi
+          test "$(gh release view "$TAG" --json tagName --jq .tagName)" = "$TAG"
+          test "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = "$expected_prerelease"
+      - name: Mark the release pull request as tagged
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -euo pipefail
+          pr_number="$(node scripts/resolve-release-pr.mjs --repository "$REPOSITORY" --tag "$TAG" --version "$VERSION" --commit "$COMMIT")"
+          current_labels="$(gh api "repos/$REPOSITORY/issues/$pr_number" --jq '[.labels[].name] | join("\n")')"
+          if ! grep -Fxq 'autorelease: tagged' <<< "$current_labels"; then
+            gh api --method POST "repos/$REPOSITORY/issues/$pr_number/labels" --raw-field 'labels[]=autorelease: tagged' --silent
+          fi
+          if grep -Fxq 'autorelease: pending' <<< "$current_labels"; then
+            gh api --method DELETE "repos/$REPOSITORY/issues/$pr_number/labels/autorelease%3A%20pending" --silent
+          fi
+          gh api "repos/$REPOSITORY/issues/$pr_number" \
+            --jq '(.labels | map(.name)) as $labels | if (($labels | index("autorelease: tagged")) != null and ($labels | index("autorelease: pending")) == null) then true else error("release pull request labels are inconsistent") end' >/dev/null

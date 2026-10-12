@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "last_activity_at": 1700000000000,
+  "metadata": [
+    {
+      "status": "completed",
+      "days": 730,
+      "held": false,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": 1763072000000,
+        "content_available": true
+      }
+    },
+    {
+      "status": "failed",
+      "days": 1,
+      "held": false,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": 1700086400000,
+        "content_available": true
+      }
+    },
+    {
+      "status": "cancelled",
+      "days": 1000,
+      "held": false,
+      "redacted": true,
+      "expected": {
+        "content_expires_at": 1786400000000,
+        "content_available": false
+      }
+    },
+    {
+      "status": "completed",
+      "days": 0,
+      "held": false,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": null,
+        "content_available": true
+      }
+    },
+    {
+      "status": "processing",
+      "days": 730,
+      "held": false,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": null,
+        "content_available": true
+      }
+    },
+    {
+      "status": "awaiting-input",
+      "days": 730,
+      "held": false,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": null,
+        "content_available": true
+      }
+    },
+    {
+      "status": "completed",
+      "days": 730,
+      "held": true,
+      "redacted": false,
+      "expected": {
+        "content_expires_at": null,
+        "content_available": true
+      }
+    }
+  ],
+  "place": {
+    "purpose": "dispute",
+    "reason": "Investigate billing discrepancy",
+    "review_due_at": 1760000060000
+  },
+  "renew": {
+    "reason": "Review still in progress",
+    "review_due_at": 1760000120000
+  },
+  "clear": {
+    "reason": "Case resolved"
+  },
+  "authentication": {
+    "scheme": "P2PK",
+    "challenge": "sha256(UTF-8(dvmkit-admin:METHOD:PATH:DVM_ID:NONCE_HEX:UNIX_SECONDS))",
+    "actor": "verified accepted public key",
+    "unknown_fields": "reject"
+  }
+}

@@ -1,0 +1,96 @@
+name: Verify
+
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: dvmkit_test
+          POSTGRES_USER: sdk_verify
+          POSTGRES_PASSWORD: sdk_verify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username sdk_verify --dbname sdk_verify"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://sdk_verify:sdk_verify@localhost:5432/dvmkit_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Scan complete history. Outside-fork PRs verify their exact head instead of GitHub's
+          # synthetic merge metadata; same-repository PRs keep the default merge checkout.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify outside-fork head checkout
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Start local Cashu mint
+        run: node scripts/start-cashu-mint.mjs
+      - name: Stage the pull request body for the public-safety scan
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PULL_REQUEST_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/verify-input"
+          printf '%s' "$PULL_REQUEST_BODY" > "$RUNNER_TEMP/verify-input/pull-request-body.txt"
+          echo "PUBLIC_SAFETY_PR_BODY_PATH=$RUNNER_TEMP/verify-input/pull-request-body.txt" >> "$GITHUB_ENV"
+      - name: Run the verification gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          npm run verify -- --require-database 2>&1 | tee .artifacts/verify.log
+      - name: Save Cashu mint log
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .artifacts
+          docker logs sdk-cashu-mint > .artifacts/cashu-mint.log 2>&1 || true
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verify-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/verify.log
+            .artifacts/cashu-mint.log
+            .artifacts/public-safety-report.json
+            .artifacts/public-safety-packed-report.json
+          if-no-files-found: ignore
+          retention-days: 1

@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ideas, design questions, and proposals
+    url: https://github.com/dvmkit/sdk/discussions
+    about: Anything without a reproduction belongs in a discussion, not an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/dvmkit/sdk/security/advisories/new
+    about: Use GitHub's private form. Never open a public issue for a suspected vulnerability.
+  - name: Account, billing, or dvmkit service support
+    url: https://github.com/dvmkit/sdk/blob/master/SUPPORT.md#email
+    about: Private, deployment-specific, or service-availability help goes to email, not the tracker.
+  - name: SDK documentation
+    url: https://dvmkit.ai/docs/build
+    about: The builder documentation, and where the full SDK reference stands. Read before filing.

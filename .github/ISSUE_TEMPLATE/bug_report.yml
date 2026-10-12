@@ -1,0 +1,114 @@
+name: Bug report
+description: Report a reproducible defect in the @dvmkit/sdk server framework.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search open and closed issues first.
+
+        **This repository does not accept unsolicited pull requests.** The reproduction below is what we need, and it is worth more to us than a patch; see [CONTRIBUTING.md](https://github.com/dvmkit/sdk/blob/master/CONTRIBUTING.md).
+
+        **Never include a live API key, wallet credential, recovery mnemonic, access token, real payment data, customer content, or an unredacted log.** Replace every secret with a synthetic value. If this might be a vulnerability, stop and follow [SECURITY.md](https://github.com/dvmkit/sdk/blob/master/SECURITY.md).
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: The `@dvmkit/sdk` version you are running, or the commit if you build from source.
+      placeholder: 0.0.1-alpha.8
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Paste the output of `node --version`, plus the operating system and architecture.
+      placeholder: v22.18.0, Linux x64 (node:22-slim)
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment shape
+      description: Where the DVM server was running when this happened.
+      options:
+        - Container image (Docker, OCI, Kubernetes)
+        - Long-running host process (VM, bare metal, systemd)
+        - Managed platform (dvmkit Cloud or another PaaS)
+        - Local development
+        - Test suite only (@dvmkit/sdk/testing)
+    validations:
+      required: true
+  - type: dropdown
+    id: entry-point
+    attributes:
+      label: Entry point
+      description: Which published export the problem is reached through.
+      options:
+        - "@dvmkit/sdk"
+        - "@dvmkit/sdk/server"
+        - "@dvmkit/sdk/testing"
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: rail
+    attributes:
+      label: Payment rail involved
+      description: Leave as "None" if money is not part of the failure.
+      options:
+        - None
+        - Cashu
+        - x402
+        - MPP / Tempo
+        - Prepaid credits
+        - Lightning funding
+        - More than one, or not sure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest handler and configuration that shows the problem. Code only; the next field is for everything else.
+      render: typescript
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction-notes
+    attributes:
+      label: How to run it
+      description: The sequence of calls that triggers the failure, whether it reproduces every time, and a link to a small standalone repository if you have one.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Include the redacted error, the JSON response body, and any error code or trace identifier.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything that helps tell an SDK defect apart from a handler, CLI, or service problem. Redacted logs are welcome.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched open and closed issues for this problem.
+          required: true
+        - label: I removed every secret, credential, real payment value, and piece of customer data from this report.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

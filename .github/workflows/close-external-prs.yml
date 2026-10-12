@@ -1,0 +1,90 @@
+# Unsolicited pull requests are closed with a pointer to where the report belongs.
+# The reasoning is in CONTRIBUTING.md: we do not merge what we cannot reproduce, and
+# what we can reproduce our own pipeline can write. The reproduction is the contribution.
+#
+# This runs on `pull_request_target`, so the token can comment on and close a pull
+# request opened from a fork. That is only safe because the job never checks out,
+# builds, or executes anything from the pull request: it makes two API calls and stops.
+# Do not add a checkout step to this workflow.
+#
+# It fires on `opened` only. Reopening is therefore a deliberate human act that sticks,
+# which is how an invited pull request the automation cannot recognise gets through.
+name: Close unsolicited pull requests
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: close-external-prs-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: close
+    # Exempt, in order: any branch pushed to this repository rather than a fork (which
+    # requires write access, and covers the release automation whatever bot identity it
+    # runs under), any bot account, and maintainers by author association.
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository
+      && github.event.pull_request.user.type != 'Bot'
+      && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No third-party actions are used, so there is no action SHA to pin: the job is
+      # the GitHub CLI preinstalled on the runner, against this repository's own token.
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Discussions is a repository setting. Ask whether it is on rather than linking
+          # somewhere that might 404, and fall back to issues if the read fails for any reason.
+          discussions="$(gh api "repos/$REPO" --jq '.has_discussions' 2>/dev/null || echo false)"
+
+          body="$RUNNER_TEMP/close-comment.md"
+
+          {
+            cat <<'PART_HEAD'
+          Thanks for taking the time to look at this closely enough to write code.
+
+          This repository does not accept unsolicited pull requests, so this one is being closed automatically. That is a standing policy rather than a judgement on your change, and nobody has reviewed the diff.
+
+          **The short reason:** we do not merge a change we cannot reproduce and verify ourselves, and once we *can* reproduce a problem, our own pipeline writes and reviews the fix against the SDK's test suite. So the reproduction is the part we actually need, and it is worth more to us than the patch.
+
+          Here is where the same work lands somewhere we can act on it:
+
+          - **Fixing a bug?** Open a [bug report](https://github.com/__REPO__/issues/new/choose) with the reproduction: SDK version, Node.js version, deployment shape, and the smallest handler that shows it. Paste your fix into the issue as a suggestion if you like; it helps.
+          - **Something broke between two versions?** Open an [API compatibility report](https://github.com/__REPO__/issues/new/choose). Those are the most valuable reports we get, because they tell us which parts of the published surface people actually build on.
+          - **Fixing a typo or wrong docs?** Open a [documentation issue](https://github.com/__REPO__/issues/new/choose) and point at it. We will just fix it; you do not need a pull request for that.
+          PART_HEAD
+
+            if [ "$discussions" = "true" ]; then
+              cat <<'PART_DISCUSSIONS'
+          - **Proposing a feature, or arguing about direction?** Start a [discussion](https://github.com/__REPO__/discussions). Design conversation is welcome and it is where proposals belong.
+          PART_DISCUSSIONS
+            else
+              cat <<'PART_NO_DISCUSSIONS'
+          - **Proposing a feature, or arguing about direction?** Open an issue describing the use case and what you tried. Design conversation is welcome; it just has to start somewhere we will see it.
+          PART_NO_DISCUSSIONS
+            fi
+
+            cat <<'PART_TAIL'
+
+          Two exceptions the automation cannot see. If a maintainer invited this pull request on a specific issue, reopen it and say so. If you believe you are a maintainer, collaborator, or organization member and this closed anyway, leave a comment and we will sort it out.
+
+          Please do not put a suspected vulnerability in a public pull request, issue, or discussion. [SECURITY.md](https://github.com/__REPO__/blob/master/SECURITY.md) has the private routes.
+
+          The full policy, including why the door is shut and what closing it does not change, is in [CONTRIBUTING.md](https://github.com/__REPO__/blob/master/CONTRIBUTING.md).
+          PART_TAIL
+          } | sed "s|__REPO__|$REPO|g" > "$body"
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body"
+          gh pr close "$PR_NUMBER" --repo "$REPO"

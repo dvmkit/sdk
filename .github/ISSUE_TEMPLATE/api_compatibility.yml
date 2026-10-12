@@ -1,0 +1,99 @@
+name: API compatibility report
+description: Something that worked on one @dvmkit/sdk version stopped working, changed shape, or disappeared on another.
+title: "Compatibility: "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This SDK is pre-1.0 alpha, so breaking changes do happen and are announced in the release notes for the release that carries them. File this anyway. A compatibility report is the single most useful thing we get from outside: it tells us what the published surface is actually load-bearing for, which no test of ours can.
+
+        Use this form for a **type, export, option, runtime behaviour, or wire-level change between two versions**. Use the bug report form if the behaviour is wrong on every version you have tried.
+
+        **Never include a live API key, wallet credential, recovery mnemonic, access token, real payment data, or customer content.**
+  - type: input
+    id: working-version
+    attributes:
+      label: Last version that worked
+      placeholder: 0.0.1-alpha.7
+    validations:
+      required: true
+  - type: input
+    id: broken-version
+    attributes:
+      label: First version that did not
+      placeholder: 0.0.1-alpha.8
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: What changed
+      options:
+        - A named export disappeared or moved
+        - A TypeScript type or signature changed
+        - A configuration option changed or was dropped
+        - Runtime behaviour changed with no API change
+        - HTTP or wire behaviour changed for callers
+        - Payment, credit, or receipt behaviour changed
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: entry-point
+    attributes:
+      label: Entry point
+      options:
+        - "@dvmkit/sdk"
+        - "@dvmkit/sdk/server"
+        - "@dvmkit/sdk/testing"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Paste the output of `node --version`, plus the operating system and architecture.
+      placeholder: v22.18.0, Linux x64
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment shape
+      options:
+        - Container image (Docker, OCI, Kubernetes)
+        - Long-running host process (VM, bare metal, systemd)
+        - Managed platform (dvmkit Cloud or another PaaS)
+        - Local development
+        - Test suite only (@dvmkit/sdk/testing)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Code that shows the difference
+      description: The smallest snippet that compiles or runs on the old version and fails on the new one. Include the exact compiler or runtime error.
+      render: typescript
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: What this cost you
+      description: What the code was doing, whether you found a workaround, and whether the release notes mentioned the change. "The release notes covered it and I want to argue about the direction" is a legitimate answer, and belongs in a discussion once this is filed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched open and closed issues for this change.
+          required: true
+        - label: I checked the release notes between these two versions.
+          required: true
+        - label: I removed every secret, credential, real payment value, and piece of customer data from this report.
+          required: true
