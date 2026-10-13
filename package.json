@@ -1,0 +1,122 @@
+{
+  "name": "@dvmkit/sdk",
+  "version": "0.8.0",
+  "description": "SDK for building Digital Vending Machines: pay-per-use HTTPS services AI agents can find, pay, and call with no account or API key",
+  "author": "DVM Technologies Ltd",
+  "keywords": [
+    "dvm",
+    "digital-vending-machine",
+    "ai-agents",
+    "agent-payments",
+    "pay-per-use",
+    "x402",
+    "cashu",
+    "lightning",
+    "mpp",
+    "hono"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dvmkit/sdk.git"
+  },
+  "homepage": "https://dvmkit.com/docs/sdk",
+  "bugs": {
+    "url": "https://github.com/dvmkit/sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./internal": {
+      "types": "./dist/internal/index.d.ts",
+      "import": "./dist/internal/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "NOTICE",
+    "recipes"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "NODE_OPTIONS=--max-old-space-size=6144 tsup --config tsup.config.ts && node scripts/write-internal-entry.mjs && node scripts/prune-sdk-dist.mjs",
+    "check:readme-quickstart": "node scripts/check-readme-quickstart.mjs",
+    "check:api": "node scripts/check-api-surface.mjs && node scripts/generate-api-reference.mjs --check",
+    "check:consumer": "node scripts/consumer-smoke.mjs",
+    "install-published-release": "node scripts/install-published-release.mjs",
+    "check:package": "node scripts/package-smoke.mjs",
+    "check:public-safety": "node scripts/public-safety.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "check:toolchain": "node scripts/check-toolchain.mjs",
+    "check:tree-shaking": "node scripts/check-internal-tree-shaking.mjs",
+    "clean-install-smoke": "node scripts/clean-install-smoke.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "docs:api": "node scripts/generate-api-reference.mjs --write",
+    "release:tag": "node scripts/release-tag.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "test:examples": "node --test examples/quickstart/handler.test.ts examples/authenticated-route/handler.test.ts examples/payments-and-lifecycle/handler.test.ts",
+    "test:server": "vitest run --config vitest.server.config.ts",
+    "test:db": "vitest run --config vitest.db.config.ts",
+    "typecheck": "tsc --noEmit",
+    "typecheck:scripts": "tsc --noEmit --project tsconfig.scripts.json",
+    "verify": "node scripts/verify.mjs",
+    "check:ownership": "node scripts/check-caller-ownership.mjs"
+  },
+  "dependencies": {
+    "@cashu/cashu-ts": "4.10.2",
+    "@hono/node-server": "1.19.17",
+    "@noble/curves": "2.0.1",
+    "@noble/hashes": "2.0.1",
+    "@scure/base": "2.0.0",
+    "@scure/bip32": "2.2.0",
+    "@scure/bip39": "2.0.1",
+    "@x402/core": "2.21.0",
+    "@x402/evm": "2.21.0",
+    "hono": "4.13.5",
+    "jose": "6.2.1",
+    "mppx": "0.8.15",
+    "nostr-tools": "2.23.3",
+    "proper-lockfile": "4.1.2",
+    "undici": "7.29.1",
+    "ws": "8.21.0",
+    "zod": "4.4.3"
+  },
+  "optionalDependencies": {
+    "pg": "8.20.0",
+    "viem": "2.55.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "25.3.4",
+    "@types/pg": "8.18.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.27.7",
+    "eslint": "10.9.1",
+    "globals": "17.11.0",
+    "sdk-receipt-compat": "npm:@dvmkit/sdk@0.1.5-rc.9",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.68.0",
+    "vitest": "4.1.10",
+    "yaml": "2.9.0"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "response": {
+    "deposit_liability_sats": 500,
+    "deposit_credits": 5,
+    "deposit_by_rail": [{ "rail": "cashu", "sats": 500, "credits": 5 }],
+    "deposit_by_currency": [
+      { "currency": "usd", "micro": 1200000, "credits": 2 },
+      { "currency": "jpy", "micro": 120000000, "credits": 2 },
+      { "currency": "eur", "micro": 500000, "credits": 1 }
+    ],
+    "drain_liability_sats": 0,
+    "drain_count": 0,
+    "total_owed_sats": 500,
+    "uncovered_credits": 2,
+    "uncovered_by_currency": [
+      { "currency": "usd", "micro": 1000000, "credits": 1 },
+      { "currency": "jpy", "micro": 100000000, "credits": 1 }
+    ],
+    "unbacked_credits": 2,
+    "unbacked_by_currency": [
+      { "currency": "usd", "micro": 200000, "credits": 1 },
+      { "currency": "jpy", "micro": 20000000, "credits": 1 }
+    ],
+    "unpriced_drains": 0
+  }
+}

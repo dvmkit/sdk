@@ -1,0 +1,44 @@
+{
+  "published_verifier": "@dvmkit/sdk@0.1.5-rc.9",
+  "receipt": {
+    "v": 1,
+    "job_id": "example-job",
+    "dvm_id": "example-dvm",
+    "dvm": "example",
+    "capability": "work",
+    "outcome": "failed",
+    "reason": "provider failed",
+    "timing": {
+      "accepted_at_ms": 1000,
+      "terminal_at_ms": 1700,
+      "caller_wait_ms": 300
+    },
+    "ended_by": "provider",
+    "seq": 7,
+    "issued_at": 2,
+    "requester_pubkey": null,
+    "paid": {
+      "msats": 1000,
+      "rail": null,
+      "native_amount": null,
+      "native_asset": null,
+      "tx_hash": null,
+      "mint": null
+    },
+    "result_hash": null,
+    "receipt_pubkey": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "signature": "5436a7854b2dc4147ae172c028c6c0e0b2f2fe2261afc2ed8adbbc3608ce0530464911d1c88a61bffac0202fa74ec9df98832f480665641c32a7d7731ab37cbb"
+  },
+  "terminal_report": {
+    "dvmId": "example-dvm",
+    "jobId": "example-job",
+    "capability": "work",
+    "outcome": "failed",
+    "endedBy": "provider",
+    "paid": true,
+    "acceptedAtMs": 1000,
+    "terminalAtMs": 1700,
+    "callerWaitMs": 300,
+    "receiptSeq": 7
+  }
+}

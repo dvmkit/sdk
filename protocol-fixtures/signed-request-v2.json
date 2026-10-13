@@ -1,0 +1,35 @@
+{
+  "version": 2,
+  "domain": {
+    "audience": {
+      "dvm_id": "example-dvm",
+      "builder_pubkey": "abababababababababababababababababababababababababababababababab"
+    },
+    "method": "POST",
+    "path": "/v1/job",
+    "capability": "echo"
+  },
+  "payload": { "text": "hello" },
+  "signing": { "timestamp": 1700000000, "nonce": "fixture-nonce" },
+  "expected": {
+    "pubkey": "84bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0",
+    "timestamp": 1700000000,
+    "nonce": "fixture-nonce",
+    "text": "hello",
+    "auth_statement": {
+      "v": 2,
+      "protocol": "dvmkit",
+      "protocol_version": 1,
+      "auth": "secp256k1-schnorr-v2",
+      "audience": {
+        "dvm_id": "example-dvm",
+        "builder_pubkey": "abababababababababababababababababababababababababababababababab"
+      },
+      "method": "POST",
+      "path": "/v1/job",
+      "capability": "echo"
+    },
+    "signature": "93c8634f7fc51598ebdd5cd59eac99fed0de34b63f3ae8637d632175d351f0b1878e1d413f7efaf32725c9e8c85ae82f2dc5a2896e2398947e80e7eeb65da789"
+  },
+  "canonical_utf8": "{\"audience\":{\"builder_pubkey\":\"abababababababababababababababababababababababababababababababab\",\"dvm_id\":\"example-dvm\"},\"auth\":\"secp256k1-schnorr-v2\",\"capability\":\"echo\",\"input\":{\"nonce\":\"fixture-nonce\",\"pubkey\":\"84bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0\",\"text\":\"hello\",\"timestamp\":1700000000},\"method\":\"POST\",\"path\":\"/v1/job\",\"protocol\":\"dvmkit\",\"protocol_version\":1,\"v\":2}"
+}

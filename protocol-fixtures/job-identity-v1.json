@@ -1,0 +1,121 @@
+{
+  "description": "DVM-Job-Identity-V1: the response-head field a DVM sets on every 200 or 202 to POST /v1/job, POST /v1/request-resume/:id and POST /v1/request-result/:id, and on no other status. Its value equals the body's top-level job_id byte for byte. Readers take the value from Headers.get (which joins repeated fields with \", \"), trim nothing and never fold case. A trailer with the same name is never identity.",
+  "header": "DVM-Job-Identity-V1",
+  "headerLowercase": "dvm-job-identity-v1",
+  "grammar": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+  "statuses": [
+    200,
+    202
+  ],
+  "vectors": [
+    {
+      "name": "field absent",
+      "value": null,
+      "kind": "absent"
+    },
+    {
+      "name": "one character",
+      "value": "a",
+      "kind": "valid",
+      "jobId": "a"
+    },
+    {
+      "name": "SDK-shaped job id",
+      "value": "job-0123456789abcdef-1",
+      "kind": "valid",
+      "jobId": "job-0123456789abcdef-1"
+    },
+    {
+      "name": "mixed case and every punctuation the grammar allows",
+      "value": "Job.ID_1:x-Y",
+      "kind": "valid",
+      "jobId": "Job.ID_1:x-Y"
+    },
+    {
+      "name": "128 characters",
+      "value": "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "valid",
+      "jobId": "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "129 characters",
+      "value": "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "invalid"
+    },
+    {
+      "name": "empty value",
+      "value": "",
+      "kind": "invalid"
+    },
+    {
+      "name": "leading '.'",
+      "value": ".job",
+      "kind": "invalid"
+    },
+    {
+      "name": "leading ':'",
+      "value": ":job",
+      "kind": "invalid"
+    },
+    {
+      "name": "leading '_'",
+      "value": "_job",
+      "kind": "invalid"
+    },
+    {
+      "name": "leading '-'",
+      "value": "-job",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal space",
+      "value": "job 1",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal comma",
+      "value": "job,1",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal semicolon",
+      "value": "job;1",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal slash",
+      "value": "job/1",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal NUL",
+      "value": "job\u00001",
+      "kind": "invalid"
+    },
+    {
+      "name": "internal non-ASCII",
+      "value": "job\u00e91",
+      "kind": "invalid"
+    },
+    {
+      "name": "leading space",
+      "value": " job-1",
+      "kind": "invalid"
+    },
+    {
+      "name": "trailing space",
+      "value": "job-1 ",
+      "kind": "invalid"
+    },
+    {
+      "name": "repeated field, equal copies joined by Headers.get",
+      "value": "job-1, job-1",
+      "kind": "invalid"
+    },
+    {
+      "name": "repeated field, unequal copies joined by Headers.get",
+      "value": "job-1, job-2",
+      "kind": "invalid"
+    }
+  ]
+}

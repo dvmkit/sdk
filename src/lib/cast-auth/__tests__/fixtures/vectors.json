@@ -1,0 +1,61 @@
+{
+  "comment": "Canonical JSON test vectors. Shared between cast's verifier and the client signer. Each vector pairs an input value with its canonical UTF-8 string. Update only when the canonicalisation algorithm itself changes — both sides depend on these.",
+  "vectors": [
+    {
+      "name": "primitives — string",
+      "input": "hello",
+      "canonical": "\"hello\""
+    },
+    {
+      "name": "primitives — number",
+      "input": 42,
+      "canonical": "42"
+    },
+    {
+      "name": "primitives — null",
+      "input": null,
+      "canonical": "null"
+    },
+    {
+      "name": "primitives — boolean",
+      "input": true,
+      "canonical": "true"
+    },
+    {
+      "name": "empty object",
+      "input": {},
+      "canonical": "{}"
+    },
+    {
+      "name": "empty array",
+      "input": [],
+      "canonical": "[]"
+    },
+    {
+      "name": "object — keys are sorted",
+      "input": { "z": 1, "a": 2, "m": 3 },
+      "canonical": "{\"a\":2,\"m\":3,\"z\":1}"
+    },
+    {
+      "name": "nested objects sort recursively, arrays preserve order",
+      "input": { "outer": { "z": [3, 1, 2], "a": 1 }, "first": true },
+      "canonical": "{\"first\":true,\"outer\":{\"a\":1,\"z\":[3,1,2]}}"
+    },
+    {
+      "name": "cast add-episode payload (signature stripped)",
+      "input": {
+        "pubkey": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "timestamp": 1714294800,
+        "nonce": "abc123XYZ_",
+        "feed_slug": "my-feed",
+        "feed_title": "Test Feed",
+        "episode": {
+          "title": "Episode 1",
+          "audio_url": "https://example.com/a.mp3",
+          "ttl_days": 30
+        }
+      },
+      "canonical": "{\"episode\":{\"audio_url\":\"https://example.com/a.mp3\",\"title\":\"Episode 1\",\"ttl_days\":30},\"feed_slug\":\"my-feed\",\"feed_title\":\"Test Feed\",\"nonce\":\"abc123XYZ_\",\"pubkey\":\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\",\"timestamp\":1714294800}"
+    }
+  ]
+}

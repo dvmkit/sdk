@@ -1,0 +1,392 @@
+{
+  "wire_path": "/v1/info → capabilities.<name>.pricing.rates",
+  "description": "A capability's rate card. Servers publish the declared array byte-for-byte: same order, same strings, no trimming or normalisation. Servers refuse a declaration that breaks a limit, so clients may apply the same limits and drop nothing a conforming server sends.",
+  "limits": {
+    "min_entries": 1,
+    "max_entries": 5,
+    "keys": [
+      "label",
+      "amount",
+      "currency",
+      "per"
+    ],
+    "required_keys": [
+      "amount",
+      "currency",
+      "per"
+    ],
+    "currency": "USD",
+    "amount_pattern": "^\\d+(\\.\\d+)?$",
+    "amount_above_zero": true,
+    "amount_max_length": 12,
+    "text_fields": [
+      "label",
+      "per"
+    ],
+    "text_min_length": 1,
+    "text_max_length": 24,
+    "text_edge_whitespace": false
+  },
+  "valid": [
+    {
+      "name": "tiers",
+      "rates": [
+        {
+          "label": "expressive",
+          "amount": "0.00030",
+          "currency": "USD",
+          "per": "character"
+        },
+        {
+          "label": "balanced",
+          "amount": "0.00015",
+          "currency": "USD",
+          "per": "character"
+        }
+      ]
+    },
+    {
+      "name": "units",
+      "rates": [
+        {
+          "amount": "1.25",
+          "currency": "USD",
+          "per": "episode"
+        },
+        {
+          "amount": "0.002",
+          "currency": "USD",
+          "per": "GB per day stored"
+        }
+      ]
+    },
+    {
+      "name": "boundaries",
+      "rates": [
+        {
+          "label": "yyyyyyyyyyyyyyyyyyyyyyyy",
+          "amount": "0.0000000001",
+          "currency": "USD",
+          "per": "xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "100",
+          "currency": "USD",
+          "per": "job"
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty",
+      "rates": [],
+      "field": "rates"
+    },
+    {
+      "name": "too-many",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates"
+    },
+    {
+      "name": "not-an-array",
+      "rates": {
+        "amount": "0.5",
+        "currency": "USD",
+        "per": "job"
+      },
+      "field": "rates"
+    },
+    {
+      "name": "null-entry",
+      "rates": [
+        null
+      ],
+      "field": "rates[0]"
+    },
+    {
+      "name": "unknown-key",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job",
+          "unit": "job"
+        }
+      ],
+      "field": "rates[0].unit"
+    },
+    {
+      "name": "lowercase-currency",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "usd",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].currency"
+    },
+    {
+      "name": "missing-currency",
+      "rates": [
+        {
+          "amount": "0.5",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].currency"
+    },
+    {
+      "name": "numeric-amount",
+      "rates": [
+        {
+          "amount": 0.5,
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "zero-amount",
+      "rates": [
+        {
+          "amount": "0",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "zero-decimal-amount",
+      "rates": [
+        {
+          "amount": "0.000",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "negative-amount",
+      "rates": [
+        {
+          "amount": "-1",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "trailing-point-amount",
+      "rates": [
+        {
+          "amount": "1.",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "leading-point-amount",
+      "rates": [
+        {
+          "amount": ".5",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "exponent-amount",
+      "rates": [
+        {
+          "amount": "1e-3",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "symbol-amount",
+      "rates": [
+        {
+          "amount": "$0.01",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "long-amount",
+      "rates": [
+        {
+          "amount": "0.00000000001",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].amount"
+    },
+    {
+      "name": "missing-per",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD"
+        }
+      ],
+      "field": "rates[0].per"
+    },
+    {
+      "name": "empty-per",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": ""
+        }
+      ],
+      "field": "rates[0].per"
+    },
+    {
+      "name": "long-per",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "xxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "field": "rates[0].per"
+    },
+    {
+      "name": "leading-space-per",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": " job"
+        }
+      ],
+      "field": "rates[0].per"
+    },
+    {
+      "name": "trailing-space-per",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job "
+        }
+      ],
+      "field": "rates[0].per"
+    },
+    {
+      "name": "empty-label",
+      "rates": [
+        {
+          "label": "",
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].label"
+    },
+    {
+      "name": "long-label",
+      "rates": [
+        {
+          "label": "yyyyyyyyyyyyyyyyyyyyyyyyy",
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].label"
+    },
+    {
+      "name": "padded-label",
+      "rates": [
+        {
+          "label": "fast\n",
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        }
+      ],
+      "field": "rates[0].label"
+    },
+    {
+      "name": "second-entry",
+      "rates": [
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job"
+        },
+        {
+          "amount": "0.5",
+          "currency": "USD",
+          "per": "job\t"
+        }
+      ],
+      "field": "rates[1].per"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "description": "Versioned hosting control signatures over the ordered JSON arrays in docs/HOSTING.md.",
+  "secret": "test-only-hosting-management-secret-32-bytes",
+  "command": {
+    "action": "drain",
+    "scope": "deployment-example",
+    "dvmId": "dvm-example",
+    "generation": 7,
+    "deadlineMs": 1700000030000,
+    "timestampMs": 1700000000000,
+    "nonce": "nonce_example_0000001"
+  },
+  "signature": "b0d2492826ec94abaafa8bb7b0b029b1980d55c98947a14c7d6ab3eef9190598",
+  "resumeV2": {
+    "command": {
+      "version": 2,
+      "action": "resume",
+      "scope": "deployment-example",
+      "dvmId": "dvm-example",
+      "generation": 8,
+      "leaseExpiresAtMs": 1700000300000,
+      "deadlineMs": 1700003900000,
+      "timestampMs": 1700000000000,
+      "nonce": "nonce_example_0000002"
+    },
+    "signature": "11c4b67bebd391474bb27b5d513602fb59a99c9d256354b3b1c3f9c7d3a77090"
+  },
+  "closureV3": {
+    "command": {
+      "version": 3,
+      "action": "close",
+      "scope": "deployment-example",
+      "dvmId": "dvm-example",
+      "generation": 9,
+      "operationId": "operation_example_0000001",
+      "timestampMs": 1700000000000,
+      "nonce": "nonce_example_0000003"
+    },
+    "signature": "63589cec65a9a578a65c3e5a6d4eb35f1df5a3c6ee1e509ef1a6bb31247e4e58"
+  }
+}
