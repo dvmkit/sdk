@@ -13,6 +13,13 @@
 - Hosted servers report every terminal job through the durable outbox with no caller identity, payment reference, amount, input or output. Deploy `/_internal/job-terminal` before rolling out this SDK: 404 follows the existing permanent-4xx policy and does not retry.
 
 
+## [0.8.0](https://github.com/dvmkit/sdk/compare/v0.8.0...v0.8.0) (2026-10-13)
+
+
+### Miscellaneous Chores
+
+* configure first stable release ([440e105](https://github.com/dvmkit/sdk/commit/440e10565bd5c474b1287cc168eefeba2ae71a65))
+
 ## 0.7.0-rc.10 (2026-10-12)
 
 
