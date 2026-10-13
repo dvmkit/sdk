@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/dvmkit/sdk/compare/v0.8.0...v0.8.0) (2026-10-13)
+
+
+### Miscellaneous Chores
+
+* configure the first stable release ([#5](https://github.com/dvmkit/sdk/issues/5)) ([b795a23](https://github.com/dvmkit/sdk/commit/b795a23775c4134124fd6da88c2f2e36bdcacd6c))
+
 ## 0.8.0
 
 This is the first stable-channel release of `@dvmkit/sdk`, based on `0.7.0-rc.10`. It carries the prerelease runtime and supported API into `0.8.0`; the capabilities below are a summary of what this snapshot ships, not a claim that they were all added after rc.10. This remains pre-1.0 software: pin exact versions and review future release notes before upgrading.
