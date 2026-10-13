@@ -37,3 +37,5 @@ Exported or public status alone does not require JSDoc. Keep generated API guida
 Every test must cover a production failure or independently specified contract. Do not assert fixture setup, mock output, language behavior, or a result calculated with the same implementation under test. Determinism, idempotence, round trips, and retry/replay remain valuable when a defective implementation can violate the stated property. Before deleting or combining a test, retain coverage for each distinct regression it caught. Architecture guards remain valuable when their source property is contractual; keep a negative control that the guard rejects. Do not add tests solely to preserve policy wording.
 
 Load `.agents/skills/test-audit/SKILL.md` before authoring, changing, reviewing, or auditing tests. It defines the evidence required for a test's value, each removal decision, and preservation checks.
+
+Load `.agents/skills/public-readme/SKILL.md` before changing README.md or a root community file.
