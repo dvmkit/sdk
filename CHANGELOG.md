@@ -1,24 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
-- `/v1/info` capabilities may carry `pricing.rates`, a builder-declared rate card published exactly as declared (`CapabilityConfig.rates`). Clients that do not read it are unaffected; the limits the server enforces at start are in `protocol-fixtures/capability-rates.json`.
-- Caller credit storage retains every unresolved drain descriptor and recovery credential, including drains on replaced credits, until explicit terminal retirement. The existing storage format remains compatible; descriptors already evicted by an older version cannot be restored by upgrading.
-- Diagnostic spans, SDK logger output, and runtime diagnostics now use catalogue version 1 before stdout or transport delivery. Arbitrary messages, error text and stacks, unknown attributes, generic protocol aliases, and unrecognized event names are removed or normalized. Routes retain only an approved method plus registered template, while URL credentials, ports, paths, queries, and fragments are discarded from validated DNS origins; localhost and IP origins are omitted. Capability fields are retained only when they match a definition configured by the emitting app; direct logger rows omit them. Diagnostic consumers should use the retained event, code, status, normalized route, URL origin, and validated client compatibility fields instead of parsing prose.
-- Caller credit trust now requires same-origin receipts to match the authenticated live DVM ID and builder key before increasing credit caps or authorizing automatic opens. Offline fallback and matching history across hostnames retain their behavior.
-- Hosted SDK servers can opt into a dedicated HMAC-authenticated control API for durable job admission, bounded drain, and resume. Direct job submissions are refused before payment after a drain closes admission. Scoped jobs remain readable and reclaimable; unfinished scoped jobs are cancelled as provider initiated at the deadline. Active jobs created before hosting admission appear separately as unowned and require an explicit ownership migration before shutdown. A handler that ignores abort may still have external side effects, so cancellation is a durable SDK outcome rather than a rollback guarantee.
-- Bitcoin credit liability reads now keep uncovered and basisless balances grouped by ledger currency. In `GET /admin/credit/bitcoin-liability`, replace `uncovered_micro` and `unbacked_micro` with `uncovered_by_currency` and `unbacked_by_currency`; ledger consumers replace `uncoveredMicro` and `unbackedMicro` with the matching `ByCurrency` arrays. Each entry carries `currency`, `micro`, and `credits`; aggregate gap counts and exact satoshi totals retain their meanings. Consumers should display or price each currency separately.
-- Update Hono to 4.13.5, including the fix that prevents URL fragment text from changing request query parameters.
-- Job receipts add optional signed lifecycle timing and SDK-derived failure/cancellation attribution without changing receipt version `1`. Published verifiers continue to accept these fields; existing receipts remain valid.
-- Hosted servers report every terminal job through the durable outbox with no caller identity, payment reference, amount, input or output. Deploy `/_internal/job-terminal` before rolling out this SDK: 404 follows the existing permanent-4xx policy and does not retry.
+This is the first stable-channel release of `@dvmkit/sdk`, based on `0.7.0-rc.10`. It carries the prerelease runtime and supported API into `0.8.0`; the capabilities below are a summary of what this snapshot ships, not a claim that they were all added after rc.10. This remains pre-1.0 software: pin exact versions and review future release notes before upgrading.
 
+### Breaking API changes
 
-## [0.8.0](https://github.com/dvmkit/sdk/compare/v0.8.0...v0.8.0) (2026-10-13)
+None relative to `0.7.0-rc.10`. The three supported entry points (`@dvmkit/sdk`, `@dvmkit/sdk/server`, and `@dvmkit/sdk/testing`) retain the same 285 declaration names and API baseline.
 
+### Migrations
 
-### Miscellaneous Chores
+None required when upgrading from `0.7.0-rc.10`: this stable preparation adds no configuration, database schema, stored-data, or wire-contract migration. Upgrading from older prereleases still requires the migrations documented in their historical entries. In particular, Bitcoin liability consumers must use currency-grouped balances, diagnostic consumers must use retained structured fields, and hosting controllers must understand finite admission leases and the terminal `closed` state. Upgrading cannot recreate credit recovery descriptors already lost by an older version.
 
-* configure first stable release ([440e105](https://github.com/dvmkit/sdk/commit/440e10565bd5c474b1287cc168eefeba2ae71a65))
+### Compatibility requirements
+
+Node.js 22 or later is required (`engines.node: >=22`). Dependency versions are unchanged from rc.10, including Hono 4.13.5 and the optional `pg` 8.20.0 and `viem` 2.55.11 packages. There are no declared peer dependencies. The default production stores and hosted control require PostgreSQL; a free standalone development server can run without it. Development mode verifies every configured payment rail rather than accepting unusable configured rails as synthetic payments.
+
+### dvmctl and platform prerequisites
+
+Standalone SDK use requires neither `dvmctl` nor a platform account. No new minimum CLI version or platform requirement is introduced relative to rc.10. The documented scaffold route targets the planned stable pairing with `@dvmkit/dvmctl@0.8.0` and its `build-dvm` skill. No older CLI compatibility minimum is specified here.
+
+Opt-in hosted control requires durable PostgreSQL storage, a dedicated management secret of at least 32 bytes, a shared deployment scope, and a controller that signs version-two resumes with finite `leaseExpiresAtMs` and `deadlineMs`. Admission starts closed until resumed; draining refuses new jobs before payment. Active jobs without scoped ownership need explicit migration before shutdown. Deadline cancellation does not roll back external effects from a handler that ignores abort.
+
+Hosted terminal reporting is enabled when platform URL, token, DVM identity, and durable database are configured. Deploy the platform's `/_internal/job-terminal` endpoint before enabling those report-emitting servers: a 404 is a permanent 4xx failure, not a retried delivery. Unmanaged servers do not need hosting control or that report endpoint.
+
+### Included in the first stable snapshot
+
+- Capability rate cards are published as builder-declared `pricing.rates` in `/v1/info`. Clients that do not read them are unaffected; server validation limits are documented in `protocol-fixtures/capability-rates.json`.
+- Shared caller credit storage retains unresolved drain descriptors and recovery credentials, including those on replaced credits, until explicit terminal retirement. Existing stored formats remain compatible. Same-origin credit receipts must match the authenticated live DVM identity and builder key before increasing credit caps or authorizing automatic opens; offline fallback and matching history across hostnames remain supported.
+- Diagnostic spans, SDK logger output, and runtime diagnostics use catalogue version 1 before stdout or transport delivery. Unapproved prose, errors, stacks, attributes, and event names are removed or normalized. Routes retain registered templates; validated DNS origins omit credentials, ports, paths, queries, and fragments, while localhost and IP origins are omitted. Capability fields require a configured definition and are omitted from direct logger rows. Consumers should read retained structured fields rather than parse prose.
+- Opt-in hosted control provides durable scoped admission, bounded drain, resume, and terminal closure. Closed admission rejects direct submissions before payment; scoped jobs remain readable and reclaimable. Unfinished scoped jobs are cancelled as provider initiated at the deadline, with no guarantee of rolling back external handler effects.
+- Bitcoin liability reads preserve uncovered and basisless balances by ledger currency. `/admin/credit/bitcoin-liability` uses `uncovered_by_currency` and `unbacked_by_currency`; ledger consumers use the corresponding `ByCurrency` arrays. Each entry contains `currency`, `micro`, and `credits`. Exact satoshi totals and aggregate gap counts retain their meanings; display or price each currency separately.
+- Hono 4.13.5 includes the query-parsing fix that prevents URL fragment text from changing query parameters.
+- Schema-version-1 job receipts support optional signed lifecycle timing and SDK-derived failure/cancellation attribution. Existing receipts remain valid, and published compatible verifiers accept the optional fields.
+- Configured hosted servers report every terminal job through the durable outbox without caller identity, payment references, amounts, input, or output. Deploy `/_internal/job-terminal` first; transport/5xx failures retry under the existing policy, while 4xx responses become permanently stale.
 
 ## 0.7.0-rc.10 (2026-10-12)
 
