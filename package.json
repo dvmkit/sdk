@@ -57,6 +57,7 @@
   },
   "scripts": {
     "build": "NODE_OPTIONS=--max-old-space-size=6144 tsup --config tsup.config.ts && node scripts/write-internal-entry.mjs && node scripts/prune-sdk-dist.mjs",
+    "check:readme-quickstart": "node scripts/check-readme-quickstart.mjs",
     "check:api": "node scripts/check-api-surface.mjs && node scripts/generate-api-reference.mjs --check",
     "check:consumer": "node scripts/consumer-smoke.mjs",
     "install-published-release": "node scripts/install-published-release.mjs",

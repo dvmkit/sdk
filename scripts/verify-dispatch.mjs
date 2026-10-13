@@ -6,6 +6,7 @@
  */
 export function dispatchVerification(options) {
   const sourceSteps = [
+    { name: "README quickstart", args: ["run", "check:readme-quickstart"] },
     { name: "caller ownership", args: ["run", "check:ownership"] },
     { name: "lint", args: ["run", "lint"] },
     { name: "build", args: ["run", "build"] },
@@ -24,6 +25,7 @@ export function dispatchVerification(options) {
   ];
   const outerSteps = [
     { name: "toolchain", args: ["run", "check:toolchain"] },
+    { name: "README quickstart", args: ["run", "check:readme-quickstart"] },
     { name: "repository safety", args: ["run", "check:public-safety", "--", "--skip-pack"] },
     { name: "clean source gate", args: ["run", "clean-install-smoke", ...(options.requireDatabase ? ["--", "--require-database"] : [])] },
   ];
@@ -43,12 +45,14 @@ export function assertReleaseDispatch(dispatch) {
   const outer = record(dispatch, { cleanSource: false, requireDatabase: true, databaseUrl: "postgres://localhost/dvmkit_test", packedSafetyReport: undefined });
   assertCalls(outer, [
     ["run", "check:toolchain"],
+    ["run", "check:readme-quickstart"],
     ["run", "check:public-safety", "--", "--skip-pack"],
     ["run", "clean-install-smoke", "--", "--require-database"],
   ], "outer verification");
 
   const source = record(dispatch, { cleanSource: true, requireDatabase: true, databaseUrl: "postgres://localhost/dvmkit_test", packedSafetyReport: "/tmp/packed-report.json" });
   const required = [
+    ["run", "check:readme-quickstart"],
     ["run", "check:ownership"], ["run", "lint"], ["run", "build"], ["run", "check:tree-shaking"], ["run", "typecheck"], ["run", "typecheck:scripts"],
     ["test"], ["run", "test:server"], ["run", "test:examples"], ["run", "test:db"], ["run", "check:api"], ["run", "check:package"],
     ["run", "check:consumer"], ["run", "check:public-safety", "--", "--pack-only", "--report", "/tmp/packed-report.json"], ["run", "check:release"],

@@ -39,6 +39,18 @@ describe("verification dispatcher", () => {
     expect(() => assertReleaseDispatch(missingLint)).toThrow("clean-source verification");
   });
 
+  it("rejects a removed README quickstart guard", () => {
+    const missingQuickstart = (options: Parameters<typeof dispatchVerification>[0]) => {
+      dispatchVerification({
+        ...options,
+        run: (step) => {
+          if (step.args[1] !== "check:readme-quickstart") options.run(step);
+        },
+      });
+    };
+    expect(() => assertReleaseDispatch(missingQuickstart)).toThrow("outer verification");
+  });
+
   it("rejects missing database forwarding across the clean-install bridge", () => {
     const missingDatabaseForwarding = (options: Parameters<typeof dispatchVerification>[0]) => {
       dispatchVerification({
