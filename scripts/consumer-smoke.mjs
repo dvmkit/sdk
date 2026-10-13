@@ -167,9 +167,9 @@ function runExamples(consumer) {
     process.execPath,
     [
       "--test",
-      "examples/quickstart/handler.test.mjs",
-      "examples/authenticated-route/handler.test.mjs",
-      "examples/payments-and-lifecycle/handler.test.mjs",
+      "examples/quickstart/handler.test.ts",
+      "examples/authenticated-route/handler.test.ts",
+      "examples/payments-and-lifecycle/handler.test.ts",
     ],
     {
       cwd: consumer,

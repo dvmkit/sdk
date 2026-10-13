@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { createTestContext } from "@dvmkit/sdk/testing";
 
-import dvm from "./handler.mjs";
+import dvm from "./handler.ts";
 
 test("the quickstart handler returns its input", async () => {
   const ctx = createTestContext({ input: { text: "hello" } });

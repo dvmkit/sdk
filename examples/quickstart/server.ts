@@ -1,6 +1,6 @@
 import { serve } from "@dvmkit/sdk/server";
 
-import dvm from "./handler.mjs";
+import dvm from "./handler.ts";
 
 const server = await serve(dvm, { devMode: true });
 

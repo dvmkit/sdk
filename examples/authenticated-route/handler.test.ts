@@ -4,7 +4,7 @@ import test from "node:test";
 import { createSignedRequestVerifier } from "@dvmkit/sdk";
 import { serve } from "@dvmkit/sdk/server";
 
-import dvm, { signedEchoSchema } from "./handler.mjs";
+import dvm, { signedEchoSchema } from "./handler.ts";
 
 const testSecret = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
 

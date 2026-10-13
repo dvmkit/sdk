@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { createTestContext } from "@dvmkit/sdk/testing";
 
-import dvm, { lifecycle } from "./handler.mjs";
+import dvm, { lifecycle } from "./handler.ts";
 
 test("payment and lifecycle behavior is testable without a live rail", async () => {
   await dvm.config.onBoot({ PROVIDER_MODE: "example" });

@@ -43,7 +43,7 @@ for (const [name, command] of Object.entries({
   lint: "eslint . --max-warnings 0",
   "release:tag": "node scripts/release-tag.mjs",
   "docs:api": "node scripts/generate-api-reference.mjs --write",
-  "test:examples": "node --test examples/quickstart/handler.test.mjs examples/authenticated-route/handler.test.mjs examples/payments-and-lifecycle/handler.test.mjs",
+  "test:examples": "node --test examples/quickstart/handler.test.ts examples/authenticated-route/handler.test.ts examples/payments-and-lifecycle/handler.test.ts",
   "typecheck:scripts": "tsc --noEmit --project tsconfig.scripts.json",
   verify: "node scripts/verify.mjs",
 })) {

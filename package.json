@@ -57,7 +57,7 @@
     "docs:api": "node scripts/generate-api-reference.mjs --write",
     "release:tag": "node scripts/release-tag.mjs",
     "test": "vitest run --config vitest.config.ts",
-    "test:examples": "node --test examples/quickstart/handler.test.mjs examples/authenticated-route/handler.test.mjs examples/payments-and-lifecycle/handler.test.mjs",
+    "test:examples": "node --test examples/quickstart/handler.test.ts examples/authenticated-route/handler.test.ts examples/payments-and-lifecycle/handler.test.ts",
     "test:server": "vitest run --config vitest.server.config.ts",
     "test:db": "vitest run --config vitest.db.config.ts",
     "typecheck": "tsc --noEmit",
