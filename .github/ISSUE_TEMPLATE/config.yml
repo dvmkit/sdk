@@ -10,5 +10,5 @@ contact_links:
     url: https://github.com/dvmkit/sdk/blob/master/SUPPORT.md#email
     about: Private, deployment-specific, or service-availability help goes to email, not the tracker.
   - name: SDK documentation
-    url: https://dvmkit.ai/docs/build
-    about: The builder documentation, and where the full SDK reference stands. Read before filing.
+    url: https://dvmkit.com/docs/sdk
+    about: The builder guide and full SDK reference. Read before filing.

@@ -26,6 +26,8 @@ Unsolicited pull requests are closed automatically. This is deliberate and is ex
 
 Email `support@dvmkit.com` for account access, billing, a private deployment-specific problem, or dvmkit service availability. Include the affected account or organization, the DVM slug, the approximate time and time zone, any trace or deploy identifier, and the SDK version. Do not email wallet recovery material or plaintext credentials.
 
+Use this address for code-of-conduct reports with the subject `dvmkit sdk code of conduct report`, and for trademark permission requests with the subject `dvmkit trademark use request`.
+
 Email is not the route for an SDK bug. A bug sent by email loses the searchable public record that makes it fixable, so we will ask you to file it.
 
 ## Boundaries

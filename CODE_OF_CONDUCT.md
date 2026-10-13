@@ -1,8 +1,8 @@
-# Contributor Covenant Code of Conduct
+# Code of conduct
 
 ## Our pledge
 
-We as members, contributors, and leaders pledge to make participation in our community a harassment-free experience for everyone, regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socio-economic status, nationality, personal appearance, race, caste, colour, religion, or sexual identity and orientation.
+We as maintainers and participants in this project's issues and discussions pledge to make participation in our community a harassment-free experience for everyone, regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, socio-economic status, nationality, personal appearance, race, caste, colour, religion, or sexual identity and orientation.
 
 We pledge to act and interact in ways that contribute to an open, welcoming, diverse, inclusive, and healthy community.
 
@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces, including this reposit
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the community leaders responsible for enforcement at **support@dvmkit.com** with the subject `dvmkit sdk code of conduct report`. Reports will be reviewed without avoidable disclosure to people not involved in handling the report.
+Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the community leaders responsible for enforcement through [the support email route](SUPPORT.md#email) with the subject `dvmkit sdk code of conduct report`. Reports will be reviewed without avoidable disclosure to people not involved in handling the report.
 
 All community leaders must respect the privacy and security of the reporter of any incident.
 

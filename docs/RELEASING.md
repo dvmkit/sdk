@@ -17,26 +17,7 @@ The split keeps each old guarantee without running the build, typecheck, unit su
 | Unsafe published bytes | The pack-only scan inspects the clean-built tarball. |
 | Missing database coverage | The clean source gate reports an unset `DATABASE_URL` as skipped, and `--require-database` fails before isolation starts. In that mode an unreachable local Cashu mint fails the mint-dependent suites instead of skipping them. |
 
-The no-database timings below are consecutive runs on the same Node 22.23.2 development machine; the database suite was skipped, not passed. The 54-second reduction comes from removing repeated source work, not from narrowing any retained check.
-
-| Phase | Before (seconds) | After (seconds) |
-| --- | ---: | ---: |
-| Toolchain | 0.2 | 0.2 |
-| Repository safety | 1.6 (with packed artifact) | 1.1 |
-| Locked install and duplicate source pass | 59.8 | 2.8 (install only) |
-| Lint | 5.2 | 5.4 |
-| Build | 14.9 | 15.0 |
-| Internal tree shaking | 0.4 | 0.4 |
-| Package typecheck | 7.0 | 7.2 |
-| Scripts typecheck | 0.8 | 0.7 |
-| Unit tests | 27.9 | 28.1 |
-| Public examples | 0.7 | 0.7 |
-| Public API surface | 4.7 | 4.8 |
-| Package shape | 1.1 | 0.9 |
-| Consumer install | 11.3 | 11.4 |
-| Packed-artifact safety | included above | 0.6 |
-| Release contract | 0.2 | 0.2 |
-| **Whole gate** | **135.8** | **81.8** |
+The whole gate takes about 82 seconds on Node 22.23.2 without the database suite; that suite is skipped, not passed.
 
 `scripts/` gets its own typecheck because the package `tsconfig.json` covers only `src` and `test`, which would leave the release scripts — the code that mints tags, binds artifacts and drives publication — checked by nothing but lint. `tsconfig.scripts.json` runs `checkJs` over them under `strict`, so a mistyped property or a wrong argument count fails the gate rather than a release.
 
@@ -120,7 +101,7 @@ Both packed-consumer verification and published-package acceptance run the same 
 
 Manual dispatch accepts an existing signed tag and runs the no-publish build path. Setting `github_release_recovery` to true also runs the release-notes and label step, but only after that exact tag verifies and builds successfully. It cannot publish and it cannot create a tag, so a release candidate still requires a reviewed and signed `vX.Y.Z-rc.N` tag.
 
-Provenance is unavailable while the source repository is private. npm may use OIDC to authenticate the publish, and release candidates may go out that way, but this repository must not claim publicly verifiable source provenance until a post-public release establishes it.
+npm trusted publishing supports publicly verifiable source provenance for releases from this public repository. Verify that the published version has a provenance attestation before claiming it; releases made while the repository was private do not establish public source provenance.
 
 ## External setup before the first release
 

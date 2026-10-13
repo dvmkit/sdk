@@ -15,7 +15,7 @@ body:
     attributes:
       label: Where
       description: The documentation URL, or the path to the file in this repository.
-      placeholder: https://dvmkit.ai/docs/build
+      placeholder: https://dvmkit.com/docs/sdk
     validations:
       required: true
   - type: textarea
@@ -34,4 +34,4 @@ body:
     id: sdk-version
     attributes:
       label: SDK version you were using
-      placeholder: 0.0.1-alpha.8
+      placeholder: 0.8.0

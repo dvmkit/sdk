@@ -17,7 +17,7 @@ body:
     attributes:
       label: SDK version
       description: The `@dvmkit/sdk` version you are running, or the commit if you build from source.
-      placeholder: 0.0.1-alpha.8
+      placeholder: 0.8.0
     validations:
       required: true
   - type: input
@@ -25,7 +25,7 @@ body:
     attributes:
       label: Node.js version
       description: Paste the output of `node --version`, plus the operating system and architecture.
-      placeholder: v22.18.0, Linux x64 (node:22-slim)
+      placeholder: v22.23.2, Linux x64 (node:22-slim)
     validations:
       required: true
   - type: dropdown

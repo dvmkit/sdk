@@ -380,7 +380,8 @@ if (signerLine[1] !== expectedSigner.principal || signerLine[2] !== expectedSign
 }
 
 for (const claim of [
-  "Provenance is unavailable while the source repository is private.",
+  "npm trusted publishing supports publicly verifiable source provenance for releases from this public repository.",
+  "Verify that the published version has a provenance attestation before claiming it; releases made while the repository was private do not establish public source provenance.",
   "tag-without-npm recovery",
   "github_release_recovery",
   "Never move, replace, or unpublish a release version.",

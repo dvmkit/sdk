@@ -21,13 +21,13 @@ const reportPath = resolve(options.report ?? join(root, ".artifacts", "public-sa
  * `dvm-cli` is the published caller package, which the contribution policy links to as the sibling
  * repository a builder is most likely to want next.
  */
-const publicRepositories = new Set(["dvmkit/sdk", "dvmkit/dvm-cli"]);
+const publicRepositories = new Set(["dvmkit/sdk", "dvmkit/dvm-cli", "dvmkit/dvmctl"]);
 /** Explicitly public hosts whose suffix otherwise resembles private infrastructure. */
 const publicSpecialHosts = new Set(["metadata.google.internal", "dvmkit-testmint.fly.dev"]);
 const safeEmailSuffixes = ["@users.noreply.github.com", "@example.com", "@example.invalid"];
-// `security@dvmkit.com` and `support@dvmkit.com` are the project's published contact channels
-// (SECURITY.md, SUPPORT.md, README). They are allow-listed individually: the project domain as a
-// whole is not, so a personal name at that domain still fails the scan.
+// Support publishes its contact address only in SUPPORT.md; security reports use GitHub
+// private vulnerability reporting. Retain the two explicit role-address exemptions without
+// allowing the whole project domain, so a personal name at that domain still fails the scan.
 const safeEmailAddresses = new Set([
   "noreply@github.com",
   "alice@getalby.com",

@@ -4,12 +4,9 @@
 
 **Do not open a public issue, a discussion, or a pull request for a suspected vulnerability.**
 
-Report it privately, by either route:
+Use the private vulnerability reporting form on this repository's Security tab.
 
-- **GitHub private vulnerability reporting**, from this repository's Security tab. Private reporting is enabled on this repository from the moment it becomes public, and it is the preferred route because it keeps the report, the fix, and the advisory in one place.
-- **Email `security@dvmkit.com`**, with the subject `dvmkit sdk security report`. Use this if the GitHub form is unavailable to you. Ask for an encrypted channel before sending anything sensitive, rather than sending it and hoping.
-
-Both routes are private. Neither is a reason to relax what you leave out of the report; see below.
+This route is private. Keep sensitive material out of the report; see below.
 
 ## What to include
 
@@ -46,7 +43,7 @@ In scope: the source in this repository, the published `@dvmkit/sdk` release art
 Out of scope for this repository:
 
 - a vulnerability in a builder's own handler code, provider credentials, or infrastructure;
-- the hosted dvmkit platform, the router, and the CLIs, which have their own reporting routes. Send it to the same security address anyway and we will route it internally rather than bounce you;
+- the hosted dvmkit platform, the router, and the CLIs, which are outside this repository. Report it through this form anyway and we will route it internally;
 - social engineering, phishing, physical attacks, and denial-of-service testing;
 - automated scanning that degrades a running service, ours or anyone else's;
 - third-party dependencies, where this SDK neither creates nor worsens the vulnerability;

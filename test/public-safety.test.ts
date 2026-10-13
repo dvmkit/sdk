@@ -81,6 +81,24 @@ describe("public safety", () => {
     }
   });
 
+  it.each([
+    ["public builder repository", "dvmctl", 0],
+    ["unlisted repository", "unpublished-example", 1],
+    ["similar unlisted repository", "dvmctl-private", 1],
+  ])("classifies a %s locator without broadening the public allow-list", (_label, repository, status) => {
+    const root = mkdtempSync(join(tmpdir(), "public-safety-repository-"));
+    try {
+      execFileSync("git", ["init", "--quiet", root]);
+      const url = ["https://github.com", "dvmkit", repository].join("/");
+      writeFileSync(join(root, "CONTRIBUTING.md"), `[Repository](${url})\n`);
+      const result = spawnSync(process.execPath, [scanner, "--root", root, "--skip-git", "--skip-pack"], { encoding: "utf8" });
+      expect(result.status).toBe(status);
+      if (status === 1) expect(result.stderr).toContain("private_repository at CONTRIBUTING.md");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("preserves ordinary lowercase runtime IDs and reserved example domains", () => {
     const root = mkdtempSync(join(tmpdir(), "public-safety-runtime-id-"));
     try {

@@ -41,7 +41,7 @@ This is a server framework, so a report that names only a symptom usually cannot
 
 A workflow comments with where the report belongs and closes the pull request. It does not run your code, and it does not check out your branch.
 
-It leaves alone pull requests from this repository's own release automation, from maintainers, collaborators, and organization members, and any branch pushed to this repository rather than a fork. If yours was closed and you believe it fits one of those cases, say so in a comment.
+It leaves alone pull requests from bot accounts, including this repository's release automation, from maintainers, collaborators, and organization members, and any branch pushed to this repository rather than a fork. If yours was closed and you believe it fits one of those cases, say so in a comment.
 
 If a maintainer has explicitly invited a pull request on a specific issue, say so in the description and reopen it; invited work is the exception the automation cannot see.
 
@@ -66,8 +66,8 @@ The Apache licence covers the source. It grants no rights in the dvmkit name or 
 Four surfaces, easy to confuse:
 
 - **This repository** owns the SDK: the DVM server runtime, its public API, its payment-rail and credit implementations, and its own tests and documentation.
-- **The caller CLI** owns the `dvm` command that callers use to find, pay, and drive a DVM. Its repository, [dvm-cli](https://github.com/dvmkit/dvm-cli), opens publicly in the same wave as this one.
-- **The builder CLI** (`dvmctl`) owns scaffolding, running, deploying, and operating a DVM.
+- **The caller CLI** owns the `dvm` command that callers use to find, pay, and drive a DVM. Its repository is [dvm-cli](https://github.com/dvmkit/dvm-cli).
+- **The builder CLI** ([dvmctl](https://github.com/dvmkit/dvmctl)) owns scaffolding, running, deploying, and operating a DVM.
 - **The dvmkit platform** is a hosted service. A defect you can reproduce without this SDK is a service problem, and goes through [SUPPORT.md](SUPPORT.md).
 
 If you cannot tell which one owns your problem, file it here and describe the observable failure. Routing it is our job, not yours.

@@ -16,14 +16,14 @@ body:
     id: working-version
     attributes:
       label: Last version that worked
-      placeholder: 0.0.1-alpha.7
+      placeholder: 0.7.0-rc.10
     validations:
       required: true
   - type: input
     id: broken-version
     attributes:
       label: First version that did not
-      placeholder: 0.0.1-alpha.8
+      placeholder: 0.8.0
     validations:
       required: true
   - type: dropdown
@@ -56,7 +56,7 @@ body:
     attributes:
       label: Node.js version
       description: Paste the output of `node --version`, plus the operating system and architecture.
-      placeholder: v22.18.0, Linux x64
+      placeholder: v22.23.2, Linux x64
     validations:
       required: true
   - type: dropdown
