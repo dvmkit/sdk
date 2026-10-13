@@ -1,9 +1,0 @@
-# Local spending history
-
-The caller's local `budget.json` retains recorded caller budget charges indefinitely. Saving the ledger, changing caps, and recording another payment preserve older entries, including their payment references, endpoint, timestamp, captured BTC/USD rate, USD amount, labels, and available wallet fee evidence. Existing files load in the same format. Entries already removed by an older version cannot be recovered from this ledger.
-
-Retention does not extend budget windows. Daily caps start at midnight UTC, weekly caps at Monday midnight UTC, and monthly caps at the first day of the month UTC. Spending before a window's start is excluded from its allowance. A planned payment that reaches the cap exactly is allowed; one that exceeds it is blocked. Job payments, Lightning float funding, and prepaid credit funding continue to share these caps; draws against already funded credit are not counted again.
-
-This legacy ledger records caller budget charges using Bitcoin-equivalent millisatoshis and their stored USD valuation. Native payment rail and currency are not separately represented in its schema; retained entries keep their existing valuation and payment references. A charge can be recorded while its settlement remains unresolved, so ledger membership alone does not prove settlement. Signed receipts and payment recovery or channel state remain the evidence for payment outcomes and retain their own storage contracts. The ledger belongs to the caller and is not uploaded as platform telemetry.
-
-Writes retain the existing temporary-file-and-rename behavior: an interrupted write leaves the previous ledger available. Retention does not add cross-process locking. Loads and saves process the full JSON file; budget queries filter retained entries by the existing window cutoff and return fixed-size summaries. Storage and processing cost therefore grow with recorded history.
