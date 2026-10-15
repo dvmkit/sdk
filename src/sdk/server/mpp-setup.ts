@@ -242,6 +242,13 @@ export interface MppxServer {
     inFlight: number;
   }>;
   /**
+   * Bring hosted close obligations whose channel has finalized to what the
+   * chain shows, without settling anything. The sweep runs it too; the hosting
+   * closure runs it alone before it decides, since those obligations block
+   * the closure certificate.
+   */
+  reconcileTempoSessionCloses?: () => Promise<void>;
+  /**
    * Reconcile and, if the channel is at risk, settle exactly one TIP-1034
    * channel. The forced-close protection path: a verified on-chain
    * `CloseRequested` event authorises this and nothing else.
@@ -764,7 +771,7 @@ function buildMppMethods(
           chainId: opts.tempoSession.chainId ?? chainId,
           ...(opts.tempoSession.getClient && { getClient: opts.tempoSession.getClient }),
           ...(opts.tempoSession.onSessionSettlement && {
-            onSessionSettlement: opts.tempoSession.onSessionSettlement,
+            onSessionSettlement: claimingCloseSettlement(opts.tempoSession),
           }),
         })
       ));
@@ -775,6 +782,43 @@ function buildMppMethods(
   // Method.AnyServer intentionally erases method generics to `any` at the SDK boundary.
 
   return { methods, tempoConfiguration };
+}
+
+/**
+ * The settlement callback handed to mppx's session method.
+ *
+ * mppx fires it inside a close credential's broadcast, once the receipt
+ * returns and before the drain route confirms the close. A concurrent poll of
+ * the same drain can meanwhile read the channel finalized, find the close and
+ * fire the callback from recovery. On a self-hosted DVM both paths therefore
+ * claim the drain's close reference first, and only the claim that sets it
+ * fires. A close with no drain intent behind it, or one whose claim errors, is
+ * reported as mppx would report it.
+ */
+function claimingCloseSettlement(
+  session: NonNullable<MppOpts["tempoSession"]>
+): NonNullable<NonNullable<MppOpts["tempoSession"]>["onSessionSettlement"]> {
+  const callback = session.onSessionSettlement!;
+  const store = session.store as ReconcileStore;
+  if (session.hostedObligations || !store.getClose || !store.claimCloseReference) return callback;
+  return async (context) => {
+    if (context.trigger === "close") {
+      const intent = await store.getClose!(context.channelId);
+      if (intent) {
+        let claimed = true;
+        try {
+          claimed = (await store.claimCloseReference!(
+            context.channelId, intent.drainId, context.txHash
+          )).claimed;
+        } catch {
+          // The route confirms this close's reference next, after which
+          // recovery never fires, so a claim that errors still reports here.
+        }
+        if (!claimed) return;
+      }
+    }
+    await callback(context);
+  };
 }
 
 /**
@@ -968,7 +1012,25 @@ type ReconcileStore = Store.AtomicStore & {
     channelId: string,
     operation: (tx: CreditLedgerQuerier, lifecycle: TempoSessionLifecycle) => Promise<value>
   ) => Promise<value>;
+  getCloseRecovery?: (channelId: string) => Promise<TempoSessionCloseRecovery | null>;
+  recordCloseSearch?: (channelId: string, drainId: string, resumeAt: bigint) => Promise<void>;
+  /** Set the reference only if none is set; `claimed` says whether this call set it. */
+  claimCloseReference?: (
+    channelId: string,
+    drainId: string,
+    reference: string
+  ) => Promise<{ reference: string | null; claimed: boolean }>;
 };
+
+/** Close-intent facts recovery reads when the close's own result was lost. */
+interface TempoSessionCloseRecovery {
+  /** Last time a close attempt began; a close it broadcast lands after this. */
+  updatedAtMs: number;
+  /** Where an unfinished search for the close resumes, if one paused. */
+  searchBefore: bigint | null;
+  /** On-chain settled amount the last attempt closed from, if recorded. */
+  settledBeforeClose: bigint | null;
+}
 
 interface TempoSessionChainOps {
   getChannelStatesBatch(
@@ -989,17 +1051,35 @@ interface TempoSessionChainOps {
   ): Promise<Hex>;
   readChannelClose(client: Client, channelId: Hex, txHash: Hex): Promise<TempoChannelCloseAmounts>;
   /**
-   * The transaction that emitted this channel's `ChannelClosed`, searched back
-   * from the chain head no further than blocks older than `notBeforeMs`. Null
-   * only when that whole range was searched and holds no close.
+   * Search back for how this channel finalized: the newest `ChannelClosed`,
+   * `CloseRequested` or `CloseRequestCancelled` log, from `startBlock` (the
+   * chain head when omitted) down to blocks older than `notBeforeMs`. One call searches a bounded number of
+   * windows; `paused` names the block the next call resumes from.
    */
   findChannelClose(
     client: Client,
     channelId: Hex,
     escrowContract: `0x${string}`,
-    notBeforeMs: number
-  ): Promise<Hex | null>;
+    notBeforeMs: number,
+    startBlock?: bigint
+  ): Promise<TempoChannelCloseSearch>;
 }
+
+type TempoChannelCloseSearch =
+  /** A `ChannelClosed` log, with the address that sent its transaction. */
+  | { outcome: "closed"; txHash: Hex; sender: `0x${string}` }
+  /**
+   * The payer's `requestClose` is newer than any `ChannelClosed` and was not
+   * cancelled: a timed exit.
+   */
+  | { outcome: "exit_requested" }
+  /**
+   * Nothing read shows what finalized the channel; a later search resumes at
+   * `stoppedAt`, which never leads below the reservation's time bound. Without
+   * it the range may still hold the answer, and a later search starts over.
+   */
+  | { outcome: "none"; stoppedAt?: bigint }
+  | { outcome: "paused"; resumeAt: bigint };
 
 /** Blocks per `eth_getLogs` call, inside the default range cap of common Tempo RPC nodes. */
 const TEMPO_CLOSE_LOG_WINDOW = 5_000n;
@@ -1018,30 +1098,69 @@ const DEFAULT_TEMPO_SESSION_CHAIN_OPS: TempoSessionChainOps = {
         channelId
       )
     ),
-  findChannelClose: async (client, channelId, escrowContract, notBeforeMs) => {
-    const { getBlock, getBlockNumber, getLogs } = await import("viem/actions");
-    const event = TempoSession.Precompile.escrowAbi.find(
-      (item) => item.type === "event" && item.name === "ChannelClosed"
-    );
-    if (!event || event.type !== "event") throw new Error("Tempo escrow ABI has no ChannelClosed event");
-    let toBlock = await getBlockNumber(client as never);
+  findChannelClose: async (client, channelId, escrowContract, notBeforeMs, startBlock) => {
+    const { getBlock, getBlockNumber, getLogs, getTransaction } = await import("viem/actions");
+    const eventNamed = (name: "ChannelClosed" | "CloseRequested" | "CloseRequestCancelled") => {
+      const event = TempoSession.Precompile.escrowAbi.find(
+        (item) => item.type === "event" && item.name === name
+      );
+      if (!event || event.type !== "event") throw new Error(`Tempo escrow ABI has no ${name} event`);
+      return event;
+    };
+    const closedEvent = eventNamed("ChannelClosed");
+    const requestedEvent = eventNamed("CloseRequested");
+    const cancelledEvent = eventNamed("CloseRequestCancelled");
+    const beforeBound = async (blockNumber: bigint) =>
+      Number((await getBlock(client as never, { blockNumber })).timestamp) * 1_000 <
+        notBeforeMs - TEMPO_CLOSE_LOG_SLACK_MS;
+    // A resumed search must not read below the reservation's time bound: an
+    // older close request is not this obligation's exit.
+    if (startBlock !== undefined && await beforeBound(startBlock)) {
+      return { outcome: "none", stoppedAt: startBlock };
+    }
+    let toBlock = startBlock ?? await getBlockNumber(client as never);
     for (let window = 0; window < TEMPO_CLOSE_LOG_MAX_WINDOWS; window += 1) {
       const fromBlock = toBlock >= TEMPO_CLOSE_LOG_WINDOW ? toBlock - TEMPO_CLOSE_LOG_WINDOW + 1n : 0n;
-      const logs = await getLogs(client as never, {
-        address: escrowContract,
-        event,
-        args: { channelId },
-        fromBlock,
-        toBlock,
-      });
-      const closed = logs.find((log) => log.transactionHash);
-      if (closed?.transactionHash) return closed.transactionHash;
-      if (fromBlock === 0n) return null;
-      const start = await getBlock(client as never, { blockNumber: fromBlock });
-      if (Number(start.timestamp) * 1_000 < notBeforeMs - TEMPO_CLOSE_LOG_SLACK_MS) return null;
+      const range = { address: escrowContract, args: { channelId }, fromBlock, toBlock };
+      const [closed, requested, cancelled] = await Promise.all([
+        getLogs(client as never, { ...range, event: closedEvent }),
+        getLogs(client as never, { ...range, event: requestedEvent }),
+        getLogs(client as never, { ...range, event: cancelledEvent }),
+      ]);
+      const newest = [
+        ...closed.map((log) => ({ log, kind: "closed" as const })),
+        ...requested.map((log) => ({ log, kind: "requested" as const })),
+        ...cancelled.map((log) => ({ log, kind: "cancelled" as const })),
+      ].filter(({ log }) => log.transactionHash && log.blockNumber !== null)
+        .sort((left, right) => left.log.blockNumber === right.log.blockNumber
+          ? Number(right.log.logIndex ?? 0) - Number(left.log.logIndex ?? 0)
+          : right.log.blockNumber! > left.log.blockNumber! ? 1 : -1)[0];
+      if (newest?.kind === "closed") {
+        const transaction = await getTransaction(client as never, {
+          hash: newest.log.transactionHash!,
+        });
+        return { outcome: "closed", txHash: newest.log.transactionHash!, sender: transaction.from };
+      }
+      if (newest?.kind === "requested") {
+        // A withdraw can finalize the channel only once the request's grace
+        // period has ended. A node whose head is earlier cannot have seen one,
+        // so the finalization it reports is a close it does not yet serve.
+        const graceEnd = (newest.log.args as { closeGraceEnd?: bigint }).closeGraceEnd;
+        const head = await getBlock(client as never, { blockTag: "latest" });
+        if (graceEnd === undefined || head.timestamp < graceEnd) return { outcome: "none" };
+        return { outcome: "exit_requested" };
+      }
+      // The newest event is a cancelled close request, and no `ChannelClosed`
+      // above it was served, so nothing read shows what finalized the channel.
+      // Older blocks hold only history the cancellation superseded, so a later
+      // pass resumes at block 0 rather than below this window.
+      if (newest) return { outcome: "none", stoppedAt: 0n };
+      if (fromBlock === 0n || await beforeBound(fromBlock)) {
+        return { outcome: "none", stoppedAt: fromBlock };
+      }
       toBlock = fromBlock - 1n;
     }
-    throw new Error(`Tempo close search for channel ${channelId} exceeded its block budget`);
+    return { outcome: "paused", resumeAt: toBlock };
   },
 };
 
@@ -1620,6 +1739,7 @@ function attachTempoSessionRuntime(
       }
     }
 
+    await reconcileUnsubmittedCloses();
     return { scanned: rows.length, closeRequested, settled, inFlight };
   };
 
@@ -1631,7 +1751,8 @@ function attachTempoSessionRuntime(
     const intent = await store.getClose(channelId);
     if (intent?.drainId !== drainId) return null;
     if (intent.reference) return intent.reference;
-    const current = readTempoSessionState(await store.get(channelId));
+    const stored = await store.get(channelId);
+    const current = readTempoSessionState(stored);
     if (!current) throw new Error(`Tempo session channel ${channelId} not found`);
     let finalized = current.finalized;
     if (!finalized) {
@@ -1645,31 +1766,39 @@ function attachTempoSessionRuntime(
       finalized = chainState.deposit === 0n;
     }
     if (!finalized) return null;
-    // A close this DVM broadcast can land after its receipt wait gave up. Its
-    // hosted obligation then holds no transaction, and without one the payout
-    // report for what the close paid this DVM is never sent. Record the
-    // landed close's transaction on the obligation before the drain completes;
-    // the payout reporter delivers from there, once per obligation.
+    // A close this DVM broadcast can land after its receipt wait gave up, and
+    // then neither the hosted obligation nor the builder's settlement callback
+    // learned its transaction. Find it before the drain completes. A hosted
+    // obligation then reports the payout once; a self-hosted host fires
+    // `onSessionSettlement` once, as a close that returned would have.
     const pending = await config.hostedObligations?.pendingTempoClose(channelId, drainId);
+    const selfHostedReport = !config.hostedObligations && !!config.onSessionSettlement &&
+      !!store.claimCloseReference && !!store.getCloseRecovery;
     let reference = pending?.txHash ?? undefined;
-    if (pending && !reference) {
-      const client = await getClient({ chainId: current.chainId });
-      const txHash = await chainOps.findChannelClose(
-        client,
-        current.channelId,
-        current.escrowContract as `0x${string}`,
-        pending.reservedAtMs
-      );
-      if (txHash) {
-        await config.hostedObligations!.recordSubmitted(pending.id, txHash);
-        reference = txHash;
-      } else {
-        // The obligation keeps no transaction, so no payout report follows and
-        // it counts as unresolved until an operator settles it.
+    if ((pending && !reference) || selfHostedReport) {
+      const recovery = await store.getCloseRecovery?.(channelId);
+      const notBeforeMs = pending?.reservedAtMs ?? recovery?.updatedAtMs;
+      if (notBeforeMs === undefined) throw new Error(`Tempo session close intent ${channelId} not found`);
+      const obligations = config.hostedObligations;
+      const found = await findFinalizedClose(current, stored, drainId, notBeforeMs, pending
+        ? { from: pending.searchBefore,
+            save: (resumeAt) => obligations!.recordTempoCloseSearch(pending.id, resumeAt) }
+        : { from: recovery?.searchBefore ?? null,
+            save: (resumeAt) => store.recordCloseSearch?.(channelId, drainId, resumeAt) });
+      if (pending) {
+        reference = await settleUnsubmittedClose(current.channelId, drainId, pending.id, found);
+      } else if (found.outcome === "ours") {
+        const claimed = await store.claimCloseReference!(channelId, drainId, found.txHash);
+        if (claimed.claimed) {
+          await reportRecoveredClose(current, found.txHash, recovery?.settledBeforeClose ?? null);
+        }
+        return claimed.reference;
+      } else if (found.outcome === "none") {
+        // The drain completes from the finalized channel, but if a close of
+        // ours landed unseen, its settlement callback never fires.
         loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
           channel_id: current.channelId,
           drain_id: drainId,
-          obligation_id: pending.id,
         });
       }
     }
@@ -1681,6 +1810,182 @@ function attachTempoSessionRuntime(
     return recovered.reference;
   };
 
+  /**
+   * How a finalized channel closed, read from its escrow logs.
+   *
+   * A `ChannelClosed` counts as this DVM's close when the stored channel's
+   * operator or payee sent it: those are the only senders a cooperative close
+   * accepts, and they stay right across an operator key rotation. Any other
+   * sender, and a newer `CloseRequested`, is the payer's timed exit.
+   *
+   * The cursor is the hosted obligation's when there is one, since a released
+   * drain's close intent is deleted, and the close intent's otherwise.
+   *
+   * A search that resumes from a stored cursor never re-reads the blocks above
+   * it. Each window is read once, so an RPC node that answered a window short
+   * hides a close in it for good, and the obligation then ends as an exit or as
+   * unmatched. Re-reading those blocks would repeat at least one whole paused
+   * pass, so it is not done. An unmatched search keeps its cursor at the
+   * lowest block it read for the same reason, so a short answer is not retried
+   * on later passes either: the obligation stays unmatched for an operator.
+   *
+   * An exit is inferred from the newest uncancelled `CloseRequested` once the
+   * node's head is past its grace end, since the escrow has no event of its
+   * own for a withdraw. If the node missed a close of ours that landed during
+   * the grace period, that inference is wrong and the obligation is resolved
+   * to `no_report`, which no pass searches again. The operating guide's repair
+   * is to set the row back to `reserved` with `close_search_before` cleared.
+   */
+  const findFinalizedClose = async (
+    current: TempoSessionState,
+    stored: unknown,
+    drainId: string,
+    notBeforeMs: number,
+    cursor: { from: bigint | null; save: (resumeAt: bigint) => Promise<void> | undefined }
+  ): Promise<{ outcome: "ours"; txHash: Hex } | { outcome: "exit" } | { outcome: "none" }> => {
+    const client = await getClient({ chainId: current.chainId });
+    const search = await chainOps.findChannelClose(
+      client,
+      current.channelId,
+      current.escrowContract,
+      notBeforeMs,
+      cursor.from ?? undefined
+    );
+    if (search.outcome === "paused") {
+      // A durable cursor, so the next pass continues below this block rather
+      // than rescanning from the head and stopping at the same budget.
+      await cursor.save(search.resumeAt);
+      loggers.tempo.warn("tempo_session_close_recovery_search_paused", {
+        channel_id: current.channelId,
+        drain_id: drainId,
+        resume_block: search.resumeAt.toString(),
+      });
+      throw new Error(`Tempo close search for channel ${current.channelId} continues on the next poll`);
+    }
+    if (search.outcome === "closed") {
+      return cooperativeCloseSenders(stored, config.account.address).has(search.sender.toLowerCase())
+        ? { outcome: "ours", txHash: search.txHash }
+        : { outcome: "exit" };
+    }
+    if (search.outcome === "exit_requested") return { outcome: "exit" };
+    // The channel is finalized, so no close log can appear above this range
+    // later. Resuming at the lowest block read makes each later pass for an
+    // unmatched obligation cost one window rather than the whole range.
+    if (search.stoppedAt !== undefined) await cursor.save(search.stoppedAt);
+    return { outcome: "none" };
+  };
+
+  /** Bring an unsubmitted hosted close obligation of a finalized channel to what the chain shows. */
+  const settleUnsubmittedClose = async (
+    channelId: string,
+    drainId: string,
+    obligationId: string,
+    found: Awaited<ReturnType<typeof findFinalizedClose>>
+  ): Promise<Hex | undefined> => {
+    const obligations = config.hostedObligations!;
+    if (found.outcome === "ours") {
+      await obligations.recordSubmitted(obligationId, found.txHash);
+      return found.txHash;
+    }
+    if (found.outcome === "exit") {
+      // The payer's timed exit finalized the channel: its withdraw is not our
+      // close, and no close of ours can land on a finalized channel.
+      if (await obligations.resolveTempoCloseExit(obligationId)) {
+        loggers.tempo.warn("tempo_session_close_exit_resolved", {
+          channel_id: channelId,
+          drain_id: drainId,
+          obligation_id: obligationId,
+        });
+      }
+      return undefined;
+    }
+    // The obligation keeps no transaction, so no payout report follows and it
+    // counts as unresolved until an operator settles it.
+    loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
+      channel_id: channelId,
+      drain_id: drainId,
+      obligation_id: obligationId,
+    });
+    return undefined;
+  };
+
+  /**
+   * Resolve close obligations no drain poll will revisit. A drain released
+   * while the payer's timed exit was pending, or after a close attempt that
+   * failed definitively, stops reaching recovery, yet its reservation still
+   * blocks the hosting closure until the chain shows how the channel ended.
+   * A channel the store still holds open is read from the chain first, as
+   * recovery reads it, so the hosting closure can run this on its own.
+   */
+  const reconcileUnsubmittedCloses = async (): Promise<void> => {
+    const obligations = config.hostedObligations;
+    if (!obligations) return;
+    for (const row of await obligations.unsubmittedTempoCloses()) {
+      try {
+        const stored = await store.get(row.channelId);
+        const current = readTempoSessionState(stored);
+        if (!current) continue;
+        if (!current.finalized) {
+          const client = await getClient({ chainId: current.chainId });
+          const [chainState] = await chainOps.getChannelStatesBatch(
+            client, [current.channelId], current.escrowContract
+          );
+          await terminalizeLostBacking(current, chainState);
+          if (!(await writeBackChainState(current, chainState))) continue;
+        }
+        const found = await findFinalizedClose(current, stored, row.drainId, row.reservedAtMs, {
+          from: row.searchBefore,
+          save: (resumeAt) => obligations.recordTempoCloseSearch(row.id, resumeAt),
+        });
+        await settleUnsubmittedClose(current.channelId, row.drainId, row.id, found);
+      } catch (error) {
+        loggers.tempo.warn("tempo_session_close_reconcile_failed", {
+          channel_id: row.channelId,
+          drain_id: row.drainId,
+          obligation_id: row.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  };
+
+  /**
+   * The settlement callback a close fires when its receipt returns, fired
+   * instead by the one recovery that recorded the close's reference.
+   */
+  const reportRecoveredClose = async (
+    channel: TempoSessionState,
+    txHash: Hex,
+    settledBeforeClose: bigint | null
+  ): Promise<void> => {
+    const client = await getClient({ chainId: channel.chainId });
+    const { settledToPayee } = await chainOps.readChannelClose(client, channel.channelId, txHash);
+    if (settledBeforeClose === null || settledToPayee < settledBeforeClose) {
+      loggers.tempo.warn("tempo_session_close_settlement_unreported", {
+        channel_id: channel.channelId,
+        tx_hash: txHash,
+      });
+      return;
+    }
+    try {
+      await config.onSessionSettlement!({
+        txHash,
+        channelId: channel.channelId as Hex,
+        trigger: "close",
+        amount: settledToPayee,
+        delta: settledToPayee - settledBeforeClose,
+      });
+    } catch (error) {
+      // As mppx isolates the callback a returned close fires, a failing
+      // observer cannot fail the drain whose refund already landed.
+      loggers.tempo.warn("tempo_session_close_settlement_callback_failed", {
+        channel_id: channel.channelId,
+        tx_hash: txHash,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const getClose = store.getClose?.bind(store) ?? (() => Promise.resolve(null));
   const beginClose = store.beginClose?.bind(store);
   const withCloseIntent = store.withCloseIntent?.bind(store);
@@ -1689,6 +1994,7 @@ function attachTempoSessionRuntime(
   const confirmClose = store.confirmClose?.bind(store);
   return Object.assign(mppx, {
     sweepTempoSessions,
+    ...(config?.hostedObligations && { reconcileTempoSessionCloses: reconcileUnsubmittedCloses }),
     ...(beginClose && {
       beginTempoSessionClose: async (channelId: string, drainId: string) => {
         await beginClose(channelId, drainId);
@@ -1708,6 +2014,23 @@ function attachTempoSessionRuntime(
       getTempoSessionCloseIntent: (channelId: string) => getClose(channelId.toLowerCase()),
     }),
   });
+}
+
+/**
+ * The addresses a cooperative close of this stored channel can come from: its
+ * operator and payee, as mppx's close checks them. `fallback` (this DVM's
+ * operator account) stands in only for a stored channel that names neither.
+ */
+function cooperativeCloseSenders(stored: unknown, fallback: string): Set<string> {
+  const record = stored && typeof stored === "object" ? stored as Record<string, unknown> : {};
+  const descriptor = record.descriptor && typeof record.descriptor === "object"
+    ? record.descriptor as Record<string, unknown> : {};
+  const senders = new Set(
+    [record.operator, record.payee, descriptor.operator, descriptor.payee]
+      .filter((value): value is string => typeof value === "string" && HEX_ADDRESS_RE.test(value))
+      .map((value) => value.toLowerCase())
+  );
+  return senders.size > 0 ? senders : new Set([fallback.toLowerCase()]);
 }
 
 function readTempoSessionState(value: unknown): TempoSessionState | undefined {

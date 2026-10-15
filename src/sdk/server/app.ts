@@ -1255,6 +1255,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!certificateOnly && await control.close(command, support) === "conflict") {
       return c.json({ error: "hosting_closure_conflict" }, 409);
     }
+    // Close obligations otherwise resolve only on the traffic-driven sweep, and
+    // an unresolved one withholds the certificate from a DVM being shut down.
+    await this.opts.mpp?.reconcileTempoSessionCloses?.().catch(() => {
+      diagnosticConsole.warn({ level: "tempo_routine_sweep_failed", dvm_id: this.opts.dvmId, error: undefined });
+    });
     const evidence = await control.certificate({ ...command, action: "certificate" }, support);
     if (!evidence) return c.json({ error: "hosting_closure_stale" }, 409);
     return c.json(evidence);

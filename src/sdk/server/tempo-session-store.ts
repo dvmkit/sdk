@@ -156,6 +156,14 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
         `ALTER TABLE mpp_tempo_close_intents
            ADD COLUMN IF NOT EXISTS forecast_pending BOOLEAN NOT NULL DEFAULT FALSE`
       );
+      // Recovery state for a close whose own result was lost: where a paused
+      // search for its transaction resumes, and the on-chain settled amount the
+      // close started from (what its settlement callback reports against).
+      await this.pool.query(
+        `ALTER TABLE mpp_tempo_close_intents
+           ADD COLUMN IF NOT EXISTS close_search_before BIGINT,
+           ADD COLUMN IF NOT EXISTS settled_before_close NUMERIC(78,0)`
+      );
     });
   }
 
@@ -412,6 +420,17 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
       if (rows[0].forecast_pending !== false) {
         throw new Error(`Tempo session drain ${drainId} refund forecast is still pending`);
       }
+      const channel = await tx.query<{ state_json: string }>(
+        "SELECT state_json FROM mpp_tempo_channels WHERE channel_key = $1",
+        [channelId.toLowerCase()]
+      );
+      const state = channel.rows[0] ? parseStoreValue(channel.rows[0].state_json) : null;
+      const settled = (state as { settledOnChain?: unknown } | null)?.settledOnChain;
+      await tx.query(
+        `UPDATE mpp_tempo_close_intents SET settled_before_close = $3
+          WHERE channel_id = $1 AND drain_id = $2`,
+        [channelId.toLowerCase(), drainId, typeof settled === "bigint" ? settled.toString() : null]
+      );
       return record;
     });
   }
@@ -525,6 +544,62 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
     );
     if (!rows[0]) throw new Error(`Tempo session close intent not found`);
     return closeRecord(rows[0]);
+  }
+
+  /** Set a close's reference only if none is set, reporting whether this call set it. */
+  async claimCloseReference(
+    channelId: string,
+    drainId: string,
+    reference: string
+  ): Promise<{ reference: string | null; claimed: boolean }> {
+    const { rows } = await this.pool.query<{ reference: string | null }>(
+      `UPDATE mpp_tempo_close_intents
+          SET reference = $3, updated_at = $4
+        WHERE channel_id = $1 AND drain_id = $2 AND forecast_pending = FALSE
+          AND reference IS NULL
+        RETURNING reference`,
+      [channelId.toLowerCase(), drainId, reference, Date.now()]
+    );
+    if (rows[0]) return { reference: rows[0].reference, claimed: true };
+    const current = await this.getClose(channelId);
+    if (current?.drainId !== drainId || current.reference === null) {
+      throw new Error(`Tempo session close intent not found`);
+    }
+    return { reference: current.reference, claimed: false };
+  }
+
+  async getCloseRecovery(channelId: string): Promise<{
+    updatedAtMs: number;
+    searchBefore: bigint | null;
+    settledBeforeClose: bigint | null;
+  } | null> {
+    const { rows } = await this.pool.query<{
+      updated_at: string;
+      close_search_before: string | null;
+      settled_before_close: string | null;
+    }>(
+      `SELECT updated_at, close_search_before, settled_before_close
+         FROM mpp_tempo_close_intents
+        WHERE channel_id = $1`,
+      [channelId.toLowerCase()]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      updatedAtMs: Number(row.updated_at),
+      searchBefore: row.close_search_before === null ? null : BigInt(row.close_search_before),
+      settledBeforeClose: row.settled_before_close === null ? null : BigInt(row.settled_before_close),
+    };
+  }
+
+  /** Record where a paused close search resumes; the cursor only moves back. */
+  async recordCloseSearch(channelId: string, drainId: string, resumeAt: bigint): Promise<void> {
+    await this.pool.query(
+      `UPDATE mpp_tempo_close_intents
+          SET close_search_before = LEAST(COALESCE(close_search_before, $3), $3)
+        WHERE channel_id = $1 AND drain_id = $2`,
+      [channelId.toLowerCase(), drainId, resumeAt.toString()]
+    );
   }
 
   private async runCloseIntentTransaction<value>(

@@ -699,15 +699,13 @@ async function completeTempoDrain(
         await beginClose(expectedChannelId, record.drainId);
         recoveryVersion = await deps.tempoSettlementReadiness?.captureRecoveryVersion();
         if (deps.hostedSettlementReports) {
-          const reserved = await deps.hostedSettlementReports.reserveTempo(
-            expectedChannelId, "close", record.drainId
+          hostedObligationId = await reserveHostedTempoClose(
+            deps.hostedSettlementReports, rail.mpp!, record, expectedChannelId
           );
-          if (reserved.replayed) throw new Error("Hosted Tempo close already has an original effect attempt");
-          hostedObligationId = reserved.id;
           if (!rail.mpp?.permitHostedTempoClose) {
             throw new Error("Hosted Tempo close credential guard is unavailable");
           }
-          rail.mpp.permitHostedTempoClose(rail.mppCredential!, reserved.id);
+          rail.mpp.permitHostedTempoClose(rail.mppCredential!, hostedObligationId);
         }
       },
     });
@@ -737,6 +735,15 @@ async function completeTempoDrain(
     // is answered above the ladder rather than falling through it.
     const wrongChannel = tempoWrongChannelRefusal(error, record);
     if (wrongChannel) return wrongChannel;
+    if (error instanceof HostedTempoCloseAttemptsExhaustedError) {
+      return jsonPaymentError("tempo_channel_exit_required", 409, {
+        message: `Tempo drain ${record.drainId} reached its limit of cooperative close attempts that never reached the chain.`,
+        display:
+          "The service could not complete a cooperative close of this stablecoin channel after several attempts. Your funds stay in the channel; use the timed on-chain exit to recover them.",
+        hint: "Start the channel's timed on-chain exit. Retrying this drain with another close credential is refused.",
+        extra: { drain_registered: true, drain_id: record.drainId, channel_id: expectedChannelId },
+      });
+    }
     // A refund short of the debit is a terminal answer about money, not one of
     // the ambiguous close failures the ladder below reconciles — it must never
     // reach the release arm, which would re-credit a balance the chain has
@@ -795,6 +802,75 @@ async function completeTempoDrain(
       extra: { drain_registered: true, drain_id: record.drainId },
     });
   }
+}
+
+/**
+ * How old an unsubmitted hosted close reservation must be before another
+ * attempt may retire it. It matches the Tempo settlement lease, above mppx's
+ * 180-second receipt wait. It is not a bound on how long an attempt runs: RPC
+ * retries before the broadcast can carry one past it, and such an attempt's
+ * landed close is recorded on the successor reservation.
+ */
+const HOSTED_TEMPO_CLOSE_STALE_MS = 300_000;
+/** Retired attempts per drain before cooperative close is refused for it. */
+const HOSTED_TEMPO_CLOSE_MAX_RELEASES = 3;
+const HOSTED_TEMPO_CLOSE_IN_FLIGHT = "Hosted Tempo close already has an original effect attempt";
+
+class HostedTempoCloseAttemptsExhaustedError extends Error {}
+
+/**
+ * Reserve the hosted close obligation this attempt broadcasts under.
+ *
+ * An earlier attempt that failed before recording a transaction (mppx's own
+ * verify failing on a chain read, or a receipt wait that gave up) leaves its
+ * reservation behind. Once it is older than the receipt wait and the chain
+ * still shows the channel open, it is retired and replaced in one
+ * transaction. The successor stays outstanding for the same drain, so a late
+ * landing of the earlier close is recorded on it and reported once; the chain
+ * closes the channel only once.
+ */
+async function reserveHostedTempoClose(
+  reports: HostedSettlementReportObligations,
+  mpp: NonNullable<UpfrontPaymentOpts["mpp"]>,
+  record: CreditDrainRecord,
+  channelId: string
+): Promise<string> {
+  const pending = await reports.pendingTempoClose(channelId, record.drainId);
+  if (!pending) {
+    const reserved = await reports.reserveTempo(channelId, "close", record.drainId);
+    if (reserved.replayed) throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
+    return reserved.id;
+  }
+  if (pending.txHash || !mpp.getTempoSessionDrainState) throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
+  const state = await mpp.getTempoSessionDrainState(channelId);
+  if (state.finalized || state.deposit === 0n || state.closeRequestedAt !== 0n) {
+    throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
+  }
+  const result = await reports.releaseStaleTempoClose(pending.id, channelId, record.drainId, {
+    staleAfterMs: HOSTED_TEMPO_CLOSE_STALE_MS,
+    maxReleases: HOSTED_TEMPO_CLOSE_MAX_RELEASES,
+  });
+  if (result.outcome === "in_flight") throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
+  if (result.outcome === "exhausted") {
+    loggers.tempo.warn("tempo_session_close_attempts_exhausted", {
+      credit_id: record.creditId,
+      drain_id: record.drainId,
+      channel_id: channelId,
+      obligation_id: pending.id,
+      attempt: result.releases + 1,
+    });
+    throw new HostedTempoCloseAttemptsExhaustedError(
+      `Tempo drain ${record.drainId} exhausted its cooperative close attempts`
+    );
+  }
+  loggers.tempo.warn("tempo_session_close_reservation_released", {
+    credit_id: record.creditId,
+    drain_id: record.drainId,
+    channel_id: channelId,
+    obligation_id: pending.id,
+    attempt: result.releases + 1,
+  });
+  return result.id;
 }
 
 function tempoCloseCredentialNeedsRefresh(error: unknown): boolean {
