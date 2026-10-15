@@ -580,6 +580,22 @@ async function waitForLockWaiters(pool: pg.Pool, applicationNames: string[]): Pr
     ).rejects.toThrow(/already closing for another drain/);
   });
 
+  it("lets exactly one replica claim a recovered close's reference", async () => {
+    await storeA.withCloseIntent(CHANNEL_ID, "drain-1", () => Promise.resolve());
+    await storeA.resolveCloseForecast(CHANNEL_ID, "drain-1", "proceed");
+    const reference = `0x${"99".repeat(32)}`;
+    const claims = await Promise.all([
+      storeA.claimCloseReference(CHANNEL_ID, "drain-1", reference),
+      storeB.claimCloseReference(CHANNEL_ID, "drain-1", reference),
+    ]);
+    expect(claims.filter(({ claimed }) => claimed)).toHaveLength(1);
+    expect(claims.map(({ reference: claimedReference }) => claimedReference))
+      .toEqual([reference, reference]);
+    // A confirmation that already landed leaves nothing to claim.
+    await expect(storeB.claimCloseReference(CHANNEL_ID, "drain-1", reference))
+      .resolves.toEqual({ reference, claimed: false });
+  });
+
   it("does not let one replica release after another opens the forecast gate", async () => {
     const callerPubkey = "ab".repeat(32);
     await ledger.fund({

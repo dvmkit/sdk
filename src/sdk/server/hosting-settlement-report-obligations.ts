@@ -271,6 +271,8 @@ export class HostedSettlementReportObligations {
           created_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint,
           updated_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
         );
+        ALTER TABLE sdk_hosted_settlement_report_obligations
+          ADD COLUMN IF NOT EXISTS close_search_before BIGINT;
         CREATE INDEX IF NOT EXISTS sdk_hosted_settlement_report_pending
           ON sdk_hosted_settlement_report_obligations (dvm_id,scope,state)
           WHERE state NOT IN ('delivered','no_report');
@@ -399,44 +401,111 @@ export class HostedSettlementReportObligations {
   }
 
   async reserveTempo(channelId: string, operation: "settle" | "close", drainId?: string): Promise<HostedEffectReservation> {
+    return transaction(this.pool, (tx) => this.reserveTempoIn(tx, channelId, operation, drainId));
+  }
+
+  /**
+   * Retire a close reservation that never recorded a transaction and reserve
+   * the drain's next attempt, in one transaction, so the drain always keeps one
+   * outstanding close obligation. A close from the retired attempt that lands
+   * late is a close of the same channel: `recordSubmitted` on the retired row
+   * writes it onto the successor, and recovery attaches it there if that
+   * attempt never got to write, so it is reported once.
+   *
+   * The caller has just read the channel open on chain. The age bound only
+   * spares a reservation young enough to be inside its first receipt wait; an
+   * attempt slowed past it by a degraded RPC can still be running.
+   */
+  async releaseStaleTempoClose(id: string, channelId: string, drainId: string, limits: {
+    staleAfterMs: number; maxReleases: number;
+  }): Promise<
+    | { outcome: "reserved"; id: string; releases: number }
+    | { outcome: "in_flight" }
+    | { outcome: "exhausted"; releases: number }
+  > {
+    return transaction(this.pool, async (tx) => {
+      // Identity before the row: reserveTempo takes them in this order.
+      await this.lockIdentity(tx);
+      const row = await this.lockRow(tx, id);
+      if (row.rail !== "tempo" || row.operation !== "close" ||
+        row.channel_id !== channelId.toLowerCase() || row.original.drainId !== drainId ||
+        row.state !== "reserved" || row.tx_hash) {
+        return { outcome: "in_flight" };
+      }
+      const age = await tx.query<{ stale: boolean }>(
+        `SELECT updated_at_ms <= FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint - $2 AS stale
+         FROM sdk_hosted_settlement_report_obligations WHERE id=$1`, [id, limits.staleAfterMs]
+      );
+      if (!age.rows[0]?.stale) return { outcome: "in_flight" };
+      const released = Number((await tx.query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM sdk_hosted_settlement_report_obligations
+         WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
+           AND original->>'drainId'=$4 AND state='no_report' AND tx_hash IS NULL`,
+        [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
+      )).rows[0].n);
+      if (released >= limits.maxReleases) return { outcome: "exhausted", releases: released };
+      await tx.query(
+        `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',
+           updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint WHERE id=$1`, [id]
+      );
+      const next = await this.reserveTempoIn(tx, channelId, "close", drainId);
+      return { outcome: "reserved", id: next.id, releases: released + 1 };
+    });
+  }
+
+  /**
+   * Resolve an unsubmitted close reservation whose channel the payer exited
+   * on its own: no cooperative close of ours can land on a finalized channel.
+   */
+  async resolveTempoCloseExit(id: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',
+         updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
+         AND state='reserved' AND tx_hash IS NULL`, [id, this.dvmId, this.scope]
+    );
+    return result.rowCount === 1;
+  }
+
+  private async reserveTempoIn(
+    tx: PoolClient, channelId: string, operation: "settle" | "close", drainId?: string
+  ): Promise<HostedEffectReservation> {
     const config = this.tempo;
     if (!config || !hex(channelId, 32)) throw new Error("Hosted Tempo settlement configuration is unavailable");
-    return transaction(this.pool, async (tx) => {
-      const state = await tx.query<{ state_json: string }>(
-        "SELECT state_json FROM mpp_tempo_channels WHERE channel_key=$1", [channelId.toLowerCase()]
+    const state = await tx.query<{ state_json: string }>(
+      "SELECT state_json FROM mpp_tempo_channels WHERE channel_key=$1", [channelId.toLowerCase()]
+    );
+    if (!state.rows[0]) throw new Error("Hosted Tempo channel is not durable");
+    const identity = await this.lockIdentity(tx);
+    const parsed = parseStoreValue(state.rows[0].state_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Hosted Tempo state is invalid");
+    const row = parsed as Record<string, unknown>;
+    if (row.chainId !== Number(config.network.split(":")[1]) ||
+      String(row.escrowContract).toLowerCase() !== config.escrow.toLowerCase() ||
+      String(row.payee).toLowerCase() !== config.payee.toLowerCase() ||
+      String(row.token).toLowerCase() !== config.token.toLowerCase()) {
+      throw new Error("Hosted Tempo channel has another chain or recipient");
+    }
+    if (operation === "close") {
+      if (!drainId) throw new Error("Hosted Tempo close requires the original drain");
+      const close = await tx.query<{ drain_id: string }>(
+        "SELECT drain_id FROM mpp_tempo_close_intents WHERE channel_id=$1", [channelId.toLowerCase()]
       );
-      if (!state.rows[0]) throw new Error("Hosted Tempo channel is not durable");
-      const identity = await this.lockIdentity(tx);
-      const parsed = parseStoreValue(state.rows[0].state_json);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Hosted Tempo state is invalid");
-      const row = parsed as Record<string, unknown>;
-      if (row.chainId !== Number(config.network.split(":")[1]) ||
-        String(row.escrowContract).toLowerCase() !== config.escrow.toLowerCase() ||
-        String(row.payee).toLowerCase() !== config.payee.toLowerCase() ||
-        String(row.token).toLowerCase() !== config.token.toLowerCase()) {
-        throw new Error("Hosted Tempo channel has another chain or recipient");
-      }
-      if (operation === "close") {
-        if (!drainId) throw new Error("Hosted Tempo close requires the original drain");
-        const close = await tx.query<{ drain_id: string }>(
-          "SELECT drain_id FROM mpp_tempo_close_intents WHERE channel_id=$1", [channelId.toLowerCase()]
-        );
-        if (close.rows[0]?.drain_id !== drainId) throw new Error("Hosted Tempo close has no matching drain");
-      }
-      const highestVoucherAmount = nativeAmount(row.highestVoucherAmount);
-      const settledOnChain = nativeAmount(row.settledOnChain);
-      const spent = nativeAmount(row.spent);
-      if (BigInt(settledOnChain) > BigInt(highestVoucherAmount) ||
-        BigInt(spent) > BigInt(highestVoucherAmount)) {
-        throw new Error("Hosted Tempo settlement source has inconsistent amounts");
-      }
-      const original = operation === "settle" ? {
-        highestVoucherAmount, settledOnChain, spent,
-      } : { drainId, highestVoucherAmount, settledOnChain, spent };
-      return this.insert(tx, identity, "tempo", operation, config.network,
-        config.escrow, channelId.toLowerCase(), original,
-        operation === "close" ? [drainId] : [highestVoucherAmount]);
-    });
+      if (close.rows[0]?.drain_id !== drainId) throw new Error("Hosted Tempo close has no matching drain");
+    }
+    const highestVoucherAmount = nativeAmount(row.highestVoucherAmount);
+    const settledOnChain = nativeAmount(row.settledOnChain);
+    const spent = nativeAmount(row.spent);
+    if (BigInt(settledOnChain) > BigInt(highestVoucherAmount) ||
+      BigInt(spent) > BigInt(highestVoucherAmount)) {
+      throw new Error("Hosted Tempo settlement source has inconsistent amounts");
+    }
+    const original = operation === "settle" ? {
+      highestVoucherAmount, settledOnChain, spent,
+    } : { drainId, highestVoucherAmount, settledOnChain, spent };
+    return this.insert(tx, identity, "tempo", operation, config.network,
+      config.escrow, channelId.toLowerCase(), original,
+      operation === "close" ? [drainId] : [highestVoucherAmount]);
   }
 
   async findPendingTempo(channelId: string, operation: "settle" | "close"): Promise<ObligationRow | undefined> {
@@ -450,17 +519,35 @@ export class HostedSettlementReportObligations {
   }
 
   /** The original close obligation reserved for this drain, while its report is outstanding. */
-  async pendingTempoClose(channelId: string, drainId: string):
-  Promise<{ id: string; txHash: string | null; reservedAtMs: number } | undefined> {
-    const result = await this.pool.query<{ id: string; tx_hash: string | null; created_at_ms: string }>(
-      `SELECT id,tx_hash,created_at_ms FROM sdk_hosted_settlement_report_obligations
+  async pendingTempoClose(channelId: string, drainId: string): Promise<{
+    id: string; txHash: string | null; reservedAtMs: number; searchBefore: bigint | null;
+  } | undefined> {
+    const result = await this.pool.query<{
+      id: string; tx_hash: string | null; created_at_ms: string; close_search_before: string | null;
+    }>(
+      `SELECT id,tx_hash,created_at_ms,close_search_before FROM sdk_hosted_settlement_report_obligations
        WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
          AND original->>'drainId'=$4 AND state NOT IN ('delivered','no_report')
        ORDER BY created_at_ms DESC LIMIT 1`,
       [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
     );
     const row = result.rows[0];
-    return row && { id: row.id, txHash: row.tx_hash, reservedAtMs: Number(row.created_at_ms) };
+    return row && { id: row.id, txHash: row.tx_hash, reservedAtMs: Number(row.created_at_ms),
+      searchBefore: searchCursor(row.close_search_before) };
+  }
+
+  /**
+   * Where the next search for this close obligation's transaction resumes. It
+   * lives on the obligation, not the drain's close intent, because releasing
+   * the drain deletes the intent while the obligation still needs the search.
+   */
+  async recordTempoCloseSearch(id: string, resumeAt: bigint): Promise<void> {
+    await this.pool.query(
+      `UPDATE sdk_hosted_settlement_report_obligations
+          SET close_search_before = LEAST(COALESCE(close_search_before, $4), $4)
+        WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'`,
+      [id, this.dvmId, this.scope, resumeAt.toString()]
+    );
   }
 
   async submittedIds(rail: Rail, operation: Operation, txHash: string,
@@ -573,16 +660,73 @@ export class HostedSettlementReportObligations {
       ? this.x402Transaction.bind(this) : <T>(operation: (tx: PoolClient) => Promise<T>) =>
         transaction(this.pool, operation);
     await write(async (tx) => {
-      const row = await this.lockRow(tx, id);
+      let row = await this.lockRow(tx, id);
+      if (row.state === "no_report" && !row.tx_hash) {
+        row = await this.successorOfRetiredClose(tx, row);
+      }
       if (row.tx_hash && row.tx_hash.toLowerCase() !== txHash.toLowerCase()) {
         throw new Error("Hosted settlement transaction replay conflicts");
       }
       await tx.query(
         `UPDATE sdk_hosted_settlement_report_obligations SET tx_hash=COALESCE(tx_hash,$2),
            updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint WHERE id=$1`,
-        [id, txHash.toLowerCase()]
+        [row.id, txHash.toLowerCase()]
       );
     });
+  }
+
+  /**
+   * Close reservations that never recorded a transaction, oldest first. Each
+   * one owes a payout report only if its close lands, so it stays unresolved
+   * until a reconcile reads how its channel finalized.
+   */
+  async unsubmittedTempoCloses(limit = 100): Promise<Array<{
+    id: string; channelId: string; drainId: string; reservedAtMs: number; searchBefore: bigint | null;
+  }>> {
+    const result = await this.pool.query<{
+      id: string; channel_id: string; drain_id: string | null; created_at_ms: string;
+      close_search_before: string | null;
+    }>(
+      `SELECT id,channel_id,original->>'drainId' AS drain_id,created_at_ms,close_search_before
+         FROM sdk_hosted_settlement_report_obligations
+        WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close'
+          AND state='reserved' AND tx_hash IS NULL
+        ORDER BY created_at_ms,id LIMIT $3`,
+      [this.dvmId, this.scope, limit]
+    );
+    return result.rows.flatMap((row) => row.drain_id === null ? [] : [{
+      id: row.id, channelId: row.channel_id, drainId: row.drain_id,
+      reservedAtMs: Number(row.created_at_ms), searchBefore: searchCursor(row.close_search_before),
+    }]);
+  }
+
+  /**
+   * A retired close reservation's attempt can still be running when its
+   * successor is reserved, and its close can land. The close is the same
+   * channel's, so it belongs to the drain's outstanding obligation; writing it
+   * onto the retired row would leave that obligation without a transaction and
+   * the payout unreported.
+   */
+  private async successorOfRetiredClose(tx: Query, retired: ObligationRow): Promise<ObligationRow> {
+    const drainId = retired.original.drainId;
+    if (retired.rail !== "tempo" || retired.operation !== "close" || typeof drainId !== "string") {
+      throw new Error("Hosted settlement obligation was resolved without a transaction");
+    }
+    const successor = await tx.query<{ id: string }>(
+      `SELECT id FROM sdk_hosted_settlement_report_obligations
+        WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
+          AND original->>'drainId'=$4 AND state NOT IN ('delivered','no_report')
+        ORDER BY created_at_ms DESC LIMIT 1`,
+      [this.dvmId, this.scope, retired.channel_id, drainId]
+    );
+    if (!successor.rows[0]) {
+      throw new Error("Hosted Tempo close was retired and the drain has no outstanding obligation");
+    }
+    const locked = await this.lockRow(tx, successor.rows[0].id);
+    // The successor is chosen before its lock is held, so another stale
+    // release can retire it while this waits; follow it to its own successor.
+    return locked.state === "no_report" && !locked.tx_hash
+      ? this.successorOfRetiredClose(tx, locked) : locked;
   }
 
   async recoveryCandidates(): Promise<HostedRecoverableEffect[]> {
@@ -1069,4 +1213,8 @@ export class HostedSettlementReportObligations {
       !isDeepStrictEqual(row.original, original)) throw new Error("Hosted settlement source replay conflicts");
     return { id: row.id, replayed: true };
   }
+}
+
+function searchCursor(value: string | null): bigint | null {
+  return value === null ? null : BigInt(value);
 }
