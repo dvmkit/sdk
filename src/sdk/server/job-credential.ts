@@ -63,7 +63,7 @@ export function jobCredentialGate(opts: { acceptsBearer: boolean }): JobCredenti
         // to a human verbatim, so the conditional advice lives in `hint`, which
         // is what the agent acts on.
         display: "Couldn't retrieve your result — the request was missing its job credential.",
-        hint: `Send the job_token from the POST /v1/job response as the X-Job-Token header${alternative}. The token is minted once, at submit, and the DVM cannot reissue it — a job submitted from another machine, or by a caller that never stored it, can't be read here. If your caller never sends X-Job-Token at all, upgrade: npm i -g @dvmkit/dvm-cli@0.2.0, then retry the same command with --endpoint <url> --job-token <hex> (or set DVM_JOB_ENDPOINT and DVM_JOB_TOKEN).`,
+        hint: `Send the job_token from the POST /v1/job response as the X-Job-Token header${alternative}. The token is minted once, at submit, and the DVM cannot reissue it — a job submitted from another machine, or by a caller that never stored it, can't be read here. If your caller never sends X-Job-Token at all, upgrade: npm i -g @dvmkit/dvm-cli@latest, then retry the same command with --endpoint <url> --job-token <hex> (or set DVM_JOB_ENDPOINT and DVM_JOB_TOKEN).`,
       };
     },
   };
