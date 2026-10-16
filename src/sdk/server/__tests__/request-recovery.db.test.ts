@@ -683,7 +683,24 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     expect(broadcast).toHaveBeenCalledOnce();
     expect(handled.count).toBe(1);
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM processed_payments")).rows[0].count).toBe(1);
-    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM credit_fundings")).rows[0].count).toBe(1);
+    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM credits")).rows[0].count).toBe(1);
+    const accounting = await poolB.query<{
+      credit_id: string; balance_micro: string; amount_micro: string; status: string;
+    }>(
+      `SELECT c.credit_id, c.balance_micro, d.amount_micro, d.status
+         FROM credits c JOIN credit_draws d ON d.credit_id = c.credit_id
+        WHERE d.job_id = $1`,
+      [original.job_id]
+    );
+    expect(accounting.rows).toHaveLength(1);
+    const recorded = accounting.rows[0];
+    expect(recorded.credit_id).toBe(`imp:tempo:${challenge.id}`);
+    expect(recorded.amount_micro).toBe(String(PRICE_MICRO));
+    expect(["pending", "settled"]).toContain(recorded.status);
+    // Completion may settle during recovery. One database snapshot must
+    // account for the quote exactly, as either held balance or spent credit.
+    expect(Number(recorded.balance_micro) +
+      (recorded.status === "settled" ? Number(recorded.amount_micro) : 0)).toBe(PRICE_MICRO);
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM credit_draws")).rows[0].count).toBe(1);
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM jobs")).rows[0].count).toBe(1);
   });
