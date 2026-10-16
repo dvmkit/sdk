@@ -7,6 +7,7 @@ import { Session as TempoSession } from "mppx/tempo";
 import type { Pool, PoolClient } from "pg";
 import { createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, http, parseAbiItem, toFunctionSelector } from "viem";
 
+import { loggers } from "../../observability/loggers";
 import { resolveRpcOverride } from "../../lib/payment-rails/rpc";
 import { X402_BATCH_CHANNEL_ABI } from "../../lib/x402/batch-abi";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
@@ -17,7 +18,7 @@ import type { PostgresX402ChannelStorage } from "./x402-channel-store";
 type Query = Pick<Pool | PoolClient, "query">;
 type Rail = "x402" | "tempo";
 type Operation = "claim" | "refund" | "settle" | "close";
-type State = "reserved" | "observed" | "report_queued" | "delivered" | "no_report";
+type State = "reserved" | "observed" | "report_queued" | "delivered" | "no_report" | "exhausted" | "unmatched";
 
 export const HOSTED_SETTLEMENT_UNRESOLVED_SQL = `state NOT IN ('delivered','no_report')
   OR (rail='x402' AND operation IN ('claim','refund')
@@ -265,14 +266,13 @@ export class HostedSettlementReportObligations {
           operation TEXT NOT NULL CHECK (operation IN ('claim','refund','settle','close')),
           network TEXT NOT NULL, contract TEXT NOT NULL, channel_id TEXT NOT NULL,
           original JSONB NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('reserved','observed','report_queued','delivered','no_report')),
+          state TEXT NOT NULL CHECK (state IN ('reserved','observed','report_queued','delivered','no_report','exhausted','unmatched')),
+          close_search_before BIGINT, close_write_off_note TEXT,
           tx_hash TEXT, block_number BIGINT, block_hash TEXT, delta_native NUMERIC(78,0),
           payout_id TEXT, report_id TEXT, report_payload JSONB, delivered_at_ms BIGINT,
           created_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint,
           updated_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
         );
-        ALTER TABLE sdk_hosted_settlement_report_obligations
-          ADD COLUMN IF NOT EXISTS close_search_before BIGINT;
         CREATE INDEX IF NOT EXISTS sdk_hosted_settlement_report_pending
           ON sdk_hosted_settlement_report_obligations (dvm_id,scope,state)
           WHERE state NOT IN ('delivered','no_report');
@@ -280,6 +280,29 @@ export class HostedSettlementReportObligations {
           ON sdk_hosted_settlement_report_obligations (report_id)
           WHERE report_id IS NOT NULL;
       `);
+      const columns = await this.pool.query<{ attname: string }>(
+        `SELECT attname FROM pg_attribute
+         WHERE attrelid='sdk_hosted_settlement_report_obligations'::regclass AND NOT attisdropped`
+      );
+      for (const [name, type] of [["close_search_before", "BIGINT"], ["close_write_off_note", "TEXT"]]) {
+        if (!columns.rows.some((column) => column.attname === name)) {
+          await this.pool.query(`ALTER TABLE sdk_hosted_settlement_report_obligations ADD COLUMN ${name} ${type}`);
+        }
+      }
+      const constraint = await this.pool.query<{ definition: string }>(
+        `SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+         WHERE conrelid='sdk_hosted_settlement_report_obligations'::regclass
+           AND conname='sdk_hosted_settlement_report_obligations_state_check'`
+      );
+      const states = ["reserved", "observed", "report_queued", "delivered", "no_report", "exhausted", "unmatched"];
+      const expected = `CHECK ((state = ANY (ARRAY[${states.map((state) => `'${state}'::text`).join(", ")}])))`;
+      if (constraint.rows[0]?.definition !== expected) {
+        await this.pool.query(`ALTER TABLE sdk_hosted_settlement_report_obligations
+          DROP CONSTRAINT IF EXISTS sdk_hosted_settlement_report_obligations_state_check;
+          ALTER TABLE sdk_hosted_settlement_report_obligations
+          ADD CONSTRAINT sdk_hosted_settlement_report_obligations_state_check
+          CHECK (state IN ('reserved','observed','report_queued','delivered','no_report','exhausted','unmatched'))`);
+      }
       await this.pool.query(
         `INSERT INTO sdk_hosted_settlement_report_history (singleton,complete)
          VALUES (TRUE,$1) ON CONFLICT (singleton) DO NOTHING`,
@@ -406,9 +429,9 @@ export class HostedSettlementReportObligations {
 
   /**
    * Retire a close reservation that never recorded a transaction and reserve
-   * the drain's next attempt, in one transaction, so the drain always keeps one
-   * outstanding close obligation. A close from the retired attempt that lands
-   * late is a close of the same channel: `recordSubmitted` on the retired row
+   * the drain's next attempt in one transaction. At the retry cap the final
+   * row becomes terminal `exhausted` and remains claimable by a late landing.
+   * A close from the retired attempt that lands late is the same channel's close: `recordSubmitted` on the retired row
    * writes it onto the successor, and recovery attaches it there if that
    * attempt never got to write, so it is reported once.
    *
@@ -417,7 +440,7 @@ export class HostedSettlementReportObligations {
    * attempt slowed past it by a degraded RPC can still be running.
    */
   async releaseStaleTempoClose(id: string, channelId: string, drainId: string, limits: {
-    staleAfterMs: number; maxReleases: number;
+    staleAfterMs: number; maxReleases: number; onExhausted?: (tx: PoolClient) => Promise<void>;
   }): Promise<
     | { outcome: "reserved"; id: string; releases: number }
     | { outcome: "in_flight" }
@@ -443,7 +466,14 @@ export class HostedSettlementReportObligations {
            AND original->>'drainId'=$4 AND state='no_report' AND tx_hash IS NULL`,
         [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
       )).rows[0].n);
-      if (released >= limits.maxReleases) return { outcome: "exhausted", releases: released };
+      if (released >= limits.maxReleases) {
+        await tx.query(
+          `UPDATE sdk_hosted_settlement_report_obligations SET state='exhausted',
+             updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint WHERE id=$1`, [id]
+        );
+        await limits.onExhausted?.(tx);
+        return { outcome: "exhausted", releases: released };
+      }
       await tx.query(
         `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',
            updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint WHERE id=$1`, [id]
@@ -462,9 +492,65 @@ export class HostedSettlementReportObligations {
       `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',
          updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
        WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
-         AND state='reserved' AND tx_hash IS NULL`, [id, this.dvmId, this.scope]
+         AND state IN ('reserved','exhausted') AND tx_hash IS NULL`, [id, this.dvmId, this.scope]
     );
     return result.rowCount === 1;
+  }
+
+  async tempoCloseAmountAtStake(id: string): Promise<string> {
+    const row = await this.lockRow(this.pool, id);
+    if (row.rail !== "tempo" || row.operation !== "close") throw new Error("Not a Tempo close obligation");
+    return (BigInt(String(row.original.highestVoucherAmount)) -
+      BigInt(String(row.original.settledOnChain))).toString();
+  }
+
+  /** Stop automatic searches without declaring a possibly missing payout discharged. */
+  async markTempoCloseUnmatched(id: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE sdk_hosted_settlement_report_obligations SET state='unmatched',
+         updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
+         AND state IN ('reserved','exhausted') AND tx_hash IS NULL`, [id, this.dvmId, this.scope]
+    );
+    return result.rowCount === 1;
+  }
+
+  async writeOffTempoClose(id: string, note: string): Promise<{ channelId: string; amount: string } | undefined> {
+    const result = await this.pool.query<{ channel_id: string; original: Record<string, unknown> }>(
+      `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report', close_write_off_note=$4,
+         updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
+         AND state='unmatched' AND tx_hash IS NULL RETURNING channel_id,original`,
+      [id, this.dvmId, this.scope, note]
+    );
+    const row = result.rows[0];
+    return row && { channelId: row.channel_id, amount: (BigInt(String(row.original.highestVoucherAmount)) -
+      BigInt(String(row.original.settledOnChain))).toString() };
+  }
+
+  async reopenTempoClose(id: string): Promise<boolean> {
+    return transaction(this.pool, async (tx) => {
+      const owned = await tx.query(
+        "SELECT id FROM sdk_hosted_settlement_report_obligations WHERE id=$1 AND dvm_id=$2 AND scope=$3",
+        [id, this.dvmId, this.scope]
+      );
+      if (!owned.rowCount) return false;
+      await this.lockIdentity(tx);
+      const result = await tx.query(
+        `UPDATE sdk_hosted_settlement_report_obligations target
+         SET state='reserved', close_search_before=NULL,
+           updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
+         WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
+           AND state IN ('unmatched','no_report') AND tx_hash IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM sdk_hosted_settlement_report_obligations other
+             WHERE other.dvm_id=target.dvm_id AND other.scope=target.scope
+               AND other.rail='tempo' AND other.operation='close' AND other.channel_id=target.channel_id
+               AND other.id<>target.id AND (other.state<>'no_report' OR other.tx_hash IS NOT NULL)
+           )`, [id, this.dvmId, this.scope]
+      );
+      return result.rowCount === 1;
+    });
   }
 
   private async reserveTempoIn(
@@ -520,19 +606,19 @@ export class HostedSettlementReportObligations {
 
   /** The original close obligation reserved for this drain, while its report is outstanding. */
   async pendingTempoClose(channelId: string, drainId: string): Promise<{
-    id: string; txHash: string | null; reservedAtMs: number; searchBefore: bigint | null;
+    id: string; state: State; txHash: string | null; reservedAtMs: number; searchBefore: bigint | null;
   } | undefined> {
     const result = await this.pool.query<{
-      id: string; tx_hash: string | null; created_at_ms: string; close_search_before: string | null;
+      id: string; state: State; tx_hash: string | null; created_at_ms: string; close_search_before: string | null;
     }>(
-      `SELECT id,tx_hash,created_at_ms,close_search_before FROM sdk_hosted_settlement_report_obligations
+      `SELECT id,state,tx_hash,created_at_ms,close_search_before FROM sdk_hosted_settlement_report_obligations
        WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
          AND original->>'drainId'=$4 AND state NOT IN ('delivered','no_report')
        ORDER BY created_at_ms DESC LIMIT 1`,
       [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
     );
     const row = result.rows[0];
-    return row && { id: row.id, txHash: row.tx_hash, reservedAtMs: Number(row.created_at_ms),
+    return row && { id: row.id, state: row.state, txHash: row.tx_hash, reservedAtMs: Number(row.created_at_ms),
       searchBefore: searchCursor(row.close_search_before) };
   }
 
@@ -669,6 +755,7 @@ export class HostedSettlementReportObligations {
       }
       await tx.query(
         `UPDATE sdk_hosted_settlement_report_obligations SET tx_hash=COALESCE(tx_hash,$2),
+           state=CASE WHEN state IN ('exhausted','unmatched') THEN 'reserved' ELSE state END,
            updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint WHERE id=$1`,
         [row.id, txHash.toLowerCase()]
       );
@@ -677,8 +764,8 @@ export class HostedSettlementReportObligations {
 
   /**
    * Close reservations that never recorded a transaction, oldest first. Each
-   * one owes a payout report only if its close lands, so it stays unresolved
-   * until a reconcile reads how its channel finalized.
+   * one owes a payout report if its close lands. Exhausted attempts remain
+   * observable for late landings; unmatched searches require an explicit retry.
    */
   async unsubmittedTempoCloses(limit = 100): Promise<Array<{
     id: string; channelId: string; drainId: string; reservedAtMs: number; searchBefore: bigint | null;
@@ -690,7 +777,7 @@ export class HostedSettlementReportObligations {
       `SELECT id,channel_id,original->>'drainId' AS drain_id,created_at_ms,close_search_before
          FROM sdk_hosted_settlement_report_obligations
         WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close'
-          AND state='reserved' AND tx_hash IS NULL
+          AND state IN ('reserved','exhausted') AND tx_hash IS NULL
         ORDER BY created_at_ms,id LIMIT $3`,
       [this.dvmId, this.scope, limit]
     );
@@ -1213,6 +1300,32 @@ export class HostedSettlementReportObligations {
       !isDeepStrictEqual(row.original, original)) throw new Error("Hosted settlement source replay conflicts");
     return { id: row.id, replayed: true };
   }
+}
+
+/** Restart a terminal close-report search after the operator repairs incomplete RPC history. */
+export async function retryHostedTempoCloseReport(args: {
+  db: Pool;
+  dvmId: string;
+  scope: string;
+  obligationId: string;
+}): Promise<boolean> {
+  const obligations = new HostedSettlementReportObligations(args.db, args.dvmId, args.scope);
+  return obligations.reopenTempoClose(args.obligationId);
+}
+
+/** Forgo an unmatched builder payout report after the operator declares its history irrecoverable. */
+export async function writeOffHostedTempoCloseReport(args: {
+  db: Pool; dvmId: string; scope: string; obligationId: string; note: string;
+}): Promise<boolean> {
+  const note = args.note.trim();
+  if (!note || note.length > 2_000) throw new Error("A write-off requires a note of 1 to 2000 characters");
+  const row = await new HostedSettlementReportObligations(args.db, args.dvmId, args.scope)
+    .writeOffTempoClose(args.obligationId, note);
+  if (!row) return false;
+  loggers.tempo.warn("tempo_session_close_report_written_off", {
+    channel_id: row.channelId, obligation_id: args.obligationId, amount_forgone_native: row.amount,
+  });
+  return true;
 }
 
 function searchCursor(value: string | null): bigint | null {

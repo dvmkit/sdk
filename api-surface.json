@@ -292,6 +292,7 @@
         "requestIdFromEnvelope",
         "requireClientCompatibility",
         "resolveCashuOptsFromEnv",
+        "retryHostedTempoCloseReport",
         "secp256k1Auth",
         "selectPrimaryCredit",
         "serve",
@@ -302,7 +303,8 @@
         "stripCreditEnvelope",
         "stripProtocolEnvelope",
         "toCreditView",
-        "withSdkInitLock"
+        "withSdkInitLock",
+        "writeOffHostedTempoCloseReport"
       ]
     },
     {

@@ -207,3 +207,5 @@ export { installAdminContentRoutes } from "./admin-content";
 export type { InstallAdminContentRoutesOpts } from "./admin-content";
 export { contentMetadata, baselineContentExpiry, isContentHoldStore, ContentHoldError } from "./content-retention";
 export type { JobContentMetadata, ContentHoldsResponse, ContentHold, ContentHoldEvent, ContentHoldHistory, ContentHoldMutation, ContentHoldStore } from "./content-retention";
+
+export { retryHostedTempoCloseReport, writeOffHostedTempoCloseReport } from "./hosting-settlement-report-obligations";

@@ -1,0 +1,29 @@
+{
+  "status": 409,
+  "body": {
+    "error": "tempo_channel_exit_required",
+    "status": "exit_required",
+    "drain_registered": true,
+    "hint": "Start the channel's timed on-chain exit. A corrected close credential does not reopen this drain or debit it again."
+  },
+  "identityFields": [
+    "drain_id",
+    "channel_id"
+  ],
+  "unbackedFinalizedDrain": {
+    "status": "sent",
+    "sent": {
+      "terminal_outcome": "payer_exit_unbacked",
+      "credit_unbacked": true
+    }
+  },
+  "nonPersisted": {
+    "status": 409,
+    "body": {
+      "error": "tempo_channel_exit_required",
+      "status": "pending",
+      "drain_registered": true,
+      "hint": "This drain remains pending. Use the channel's timed on-chain exit, or retry the same drain with a valid close credential if cooperative attempts remain. Retrying does not debit it again."
+    }
+  }
+}

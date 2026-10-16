@@ -40,7 +40,7 @@ import { lightningFloorMicro } from "./credit-menu";
 import { derivedFundCreditId, isDerivedCreditId } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
 import type { LightningReceive } from "./lightning-receive";
-import type { TempoSessionDrainState } from "./mpp-setup";
+import { TempoCloseDescriptorError, type TempoSessionDrainState } from "./mpp-setup";
 import type { PaymentErrorDetail, PaymentInfo, UpfrontPaymentOpts } from "./payment";
 import {
   buildPaymentErrorResponse,
@@ -372,7 +372,8 @@ async function handleDrain(
       404
     );
   }
-  if (credit.status === "unbacked") {
+  let existing = await deps.ledger.getDrain({ creditId, drainId: drain.drain_id });
+  if (credit.status === "unbacked" && existing?.status !== "sent") {
     const rejected = await burnNonce(c, deps, args.envelope);
     if (rejected) return rejected;
     return jsonPaymentError("credit_unbacked", 409, {
@@ -380,7 +381,6 @@ async function handleDrain(
     });
   }
 
-  let existing = await deps.ledger.getDrain({ creditId, drainId: drain.drain_id });
   if (existing) {
     // Only a *channel* poll has a discovery hop to spare the nonce for: the
     // caller comes back unauthenticated to collect a close challenge. A
@@ -409,6 +409,17 @@ async function handleDrain(
     if (credit.tempoChannelId && existing.method !== "tempo" && existing.status === "pending") {
       const released = await releaseTempoDrain(c, deps, existing, credit.tempoChannelId);
       return respondDrain(c, deps, { record: released, credit });
+    }
+    if (existing.status === "exit_required") {
+      const mpp = (await deps.railOpts(c)).mpp;
+      if (mpp && credit.tempoChannelId) {
+        const recovered = await recoverTempoDrain(deps, mpp, existing, credit.tempoChannelId);
+        if (recovered) {
+          if (isHttpResponse(recovered)) return recovered;
+          return respondDrain(c, deps, { record: recovered, credit });
+        }
+      }
+      return tempoExitRequiredResponse(existing);
     }
     if (existing.method === "tempo" && existing.status === "pending" && credit.tempoChannelId) {
       if (credit.balanceMicro !== credit.availableMicro) {
@@ -700,7 +711,7 @@ async function completeTempoDrain(
         recoveryVersion = await deps.tempoSettlementReadiness?.captureRecoveryVersion();
         if (deps.hostedSettlementReports) {
           hostedObligationId = await reserveHostedTempoClose(
-            deps.hostedSettlementReports, rail.mpp!, record, expectedChannelId
+            deps.hostedSettlementReports, rail.mpp!, record, expectedChannelId, deps.ledger
           );
           if (!rail.mpp?.permitHostedTempoClose) {
             throw new Error("Hosted Tempo close credential guard is unavailable");
@@ -735,14 +746,20 @@ async function completeTempoDrain(
     // is answered above the ladder rather than falling through it.
     const wrongChannel = tempoWrongChannelRefusal(error, record);
     if (wrongChannel) return wrongChannel;
-    if (error instanceof HostedTempoCloseAttemptsExhaustedError) {
-      return jsonPaymentError("tempo_channel_exit_required", 409, {
-        message: `Tempo drain ${record.drainId} reached its limit of cooperative close attempts that never reached the chain.`,
-        display:
-          "The service could not complete a cooperative close of this stablecoin channel after several attempts. Your funds stay in the channel; use the timed on-chain exit to recover them.",
-        hint: "Start the channel's timed on-chain exit. Retrying this drain with another close credential is refused.",
-        extra: { drain_registered: true, drain_id: record.drainId, channel_id: expectedChannelId },
-      });
+    if (error instanceof HostedTempoCloseAttemptsExhaustedError || error instanceof TempoCloseDescriptorError) {
+      const result = deps.ledger.requireTempoDrainExit
+        ? await deps.ledger.requireTempoDrainExit({ creditId: record.creditId, drainId: record.drainId })
+        : { drain: record, replayed: false };
+      if (!result.replayed && error instanceof TempoCloseDescriptorError) {
+        loggers.tempo.warn("tempo_session_close_descriptor_refused", {
+          credit_id: record.creditId, drain_id: record.drainId, channel_id: expectedChannelId,
+          amount_at_stake_native: record.drainedNative?.toString() ?? null,
+          amount_at_stake_micro: record.amountMicro, currency: record.currency,
+          error: error.message,
+        });
+      }
+      if (result.drain.status === "sent") return respondDrain(c, deps, { record: result.drain, credit });
+      return tempoExitRequiredResponse(result.drain);
     }
     // A refund short of the debit is a terminal answer about money, not one of
     // the ambiguous close failures the ladder below reconciles — it must never
@@ -833,7 +850,8 @@ async function reserveHostedTempoClose(
   reports: HostedSettlementReportObligations,
   mpp: NonNullable<UpfrontPaymentOpts["mpp"]>,
   record: CreditDrainRecord,
-  channelId: string
+  channelId: string,
+  ledger: CreditLedgerLike
 ): Promise<string> {
   const pending = await reports.pendingTempoClose(channelId, record.drainId);
   if (!pending) {
@@ -841,6 +859,8 @@ async function reserveHostedTempoClose(
     if (reserved.replayed) throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
     return reserved.id;
   }
+  if (pending.state === "exhausted") throw new HostedTempoCloseAttemptsExhaustedError();
+  if (pending.state === "unmatched") throw new Error("Hosted Tempo close report requires an operator retry");
   if (pending.txHash || !mpp.getTempoSessionDrainState) throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
   const state = await mpp.getTempoSessionDrainState(channelId);
   if (state.finalized || state.deposit === 0n || state.closeRequestedAt !== 0n) {
@@ -849,6 +869,9 @@ async function reserveHostedTempoClose(
   const result = await reports.releaseStaleTempoClose(pending.id, channelId, record.drainId, {
     staleAfterMs: HOSTED_TEMPO_CLOSE_STALE_MS,
     maxReleases: HOSTED_TEMPO_CLOSE_MAX_RELEASES,
+    onExhausted: async (tx) => {
+      await ledger.requireTempoDrainExit?.({ creditId: record.creditId, drainId: record.drainId, tx });
+    },
   });
   if (result.outcome === "in_flight") throw new Error(HOSTED_TEMPO_CLOSE_IN_FLIGHT);
   if (result.outcome === "exhausted") {
@@ -858,6 +881,7 @@ async function reserveHostedTempoClose(
       channel_id: channelId,
       obligation_id: pending.id,
       attempt: result.releases + 1,
+      amount_at_stake_native: await reports.tempoCloseAmountAtStake(pending.id),
     });
     throw new HostedTempoCloseAttemptsExhaustedError(
       `Tempo drain ${record.drainId} exhausted its cooperative close attempts`
@@ -871,6 +895,20 @@ async function reserveHostedTempoClose(
     attempt: result.releases + 1,
   });
   return result.id;
+}
+
+function tempoExitRequiredResponse(record: CreditDrainRecord): Response {
+  const terminal = record.status === "exit_required";
+  return jsonPaymentError("tempo_channel_exit_required", 409, {
+    message: terminal ? `Tempo drain ${record.drainId} cannot cooperatively close this channel.`
+      : `This Tempo close credential cannot complete drain ${record.drainId}.`,
+    display: "Your funds remain in the channel. Use the timed on-chain exit to recover them.",
+    hint: terminal
+      ? "Start the channel's timed on-chain exit. A corrected close credential does not reopen this drain or debit it again."
+      : "This drain remains pending. Use the channel's timed on-chain exit, or retry the same drain with a valid close credential if cooperative attempts remain. Retrying does not debit it again.",
+    extra: { drain_registered: true, drain_id: record.drainId, channel_id: record.channelId,
+      status: record.status },
+  });
 }
 
 function tempoCloseCredentialNeedsRefresh(error: unknown): boolean {
@@ -1545,6 +1583,11 @@ function drainCopy(record: CreditDrainRecord): { display: string; hint: string }
       return {
         display: "The refund was sent to the payout destination you provided.",
         hint: "See `sent` for the settlement reference (e.g. the on-chain transaction hash).",
+      };
+    case "exit_required":
+      return {
+        display: "This drain cannot cooperatively close the channel. Your funds remain in the channel.",
+        hint: "Use the channel's timed on-chain exit. A corrected credential does not reopen this drain.",
       };
     case "released":
       return {

@@ -9,6 +9,15 @@ Hosted servers with platform URL, token, DVM identity and durable database confi
 Deploy the platform endpoint before deploying report-emitting servers. These reports use the existing revenue transport policy: transport/5xx failures retry and abandon after 24 hours; 4xx responses, including 404, become permanently stale. The portable receipt and report contract is in `protocol-fixtures/job-terminal-evidence.json`; compatibility is tested with the pinned published `@dvmkit/sdk@0.1.5-rc.9` verifier.
 
 
+## Tempo close terminal outcomes
+
+A registered Tempo drain that cannot cooperatively close because its descriptor is invalid or its hosted retries are exhausted now returns HTTP 409 `tempo_channel_exit_required`, with `status: "exit_required"`, `drain_registered: true`, `drain_id`, and `channel_id`. Callers must use the channel's timed on-chain exit. A corrected credential does not reopen or debit that drain again. The debit remains reserved for the channel's refund; a late confirmed close can still fulfill it. Older callers that poll every 402 must handle this terminal 409. For a custom ledger without terminal-drain persistence, the 409 instead retains `status: "pending"` and explains that a corrected credential can retry when cooperative attempts remain. The portable response contract includes both modes in `protocol-fixtures/tempo-close-terminal.json`.
+
+Completed Tempo drains remain readable when their credit is `unbacked`. Sweep-completed drains use the existing `sent` state and include `terminal_outcome` and `credit_unbacked` in their settlement evidence; caller liability is discharged only with sufficient refund evidence.
+
+Hosted report searches now stop in persisted `unmatched` after a definitive empty range and require an explicit operator retry. This does not discharge the payout obligation or authorize cleanup. See [HOSTING.md](HOSTING.md) for the retry API and recovery constraints.
+
+
 ## Compatibility and versioning
 
 This is pre-1.0 alpha software and the promises match that. Breaking changes can land in any release, they are announced in the release notes for the release that carries them, and there is no long-term support release. Security fixes are made on the latest published release rather than backported.

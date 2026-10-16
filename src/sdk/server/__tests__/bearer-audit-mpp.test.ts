@@ -27,7 +27,8 @@ const BEARER_CHALLENGE_OPAQUE = Buffer.from(
 
 const BEARER_PATTERNS = [BEARER_HMAC_SECRET, "opaque_nonce_secret_value", BEARER_CHALLENGE_OPAQUE];
 
-vi.mock("mppx", () => ({
+vi.mock("mppx", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("mppx")>()),
   Challenge: { Challenge: vi.fn() },
 }));
 vi.mock("../../../lib/currency", () => ({

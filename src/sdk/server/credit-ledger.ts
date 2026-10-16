@@ -393,7 +393,7 @@ export class CreditLedger {
     // ordinary case and needs no evidence — the consumed rows are the record.
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS fulfilment JSONB`);
     // the operator's decision on a channel drain the payout floor
-    // refused. Two nullable columns rather than a sixth `DrainStatus`, because
+    // refused. Two nullable columns rather than a separate drain status, because
     // a write-off books nothing and moves no money — the drain is still
     // `pending`, its balance still debited, and a later reconcile still books
     // it through the ordinary `pending → sent` CAS with no widening.
@@ -2631,7 +2631,7 @@ export class CreditLedger {
     const { rows } = await this.pool.query<DrainJoinRow>(
       `SELECT d.*, ${DRAIN_CREDIT_COLUMNS} FROM credit_drains d
        JOIN credits c ON c.credit_id = d.credit_id
-       WHERE d.status = 'pending' ORDER BY d.created_at, d.credit_id, d.drain_id`
+       WHERE d.status IN ('pending','exit_required') ORDER BY d.created_at, d.credit_id, d.drain_id`
     );
     return rows.map(drainRecordFromJoinRow);
   }
@@ -2658,7 +2658,7 @@ export class CreditLedger {
     const { rows } = await this.pool.query<DrainJoinRow>(
       `SELECT d.*, ${DRAIN_CREDIT_COLUMNS} FROM credit_drains d
        JOIN credits c ON c.credit_id = d.credit_id
-       WHERE d.status = 'pending'
+       WHERE d.status IN ('pending','exit_required')
          AND d.method = 'tempo'
          AND c.tempo_channel_id IS NOT NULL
          AND d.created_at <= $1
@@ -2720,6 +2720,24 @@ export class CreditLedger {
         WHERE credit_id = $1 AND drain_id = $2`,
       [args.creditId, args.drainId]
     );
+  }
+
+  /** Keep the debit and close intent while the caller uses its timed channel exit. */
+  async requireTempoDrainExit(args: {
+    creditId: string; drainId: string; tx?: CreditLedgerQuerier;
+  }): Promise<DrainTransitionResult> {
+    const q = args.tx ?? this.pool;
+    const { rows } = await q.query<DrainRow>(
+      `UPDATE credit_drains d SET status='exit_required'
+       FROM credits c WHERE d.credit_id=c.credit_id AND d.credit_id=$1 AND d.drain_id=$2
+         AND d.status='pending' AND d.method='tempo' AND c.tempo_channel_id IS NOT NULL
+       RETURNING d.*`, [args.creditId, args.drainId]
+    );
+    if (rows.length) return { drain: await this.rejoin(q, rows[0]), replayed: false };
+    return this.refuseTransition(q, args.creditId, args.drainId, {
+      idempotentWhen: (row) => row.status === "exit_required" || row.status === "sent",
+      verb: "require timed exit",
+    });
   }
 
   /**
@@ -2898,7 +2916,7 @@ export class CreditLedger {
     const nowMs = args.nowMs ?? Date.now();
     const { rows } = await q.query<DrainRow>(
       `UPDATE credit_drains SET status = 'sent', sent_ref = $3, sent_at = $4
-       WHERE credit_id = $1 AND drain_id = $2 AND status = 'pending' AND method <> 'cashu'
+       WHERE credit_id = $1 AND drain_id = $2 AND status IN ('pending','exit_required') AND method <> 'cashu'
        RETURNING *`,
       [args.creditId, args.drainId, JSON.stringify(args.sentRef), nowMs]
     );
@@ -3532,6 +3550,9 @@ export interface CreditLedgerLike {
     drainId: string;
     tx?: CreditLedgerQuerier;
   }): Promise<void>;
+  requireTempoDrainExit?(args: {
+    creditId: string; drainId: string; tx?: CreditLedgerQuerier;
+  }): Promise<DrainTransitionResult>;
   releaseDrain(args: {
     creditId: string;
     drainId: string;
@@ -3657,8 +3678,10 @@ export function isDrainMethod(value: string): value is DrainMethod {
  * `pending → sent` (builder batch job shipped the send-back). MPP either
  * reaches `sent` through cooperative close or `released` with its exact basis
  * restored when chain reconciliation proves that close cannot complete.
+ * `exit_required` ends cooperative attempts without restoring the debit;
+ * a late confirmed close can still fulfill it as `sent`.
  */
-export type DrainStatus = "pending" | "parked" | "picked_up" | "sent" | "released";
+export type DrainStatus = "pending" | "parked" | "picked_up" | "sent" | "released" | "exit_required";
 
 /**
  * The sats a DVM owes back on undrawn non-channel Bitcoin credit —

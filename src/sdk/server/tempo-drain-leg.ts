@@ -67,6 +67,7 @@ export async function completeTempoChannelDrain(args: {
   reference: string;
   /** Marks a drain an operator finished by hand rather than the caller's own poll. */
   repaired?: boolean;
+  finalization?: { outcome: string; creditUnbacked: boolean };
   tx?: CreditLedgerQuerier;
 }): Promise<DrainTransitionResult> {
   const settlementEvidence = refundFloorEvidence({
@@ -94,6 +95,8 @@ export async function completeTempoChannelDrain(args: {
           tx_hash: args.reference,
           channel_id: args.channelId,
           ...settlementEvidence,
+          ...(args.finalization && { terminal_outcome: args.finalization.outcome,
+            credit_unbacked: args.finalization.creditUnbacked }),
           ...(args.repaired
             ? { repaired: true, repair_kind: "tempo_close_reconciled" }
             : {}),

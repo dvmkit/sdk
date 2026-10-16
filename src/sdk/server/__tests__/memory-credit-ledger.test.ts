@@ -534,6 +534,26 @@ describe("MemoryCreditLedger", () => {
   describe("drains", () => {
     const PAYOUT = { refund_pubkey: "02" + "cd".repeat(32) };
 
+    it("retains the debit through a terminal Tempo refusal and permits one confirmed refund", async () => {
+      const ledger = make();
+      const channelId = `0x${"91".repeat(32)}`;
+      const credit = await ledger.fund({ callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
+        expiryMs: FUTURE_MS, basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100_000,
+          tempoSession: { channelId, cumulativeAmount: "100000" } } });
+      await ledger.requestDrain({ creditId: credit.creditId, drainId: "d1", callerPubkey: CALLER,
+        method: "tempo", payout: {} });
+      expect((await ledger.requireTempoDrainExit({ creditId: credit.creditId, drainId: "d1" })).replayed).toBe(false);
+      expect((await ledger.requireTempoDrainExit({ creditId: credit.creditId, drainId: "d1" })).replayed).toBe(true);
+      expect(await ledger.get(credit.creditId)).toMatchObject({ balanceMicro: 0, nativeAvailable: 0 });
+      expect(await ledger.listPendingDrains()).toEqual([expect.objectContaining({ status: "exit_required" })]);
+      expect(await ledger.listChannelDrains({ limit: 10, createdBeforeMs: Date.now(), rail: "tempo" }))
+        .toEqual([expect.objectContaining({ status: "exit_required" })]);
+      const sent = await ledger.markDrainSent({ creditId: credit.creditId, drainId: "d1", sentRef: { tx_hash: "test-refund" } });
+      expect(sent).toMatchObject({ replayed: false, drain: { status: "sent" } });
+      expect((await ledger.markDrainSent({ creditId: credit.creditId, drainId: "d1", sentRef: {} })).replayed).toBe(true);
+      expect(await ledger.get(credit.creditId)).toMatchObject({ balanceMicro: 0 });
+    });
+
     it("drains available balance exactly once, takes a seq, replays idempotently", async () => {
       const ledger = make();
       const { creditId } = await fund(ledger, 100_000);

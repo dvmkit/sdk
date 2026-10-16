@@ -16,6 +16,8 @@ vi.mock("viem", async (importOriginal) => ({
   createPublicClient: vi.fn(() => chainClient),
 }));
 
+import { writeOffHostedTempoCloseReport } from "../index";
+import { loggers } from "../../../observability/loggers";
 import { HostingControl } from "../hosting-control";
 import { HostedChannelEvidenceReader } from "../hosting-channel-evidence";
 import { CreditLedger } from "../credit-ledger";
@@ -692,6 +694,87 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
       "SELECT claimed_native FROM payout_x402_batches WHERE batch_id=$1", [batches[0]]
     );
     expect(recovered.rows[0].claimed_native).toBe("100");
+  });
+
+  it.each(["reserved", "observed", "report_queued", "delivered", "no_report", "exhausted",
+    "submitted", "foreign_owner", "foreign_scope", "unmatched"])("only writes off an owned unsubmitted unmatched report: %s", async (scenario) => {
+    const current = await fixture(); fixtures.push(current);
+    const channelId = `0x${"91".repeat(32)}`;
+    const escrow = TempoSession.Precompile.Constants.tip20ChannelEscrow;
+    current.obligations.configureTempo({ network: "eip155:42431", escrow, payee: RECEIVER, token: TOKEN });
+    const sessions = new PostgresTempoSessionStore(current.pool);
+    await sessions.init();
+    await sessions.put(channelId, { channelId, chainId: 42431, escrowContract: escrow, payee: RECEIVER,
+      payer: CONFIG.payer, token: TOKEN, highestVoucherAmount: 20n, settledOnChain: 10n, spent: 20n });
+    await current.pool.query("INSERT INTO mpp_tempo_close_intents(channel_id,drain_id,updated_at) VALUES($1,$2,$3)",
+      [channelId, "original-drain", Date.now()]);
+    const reserved = await current.obligations.reserveTempo(channelId, "close", "original-drain");
+    const state = ["foreign_owner", "foreign_scope", "submitted"].includes(scenario) ? "unmatched" : scenario;
+    await current.pool.query("UPDATE sdk_hosted_settlement_report_obligations SET state=$2,tx_hash=$3 WHERE id=$1",
+      [reserved.id, state, scenario === "submitted" ? TX : null]);
+    const warn = vi.spyOn(loggers.tempo, "warn");
+    const args = { db: current.pool, dvmId: scenario === "foreign_owner" ? "other" : current.dvmId,
+      scope: scenario === "foreign_scope" ? "other" : current.scope, obligationId: reserved.id,
+      note: "Escrow log history is irrecoverable" };
+    expect(await writeOffHostedTempoCloseReport(args)).toBe(scenario === "unmatched");
+    if (scenario === "unmatched") {
+      expect((await current.pool.query(
+        "SELECT state,close_write_off_note FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved.id])).rows)
+        .toEqual([{ state: "no_report", close_write_off_note: args.note }]);
+      expect(warn).toHaveBeenCalledWith("tempo_session_close_report_written_off",
+        expect.objectContaining({ channel_id: channelId, amount_forgone_native: "10" }));
+      expect(await current.obligations.unresolvedCount()).toBe(0);
+      expect(await writeOffHostedTempoCloseReport(args)).toBe(false);
+      expect(warn.mock.calls.filter(([name]) => name === "tempo_session_close_report_written_off")).toHaveLength(1);
+    } else {
+      expect((await current.pool.query("SELECT state FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved.id])).rows)
+        .toEqual([{ state }]);
+      expect(warn).not.toHaveBeenCalledWith("tempo_session_close_report_written_off", expect.anything());
+    }
+  });
+
+  it("keeps the existing state constraint on a second initialization", async () => {
+    const current = await fixture(); fixtures.push(current);
+    const constraint = async () => (await current.pool.query(
+      `SELECT oid,convalidated FROM pg_constraint
+       WHERE conrelid='sdk_hosted_settlement_report_obligations'::regclass
+         AND conname='sdk_hosted_settlement_report_obligations_state_check'`)).rows;
+    const before = await constraint();
+    await current.obligations.init();
+    expect(await constraint()).toEqual(before);
+  });
+
+  it("upgrades an existing close reservation and preserves its terminal late-receipt claim", async () => {
+    const current = await fixture(); fixtures.push(current);
+    const channelId = `0x${"91".repeat(32)}`;
+    const escrow = TempoSession.Precompile.Constants.tip20ChannelEscrow;
+    current.obligations.configureTempo({ network: "eip155:42431", escrow,
+      payee: RECEIVER, token: TOKEN });
+    const sessions = new PostgresTempoSessionStore(current.pool);
+    await sessions.init();
+    await sessions.put(channelId, { channelId, chainId: 42431, escrowContract: escrow,
+      payee: RECEIVER, payer: CONFIG.payer, token: TOKEN,
+      highestVoucherAmount: 20n, settledOnChain: 10n, spent: 20n });
+    await current.pool.query(
+      "INSERT INTO mpp_tempo_close_intents(channel_id,drain_id,updated_at) VALUES($1,$2,$3)",
+      [channelId, "original-drain", Date.now()]
+    );
+    await current.pool.query(`ALTER TABLE sdk_hosted_settlement_report_obligations
+      DROP CONSTRAINT sdk_hosted_settlement_report_obligations_state_check;
+      ALTER TABLE sdk_hosted_settlement_report_obligations ADD CONSTRAINT
+      sdk_hosted_settlement_report_obligations_state_check CHECK
+      (state IN ('reserved','observed','report_queued','delivered','no_report'))`);
+    const reserved = await current.obligations.reserveTempo(channelId, "close", "original-drain");
+    await current.obligations.init();
+    await current.obligations.releaseStaleTempoClose(reserved.id, channelId, "original-drain",
+      { staleAfterMs: 0, maxReleases: 0 });
+    expect((await current.pool.query("SELECT state FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved.id])).rows)
+      .toEqual([{ state: "exhausted" }]);
+    await current.obligations.recordSubmitted(reserved.id, TX);
+    expect((await current.pool.query(
+      "SELECT state,tx_hash,original FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved.id])).rows)
+      .toEqual([{ state: "reserved", tx_hash: TX, original: { drainId: "original-drain",
+        highestVoucherAmount: "20", settledOnChain: "10", spent: "20" } }]);
   });
 
   it("repairs an original Tempo close by reporting only its newly settled payee amount", async () => {
