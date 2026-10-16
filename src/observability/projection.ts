@@ -40,6 +40,7 @@ const BOOLEAN_FIELDS = new Set<string>(catalogue.booleanFields);
 const INTEGER_FIELDS = new Set<string>(catalogue.integerFields);
 const TOKEN_FIELDS = new Set<string>(catalogue.tokenFields);
 const HASH_FIELDS = new Set<string>(catalogue.hashFields);
+const TRANSACTION_HASH_FIELDS = new Set<string>(catalogue.transactionHashFields);
 const URL_FIELDS = new Set<string>(catalogue.urlFields);
 const IDENTITY_FIELDS = new Set<string>(catalogue.identityFields);
 const CAPABILITY_FIELDS = new Set<string>(catalogue.capabilityFields);
@@ -352,6 +353,8 @@ function projectField(
     return isNonnegativeSafeInteger(value) ? value : undefined;
   if (HASH_FIELDS.has(key))
     return typeof value === "string" && HASH_RE.test(value) ? value : undefined;
+  if (TRANSACTION_HASH_FIELDS.has(key))
+    return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value) ? value : undefined;
   if (URL_FIELDS.has(key)) return projectOrigin(value);
   if (IDENTITY_FIELDS.has(key)) return projectIdentity(key, identityAuthority);
   if (TOKEN_FIELDS.has(key)) return undefined;

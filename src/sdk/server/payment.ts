@@ -1504,12 +1504,25 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           },
         };
       }
-      // A one-time charge is marked consumed after its broadcast and before the
-      // ledger commit. A session credential is marked after its commit below.
+      // The rail's transaction-hash guard already protects a proven charge.
+      // A failed challenge mark must not strand paid work before accounting.
       if (consumedCredentialStore && !sessionBasis) {
         await withPaymentStage("replay_store", () => consumedCredentialStore.mark(
           replayRealm, cred.challenge.id, CONSUMED_CREDENTIAL_TTL_MS / 1000
-        ));
+        )).catch((error: unknown) => {
+          const transactionHash = tempoReceiptTransactionHash(tempoReceipt);
+          // Zero-dollar proofs have no chain payment to recover and may rely
+          // on this store alone for challenge replay protection.
+          if (!transactionHash) throw error;
+          diagnosticConsole.error({
+            level: "error",
+            event: "tempo_replay_mark_failed",
+            phase: "upfront",
+            rail: "tempo",
+            transaction_hash: transactionHash,
+            ...paymentFailureFields(error),
+          });
+        });
       }
       // Ledger leg: the credential was settled by the payer's mpp
       // server; the durable dvmkit-side commit is the marker + fund + draw
