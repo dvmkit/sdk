@@ -636,7 +636,7 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM jobs")).rows[0].count).toBe(1);
   });
 
-  it("retries a Tempo charge with a failed replay mark on another server without charging again", async () => {
+  it("recovers a Tempo charge with a failed replay mark on another server without charging again", async () => {
     const handled = { count: 0 };
     const broadcast = vi.fn(async () => ({
       method: "tempo", status: "success" as const,
@@ -651,7 +651,8 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     vi.spyOn(consumedCredentialStore, "mark").mockRejectedValue(new Error("replay store unavailable"));
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const firstMachine = await tempoServer(storeA, handled, mpp, consumedCredentialStore);
-    const body = requestBody("tempo-replay-mark-failed");
+    const requestId = "tempo-replay-mark-failed";
+    const body = requestBody(requestId);
     const challengeResponse = await submit(firstMachine.app, body);
     expect(challengeResponse.status).toBe(402);
     const challenge = Challenge.fromHeadersList(challengeResponse.headers)[0];
@@ -671,8 +672,14 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
 
     const secondMachine = await tempoServer(storeB, handled, mpp);
     const retried = await submitTempo(secondMachine.app, body, authorization);
-    expect([200, 202]).toContain(retried.status);
-    expect(await retried.json()).toMatchObject({ job_id: original.job_id });
+    expect(retried.status).toBe(409);
+    expect(await retried.json()).toMatchObject({ error: "request_id_exists" });
+    expect(broadcast).toHaveBeenCalledOnce();
+
+    const endpoint = await expose(secondMachine.app.fetch);
+    currentIntent = requestIntent(requestId, endpoint);
+    const resumed = await requestResume(requestId);
+    expect(resumed).toMatchObject({ job_id: original.job_id });
     expect(broadcast).toHaveBeenCalledOnce();
     expect(handled.count).toBe(1);
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM processed_payments")).rows[0].count).toBe(1);
