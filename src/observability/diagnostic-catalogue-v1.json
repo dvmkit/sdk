@@ -996,6 +996,9 @@
     "key_hash",
     "prefix_hash"
   ],
+  "transactionHashFields": [
+    "transaction_hash"
+  ],
   "urlFields": [
     "url",
     "facilitator_url",

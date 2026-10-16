@@ -15,6 +15,7 @@ const approved = {
   source_failure: "http_error",
   source_status: 429,
   job_id_hash: "026ab639c21df8aa80e5789370a9db1b8b524b776fd8a0c2ba71efb377ecc7d9",
+  transaction_hash: `0x${"ab".repeat(32)}`,
   failure_category: "unknown",
   failure_stage: "replay_store",
   phase: "upfront",
@@ -38,6 +39,10 @@ afterEach(() => {
 });
 
 describe("payment diagnostic catalogue", () => {
+  it.each(["0xref", "ab".repeat(32), `0x${"ab".repeat(31)}`, `0x${"ab".repeat(33)}`, `0x${"gg".repeat(32)}`])("omits an invalid transaction hash (%s)", (transaction_hash) => {
+    expect(projectDiagnosticFields({ transaction_hash })).toEqual({});
+  });
+
   it.each([
     ["reason", ["credit_or_draw_missing", "draw_not_pending", "draw_job_mismatch", "rail_mismatch", "channel_binding_mismatch", "denomination_unavailable", "topup_cap_unavailable", "topup_cap_currency_mismatch", "unknown"]],
     ["cause", ["no_msats", "sub_micro", "unsupported_currency", "rate_unavailable", "rate_stale_refused", "unknown"]],

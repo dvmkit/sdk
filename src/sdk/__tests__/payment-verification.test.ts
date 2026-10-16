@@ -349,7 +349,7 @@ describe("verifyUpfrontPayment", () => {
     const consumedCredentialStore = new MemoryConsumedCredentialStore();
     const failure = new TypeError("SENTINEL_DATABASE https://example.com/?secret=SENTINEL");
     const failingOperation = stage === "replay_store"
-      ? vi.spyOn(consumedCredentialStore, "mark").mockRejectedValue(failure)
+      ? vi.spyOn(processedPayments, "record").mockRejectedValue(failure)
       : vi.spyOn(ledger, "fund").mockRejectedValue(failure);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -366,6 +366,71 @@ describe("verifyUpfrontPayment", () => {
       });
       expect(JSON.stringify(warn.mock.calls)).not.toContain("SENTINEL");
       expect(await ledger.get(`imp:tempo:${credential.challenge.id}`)).toBeUndefined();
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it.each([false, true])("honours a proven charge when its replay mark fails (ledger: %s)", async (withLedger) => {
+    const { mpp, setVerify } = makeMppx();
+    const transactionHash = `0x${"ab".repeat(32)}`;
+    const broadcast = vi.fn(async (): Promise<Receipt.Receipt> => ({
+      method: "tempo", status: "success", timestamp: new Date().toISOString(),
+      reference: transactionHash,
+    }));
+    setVerify(broadcast);
+    const credential = await makeTempoCredential(mpp, 1000);
+    const ledger = new MemoryCreditLedger();
+    const processedPayments = new MemoryProcessedPaymentStore();
+    const consumedCredentialStore = new MemoryConsumedCredentialStore();
+    vi.spyOn(consumedCredentialStore, "mark").mockRejectedValue(new Error("SENTINEL_DATABASE"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const result = await verifyUpfrontPayment({
+        requiredMsats: 1000, mppCredential: credential, mpp, fxFetcher: stubFx,
+        consumedCredentialStore,
+        ...(withLedger && {
+          priceFiat: { currency: "usd" as const, amountMicro: 1000 },
+          creditLedger: ledger, processedPayments, dvmId: "example-dvm", jobId: "job-1",
+        }),
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.paidMsats).toBe(1000);
+      expect(result.paymentTransactionHash).toBe(transactionHash);
+      expect(broadcast).toHaveBeenCalledOnce();
+      expect(error).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(error.mock.calls[0][0]))).toEqual({
+        event: "tempo_replay_mark_failed", level: "error", phase: "upfront", rail: "tempo",
+        transaction_hash: transactionHash, failure_category: "unknown", failure_stage: "replay_store",
+      });
+      expect(JSON.stringify(error.mock.calls)).not.toContain("SENTINEL");
+      if (withLedger) {
+        const creditId = `imp:tempo:${credential.challenge.id}`;
+        expect(await processedPayments.get({
+          dvmId: "example-dvm", rail: "tempo", paymentId: credential.challenge.id,
+        })).toMatchObject({ creditId, jobId: "job-1" });
+        expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 1000 });
+        expect(await ledger.getDrawByJobId("job-1")).toMatchObject({
+          creditId, amountMicro: 1000, status: "pending",
+        });
+      }
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it("keeps a failed replay mark fail-closed without an on-chain receipt", async () => {
+    const { mpp } = makeMppx();
+    const credential = await makeTempoCredential(mpp, 1000);
+    const consumedCredentialStore = new MemoryConsumedCredentialStore();
+    vi.spyOn(consumedCredentialStore, "mark").mockRejectedValue(new Error("store unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = await verifyUpfrontPayment({
+        requiredMsats: 1000, mppCredential: credential, mpp, fxFetcher: stubFx,
+        consumedCredentialStore,
+      });
+      expect(result.error?.status).toBe(402);
+      expect(result.paidMsats).toBe(0);
+      expect(JSON.parse(String(warn.mock.calls[0][0]))).toMatchObject({
+        event: "tempo_credential_rejected", failure_stage: "replay_store",
+      });
     } finally { vi.restoreAllMocks(); }
   });
 

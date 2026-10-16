@@ -20,6 +20,7 @@ import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
+import { type ConsumedCredentialStore, MemoryConsumedCredentialStore } from "../consumed-credential-store";
 import { CreditLedger } from "../credit-ledger";
 import type { JobRecord, RequestIdClaim } from "../job-store";
 import { MintHealthTracker } from "../mint-health-tracker";
@@ -635,6 +636,51 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM jobs")).rows[0].count).toBe(1);
   });
 
+  it("retries a Tempo charge with a failed replay mark on another server without charging again", async () => {
+    const handled = { count: 0 };
+    const broadcast = vi.fn(async () => ({
+      method: "tempo", status: "success" as const,
+      timestamp: new Date().toISOString(), reference: TEMPO_TX_HASH,
+    }));
+    const charge = stubbedTempoCharge(TEMPO_RECIPIENT, broadcast);
+    const mpp = wrapMppx(Mppx.create({
+      methods: [charge.method], secretKey: randomBytes(32).toString("hex"),
+      realm: "request-recovery-tempo.test",
+    }));
+    const consumedCredentialStore = new MemoryConsumedCredentialStore();
+    vi.spyOn(consumedCredentialStore, "mark").mockRejectedValue(new Error("replay store unavailable"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const firstMachine = await tempoServer(storeA, handled, mpp, consumedCredentialStore);
+    const body = requestBody("tempo-replay-mark-failed");
+    const challengeResponse = await submit(firstMachine.app, body);
+    expect(challengeResponse.status).toBe(402);
+    const challenge = Challenge.fromHeadersList(challengeResponse.headers)[0];
+    const authorization = Credential.serialize(Credential.from({
+      challenge, payload: { type: "hash" as const, hash: TEMPO_TX_HASH },
+    }));
+
+    const accepted = await submitTempo(firstMachine.app, body, authorization);
+    expect([200, 202]).toContain(accepted.status);
+    const original = await accepted.json() as { job_id: string };
+    expect(original.job_id).toBeTruthy();
+    expect(error.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(
+      expect.objectContaining({
+        event: "tempo_replay_mark_failed", level: "error", transaction_hash: TEMPO_TX_HASH,
+      })
+    );
+
+    const secondMachine = await tempoServer(storeB, handled, mpp);
+    const retried = await submitTempo(secondMachine.app, body, authorization);
+    expect([200, 202]).toContain(retried.status);
+    expect(await retried.json()).toMatchObject({ job_id: original.job_id });
+    expect(broadcast).toHaveBeenCalledOnce();
+    expect(handled.count).toBe(1);
+    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM processed_payments")).rows[0].count).toBe(1);
+    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM credit_fundings")).rows[0].count).toBe(1);
+    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM credit_draws")).rows[0].count).toBe(1);
+    expect((await poolA.query("SELECT COUNT(*)::int AS count FROM jobs")).rows[0].count).toBe(1);
+  });
+
   it("recovers direct Tempo charge acceptance through request-resume without a second credential", async () => {
     const handled = { count: 0 };
     const failingStore = new FailFirstSaveJobStore(poolA);
@@ -896,7 +942,10 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     return instance;
   }
 
-  async function tempoServer(store: PostgresJobStore, handled: { count: number }, mpp: MppxServer) {
+  async function tempoServer(
+    store: PostgresJobStore, handled: { count: number }, mpp: MppxServer,
+    consumedCredentialStore?: ConsumedCredentialStore
+  ) {
     const descriptor = configureDVM({
       name: "request-recovery-tempo-db-test",
       capabilities: {
@@ -920,6 +969,7 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
       creditLedger: store === storeB ? ledgerB : ledgerA,
       processedPayments: store === storeB ? paymentsB : paymentsA,
       mpp,
+      consumedCredentialStore,
     });
     shutdowns.push(instance.shutdown);
     return instance;
