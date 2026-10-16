@@ -11,7 +11,7 @@ import type { PostgresTempoChargeStore } from "./tempo-charge-store";
 import type { Account, Client, Hex } from "viem";
 
 import { loggers } from "../../observability/loggers";
-import type { CreditLedgerLike, CreditLedgerQuerier } from "./credit-ledger";
+import type { CreditDrainRecord, CreditLedgerLike, CreditLedgerQuerier } from "./credit-ledger";
 import type { MppSecretState } from "./mpp-secret-state";
 import type {
   TempoSessionCloseForecastDecision,
@@ -20,6 +20,24 @@ import type {
   TempoSessionLifecycle,
 } from "./tempo-session-store";
 import { isTempoInsufficientFundsError } from "./tempo-settlement-readiness";
+
+interface TempoDrainFinalization {
+  reference: string;
+  refundedNative: bigint;
+  outcome: "payer_exit" | "cooperative_close";
+  creditUnbacked: boolean;
+}
+
+type TempoDrainFinalizer = (drain: CreditDrainRecord, evidence: TempoDrainFinalization) => Promise<boolean>;
+
+class TempoDrainRefundUnprovenError extends Error {
+  constructor(readonly reason: "close_history_unmatched" | "collateral_missing" | "close_evidence_missing" | "refund_short", message: string) {
+    super(message);
+  }
+}
+
+/** A descriptor refusal is definitive before any close is submitted. */
+export class TempoCloseDescriptorError extends MppxErrors.VerificationFailedError {}
 
 /**
  * Reason string emitted by mppx's `broadcastCredential` when the HMAC binding
@@ -357,7 +375,7 @@ export interface MppxServer {
   /** Reconcile one channel to chain state before deciding how its drain proceeds. */
   getTempoSessionDrainState?: (channelId: string) => Promise<TempoSessionDrainState>;
   /** Bind the credit ledger that must be terminalized when Tempo backing is lost. */
-  useTempoCreditLedger?: (ledger: CreditLedgerLike) => void;
+  useTempoCreditLedger?: (ledger: CreditLedgerLike, finalizeDrain?: TempoDrainFinalizer) => void;
 }
 
 /** What a `ChannelClosed` event split the escrow into. Atomic token units. */
@@ -1173,9 +1191,11 @@ function attachTempoSessionRuntime(
   chainOpOverrides: Partial<TempoSessionChainOps> = {}
 ): MppxServer {
   let creditLedger: CreditLedgerLike | undefined;
+  let finalizeDrain: TempoDrainFinalizer | undefined;
   Object.assign(mppx, {
-    useTempoCreditLedger: (ledger: CreditLedgerLike) => {
+    useTempoCreditLedger: (ledger: CreditLedgerLike, finalizer?: TempoDrainFinalizer) => {
       creditLedger = ledger;
+      finalizeDrain = finalizer;
     },
   });
   const chainOps: TempoSessionChainOps = {
@@ -1202,7 +1222,7 @@ function attachTempoSessionRuntime(
         // the stored channel. Nothing here reads the chain or writes.
         const descriptor = readChannelDescriptor(voucher.descriptor);
         if (!descriptor) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "descriptor required for TIP-1034 session action",
           });
         }
@@ -1224,22 +1244,22 @@ function attachTempoSessionRuntime(
           escrow: escrow as `0x${string}`,
         });
         if (computed.toLowerCase() !== voucher.channelId.toLowerCase()) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "channel descriptor does not match channelId",
           });
         }
         if (!sameHex(descriptor.payee, voucher.request.recipient)) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "channel descriptor payee does not match server destination",
           });
         }
         if (!sameHex(descriptor.token, voucher.request.currency)) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "channel descriptor token does not match server token",
           });
         }
         if (!sameHex(descriptor.operator, details.operator ?? ZERO_ADDRESS)) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "channel descriptor operator does not match server operator",
           });
         }
@@ -1253,7 +1273,7 @@ function attachTempoSessionRuntime(
         }
         const storedDescriptor = readChannelDescriptor(stored.descriptor);
         if (!storedDescriptor || !sameDescriptor(descriptor, storedDescriptor)) {
-          throw new MppxErrors.VerificationFailedError({
+          throw new TempoCloseDescriptorError({
             reason: "credential descriptor does not match stored channel",
           });
         }
@@ -1362,6 +1382,9 @@ function attachTempoSessionRuntime(
         value: {
           ...(value as Record<string, unknown>),
           finalized: active.finalized || chainFinalized,
+          ...(chainFinalized && !active.finalized && {
+            depositBeforeFinalization: active.deposit,
+          }),
           closeRequestedAt: chainFinalized ? 0n : BigInt(chainState.closeRequestedAt),
           deposit: chainFinalized ? 0n : maxBigInt(active.deposit, chainState.deposit),
           settledOnChain: maxBigInt(active.settledOnChain, chainState.settled),
@@ -1399,6 +1422,9 @@ function attachTempoSessionRuntime(
         value: {
           ...(current as Record<string, unknown>),
           finalized: active.finalized || chainFinalized,
+          ...(chainFinalized && !active.finalized && {
+            depositBeforeFinalization: active.deposit,
+          }),
           closeRequestedAt: chainFinalized ? 0n : BigInt(chainState.closeRequestedAt),
           deposit: chainFinalized ? 0n : maxBigInt(active.deposit, chainState.deposit),
           settledOnChain: maxBigInt(active.settledOnChain, chainState.settled),
@@ -1739,7 +1765,7 @@ function attachTempoSessionRuntime(
       }
     }
 
-    await reconcileUnsubmittedCloses();
+    await reconcileTempoSessionCloses();
     return { scanned: rows.length, closeRequested, settled, inFlight };
   };
 
@@ -1775,7 +1801,7 @@ function attachTempoSessionRuntime(
     const selfHostedReport = !config.hostedObligations && !!config.onSessionSettlement &&
       !!store.claimCloseReference && !!store.getCloseRecovery;
     let reference = pending?.txHash ?? undefined;
-    if ((pending && !reference) || selfHostedReport) {
+    if ((pending && pending.state !== "unmatched" && !reference) || selfHostedReport) {
       const recovery = await store.getCloseRecovery?.(channelId);
       const notBeforeMs = pending?.reservedAtMs ?? recovery?.updatedAtMs;
       if (notBeforeMs === undefined) throw new Error(`Tempo session close intent ${channelId} not found`);
@@ -1788,9 +1814,11 @@ function attachTempoSessionRuntime(
       if (pending) {
         reference = await settleUnsubmittedClose(current.channelId, drainId, pending.id, found);
       } else if (found.outcome === "ours") {
+        const client = await getClient({ chainId: current.chainId });
+        const { settledToPayee } = await chainOps.readChannelClose(client, current.channelId, found.txHash);
         const claimed = await store.claimCloseReference!(channelId, drainId, found.txHash);
         if (claimed.claimed) {
-          await reportRecoveredClose(current, found.txHash, recovery?.settledBeforeClose ?? null);
+          await reportRecoveredClose(current, found.txHash, recovery?.settledBeforeClose ?? null, settledToPayee);
         }
         return claimed.reference;
       } else if (found.outcome === "none") {
@@ -1799,6 +1827,8 @@ function attachTempoSessionRuntime(
         loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
           channel_id: current.channelId,
           drain_id: drainId,
+          amount_at_stake_native: (current.highestVoucherAmount -
+            (recovery?.settledBeforeClose ?? current.settledOnChain)).toString(),
         });
       }
     }
@@ -1821,20 +1851,11 @@ function attachTempoSessionRuntime(
    * The cursor is the hosted obligation's when there is one, since a released
    * drain's close intent is deleted, and the close intent's otherwise.
    *
-   * A search that resumes from a stored cursor never re-reads the blocks above
-   * it. Each window is read once, so an RPC node that answered a window short
-   * hides a close in it for good, and the obligation then ends as an exit or as
-   * unmatched. Re-reading those blocks would repeat at least one whole paused
-   * pass, so it is not done. An unmatched search keeps its cursor at the
-   * lowest block it read for the same reason, so a short answer is not retried
-   * on later passes either: the obligation stays unmatched for an operator.
-   *
-   * An exit is inferred from the newest uncancelled `CloseRequested` once the
-   * node's head is past its grace end, since the escrow has no event of its
-   * own for a withdraw. If the node missed a close of ours that landed during
-   * the grace period, that inference is wrong and the obligation is resolved
-   * to `no_report`, which no pass searches again. The operating guide's repair
-   * is to set the row back to `reserved` with `close_search_before` cleared.
+   * Paused searches resume below their cursor. A completed unmatched range
+   * becomes terminal and requires an operator retry after repairing RPC history.
+   * A payer exit is inferred from its latest uncancelled close request after
+   * the grace period, since withdrawal has no separate event. Incomplete logs
+   * can make that inference wrong; the same retry operation reopens it.
    */
   const findFinalizedClose = async (
     current: TempoSessionState,
@@ -1842,7 +1863,7 @@ function attachTempoSessionRuntime(
     drainId: string,
     notBeforeMs: number,
     cursor: { from: bigint | null; save: (resumeAt: bigint) => Promise<void> | undefined }
-  ): Promise<{ outcome: "ours"; txHash: Hex } | { outcome: "exit" } | { outcome: "none" }> => {
+  ): Promise<{ outcome: "ours"; txHash: Hex } | { outcome: "exit" } | { outcome: "none"; terminal: boolean }> => {
     const client = await getClient({ chainId: current.chainId });
     const search = await chainOps.findChannelClose(
       client,
@@ -1868,11 +1889,9 @@ function attachTempoSessionRuntime(
         : { outcome: "exit" };
     }
     if (search.outcome === "exit_requested") return { outcome: "exit" };
-    // The channel is finalized, so no close log can appear above this range
-    // later. Resuming at the lowest block read makes each later pass for an
-    // unmatched obligation cost one window rather than the whole range.
+    // A completed range is terminal; keep its boundary as operator evidence.
     if (search.stoppedAt !== undefined) await cursor.save(search.stoppedAt);
-    return { outcome: "none" };
+    return { outcome: "none", terminal: search.stoppedAt !== undefined };
   };
 
   /** Bring an unsubmitted hosted close obligation of a finalized channel to what the chain shows. */
@@ -1895,17 +1914,21 @@ function attachTempoSessionRuntime(
           channel_id: channelId,
           drain_id: drainId,
           obligation_id: obligationId,
+          amount_at_stake_native: await obligations.tempoCloseAmountAtStake(obligationId),
         });
       }
       return undefined;
     }
-    // The obligation keeps no transaction, so no payout report follows and it
-    // counts as unresolved until an operator settles it.
-    loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
-      channel_id: channelId,
-      drain_id: drainId,
-      obligation_id: obligationId,
-    });
+    // An incomplete RPC history must not authorize deletion of a payout obligation.
+    // A transient missing log (without a completed range) still retries normally.
+    if (found.terminal && await obligations.markTempoCloseUnmatched(obligationId)) {
+      loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
+        channel_id: channelId,
+        drain_id: drainId,
+        obligation_id: obligationId,
+        amount_at_stake_native: await obligations.tempoCloseAmountAtStake(obligationId),
+      });
+    }
     return undefined;
   };
 
@@ -1949,6 +1972,116 @@ function attachTempoSessionRuntime(
     }
   };
 
+  const reconcileFinalizedDrains = async (): Promise<void> => {
+    const ledger = creditLedger;
+    if (!ledger || !finalizeDrain) return;
+    let after: { createdAt: number; creditId: string; drainId: string } | undefined;
+    do {
+      const page = await ledger.listChannelDrains({ limit: 100, after,
+        createdBeforeMs: Date.now(), rail: "tempo", includeResolved: true });
+      for (const drain of page) {
+        if (drain.status !== "exit_required" || !drain.channelId) continue;
+        try {
+          const stored = await store.get(drain.channelId);
+          const current = readTempoSessionState(stored);
+          if (!current) throw new Error("Channel history is unavailable");
+          const client = await getClient({ chainId: current.chainId });
+          const [chainState] = await chainOps.getChannelStatesBatch(client, [current.channelId], current.escrowContract);
+          if (!chainState || chainState.deposit !== 0n) continue;
+          await terminalizeLostBacking(current, chainState);
+          await writeBackChainState(current, chainState);
+          const pending = await config.hostedObligations?.pendingTempoClose(drain.channelId, drain.drainId);
+          if (pending && !pending.txHash) {
+            if (pending.state === "unmatched") throw new TempoDrainRefundUnprovenError("close_history_unmatched", "Close history requires an operator retry");
+            // The obligation search owns its paused cursor and its next pass.
+            continue;
+          }
+          const recovery = await store.getCloseRecovery?.(drain.channelId);
+          const found = pending?.txHash ? { outcome: "ours" as const, txHash: pending.txHash as Hex }
+            : await findFinalizedClose(current, stored, drain.drainId, drain.createdAt, {
+              from: recovery?.searchBefore ?? null,
+              save: (resumeAt) => store.recordCloseSearch?.(drain.channelId!, drain.drainId, resumeAt),
+            });
+          let refundedNative: bigint;
+          let reference: string;
+          if (found.outcome === "ours") {
+            reference = found.txHash;
+            const receipt = await chainOps.readChannelClose(client, current.channelId, found.txHash);
+            refundedNative = receipt.refundedToPayer;
+            if (!config.hostedObligations && config.onSessionSettlement && store.claimCloseReference) {
+              const claimed = await store.claimCloseReference(drain.channelId, drain.drainId, found.txHash);
+              if (claimed.claimed) {
+                await reportRecoveredClose(current, found.txHash, recovery?.settledBeforeClose ?? null, receipt.settledToPayee);
+              }
+            }
+          } else if (found.outcome === "exit") {
+            const snapshot = stored as Record<string, unknown>;
+            const deposit = typeof snapshot.depositBeforeFinalization === "bigint"
+              ? snapshot.depositBeforeFinalization : current.deposit;
+            if (deposit <= 0n) throw new TempoDrainRefundUnprovenError("collateral_missing", "The pre-exit collateral is unavailable");
+            // Deposits only grow before finalization. The retained snapshot is
+            // a lower bound on what the payer withdrew, net of settled vouchers.
+            refundedNative = deposit - maxBigInt(current.settledOnChain, chainState.settled);
+            reference = `channel:${current.channelId}`;
+          } else {
+            throw new TempoDrainRefundUnprovenError("close_evidence_missing", "Channel finalization has no matching refund evidence");
+          }
+          if (drain.drainedNative === null || refundedNative < BigInt(drain.drainedNative)) {
+            throw new TempoDrainRefundUnprovenError("refund_short", "Proven refund is below the drain debit");
+          }
+          const creditUnbacked = (await ledger.get(drain.creditId))?.status === "unbacked";
+          await store.confirmClose?.(drain.channelId, drain.drainId, reference);
+          const changed = await finalizeDrain(drain, { reference, refundedNative,
+            outcome: found.outcome === "ours" ? "cooperative_close" : "payer_exit", creditUnbacked });
+          if (changed) {
+            loggers.tempo.warn(creditUnbacked ? "tempo_session_drain_unbacked_resolved" : "tempo_session_drain_finalized", {
+              channel_id: drain.channelId, credit_id: drain.creditId, drain_id: drain.drainId,
+              amount_at_stake_native: drain.drainedNative.toString(), refund_native: refundedNative.toString(),
+              builder_loss_native: (current.highestVoucherAmount > maxBigInt(current.settledOnChain, chainState.settled)
+                ? current.highestVoucherAmount - maxBigInt(current.settledOnChain, chainState.settled) : 0n).toString(),
+            });
+          }
+        } catch (error) {
+          let failure = error;
+          if (error instanceof TempoDrainRefundUnprovenError) {
+            try {
+              // The channel lock serializes the check and log. Emit before the
+              // claim commits so a rollback or crash can repeat, but not lose, the alert.
+              await store.update(drain.channelId, (current): Store.Change<unknown, boolean> => {
+                if (!isStateRecord(current)) throw new Error("Channel history is unavailable");
+                const key = JSON.stringify([drain.creditId, drain.drainId, error.reason]);
+                const seen = Array.isArray(current.drainRefundWarnings) ? current.drainRefundWarnings : [];
+                if (seen.includes(key)) return { op: "noop", result: false };
+                loggers.tempo.warn("tempo_session_drain_refund_unproven", {
+                  channel_id: drain.channelId, credit_id: drain.creditId, drain_id: drain.drainId,
+                  amount_at_stake_native: drain.drainedNative?.toString() ?? null,
+                  amount_at_stake_micro: drain.amountMicro, currency: drain.currency,
+                  reason: error.reason, error: error.message,
+                });
+                return { op: "set", value: { ...current, drainRefundWarnings: [...seen, key] }, result: true };
+              });
+              continue;
+            } catch (claimError) {
+              failure = claimError;
+            }
+          }
+          loggers.tempo.warn("tempo_session_close_reconcile_failed", {
+            channel_id: drain.channelId, credit_id: drain.creditId, drain_id: drain.drainId,
+            error: failure instanceof Error ? failure.message : String(failure),
+          });
+        }
+      }
+      const last = page.at(-1);
+      after = page.length === 100 && last
+        ? { createdAt: last.createdAt, creditId: last.creditId, drainId: last.drainId } : undefined;
+    } while (after);
+  };
+
+  const reconcileTempoSessionCloses = async (): Promise<void> => {
+    await reconcileUnsubmittedCloses();
+    await reconcileFinalizedDrains();
+  };
+
   /**
    * The settlement callback a close fires when its receipt returns, fired
    * instead by the one recovery that recorded the close's reference.
@@ -1956,14 +2089,14 @@ function attachTempoSessionRuntime(
   const reportRecoveredClose = async (
     channel: TempoSessionState,
     txHash: Hex,
-    settledBeforeClose: bigint | null
+    settledBeforeClose: bigint | null,
+    settledToPayee: bigint
   ): Promise<void> => {
-    const client = await getClient({ chainId: channel.chainId });
-    const { settledToPayee } = await chainOps.readChannelClose(client, channel.channelId, txHash);
     if (settledBeforeClose === null || settledToPayee < settledBeforeClose) {
       loggers.tempo.warn("tempo_session_close_settlement_unreported", {
         channel_id: channel.channelId,
         tx_hash: txHash,
+        amount_at_stake_native: settledToPayee.toString(),
       });
       return;
     }
@@ -1981,6 +2114,7 @@ function attachTempoSessionRuntime(
       loggers.tempo.warn("tempo_session_close_settlement_callback_failed", {
         channel_id: channel.channelId,
         tx_hash: txHash,
+        amount_at_stake_native: (settledToPayee - settledBeforeClose).toString(),
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -1994,7 +2128,7 @@ function attachTempoSessionRuntime(
   const confirmClose = store.confirmClose?.bind(store);
   return Object.assign(mppx, {
     sweepTempoSessions,
-    ...(config?.hostedObligations && { reconcileTempoSessionCloses: reconcileUnsubmittedCloses }),
+    ...(config?.hostedObligations && { reconcileTempoSessionCloses }),
     ...(beginClose && {
       beginTempoSessionClose: async (channelId: string, drainId: string) => {
         await beginClose(channelId, drainId);

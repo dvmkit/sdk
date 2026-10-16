@@ -2024,7 +2024,7 @@ async function requireWedgedTempoDrain(
       ),
     };
   }
-  if (record.status !== "pending" && !(admitBooked && record.status === "sent")) {
+  if (record.status !== "pending" && !(admitBooked && (record.status === "sent" || record.status === "exit_required"))) {
     return { response: tempoNotWedgedRefusal(c, args, record.status) };
   }
   return { record, channelId: record.channelId };

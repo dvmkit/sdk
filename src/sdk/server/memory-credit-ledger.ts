@@ -1224,7 +1224,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     const out: CreditDrainRecord[] = [];
     for (const credit of this.credits.values()) {
       for (const drain of credit.drains.values()) {
-        if (drain.status === "pending") out.push(drainRecord(drain, credit));
+        if (drain.status === "pending" || drain.status === "exit_required") out.push(drainRecord(drain, credit));
       }
     }
     out.sort((a, b) => a.createdAt - b.createdAt || a.creditId.localeCompare(b.creditId));
@@ -1242,7 +1242,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     for (const credit of this.credits.values()) {
       if (credit.tempoChannelId === null) continue;
       for (const drain of credit.drains.values()) {
-        if (drain.status !== "pending" || drain.method !== "tempo") continue;
+        if ((drain.status !== "pending" && drain.status !== "exit_required") || drain.method !== "tempo") continue;
         if (drain.createdAt > args.createdBeforeMs) continue;
         if (!args.includeResolved && drain.writtenOffAt !== null) continue;
         out.push(drainRecord(drain, credit));
@@ -1291,6 +1291,20 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       drain.writtenOffAt = null;
     }
     return Promise.resolve();
+  }
+
+  requireTempoDrainExit(args: { creditId: string; drainId: string }): Promise<DrainTransitionResult> {
+    return run(() => {
+      const { credit, drain } = this.requireDrain(args.creditId, args.drainId);
+      if (drain.status === "exit_required" || drain.status === "sent") {
+        return { drain: drainRecord(drain, credit), replayed: true };
+      }
+      if (drain.status !== "pending" || drain.method !== "tempo" || !credit.tempoChannelId) {
+        throw this.transitionRefusal(drain, "require timed exit");
+      }
+      drain.status = "exit_required";
+      return { drain: drainRecord(drain, credit), replayed: false };
+    });
   }
 
   releaseDrain(args: {
@@ -1385,7 +1399,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
   }): Promise<DrainTransitionResult> {
     return run(() => {
       const { credit, drain } = this.requireDrain(args.creditId, args.drainId);
-      if (drain.status === "pending" && drain.method !== "cashu") {
+      if ((drain.status === "pending" || drain.status === "exit_required") && drain.method !== "cashu") {
         drain.status = "sent";
         drain.sentRef = { ...args.sentRef };
         drain.sentAt = args.nowMs ?? Date.now();

@@ -1,3 +1,4 @@
+import { completeTempoChannelDrain } from "./tempo-drain-leg";
 import { installAdminContentRoutes } from "./admin-content";
 import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
@@ -1089,7 +1090,28 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         })
       : undefined;
     this.creditLedger = opts.creditLedger ?? new MemoryCreditLedger();
-    this.opts.mpp?.useTempoCreditLedger?.(this.creditLedger);
+    this.opts.mpp?.useTempoCreditLedger?.(this.creditLedger, async (drain, evidence) => {
+      const completed = await completeTempoChannelDrain({
+        deps: { ledger: this.creditLedger, drainReport: {
+          db: this.opts.db, dvmId: this.opts.dvmId, enqueueCreditDrain: this.opts.enqueueCreditDrain,
+        } },
+        creditId: drain.creditId, drainId: drain.drainId, channelId: drain.channelId!,
+        refundedNative: evidence.refundedNative, debitedNative: drain.drainedNative,
+        reference: evidence.reference,
+        finalization: { outcome: evidence.creditUnbacked ? `${evidence.outcome}_unbacked` : evidence.outcome,
+          creditUnbacked: evidence.creditUnbacked },
+      });
+      if (!completed.replayed && this.receiptIssuer) {
+        const receipt = this.receiptIssuer.issueDrain({
+          creditId: drain.creditId, drainId: drain.drainId, event: "sent", method: drain.method,
+          amountMicro: drain.amountMicro, balanceAfterMicro: drain.balanceAfterMicro,
+          ledgerSeq: drain.ledgerSeq, callerPubkey: drain.callerPubkey,
+        });
+        await this.creditLedger.appendDrainReceipt({ creditId: drain.creditId, drainId: drain.drainId,
+          receipt: receipt as unknown as Record<string, unknown> });
+      }
+      return !completed.replayed;
+    });
     this.processedPayments = opts.processedPayments ?? new MemoryProcessedPaymentStore();
     this.jobManager = new JobManager(descriptor, {
       receiptIssuer: this.receiptIssuer,

@@ -11,7 +11,7 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
   ".": ["configureDVM", "isConfiguredDVMDescriptor"],
-  "./server": ["createDVMHost", "signHostingControl"],
+  "./server": ["createDVMHost", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
   "./testing": ["createTestContext"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
@@ -248,7 +248,7 @@ function typecheckConsumer(consumer, resolution) {
     entry,
     [
       `import { configureDVM } from "${manifest.name}";`,
-      `import { createDVMHost, signHostingControl, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus } from "${manifest.name}/server";`,
+      `import { createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { bindDiagnosticCapabilityAuthority, bindDiagnosticIdentityAuthority, createDiagnosticCapabilityAuthority, type CreditDepositPayload, type CreditDrainPayload, type DiagnosticCapabilityAuthority, type DiagnosticIdentityAuthority, extendDiagnosticIdentityAuthority, readX402ChannelGuardFacts, tempoChallengeAmountMicro, type StoredX402ChannelMetadata, readCompletedCreditHistory, type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage, type CompletedCreditHistoryRecord, type CompletedRefundHistoryRecord, type ExpiredCreditLossHistoryRecord, toLockPubkey } from "${manifest.name}/internal";`,
       "",
@@ -259,7 +259,7 @@ function typecheckConsumer(consumer, resolution) {
       "export declare const guardChannel: StoredX402ChannelMetadata;",
       "export const guardFacts: Promise<{balance: bigint; pendingWithdrawal: bigint}> = readX402ChannelGuardFacts({channel: guardChannel, configuredNetwork: 'base-sepolia'});",
       "export const parseTempoAmount: (challenge: Parameters<typeof tempoChallengeAmountMicro>[0]) => bigint = tempoChallengeAmountMicro;",
-      "export const surface = [configureDVM, createDVMHost, createTestContext, toLockPubkey] as const;",
+      "export const surface = [configureDVM, createDVMHost, createTestContext, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, toLockPubkey] as const;",
       "export const readHistory: (query?: CompletedCreditHistoryQuery) => CompletedCreditHistoryPage = readCompletedCreditHistory;",
       "export type CompletedRecords = CompletedRefundHistoryRecord | ExpiredCreditLossHistoryRecord;",
       "export declare const historyRecord: CompletedCreditHistoryRecord;",
