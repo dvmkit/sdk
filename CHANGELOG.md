@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/dvmkit/sdk/compare/v0.8.1...v0.9.0) (2026-10-16)
+
+
+### Features
+
+* terminalize hosted Tempo close obligations ([#9](https://github.com/dvmkit/sdk/issues/9)) ([3f306d4](https://github.com/dvmkit/sdk/commit/3f306d46f7a9adb378c577f6efb911de96dcc386))
+
 ## [0.8.1](https://github.com/dvmkit/sdk/compare/v0.8.0...v0.8.1) (2026-10-15)
 
 
