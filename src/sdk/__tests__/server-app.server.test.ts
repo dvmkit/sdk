@@ -1881,7 +1881,7 @@ describe("SDK server app", () => {
     expect(noTokenBody.hint).toContain("--job-token <hex>");
     expect(noTokenBody.hint).toContain("DVM_JOB_ENDPOINT");
     expect(noTokenBody.hint).toContain("DVM_JOB_TOKEN");
-    expect(noTokenBody.hint).toContain("@dvmkit/dvm-cli@0.2.0");
+    expect(noTokenBody.hint).toContain("npm i -g @dvmkit/dvm-cli@latest");
     expect(noTokenBody.hint).not.toContain("client");
     expect(typeof noTokenBody.display).toBe("string");
     // The SDK's auth middleware pins `requesterId` to anonymous, so a Bearer
