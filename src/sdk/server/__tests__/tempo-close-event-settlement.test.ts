@@ -13,6 +13,7 @@ import {
   _testing,
   TEMPO_SETTLEMENT_IN_FLIGHT,
   TEMPO_SETTLEMENT_LEASE_FIELD,
+  TEMPO_SETTLEMENT_LEASE_OWNER_FIELD,
   TEMPO_SETTLEMENT_LEASE_MS,
 } from "../mpp-setup";
 
@@ -124,7 +125,8 @@ describe("settleTempoSessionChannel", () => {
   });
 
   it("refuses a channel this DVM does not hold, without touching the chain", async () => {
-    const { mpp, settle, getChannelStatesBatch } = await runtime({ state: null });
+    const { mpp, settle, getChannelStatesBatch, memory } = await runtime({ state: null });
+    const update = vi.spyOn(memory, "update");
 
     await expect(mpp.settleTempoSessionChannel?.(CHANNEL_ID)).resolves.toEqual({
       outcome: "unknown_channel",
@@ -132,6 +134,7 @@ describe("settleTempoSessionChannel", () => {
     });
     expect(getChannelStatesBatch).not.toHaveBeenCalled();
     expect(settle).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
   });
 
   it("reports a money incident when the channel finalized still owing us value", async () => {
@@ -183,6 +186,27 @@ describe("settleTempoSessionChannel", () => {
       error: "rpc down",
     });
   });
+
+  it.each([
+    { name: "fully settled", chainState: { settled: 60n, deposit: 100n, closeRequestedAt: 123 } },
+    { name: "finalized with debt", chainState: { settled: 20n, deposit: 0n, closeRequestedAt: 0 } },
+    { name: "finalized safely", chainState: { settled: 60n, deposit: 0n, closeRequestedAt: 0 } },
+    { name: "not closing", chainState: { settled: 20n, deposit: 100n, closeRequestedAt: 0 } },
+    { name: "unreadable", chainState: undefined },
+  ])("leaves no lease when the channel is $name", async ({ chainState }) => {
+    const { mpp, memory, settle } = await runtime({
+      ...(chainState
+        ? { chainState }
+        : { getChannelStatesBatch: () => Promise.reject(new Error("rpc down")) }),
+    });
+
+    await mpp.settleTempoSessionChannel?.(CHANNEL_ID);
+
+    expect(settle).not.toHaveBeenCalled();
+    const stored = await memory.get(CHANNEL_ID);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_FIELD);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_OWNER_FIELD);
+  });
 });
 
 /**
@@ -196,6 +220,136 @@ describe("settleTempoSessionChannel", () => {
  * no guard — broadcasts a second transaction.
  */
 describe("settlement in-flight guard", () => {
+  it.each([
+    ["close", "close"],
+    ["close", "sweep"],
+    ["sweep", "close"],
+    ["sweep", "sweep"],
+  ] as const)("broadcasts once when %s and %s read before either claims", async (firstPath, secondPath) => {
+    const state = channelState();
+    const shared = Object.assign(Store.memory(), {
+      listActive: () => Promise.resolve([{ key: CHANNEL_ID, state, updatedAt: 1 }]),
+    });
+    await shared.put(CHANNEL_ID, state);
+    const bothRead = Promise.withResolvers<void>();
+    const firstFinished = Promise.withResolvers<void>();
+    let reads = 0;
+    const getChannelStatesBatch = async () => {
+      if (++reads === 2) bothRead.resolve();
+      await bothRead.promise;
+      return [{ settled: 20n, deposit: 100n, closeRequestedAt: 123 }];
+    };
+    const delayed = {
+      ...shared,
+      update: (async (key, fn) => {
+        await firstFinished.promise;
+        return shared.update(key, fn);
+      }) as Store.AtomicStore["update"],
+    };
+    const first = await runtime({
+      store: shared,
+      getChannelStatesBatch,
+      settle: async () => {
+        // mppx persists the confirmed watermark before its settle helper returns.
+        await shared.update(CHANNEL_ID, (current) => ({
+          op: "set",
+          value: { ...(current as Record<string, unknown>), settledOnChain: 60n },
+          result: undefined,
+        }));
+        return `0x${"33".repeat(32)}`;
+      },
+    });
+    const second = await runtime({ store: delayed, getChannelStatesBatch });
+    const run = (machine: typeof first, path: "close" | "sweep") =>
+      path === "close"
+        ? machine.mpp.settleTempoSessionChannel!(CHANNEL_ID)
+        : machine.mpp.sweepTempoSessions!();
+    const pendingFirst = run(first, firstPath);
+    const pendingSecond = run(second, secondPath);
+    try {
+      await pendingFirst;
+    } finally {
+      firstFinished.resolve();
+    }
+    await expect(pendingSecond).resolves.toMatchObject(
+      secondPath === "close"
+        ? { outcome: "already_safe", settledOnChain: 60n }
+        : { settled: 0, inFlight: 0 }
+    );
+    expect(first.settle).toHaveBeenCalledTimes(1);
+    expect(second.settle).not.toHaveBeenCalled();
+    const stored = await shared.get(CHANNEL_ID);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_FIELD);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_OWNER_FIELD);
+
+    await shared.update(CHANNEL_ID, (current) => ({
+      op: "set",
+      value: { ...(current as Record<string, unknown>), highestVoucherAmount: 80n, spent: 80n },
+      result: undefined,
+    }));
+    await expect(run(second, secondPath)).resolves.toMatchObject(
+      secondPath === "close" ? { outcome: "settled", settledAmount: 80n } : { settled: 1 }
+    );
+    expect(second.settle).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { name: "new unspent funding", patch: { highestVoucherAmount: 80n } },
+    { name: "a recent settlement", patch: { lastSettlementAt: new Date().toISOString() } },
+    { name: "finalization", patch: { finalized: true } },
+  ])("rechecks routine settlement eligibility after $name", async ({ patch }) => {
+    const state = channelState({ spent: 60n, createdAt: new Date(0).toISOString() });
+    const shared = Object.assign(Store.memory(), {
+      listActive: () => Promise.resolve([{ key: CHANNEL_ID, state, updatedAt: 1 }]),
+    });
+    await shared.put(CHANNEL_ID, state);
+    const { mpp, settle } = await runtime({
+      store: shared,
+      getChannelStatesBatch: async () => {
+        await shared.update(CHANNEL_ID, (current) => ({
+          op: "set",
+          value: { ...(current as Record<string, unknown>), ...patch },
+          result: undefined,
+        }));
+        return [{ settled: 20n, deposit: 100n, closeRequestedAt: 0 }];
+      },
+    });
+
+    await expect(mpp.sweepTempoSessions!()).resolves.toMatchObject({ settled: 0, inFlight: 0 });
+
+    expect(settle).not.toHaveBeenCalled();
+    const stored = await shared.get(CHANNEL_ID);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_FIELD);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_OWNER_FIELD);
+  });
+
+  it("reports debt finalized by another runtime after the initial channel read", async () => {
+    const shared = Store.memory();
+    await shared.put(CHANNEL_ID, channelState());
+    const { mpp, settle } = await runtime({
+      store: shared,
+      getChannelStatesBatch: async () => {
+        await shared.update(CHANNEL_ID, (current) => ({
+          op: "set",
+          value: { ...(current as Record<string, unknown>), finalized: true, deposit: 0n },
+          result: undefined,
+        }));
+        return [{ settled: 20n, deposit: 100n, closeRequestedAt: 123 }];
+      },
+    });
+
+    await expect(mpp.settleTempoSessionChannel!(CHANNEL_ID)).resolves.toEqual({
+      outcome: "finalized_before_protection",
+      channelId: CHANNEL_ID,
+      owed: 40n,
+      settledOnChain: 20n,
+    });
+    expect(settle).not.toHaveBeenCalled();
+    const stored = await shared.get(CHANNEL_ID);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_FIELD);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_OWNER_FIELD);
+  });
+
   it("holds its lease longer than the receipt wait it has to cover", () => {
     // mppx's `settle` awaits `waitForSuccessfulReceipt`, which passes no
     // `timeout` to viem's `waitForTransactionReceipt` and so inherits its
