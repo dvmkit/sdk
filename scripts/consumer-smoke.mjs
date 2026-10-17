@@ -11,7 +11,7 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
   ".": ["configureDVM", "isConfiguredDVMDescriptor"],
-  "./server": ["createDVMHost", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
+  "./server": ["readPendingImplicitDraws", "createDVMHost", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
   "./testing": ["createTestContext"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
@@ -248,7 +248,7 @@ function typecheckConsumer(consumer, resolution) {
     entry,
     [
       `import { configureDVM } from "${manifest.name}";`,
-      `import { createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus } from "${manifest.name}/server";`,
+      `import { readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { bindDiagnosticCapabilityAuthority, bindDiagnosticIdentityAuthority, createDiagnosticCapabilityAuthority, type CreditDepositPayload, type CreditDrainPayload, type DiagnosticCapabilityAuthority, type DiagnosticIdentityAuthority, extendDiagnosticIdentityAuthority, readX402ChannelGuardFacts, tempoChallengeAmountMicro, type StoredX402ChannelMetadata, readCompletedCreditHistory, type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage, type CompletedCreditHistoryRecord, type CompletedRefundHistoryRecord, type ExpiredCreditLossHistoryRecord, toLockPubkey } from "${manifest.name}/internal";`,
       "",
@@ -271,6 +271,10 @@ function typecheckConsumer(consumer, resolution) {
       "export const diagnosticIdentityAuthority: DiagnosticIdentityAuthority | undefined = extendDiagnosticIdentityAuthority(undefined, 'dvm_slug', 'example-app');",
       "export const trustedDiagnosticValue = bindDiagnosticIdentityAuthority(bindDiagnosticCapabilityAuthority({}, diagnosticCapabilityAuthority), diagnosticIdentityAuthority);",
       "export const paidCompletion: PaidJobCompletion = { jobId: 'job', rail: 'cashu', amountMicro: 1000, currency: 'usd', testFunds: true };",
+      "export declare const db: CreditLedgerQuerier;",
+      "export const pendingDraws: Promise<PendingImplicitDrawSummary> = readPendingImplicitDraws({ db });",
+      "export declare const pendingGroup: PendingImplicitDrawGroup;",
+      "export const pendingMicro: number = pendingGroup.amountMicro;",
       "export declare const serveResult: DVMServeResult;",
       "export const paymentMode: PaymentMode = serveResult.paymentModes[0]!;",
       "export const hostingConfig: HostingControlConfig = { secret: 'example-management-secret-32-bytes-long', scope: 'example-deployment' };",

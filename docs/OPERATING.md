@@ -19,6 +19,35 @@ Builders can pass `onPaidJobCompleted` to observe settled customer charges after
 
 Reusable x402 channels default to a 24-hour payer withdrawal grace (86400 seconds) on every network. For Base Sepolia (`eip155:84532`) acceptance tests, set `x402.batchSettlement.withdrawDelay: 900` or `DVMKIT_X402_WITHDRAW_DELAY_SECONDS=900` with `DVMKIT_X402_BATCH_SETTLEMENT=true`. Explicit delays must be integer seconds and at least 900 on Base Sepolia; Base mainnet retains the 86400 minimum even in development mode and still requires self-relay. The grace is bound into each channel's immutable configuration: changing the server setting affects new channels, not existing deposits. A shorter testnet run exercises early-withdrawal refusal and post-deadline recovery; retain a separate 24-hour run to cover next-day recovery.
 
+## Pending implicit draws
+
+To inspect held per-call payments while the service is stopped, use an existing Postgres
+connection to the service's database and `readPendingImplicitDraws` from the server entry point:
+
+```ts
+import { readPendingImplicitDraws } from "@dvmkit/sdk/server";
+
+const summary = await readPendingImplicitDraws({ db });
+```
+
+The connection uses the same database credentials as `DATABASE_URL`; a role with `SELECT`
+access to `credits` and `credit_draws` suffices. The query requires the existing SDK schema
+and runs one read-only `SELECT`, without starting a host, initializing tables, or opening a
+write transaction. Database failures propagate rather than returning a zero balance.
+
+`drawCount` counts all pending draws on implicit credits (`imp:`), including unfinished jobs
+and holds without a job record. The ledger is database-wide: the result includes every mount
+sharing it and is not filtered by cancellation or stop reason. `oldestDrawAt` is the earliest
+draw creation time in epoch milliseconds, or `null` when empty. `byRailCurrency` contains
+`rail`, `currency`, `drawCount`, integer `amountMicro`, and `oldestDrawAt` for each group,
+ordered by rail then currency, with an unknown historical rail represented by `null` last.
+Amounts are millionths of the recorded currency; keep currencies separate. Unsafe integer
+totals fail instead of rounding. The result contains no caller or payment identifiers.
+
+These are held draws awaiting settlement or release, rather than a total of payable refunds
+or all caller balances. Settled and released draws, explicit prepaid credits, and registered
+drain payouts are excluded. This query does not release holds or move money.
+
 ## Bitcoin liability
 
 For Bitcoin credit monitoring, `GET /admin/credit/bitcoin-liability` reports exact in-kind obligations in satoshis. Uncovered and basisless credits need live-rate pricing on reclaim, so their whole balances appear in `uncovered_by_currency` and `unbacked_by_currency` as `{ currency, micro, credits }` entries. Sum the credit counts if useful, but display or price each currency separately. Older consumers must replace the former `uncovered_micro` and `unbacked_micro` scalar reads; the [portable response fixture](../protocol-fixtures/bitcoin-liability.json) shows the full shape.
