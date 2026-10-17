@@ -29024,6 +29024,31 @@
       ]
     },
     {
+      "module": "src/sdk/server/pending-implicit-draws.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Database-only administrative summary for held implicit payments, exposed through the supported server entry point.",
+          "symbols": [
+            "PendingImplicitDrawGroup",
+            "PendingImplicitDrawSummary",
+            "readPendingImplicitDraws"
+          ],
+          "consumerEvidence": [
+            "supported:./server#PendingImplicitDrawGroup",
+            "supported:./server#PendingImplicitDrawSummary",
+            "supported:./server#readPendingImplicitDraws"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/server/postgres-consumed-credential-store.ts",
       "allocations": [
         {

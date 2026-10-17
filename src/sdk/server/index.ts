@@ -70,6 +70,8 @@ export type {
 } from "./credit-ledger";
 export { allocateDrawValue, CreditLedger, CreditLedgerError } from "./credit-ledger";
 export { DRAIN_DELIVERY_RESERVE_SATS } from "./credit-lots";
+export { readPendingImplicitDraws } from "./pending-implicit-draws";
+export type { PendingImplicitDrawGroup, PendingImplicitDrawSummary } from "./pending-implicit-draws";
 export type { BuildCreditMenuArgs, CreditMenu, CreditTerms } from "./credit-menu";
 export {
   attachCreditMenu,
