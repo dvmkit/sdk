@@ -47,6 +47,7 @@ afterEach(() => {
 
 describe("MintHealthTracker", () => {
   it("uses supplied environment defaults instead of ambient mint-health settings", async () => {
+    vi.stubEnv("DVMKIT_MINT_HEALTH_TICK_MS", "10000");
     vi.stubEnv("DVMKIT_MINT_FAILURES_TO_SICK", "3");
     const fetchImpl = buildFetch({
       [MINT_A]: async () => new Response("nope", { status: 503 })
@@ -54,19 +55,27 @@ describe("MintHealthTracker", () => {
     const tracker = new MintHealthTracker({
       mints: [MINT_A],
       env: {
-        DVMKIT_MINT_HEALTH_TICK_MS: "1",
+        DVMKIT_MINT_HEALTH_TICK_MS: "1000",
         DVMKIT_MINT_FAILURES_TO_SICK: "1"
       },
       fetchImpl,
       probe: NO_BACKOFF
     });
-    await tracker.runOnce();
-    expect(tracker.isHealthy(MINT_A)).toBe(false);
+    vi.useFakeTimers();
+    try {
+      tracker.start();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(tracker.isHealthy(MINT_A)).toBe(false);
+      expect(tracker.snapshot()[MINT_A].consecutiveFailures).toBe(1);
 
-    tracker.start();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(tracker.snapshot()[MINT_A].consecutiveFailures).toBeGreaterThan(1);
-    tracker.stop();
+      await vi.advanceTimersByTimeAsync(1);
+      // The failed probe's two zero-delay retry timers must also complete.
+      await vi.advanceTimersByTimeAsync(2);
+      expect(tracker.snapshot()[MINT_A].consecutiveFailures).toBe(2);
+    } finally {
+      tracker.stop();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps explicit mint-health options ahead of supplied environment defaults", async () => {
