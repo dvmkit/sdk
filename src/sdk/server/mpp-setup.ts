@@ -1443,6 +1443,9 @@ function attachTempoSessionRuntime(
    */
   const settlingHere = new Set<string>();
   const leaseMs = config.settlementSchedule?.leaseMs ?? TEMPO_SETTLEMENT_LEASE_MS;
+  type SettlementClaim =
+    | { outcome: "claimed"; channel: TempoSessionState }
+    | Exclude<TempoChannelSettlementOutcome, { outcome: "settled" }>;
 
   /**
    * Reserve the right to broadcast a settlement for one channel.
@@ -1450,30 +1453,66 @@ function attachTempoSessionRuntime(
    * The durable half is a lease stamped into the channel's own row, taken
    * through `store.update` — already the cross-machine linearization point
    * (advisory lock, `SELECT … FOR UPDATE`, write, one transaction), so exactly
-   * one caller across the fleet sees `true`. It exists because a process flag
+   * one caller across the fleet owns it. It exists because a process flag
    * does not survive a fleet: mppx's `settle` submits and then awaits the
    * receipt, routinely longer than the platform's 30-second wake timeout, so
    * the observer's retry lands on a sibling machine while the first broadcast
    * is still confirming and reads the same pre-settlement watermark.
    *
    * The lease is taken immediately before the broadcast rather than before the
-   * chain read, so a delivery that turns out not to be due costs no write. That
-   * still excludes a second claimant when both chain reads precede the claim: the
-   * atomic store update elects one lease owner. The process marker additionally
-   * rejects duplicate work on this runtime.
+   * chain read, so a delivery that turns out not to be due costs no lease write. The
+   * atomic update also rechecks the settlement predicate against the persisted
+   * watermark: mppx advances it before a successful settle returns. A caller
+   * whose chain read preceded that settlement must not broadcast after its
+   * lease has already been released. No transaction spans a chain call.
    */
-  const claimSettlement = async (channelId: string): Promise<boolean> => {
-    if (settlingHere.has(channelId)) return false;
+  const claimSettlement = async (
+    channelId: string,
+    chainSettled: bigint,
+    forcedClose: boolean
+  ): Promise<SettlementClaim> => {
+    const inFlight: SettlementClaim = {
+      outcome: "retryable_failure",
+      channelId,
+      error: TEMPO_SETTLEMENT_IN_FLIGHT,
+    };
+    if (settlingHere.has(channelId)) return inFlight;
     settlingHere.add(channelId);
     const leaseOwner = randomUUID();
     const leaseUntil = Date.now() + leaseMs;
     try {
-      const claimed = await store.update(channelId, (current): Store.Change<unknown, boolean> => {
-        if (!isStateRecord(current)) return { op: "noop", result: false };
+      const claim = await store.update(channelId, (current): Store.Change<unknown, SettlementClaim> => {
+        const channel = readTempoSessionState(current);
+        if (!channel || !isStateRecord(current)) {
+          return { op: "noop", result: { outcome: "unknown_channel", channelId } };
+        }
         const until = current[TEMPO_SETTLEMENT_LEASE_FIELD];
         const owner = current[TEMPO_SETTLEMENT_LEASE_OWNER_FIELD];
         if (typeof until === "number" && until > Date.now() && owner !== leaseOwner) {
-          return { op: "noop", result: false };
+          return { op: "noop", result: inFlight };
+        }
+        const settledOnChain = maxBigInt(channel.settledOnChain, chainSettled);
+        if (channel.finalized && channel.highestVoucherAmount > settledOnChain) {
+          return {
+            op: "noop",
+            result: {
+              outcome: "finalized_before_protection",
+              channelId,
+              owed: channel.highestVoucherAmount - settledOnChain,
+              settledOnChain,
+            },
+          };
+        }
+        if (
+          channel.finalized ||
+          !tempoSettlementDue({
+            channel,
+            chainSettled: settledOnChain,
+            forcedClose,
+            intervalMs: config.settlementSchedule?.intervalMs,
+          })
+        ) {
+          return { op: "noop", result: { outcome: "already_safe", channelId, settledOnChain } };
         }
         return {
           op: "set",
@@ -1482,11 +1521,11 @@ function attachTempoSessionRuntime(
             [TEMPO_SETTLEMENT_LEASE_FIELD]: leaseUntil,
             [TEMPO_SETTLEMENT_LEASE_OWNER_FIELD]: leaseOwner,
           },
-          result: true,
+          result: { outcome: "claimed", channel },
         };
       });
-      if (!claimed) settlingHere.delete(channelId);
-      return claimed;
+      if (claim.outcome !== "claimed") settlingHere.delete(channelId);
+      return claim;
     } catch (err) {
       settlingHere.delete(channelId);
       throw err;
@@ -1534,15 +1573,22 @@ function attachTempoSessionRuntime(
    * of `chainOps.settle`, shared by the sweep and the close-event path so the
    * two cannot disagree about when a settlement may be broadcast.
    *
-   * Returns `false` when another path already holds the channel's lease. The
-   * caller refuses rather than waiting: awaiting would hold the close-event
-   * request across the very receipt wait that blew the wake timeout in the
+   * Refuses when another path already holds the channel's lease, rather than
+   * waiting: awaiting would hold the close-event request across the very
+   * receipt wait that blew the wake timeout in the
    * first place, and would serialize a whole sweep behind one chain call.
    * Nothing is lost by refusing — the close event is a durable platform row
    * that retries until it is acknowledged.
    */
-  const settleChannel = async (channel: TempoSessionState, client: Client): Promise<boolean> => {
-    if (!(await claimSettlement(channel.channelId))) return false;
+  const settleChannel = async (
+    channelId: string,
+    client: Client,
+    chainSettled: bigint,
+    forcedClose: boolean
+  ): Promise<TempoChannelSettlementOutcome> => {
+    const claim = await claimSettlement(channelId, chainSettled, forcedClose);
+    if (claim.outcome !== "claimed") return claim;
+    const { channel } = claim;
     try {
       const recoveryVersion = await config.beforeSessionSettlement?.();
       const reservation = await config.hostedObligations?.reserveTempo(channel.channelId, "settle");
@@ -1583,7 +1629,7 @@ function attachTempoSessionRuntime(
       throw err;
     }
     await releaseSettlement(channel.channelId);
-    return true;
+    return { outcome: "settled", channelId, settledAmount: channel.highestVoucherAmount };
   };
 
   /**
@@ -1647,18 +1693,7 @@ function attachTempoSessionRuntime(
         return { outcome: "already_safe", channelId: normalized, settledOnChain };
       }
 
-      if (!(await settleChannel(channel, client))) {
-        return {
-          outcome: "retryable_failure",
-          channelId: normalized,
-          error: TEMPO_SETTLEMENT_IN_FLIGHT,
-        };
-      }
-      return {
-        outcome: "settled",
-        channelId: normalized,
-        settledAmount: channel.highestVoucherAmount,
-      };
+      return await settleChannel(normalized, client, chainState.settled, forcedClose);
     } catch (err) {
       return {
         outcome: "retryable_failure",
@@ -1759,8 +1794,9 @@ function attachTempoSessionRuntime(
           ) {
             continue;
           }
-          if (await settleChannel(channel, client)) settled += 1;
-          else inFlight += 1;
+          const result = await settleChannel(channel.channelId, client, chainState.settled, forcedClose);
+          if (result.outcome === "settled") settled += 1;
+          else if (result.outcome === "retryable_failure") inFlight += 1;
         }
       }
     }

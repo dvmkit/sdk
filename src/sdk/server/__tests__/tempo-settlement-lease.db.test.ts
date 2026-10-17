@@ -99,7 +99,11 @@ function blockingSettle() {
   /** One machine's Tempo session runtime over its own pool. */
   function machine(
     store: PostgresTempoSessionStore,
-    opts: { settle?: () => Promise<`0x${string}`>; chainState?: typeof CHAIN_STATE } = {}
+    opts: {
+      settle?: () => Promise<`0x${string}`>;
+      chainState?: typeof CHAIN_STATE;
+      getChannelStatesBatch?: () => Promise<(typeof CHAIN_STATE)[]>;
+    } = {}
   ) {
     const settleSpy = vi.fn(opts.settle ?? (() => Promise.resolve(TX_HASH)));
     const mpp = _testing.attachTempoSessionRuntime(
@@ -111,7 +115,8 @@ function blockingSettle() {
         settlementSchedule: { intervalMs: 24 * 60 * 60 * 1_000 },
       },
       {
-        getChannelStatesBatch: () => Promise.resolve([opts.chainState ?? CHAIN_STATE]),
+        getChannelStatesBatch:
+          opts.getChannelStatesBatch ?? (() => Promise.resolve([opts.chainState ?? CHAIN_STATE])),
         settle: settleSpy,
       }
     );
@@ -168,6 +173,62 @@ function blockingSettle() {
     const settled = outcomes.filter((outcome) => outcome?.outcome === "settled");
     expect(settled).toHaveLength(1);
     expect(machineA.settle.mock.calls.length + machineB.settle.mock.calls.length).toBe(1);
+  });
+
+  it.each([
+    ["close", "close"],
+    ["close", "sweep"],
+    ["sweep", "close"],
+    ["sweep", "sweep"],
+  ] as const)("broadcasts once when %s and %s read before either claims", async (firstPath, secondPath) => {
+    const bothRead = Promise.withResolvers<void>();
+    const firstFinished = Promise.withResolvers<void>();
+    let reads = 0;
+    const getChannelStatesBatch = async () => {
+      if (++reads === 2) bothRead.resolve();
+      await bothRead.promise;
+      return [CHAIN_STATE];
+    };
+    const updateB = storeB.update;
+    // Delay this machine's writes, so its stale read outlives the winner's lease.
+    vi.spyOn(storeB, "update").mockImplementation(async (key, fn) => {
+      await firstFinished.promise;
+      return updateB(key, fn);
+    });
+    const machineA = machine(storeA, {
+      getChannelStatesBatch,
+      settle: async () => {
+        // Match mppx's confirmed-watermark write before returning from settle.
+        await storeA.update(CHANNEL_ID, (current) => ({
+          op: "set",
+          value: { ...(current as Record<string, unknown>), settledOnChain: 60n },
+          result: undefined,
+        }));
+        return TX_HASH;
+      },
+    });
+    const machineB = machine(storeB, { getChannelStatesBatch });
+    const run = (runtime: typeof machineA, path: "close" | "sweep") =>
+      path === "close"
+        ? runtime.mpp.settleTempoSessionChannel!(CHANNEL_ID)
+        : runtime.mpp.sweepTempoSessions!();
+    const first = run(machineA, firstPath);
+    const second = run(machineB, secondPath);
+    try {
+      await first;
+    } finally {
+      firstFinished.resolve();
+    }
+    await expect(second).resolves.toMatchObject(
+      secondPath === "close"
+        ? { outcome: "already_safe", settledOnChain: 60n }
+        : { settled: 0, inFlight: 0 }
+    );
+    expect(machineA.settle).toHaveBeenCalledTimes(1);
+    expect(machineB.settle).not.toHaveBeenCalled();
+    const stored = await storeB.get(CHANNEL_ID);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_FIELD);
+    expect(stored).not.toHaveProperty(TEMPO_SETTLEMENT_LEASE_OWNER_FIELD);
   });
 
   it.each(["before", "after"] as const)(
