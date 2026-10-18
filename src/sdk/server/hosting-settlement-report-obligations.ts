@@ -24,6 +24,18 @@ export const HOSTED_SETTLEMENT_UNRESOLVED_SQL = `state NOT IN ('delivered','no_r
   OR (rail='x402' AND operation IN ('claim','refund')
       AND COALESCE(original->>'authorizationCallData','') !~* '^0x([0-9a-f]{2})+$')`;
 
+// Keep operator capability flags and their state transitions on the same SQL predicates.
+const TEMPO_CLOSE_RETRYABLE_SQL = `target.rail='tempo' AND target.operation='close'
+  AND target.state IN ('unmatched','no_report') AND target.tx_hash IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM sdk_hosted_settlement_report_obligations other
+    WHERE other.dvm_id=target.dvm_id AND other.scope=target.scope
+      AND other.rail='tempo' AND other.operation='close' AND other.channel_id=target.channel_id
+      AND other.id<>target.id AND (other.state<>'no_report' OR other.tx_hash IS NOT NULL)
+  )`;
+const TEMPO_CLOSE_WRITE_OFF_ALLOWED_SQL = `target.rail='tempo' AND target.operation='close'
+  AND target.state='unmatched' AND target.tx_hash IS NULL`;
+
 interface ObligationRow {
   id: string;
   source_key: string;
@@ -267,7 +279,7 @@ export class HostedSettlementReportObligations {
           network TEXT NOT NULL, contract TEXT NOT NULL, channel_id TEXT NOT NULL,
           original JSONB NOT NULL,
           state TEXT NOT NULL CHECK (state IN ('reserved','observed','report_queued','delivered','no_report','exhausted','unmatched')),
-          close_search_before BIGINT, close_write_off_note TEXT,
+          close_search_before BIGINT, close_write_off_note TEXT, close_written_off_at_ms BIGINT,
           tx_hash TEXT, block_number BIGINT, block_hash TEXT, delta_native NUMERIC(78,0),
           payout_id TEXT, report_id TEXT, report_payload JSONB, delivered_at_ms BIGINT,
           created_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint,
@@ -284,7 +296,7 @@ export class HostedSettlementReportObligations {
         `SELECT attname FROM pg_attribute
          WHERE attrelid='sdk_hosted_settlement_report_obligations'::regclass AND NOT attisdropped`
       );
-      for (const [name, type] of [["close_search_before", "BIGINT"], ["close_write_off_note", "TEXT"]]) {
+      for (const [name, type] of [["close_search_before", "BIGINT"], ["close_write_off_note", "TEXT"], ["close_written_off_at_ms", "BIGINT"]]) {
         if (!columns.rows.some((column) => column.attname === name)) {
           await this.pool.query(`ALTER TABLE sdk_hosted_settlement_report_obligations ADD COLUMN ${name} ${type}`);
         }
@@ -515,42 +527,104 @@ export class HostedSettlementReportObligations {
     return result.rowCount === 1;
   }
 
+  async listTempoCloseReports(args: {
+    limit: number; after?: { createdAtMs: number; obligationId: string }; all?: boolean;
+  }): Promise<{
+    id: string; channelId: string; amountNative: string; status: "unmatched" | "no_report";
+    createdAtMs: number; updatedAtMs: number; deliveredAtMs: number | null;
+    retryable: boolean; writeOffAllowed: boolean; writtenOff: boolean;
+    writeOffNote: string | null; writtenOffAtMs: number | null;
+  }[]> {
+    const result = await this.pool.query<{
+      id: string; channel_id: string; original: Record<string, unknown>; state: "unmatched" | "no_report";
+      created_at_ms: string; updated_at_ms: string; delivered_at_ms: string | null;
+      retryable: boolean; write_off_allowed: boolean; close_write_off_note: string | null;
+      close_written_off_at_ms: string | null;
+    }>(
+      `WITH candidates AS (
+         SELECT target.*, (${TEMPO_CLOSE_RETRYABLE_SQL}) AS retryable,
+           (${TEMPO_CLOSE_WRITE_OFF_ALLOWED_SQL}) AS write_off_allowed
+         FROM sdk_hosted_settlement_report_obligations target
+         WHERE target.dvm_id=$1 AND target.scope=$2 AND target.rail='tempo' AND target.operation='close'
+           AND target.state IN ('unmatched','no_report')
+       )
+       SELECT * FROM candidates
+       WHERE ($6::boolean OR (state='unmatched' AND (retryable OR write_off_allowed)))
+         AND ($4::bigint IS NULL OR (created_at_ms,id)>($4,$5))
+       ORDER BY created_at_ms,id LIMIT $3`,
+      [this.dvmId, this.scope, args.limit, args.after?.createdAtMs ?? null, args.after?.obligationId ?? null,
+        args.all ?? false]
+    );
+    return result.rows.map(row => ({
+      id: row.id, channelId: row.channel_id, amountNative: tempoCloseAmount(row.original), status: row.state,
+      createdAtMs: Number(row.created_at_ms), updatedAtMs: Number(row.updated_at_ms),
+      deliveredAtMs: row.delivered_at_ms === null ? null : Number(row.delivered_at_ms),
+      retryable: row.retryable, writeOffAllowed: row.write_off_allowed,
+      writtenOff: row.close_write_off_note !== null, writeOffNote: row.close_write_off_note,
+      writtenOffAtMs: row.close_written_off_at_ms === null ? null : Number(row.close_written_off_at_ms),
+    }));
+  }
+
+  async hasTempoCloseReport(id: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT id FROM sdk_hosted_settlement_report_obligations
+       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'`,
+      [id, this.dvmId, this.scope]
+    );
+    return result.rowCount === 1;
+  }
+
   async writeOffTempoClose(id: string, note: string): Promise<{ channelId: string; amount: string } | undefined> {
     const result = await this.pool.query<{ channel_id: string; original: Record<string, unknown> }>(
-      `UPDATE sdk_hosted_settlement_report_obligations SET state='no_report', close_write_off_note=$4,
+      `UPDATE sdk_hosted_settlement_report_obligations target
+       SET state='no_report', close_write_off_note=$4,
+         close_written_off_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint,
          updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
-       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
-         AND state='unmatched' AND tx_hash IS NULL RETURNING channel_id,original`,
+       WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND ${TEMPO_CLOSE_WRITE_OFF_ALLOWED_SQL}
+       RETURNING channel_id,original`,
       [id, this.dvmId, this.scope, note]
     );
     const row = result.rows[0];
-    return row && { channelId: row.channel_id, amount: (BigInt(String(row.original.highestVoucherAmount)) -
-      BigInt(String(row.original.settledOnChain))).toString() };
+    if (!row) return undefined;
+    const written = { channelId: row.channel_id, amount: tempoCloseAmount(row.original) };
+    loggers.tempo.warn("tempo_session_close_report_written_off", {
+      channel_id: written.channelId, obligation_id: id, amount_forgone_native: written.amount,
+    });
+    return written;
   }
 
   async reopenTempoClose(id: string): Promise<boolean> {
-    return transaction(this.pool, async (tx) => {
+    const reopened = await transaction(this.pool, async (tx) => {
       const owned = await tx.query(
         "SELECT id FROM sdk_hosted_settlement_report_obligations WHERE id=$1 AND dvm_id=$2 AND scope=$3",
         [id, this.dvmId, this.scope]
       );
-      if (!owned.rowCount) return false;
+      if (!owned.rowCount) return undefined;
+      // Match reservation lock order, then retain the prior state under the row lock for the audit event.
       await this.lockIdentity(tx);
+      const prior = await tx.query<{
+        channel_id: string; state: State; close_write_off_note: string | null; original: Record<string, unknown>;
+      }>(
+        `SELECT channel_id,state,close_write_off_note,original FROM sdk_hosted_settlement_report_obligations
+         WHERE id=$1 AND dvm_id=$2 AND scope=$3 FOR UPDATE`, [id, this.dvmId, this.scope]
+      );
+      const row = prior.rows[0];
+      if (!row) return undefined;
       const result = await tx.query(
         `UPDATE sdk_hosted_settlement_report_obligations target
          SET state='reserved', close_search_before=NULL,
            updated_at_ms=FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
-         WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND rail='tempo' AND operation='close'
-           AND state IN ('unmatched','no_report') AND tx_hash IS NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM sdk_hosted_settlement_report_obligations other
-             WHERE other.dvm_id=target.dvm_id AND other.scope=target.scope
-               AND other.rail='tempo' AND other.operation='close' AND other.channel_id=target.channel_id
-               AND other.id<>target.id AND (other.state<>'no_report' OR other.tx_hash IS NOT NULL)
-           )`, [id, this.dvmId, this.scope]
+         WHERE id=$1 AND dvm_id=$2 AND scope=$3 AND ${TEMPO_CLOSE_RETRYABLE_SQL}`,
+        [id, this.dvmId, this.scope]
       );
-      return result.rowCount === 1;
+      return result.rowCount === 1 ? row : undefined;
     });
+    if (!reopened) return false;
+    loggers.tempo.info("tempo_session_close_report_reopened", {
+      obligation_id: id, channel_id: reopened.channel_id, prior_status: reopened.state,
+      written_off: reopened.close_write_off_note !== null, amount_native: tempoCloseAmount(reopened.original),
+    });
+    return true;
   }
 
   private async reserveTempoIn(
@@ -1313,19 +1387,36 @@ export async function retryHostedTempoCloseReport(args: {
   return obligations.reopenTempoClose(args.obligationId);
 }
 
-/** Forgo an unmatched builder payout report after the operator declares its history irrecoverable. */
-export async function writeOffHostedTempoCloseReport(args: {
+export interface HostedTempoCloseReportWriteOff {
+  channelId: string;
+  /** Builder payout abandoned, as a decimal string in native token units. */
+  amountForgoneNative: string;
+}
+
+interface WriteOffHostedTempoCloseReportArgs {
   db: Pool; dvmId: string; scope: string; obligationId: string; note: string;
-}): Promise<boolean> {
+}
+
+/** Forgo an unmatched builder payout report; includeDetails returns the amount without another read. */
+export function writeOffHostedTempoCloseReport(
+  args: WriteOffHostedTempoCloseReportArgs & { includeDetails: true }
+): Promise<HostedTempoCloseReportWriteOff | false>;
+export function writeOffHostedTempoCloseReport(
+  args: WriteOffHostedTempoCloseReportArgs & { includeDetails?: false }
+): Promise<boolean>;
+export async function writeOffHostedTempoCloseReport(
+  args: WriteOffHostedTempoCloseReportArgs & { includeDetails?: boolean }
+): Promise<boolean | HostedTempoCloseReportWriteOff> {
   const note = args.note.trim();
   if (!note || note.length > 2_000) throw new Error("A write-off requires a note of 1 to 2000 characters");
   const row = await new HostedSettlementReportObligations(args.db, args.dvmId, args.scope)
     .writeOffTempoClose(args.obligationId, note);
   if (!row) return false;
-  loggers.tempo.warn("tempo_session_close_report_written_off", {
-    channel_id: row.channelId, obligation_id: args.obligationId, amount_forgone_native: row.amount,
-  });
-  return true;
+  return args.includeDetails ? { channelId: row.channelId, amountForgoneNative: row.amount } : true;
+}
+
+function tempoCloseAmount(original: Record<string, unknown>): string {
+  return (BigInt(String(original.highestVoucherAmount)) - BigInt(String(original.settledOnChain))).toString();
 }
 
 function searchCursor(value: string | null): bigint | null {

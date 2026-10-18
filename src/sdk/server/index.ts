@@ -211,3 +211,11 @@ export { contentMetadata, baselineContentExpiry, isContentHoldStore, ContentHold
 export type { JobContentMetadata, ContentHoldsResponse, ContentHold, ContentHoldEvent, ContentHoldHistory, ContentHoldMutation, ContentHoldStore } from "./content-retention";
 
 export { retryHostedTempoCloseReport, writeOffHostedTempoCloseReport } from "./hosting-settlement-report-obligations";
+
+export type {
+  TempoCloseReportSummary,
+  TempoCloseReportsResponse,
+  RetryTempoCloseReportResponse,
+  WriteOffTempoCloseReportResponse,
+} from "./admin-credit";
+export type { HostedTempoCloseReportWriteOff } from "./hosting-settlement-report-obligations";

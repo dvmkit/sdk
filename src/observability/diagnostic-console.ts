@@ -36,10 +36,11 @@ function writeDiagnostic(
       severityOverride === "error"
         ? severityOverride
         : defaultSeverity;
+    const eventName = projectEventName(event);
     const record = {
-      event: projectEventName(event),
+      event: eventName,
       level: severity,
-      ...projectDiagnosticFields(fields, dataset),
+      ...projectDiagnosticFields(fields, dataset, undefined, undefined, eventName),
     };
     const sink = sinkLevel === "log" ? console.log : console[sinkLevel];
     sink(JSON.stringify(record));

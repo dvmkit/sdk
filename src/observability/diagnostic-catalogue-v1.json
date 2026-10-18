@@ -422,6 +422,7 @@
     "tempo_session_close_recovery_failed",
     "tempo_session_close_recovery_search_paused",
     "tempo_session_close_recovery_unmatched",
+    "tempo_session_close_report_reopened",
     "tempo_session_close_report_written_off",
     "tempo_session_close_reservation_released",
     "tempo_session_close_settlement_callback_failed",
@@ -548,9 +549,12 @@
     "/admin/credit/reconcile-tempo-drain",
     "/admin/credit/reconcile-x402-exact-settlement",
     "/admin/credit/reconcile-x402-settlement",
+    "/admin/credit/retry-tempo-close-report",
+    "/admin/credit/tempo-close-reports",
     "/admin/credit/tempo-drains",
     "/admin/credit/tempo-losses",
     "/admin/credit/write-off-invoice",
+    "/admin/credit/write-off-tempo-close-report",
     "/admin/credit/write-off-tempo-drain",
     "/admin/credit/write-off-x402-settlement",
     "/admin/credit/x402-exact-settlements",
@@ -955,7 +959,8 @@
     "storefront_probe",
     "success",
     "verified",
-    "wallet_reported_budget"
+    "wallet_reported_budget",
+    "written_off"
   ],
   "integerFields": [
     "ageMs",
@@ -1100,5 +1105,9 @@
     "builder_pause",
     "withdrawn",
     "operator"
+  ],
+  "tempoCloseReportPriorStatuses": [
+    "no_report",
+    "unmatched"
   ]
 }

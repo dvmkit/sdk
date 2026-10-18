@@ -122,6 +122,7 @@ export async function withSpan<T>(
     opts.dataset,
     authority,
     identityAuthority,
+    opts.name,
   );
 
   const childDimensions = bindDiagnosticIdentityAuthority(
@@ -132,12 +133,14 @@ export async function withSpan<T>(
           opts.dataset,
           authority,
           identityAuthority,
+          opts.name,
         ),
         ...projectDiagnosticFields(
           opts.dims,
           opts.dataset,
           authority,
           identityAuthority,
+          opts.name,
         ),
       },
       authority,
@@ -166,6 +169,7 @@ export async function withSpan<T>(
       opts.dataset,
       authority,
       latestIdentityAuthority(),
+      opts.name,
     );
   };
 
@@ -191,6 +195,7 @@ export async function withSpan<T>(
         opts.dataset,
         authority,
         activeIdentityAuthority,
+        opts.name,
       ),
       attributes,
       error_message: null,
@@ -230,6 +235,7 @@ export async function withSpan<T>(
             opts.dataset,
             authority,
             latestIdentityAuthority(),
+            opts.name,
           ),
         };
       }
@@ -256,6 +262,7 @@ export async function withSpan<T>(
               opts.dataset,
               authority,
               latestIdentityAuthority(),
+              opts.name,
             );
 
       if (nextStatus === "ok" || nextStatus === "error") status = nextStatus;
