@@ -1184,16 +1184,14 @@ describe("POST /v1/credit", () => {
         drain: { drain_id: "d1", method: "tempo" },
       });
 
-      expect(poll.status).toBe(200);
+      expect(poll.status).toBe(409);
       expect((await poll.json()) as object).toMatchObject({
-        drain: { drain_id: "d1", status: "sent" },
-        credit: { balance_micro: 0 },
+        error: "settlement_pending", retryable: false,
       });
       expect(
         await ledger.getDrain({ creditId: "tempo-finalized-poll", drainId: "d1" })
       ).toMatchObject({
-        status: "sent",
-        sentRef: { tx_hash: `channel:${channelId}`, channel_id: channelId },
+        status: "pending", sentRef: null,
       });
       expect(await ledger.get("tempo-finalized-poll")).toMatchObject({
         balanceMicro: 0,
@@ -1201,7 +1199,7 @@ describe("POST /v1/credit", () => {
         nativeAvailable: 0,
       });
       expect(mpp.forecastPending()).toBe(false);
-      expect(mpp.recoverTempoSessionClose).toHaveBeenCalledWith(channelId, "d1");
+      expect(mpp.recoverTempoSessionClose).toHaveBeenCalledWith(channelId, "d1", "tempo-finalized-poll");
       expect(mpp.issueChallenge).not.toHaveBeenCalled();
       expect(mpp.broadcastCredential).not.toHaveBeenCalled();
     });
@@ -1369,8 +1367,9 @@ describe("POST /v1/credit", () => {
         )
       );
       mpp.recoverTempoSessionClose = vi.fn((_channelId, drainId) =>
-        Promise.resolve(mpp.closeIntentDrainId() === drainId ? `channel:${channelId}` : null)
+        Promise.resolve(mpp.closeIntentDrainId() === drainId ? `0x${"99".repeat(32)}` : null)
       );
+      mpp.getTempoSessionCloseAmounts = () => Promise.resolve({ refundedToPayer: 100_000n, settledToPayee: 10_000n });
       mpp.broadcastCredential = vi.fn(() => Promise.reject(new Error("must not broadcast")));
       const { url } = await startServer({ ledger, mpp });
 
@@ -1413,14 +1412,14 @@ describe("POST /v1/credit", () => {
         })
       ).toMatchObject({
         status: "sent",
-        sentRef: { tx_hash: `channel:${channelId}`, channel_id: channelId },
+        sentRef: { tx_hash: `0x${"99".repeat(32)}`, channel_id: channelId, settled_amount: "100000" },
       });
       expect(await ledger.get("tempo-finalized-after-challenge")).toMatchObject({
         balanceMicro: 0,
         availableMicro: 0,
         nativeAvailable: 0,
       });
-      expect(mpp.recoverTempoSessionClose).toHaveBeenCalledWith(channelId, "d1");
+      expect(mpp.recoverTempoSessionClose).toHaveBeenCalledWith(channelId, "d1", "tempo-finalized-after-challenge");
       expect(mpp.broadcastCredential).not.toHaveBeenCalled();
     });
 
