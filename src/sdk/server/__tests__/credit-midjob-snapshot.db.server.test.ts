@@ -35,9 +35,10 @@ const TOTAL = 600_000;
 class SnapshotFaultStore extends PostgresJobStore {
   failures = 0;
   failedSnapshots = 0;
+  failureStatus: JobRecord["status"] = "processing";
 
   override async save(record: JobRecord): Promise<void> {
-    if (record.paidMsats === TOTAL && record.status === "processing" && this.failures > 0) {
+    if (record.paidMsats === TOTAL && record.status === this.failureStatus && this.failures > 0) {
       this.failures--;
       this.failedSnapshots++;
       throw Object.assign(new Error("injected snapshot conflict after accounting"), {
@@ -73,10 +74,11 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
   });
 
   it.each([
-    { cold: false, failures: 2, status: 201 },
-    { cold: false, failures: Infinity, status: 503 },
-    { cold: true, failures: Infinity, status: 503 },
-  ])("recovers with cold=$cold, failures=$failures", async ({ cold, failures, status }) => {
+    { cold: false, failures: 2, status: 201, prompt: false },
+    { cold: false, failures: Infinity, status: 503, prompt: false },
+    { cold: true, failures: Infinity, status: 503, prompt: false },
+    { cold: false, failures: 2, status: 201, prompt: true },
+  ])("recovers with cold=$cold, failures=$failures, prompt=$prompt", async ({ cold, failures, status, prompt }) => {
     const creditId = randomUUID();
     const drawId = randomUUID();
     const txHash = `0x${randomUUID().replaceAll("-", "")}`;
@@ -85,6 +87,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
     vi.mocked(verifyX402Payment).mockResolvedValue({
       verified: true, amountMsats: TOPUP, amountUsdcMicro: TOPUP, txHash,
     } as Awaited<ReturnType<typeof verifyX402Payment>>);
+    let paymentResumes = 0;
     let finish!: () => void;
     const finishWork = new Promise<void>(resolve => { finish = resolve; });
     const descriptor = configureDVM({
@@ -93,7 +96,8 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
         metered: {
           input: signedSchema, price: "$0.10",
           async onJob(ctx) {
-            await ctx.requestPayment(TOPUP, "more work");
+            const paid = ctx.requestPayment(TOPUP, "more work").then(() => { paymentResumes++; });
+            await Promise.all([paid, ...(prompt ? [ctx.prompt("question", "Continue?")] : [])]);
             await finishWork;
             ctx.complete("done");
           },
@@ -143,6 +147,12 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
         stores.push(target);
         ({ instance, url } = await host(target));
       }
+      if (prompt) {
+        // Stop LISTEN delivery so the HTTP dispatch must reopen the remaining
+        // prompt wait before resolving the accepted payment.
+        await store.shutdownStreaming();
+        target.failureStatus = "awaiting-input";
+      }
       target.failures = failures;
       const payment = encodePayment({ x402Version: 1, scheme: "exact", network: "base-sepolia", payload: {
         signature: "0xdeadbeef", authorization: { from: "0xfrom", to: "0x1111111111111111111111111111111111111111",
@@ -161,6 +171,13 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ amountMicro: TOTAL, status: "pending" });
       expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: TOTAL, availableMicro: 0 });
       expect(await processed.get({ dvmId, rail: "x402", paymentId: txHash })).toMatchObject({ creditId, drawId, jobId: job.job_id });
+      if (prompt) {
+        expect(paymentResumes).toBe(1);
+        const active = instance.jobManager.activeJobs.get(job.job_id);
+        expect(active?.pendingPayment).toBeNull();
+        expect(active?.pendingPrompts.has("question")).toBe(true);
+        expect((await target.get(job.job_id))?.status).toBe("awaiting-input");
+      }
       const counters = await pool.query("SELECT next_seq, seq FROM jobs WHERE id=$1", [job.job_id]);
       expect(counters.rows[0].next_seq).toBeGreaterThan(counters.rows[0].seq);
 
@@ -175,6 +192,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       if (cold) {
         expect((await send("response", { prompt_id: "resume", text: "resume accepted work" })).status).toBe(201);
       } else {
+        if (prompt) expect((await send("response", { prompt_id: "question", text: "yes" })).status).toBe(201);
         finish();
       }
       await vi.waitFor(async () => {
@@ -182,6 +200,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
         expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "settled", amountMicro: TOTAL });
       });
       expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 0 });
+      if (prompt) expect(paymentResumes).toBe(1);
       const funding = await pool.query("SELECT count(*)::int AS n FROM processed_payments WHERE dvm_id=$1 AND payment_id=$2", [dvmId, txHash]);
       expect(funding.rows[0].n).toBe(1);
     } finally {

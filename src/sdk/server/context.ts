@@ -74,6 +74,8 @@ export interface BuildContextOpts {
   onTerminal?: () => void | Promise<void>;
   /** Called at yield points (prompt, payment-request) and terminal states to persist job state. */
   onYield?: () => Promise<void>;
+  /** Persist a remaining prompt wait after accepted payment, without repeating verification. */
+  onPaymentResume?: () => Promise<void>;
   paymentMethods?: PaymentMethod[];
   x402?: X402Config;
   /** Live facilitator capabilities used to suppress unavailable mid-job asks. */
@@ -868,6 +870,14 @@ export function buildContext(
         };
         const doResolve = async (pc: PaymentContent): Promise<void> => {
           if (resolved) return;
+          if (job.pendingPayment?.resolve === doResolve) {
+            job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
+            const persist = opts.onPaymentResume ?? opts.onYield;
+            if (job.status === "awaiting-input" && persist) await persist();
+            // Cancellation may reject this wait while its snapshot is retried.
+            if (resolved) return;
+            job.pendingPayment = null;
+          }
           resolved = true;
           cleanup();
           creditedToHandlerMsats += amountMsats;
@@ -885,18 +895,6 @@ export function buildContext(
           // preflight, which leaves this line over-consuming — the direction
           // that yields, never the one that gives work away.
           creditedToHandlerMicro += pendingFiat?.amountMicro ?? 0;
-          if (job.pendingPayment?.resolve === doResolve) {
-            job.pendingPayment = null;
-            job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
-            if (job.status === "awaiting-input" && opts.onYield) {
-              try {
-                await opts.onYield();
-              } catch (err) {
-                reject(err);
-                return;
-              }
-            }
-          }
           resolve(pc);
         };
         const doReject = (err: Error): void => {

@@ -1202,9 +1202,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           return;
         }
         if (job.pendingPayment !== pp || isTerminal(job.status)) return;
-        job.pendingPayment = null;
         job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
-        if (job.status === "awaiting-input") await this.persistJob(job);
+        // Keep the paid wait reachable until the remaining prompt wait is
+        // durable. Retry only this snapshot while holding the local resume queue.
+        if (job.status === "awaiting-input") await retryJobSnapshot(() => this.persistJob(job));
+        if (job.pendingPayment !== pp || isTerminal(job.status)) return;
+        job.pendingPayment = null;
         await pp.resolve(pc);
       } else if (cap?.onPayment && ctx) {
         await cap.onPayment(ctx, pc);
@@ -3236,6 +3239,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       fxFetcher: this.opts.fxFetcher,
       onTerminal: () => this.handleJobTerminal(job),
       onYield: () => this.persistJob(job),
+      onPaymentResume: () => retryJobSnapshot(() => this.persistJob(job)),
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
         : undefined,
@@ -4321,5 +4325,18 @@ export class JobSnapshotPersistenceError extends Error {
   constructor(cause: unknown) {
     super("Job snapshot could not be persisted", { cause });
     this.name = "JobSnapshotPersistenceError";
+  }
+}
+
+// The callback must contain only persistence, never payment verification or dispatch.
+export async function retryJobSnapshot(persist: () => Promise<void>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await persist();
+      return;
+    } catch (error) {
+      if (!(error instanceof JobSnapshotPersistenceError) || attempt >= 2) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    }
   }
 }

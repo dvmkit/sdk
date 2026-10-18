@@ -117,6 +117,7 @@ import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
   JobSnapshotPersistenceError,
+  retryJobSnapshot,
   type JobManagerOpts,
   MissingStructuredInputError,
   ReactivationAuthSchemaError,
@@ -4405,16 +4406,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     job: ServerJob,
     type: MessageType
   ): Promise<void> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await jm.persistJob(job);
-        return;
-      } catch (error) {
-        // Only retry the post-payment snapshot. Initial submission failures must
-        // retain their request-recovery path, and dispatch must never run twice.
-        if (type !== "payment" || !(error instanceof JobSnapshotPersistenceError) || attempt >= 2) throw error;
-        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
-      }
+    if (type === "payment") {
+      await retryJobSnapshot(() => jm.persistJob(job));
+    } else {
+      await jm.persistJob(job);
     }
   }
 
