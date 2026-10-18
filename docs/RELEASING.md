@@ -36,6 +36,12 @@ DATABASE_URL=postgresql://user:password@localhost:5432/dvmkit_test npm run verif
 
 `.nvmrc` pins an exact Node release rather than a major, so rebuilding an old tag months later resolves the same toolchain and reproduces the same tarball. `npm run check:toolchain` refuses any other Node, and refuses an npm outside the major that ships with it, because the lockfile is maintained with that npm.
 
+## Runner image
+
+All workflows select `ubuntu-26.04` explicitly. This keeps verification and release jobs on the same supported image instead of changing their operating system when GitHub moves `ubuntu-latest`. GitHub's [Ubuntu 26.04 migration notice](https://github.com/actions/runner-images/issues/14748) describes the transition and the `ubuntu-24.04` fallback if an incompatibility requires it.
+
+Node still comes from `.nvmrc`, including tag verification and release bookkeeping. The gate uses its bundled npm 10; publication uses the integrity-checked npm 11.16.0 bootstrap. The publishing toolchain satisfies the [npm trusted-publishing requirements](https://docs.npmjs.com/trusted-publishers/) of Node 22.14.0 or newer and npm 11.5.1 or newer. Only the publish job receives `id-token: write` and uses the `npm-release` environment.
+
 ## Preparing a version
 
 Release-please turns merged Conventional Commits into a version and changelog pull request. It does not create a tag, a GitHub release, or an npm publication, and it stays switched off until the repository variable `RELEASE_PLEASE_ENABLED` is exactly `true`.
@@ -99,7 +105,7 @@ Both packed-consumer verification and published-package acceptance run the same 
 
 `github-release` creates or verifies the GitHub release for the existing tag, marking release candidates as prereleases, and flips the merged release pull request from `autorelease: pending` to `autorelease: tagged`. Without that transition release-please treats the merged pull request as untagged and refuses to prepare the next version.
 
-Manual dispatch accepts an existing signed tag and runs the no-publish build path. Setting `github_release_recovery` to true also runs the release-notes and label step, but only after that exact tag verifies and builds successfully. It cannot publish and it cannot create a tag, so a release candidate still requires a reviewed and signed `vX.Y.Z-rc.N` tag.
+Manual dispatch accepts an existing signed tag and runs the no-publish build path. Its separate `no-publish` job downloads the uploaded package, verifies its tag, version, dist-tag, file list, and digest, and runs the pinned publishing npm bootstrap with `--version`. This exercises the artifact handoff and tar extraction without publishing or requesting an OIDC token. It does not prove npm authorization or a registry publication. Setting `github_release_recovery` to true also runs the release-notes and label step, but only after that exact tag verifies and builds successfully. It cannot publish and it cannot create a tag, so a release candidate still requires a reviewed and signed `vX.Y.Z-rc.N` tag.
 
 npm trusted publishing supports publicly verifiable source provenance for releases from this public repository. Verify that the published version has a provenance attestation before claiming it; releases made while the repository was private do not establish public source provenance.
 

@@ -21,7 +21,7 @@ permissions:
 jobs:
   prepare:
     name: verify signed release tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       commit: ${{ steps.release.outputs.commit }}
       dist_tag: ${{ steps.release.outputs.dist_tag }}
@@ -33,6 +33,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
       - name: Verify tag shape, package binding, and signature
         id: release
         shell: bash
@@ -85,7 +90,7 @@ jobs:
   build:
     name: build immutable package artifact
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Verify's limit. A passing build takes about eight minutes, so a stalled build fails with its
     # log uploaded instead of holding a runner for Actions' six-hour default.
     timeout-minutes: 30
@@ -176,12 +181,48 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  no-publish:
+    name: verify no-publish artifact handoff
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the verified release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Download immutable package artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: sdk-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/sdk-release/input
+      - name: Verify downloaded artifact binding
+        shell: bash
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/release-artifact.mjs verify --directory "$RUNNER_TEMP/sdk-release/input" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG"
+      - name: Check trusted-publishing npm bootstrap without publishing
+        run: node scripts/pinned-publish-npm.mjs --version
+
   publish:
     name: publish immutable package artifact
     timeout-minutes: 75
     if: github.event_name == 'push'
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment: npm-release
     permissions:
       contents: read
@@ -267,7 +308,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.github_release_recovery == true && needs.prepare.result == 'success' && needs.build.result == 'success')
       )
     needs: [prepare, build, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       issues: write
@@ -280,6 +321,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Use pinned Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
       - name: Create or verify notes for the existing tag
         shell: bash
         env:

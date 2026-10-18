@@ -32,7 +32,7 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository
       && github.event.pull_request.user.type != 'Bot'
       && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # No third-party actions are used, so there is no action SHA to pin: the job is

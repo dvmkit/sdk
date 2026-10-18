@@ -11,7 +11,7 @@ jobs:
   release-please:
     if: vars.RELEASE_PLEASE_ENABLED == 'true'
     name: prepare version and changelog pull request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Create current-repository release-please token
         id: app-token
