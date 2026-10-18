@@ -1303,10 +1303,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         record.seq = Math.max(record.seq, highSeq);
       }
     }
-    if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
-      await this.jobStore.saveForDvm(record, this.opts.dvmId);
-    } else {
-      await this.jobStore.save(record);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
+          await this.jobStore.saveForDvm(record, this.opts.dvmId);
+        } else {
+          await this.jobStore.save(record);
+        }
+        break;
+      } catch (error) {
+        // Retry only the snapshot: payment verification, funding and job-credit
+        // CAS have already run and must never be repeated by this recovery.
+        if (attempt >= 2) throw new JobSnapshotPersistenceError(error);
+        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+      }
     }
     const saved = await this.jobStore.get(job.id);
     if (saved) {
@@ -4310,4 +4320,12 @@ function resolvePricingMax(
 ): { amount: number; currency: string } | undefined {
   if (raw === undefined) return undefined;
   return { amount: roundUsd(parseUsdPrice(raw, "price")), currency: "usd" };
+}
+
+/** Identifies a failed snapshot separately from handler and payment failures. */
+export class JobSnapshotPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("Job snapshot could not be persisted", { cause });
+    this.name = "JobSnapshotPersistenceError";
+  }
 }

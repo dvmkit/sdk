@@ -44,6 +44,13 @@ The same values are accepted as `--endpoint <url>` and `--job-token <hex>`. Thes
 If an upgrade broke something for you, an [API compatibility report](https://github.com/dvmkit/sdk/issues/new/choose) is the most useful thing you can send us. It tells us which parts of the published surface people actually build on, which no test of ours can.
 
 
+## Payment recorded before a snapshot failure
+
+After a mid-job payment's accounting and inbound verification commit, a later snapshot failure returns HTTP 503 `job_snapshot_unavailable` with `payment_status: "recorded"`, `retryable: false`, and the `job_id` and inbound `seq`. Read the job status and messages instead of sending another payment. If the worker stopped, a non-payment message can resume the stored job using its accepted credit. An optional `credit` block retains the usual explanation of funds that did not apply to this job.
+
+This is an additive error response for a failure that previously returned an unstructured 500. It does not change payment amounts, caller/request uniqueness, or funding and draw semantics. The portable response is in [job-snapshot-unavailable.json](../protocol-fixtures/job-snapshot-unavailable.json).
+
+
 ## Job identity field
 
 Every 200 or 202 response to `POST /v1/job`, `POST /v1/request-resume/:id` and `POST /v1/request-result/:id` carries a `DVM-Job-Identity-V1` response-head field whose value is the body's `job_id`, byte for byte, so a router or caller can learn which job a response names without reading a body of any size. No other status carries it. The value grammar is `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`; a server whose job ID falls outside it sends no field. A reader takes the value from `Headers.get`, trims nothing and never folds case: a repeated field (joined with `", "`), an empty value or any other character is invalid, and a trailer of the same name is never identity. The portable contract and its classification vectors are in `protocol-fixtures/job-identity-v1.json`. Hosting control's status reports `jobIdentityHeader: "v1"` when the deployment emits the field.

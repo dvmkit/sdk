@@ -97,6 +97,24 @@ describe.skipIf(!RUN)("concurrent job snapshots", () => {
     expect(count.rows[0].n).toBe(1);
   });
 
+  it("keeps transactional credit and counters while terminal snapshots race inbound messages", async () => {
+    const job = record();
+    await store.save(job);
+    const terminal = { ...job, status: "completed" as const, summary: "done" };
+    const allocated = await Promise.all(Array.from({ length: 8 }, (_, worker) => store.recordInbound(job.id, {
+      from: "requester", type: "payment", timestamp: Date.now(), content: { worker },
+    })));
+    const results = await Promise.allSettled([
+      ...Array.from({ length: 8 }, (_, worker) => save(terminal, worker)),
+      ...allocated.map(seq => store.verifyAndCredit(job.id, seq, { paidMsatsDelta: 1000, clearPending: true })),
+    ]);
+    expect(failures(results)).toEqual([]);
+    expect(allocated.toSorted((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(await store.get(job.id)).toMatchObject({ status: "completed", summary: "done", paidMsats: 8000 });
+    const counter = await snapshots.query("SELECT next_seq FROM jobs WHERE id=$1", [job.id]);
+    expect(counter.rows[0].next_seq).toBe(9);
+  });
+
   it("preserves terminal state and payment/sequence counters under stale snapshots", async () => {
     const job = record();
     await store.save(job);

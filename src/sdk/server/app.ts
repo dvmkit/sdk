@@ -116,6 +116,7 @@ import { isTerminal, isYieldMessage, localMessage } from "./job";
 import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
+  JobSnapshotPersistenceError,
   type JobManagerOpts,
   MissingStructuredInputError,
   ReactivationAuthSchemaError,
@@ -4256,8 +4257,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
 
       jm.startIdleTimer(activeJob);
-      await jm.dispatchMessage(activeJob, body.type, body.content);
-      await jm.persistJob(activeJob);
+      try {
+        await jm.dispatchMessage(activeJob, body.type, body.content);
+        await jm.persistJob(activeJob);
+      } catch (error) {
+        const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit);
+        if (response) return response;
+        throw error;
+      }
       const lastMsg = activeJob.messages[activeJob.messages.length - 1];
       // `credit` is present only when this payment funded a credit the
       // job row didn't take — a concurrent free-then-paid top-up that lost the
@@ -4368,23 +4375,55 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // simultaneous inbounds on different machines from double-reactivating.
     // The lock is tx-scoped on Postgres; the memory store mirrors the
     // semantics with a simple Set guard so unit tests exercise the same path.
-    if (isStreamableJobStore(jm.store)) {
-      const store = jm.store;
-      const lockResult = await store.tryReactivationLock(job.id, async () => {
+    try {
+      if (isStreamableJobStore(jm.store)) {
+        const store = jm.store;
+        const lockResult = await store.tryReactivationLock(job.id, async () => {
+          await this.runReactivation(jm, job, body, record.status);
+        });
+        if (!lockResult.acquired) {
+          // Our credit is durable, but another machine owns reactivation. Remove this
+          // local scaffold and idle timer; never persist its stale snapshot or it could
+          // later cancel/clobber the winner.
+          this.teardownReactivationScaffold(jm, job);
+        }
+      } else {
         await this.runReactivation(jm, job, body, record.status);
-      });
-      if (!lockResult.acquired) {
-        // Our credit is durable, but another machine owns reactivation. Remove this
-        // local scaffold and idle timer; never persist its stale snapshot or it could
-        // later cancel/clobber the winner.
-        this.teardownReactivationScaffold(jm, job);
       }
-    } else {
-      await this.runReactivation(jm, job, body, record.status);
+    } catch (error) {
+      const response = this.postPaymentSnapshotFailure(c, error, job, body.type, inboundSeq, unappliedCredit);
+      if (response) return response;
+      throw error;
     }
 
     const lastMsg = job.messages[job.messages.length - 1];
     return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
+  }
+
+  private postPaymentSnapshotFailure(
+    c: Context<AppEnv>,
+    error: unknown,
+    job: ServerJob,
+    type: MessageType,
+    inboundSeq: number | null,
+    unappliedCredit?: UnappliedCredit
+  ): Response | undefined {
+    if (!(error instanceof JobSnapshotPersistenceError) || type !== "payment" ||
+      inboundSeq === null || !isStreamableJobStore(this.jobManager.store)) return undefined;
+    // processPayment returned success, so the inbound CAS and accounting are
+    // recorded. This is a snapshot failure, never a request for another spend.
+    diagnosticConsole.error({ level: "job_snapshot_unavailable", job_id: job.id, seq: inboundSeq });
+    return c.json({
+      error: "job_snapshot_unavailable",
+      message: "Payment was recorded but the job snapshot could not be persisted.",
+      display: "Your payment was recorded. The service could not save the latest job progress.",
+      hint: "Do not send another payment. Read the job status and messages; if the worker stopped, resume with a non-payment message.",
+      retryable: false,
+      payment_status: "recorded",
+      job_id: job.id,
+      seq: inboundSeq,
+      ...(unappliedCredit && { credit: unappliedCredit }),
+    }, 503);
   }
 
   /**

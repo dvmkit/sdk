@@ -426,7 +426,16 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   }
 
   async save(record: JobRecord): Promise<void> {
-    await this.saveRecord(record, (record as DvmScopedJobRecord)[JOB_DVM_ID]);
+    const dvmId = (record as DvmScopedJobRecord)[JOB_DVM_ID];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.saveRecord(record, dvmId);
+        return;
+      } catch (error) {
+        if (attempt >= 7 || !(await this.canRetrySnapshot(error, record))) throw error;
+        await new Promise(resolve => setTimeout(resolve, 5 * (attempt + 1)));
+      }
+    }
   }
 
   /** Persist a job while retaining its mount identity for cost-report recovery. */
@@ -440,6 +449,24 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     } finally {
       delete scoped[JOB_DVM_ID];
     }
+  }
+
+  private async canRetrySnapshot(error: unknown, record: JobRecord): Promise<boolean> {
+    if (error === null || typeof error !== "object") return false;
+    const { code, constraint } = error as { code?: unknown; constraint?: unknown };
+    // A deadlock aborts the statement/transaction. Hosted saves roll back and
+    // release their client before reaching this retry boundary.
+    if (code === "40P01") return true;
+    if (code !== "23505" || constraint !== "idx_jobs_request_id_caller") return false;
+    // ON CONFLICT(id) arbitrates only the primary key. A concurrent insert or
+    // indexed-status UPDATE can make its secondary unique-index check fail for
+    // the very same job. Retry only after proving the pair's durable owner;
+    // another job claiming it must remain a uniqueness violation.
+    const { rows } = await this.pool.query<{ id: string }>(
+      "SELECT id FROM jobs WHERE requester_pubkey=$1 AND request_id=$2",
+      [record.requesterPubkey, record.requestId]
+    );
+    return rows[0]?.id === record.id;
   }
 
   private async saveRecord(record: JobRecord, dvmId?: string): Promise<void> {
@@ -1488,10 +1515,15 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   }
 
   private async deleteResolvedMessages(jobId: string): Promise<void> {
-    await this.pool.query(this.hostingCleanupFence
-      ? `DELETE FROM job_messages WHERE job_id=$1 AND NOT (
-           data->>'type'='payment' AND status IN ('pending-verification','failed-verify'))`
-      : "DELETE FROM job_messages WHERE job_id=$1", [jobId]);
+    // An HTTP payment admitted before the terminal snapshot may still be
+    // committing its accounting. Keep its CAS row until verification resolves;
+    // hosted cleanup also needs failed payment evidence for reconciliation.
+    await this.pool.query(
+      `DELETE FROM job_messages WHERE job_id=$1 AND NOT (
+         data->>'type'='payment' AND (status='pending-verification'
+           OR ($2::boolean AND status='failed-verify')))`,
+      [jobId, !!this.hostingCleanupFence]
+    );
   }
 
   private async fetchCountersTx(
