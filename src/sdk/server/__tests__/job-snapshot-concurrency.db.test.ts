@@ -46,8 +46,9 @@ describe.skipIf(!RUN)("concurrent job snapshots", () => {
     return worker % 2 ? store.saveForDvm({ ...job }, "snapshot-test") : store.save({ ...job });
   }
 
-  function failures(results: PromiseSettledResult<unknown>[]) {
+  function failures(results: PromiseSettledResult<unknown>[], operation?: string) {
     return results.flatMap(result => result.status === "rejected" ? [{
+      ...(operation && { operation }),
       code: (result.reason as { code?: string }).code,
       constraint: (result.reason as { constraint?: string }).constraint,
       message: String(result.reason),
@@ -76,7 +77,7 @@ describe.skipIf(!RUN)("concurrent job snapshots", () => {
           worker < 8 ? save({ ...job, status }, worker) : updates.query(
             "UPDATE jobs SET next_seq = next_seq + 1, status = $2 WHERE id = $1", [job.id, status]
           ),
-        ])));
+        ]), worker < 8 ? "snapshot" : "update"));
       }
       return errors;
     }));

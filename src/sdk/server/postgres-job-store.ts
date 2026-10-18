@@ -621,13 +621,16 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       ]
     );
     let rowCount: number | null;
-    if (this.hostingCleanupFence) {
-      const tx = await this.pool.connect();
-      try {
-        await tx.query("BEGIN");
-        const existing = await tx.query<{ dvm_id: string | null }>(
-          "SELECT dvm_id FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
-        );
+    const tx = await this.pool.connect();
+    try {
+      await tx.query("BEGIN");
+      // Lock an existing row before speculative insertion touches its unique
+      // indexes. Otherwise a concurrent indexed UPDATE can become the deadlock
+      // victim, and retrying only this save cannot recover that other writer.
+      const existing = await tx.query<{ dvm_id: string | null }>(
+        "SELECT dvm_id FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
+      );
+      if (this.hostingCleanupFence) {
         if (existing.rows[0]) {
           if (existing.rows[0].dvm_id !== null &&
             existing.rows[0].dvm_id !== this.hostingCleanupFence.dvmId) {
@@ -636,16 +639,14 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         } else {
           await this.hostingCleanupFence.assertNewIntent(tx, { jobId: record.id });
         }
-        ({ rowCount } = await write(tx));
-        await tx.query("COMMIT");
-      } catch (error) {
-        await tx.query("ROLLBACK").catch(() => undefined);
-        throw error;
-      } finally {
-        tx.release();
       }
-    } else {
-      ({ rowCount } = await write(this.pool));
+      ({ rowCount } = await write(tx));
+      await tx.query("COMMIT");
+    } catch (error) {
+      await tx.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      tx.release();
     }
 
     if (rowCount === 0) {

@@ -15,36 +15,47 @@ const duplicate = () => Object.assign(new Error("duplicate caller/request"), {
   code: "23505", constraint: "idx_jobs_request_id_caller",
 });
 
+function faultingPool(error: Error, owner = job.id, failures = 1) {
+  const write = vi.fn(() => {
+    if (failures-- > 0) throw error;
+    return { rowCount: 1, rows: [] };
+  });
+  const query = vi.fn(async (sql: string) => {
+    if (sql.includes("INSERT INTO jobs")) return write();
+    return { rowCount: 1, rows: [{ dvm_id: null }] };
+  });
+  const lookup = vi.fn().mockResolvedValue({ rows: [{ id: owner }] });
+  const connect = vi.fn().mockResolvedValue({ query, release: vi.fn() });
+  return { pool: { query: lookup, connect } as unknown as Pool, write, lookup };
+}
+
 describe("snapshot retry classification", () => {
   it.each(["save", "saveForDvm"] as const)("%s retries the secondary-index conflict after confirming the same job owns the pair", async method => {
-    const query = vi.fn()
-      .mockRejectedValueOnce(duplicate())
-      .mockResolvedValueOnce({ rows: [{ id: job.id }] })
-      .mockResolvedValue({ rowCount: 1, rows: [] });
-    const store = new PostgresJobStore({ query } as unknown as Pool);
-    await store[method]({ ...job }, "snapshot-dvm");
-    expect(query).toHaveBeenCalledTimes(3);
+    const { pool, write } = faultingPool(duplicate());
+    await new PostgresJobStore(pool)[method]({ ...job }, "snapshot-dvm");
+    expect(write).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry when a different job owns the caller/request pair", async () => {
     const error = duplicate();
-    const query = vi.fn().mockRejectedValueOnce(error).mockResolvedValue({ rows: [{ id: "other-job" }] });
-    const store = new PostgresJobStore({ query } as unknown as Pool);
-    await expect(store.save(job)).rejects.toBe(error);
+    const { pool, write } = faultingPool(error, "other-job");
+    await expect(new PostgresJobStore(pool).save(job)).rejects.toBe(error);
+    expect(write).toHaveBeenCalledTimes(1);
   });
 
   it("does not swallow unrelated uniqueness violations", async () => {
     const error = Object.assign(new Error("other constraint"), { code: "23505", constraint: "another_unique_index" });
-    const query = vi.fn().mockRejectedValue(error);
-    await expect(new PostgresJobStore({ query } as unknown as Pool).save(job)).rejects.toBe(error);
-    expect(query).toHaveBeenCalledTimes(1);
+    const { pool, write, lookup } = faultingPool(error);
+    await expect(new PostgresJobStore(pool).save(job)).rejects.toBe(error);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it("bounds repeated deadlocks instead of holding the caller indefinitely", async () => {
     const error = Object.assign(new Error("deadlock"), { code: "40P01" });
-    const query = vi.fn().mockRejectedValue(error);
-    await expect(new PostgresJobStore({ query } as unknown as Pool).save(job)).rejects.toBe(error);
-    expect(query).toHaveBeenCalledTimes(8);
+    const { pool, write } = faultingPool(error, job.id, Infinity);
+    await expect(new PostgresJobStore(pool).save(job)).rejects.toBe(error);
+    expect(write).toHaveBeenCalledTimes(8);
   });
 
   it("rolls back a hosted deadlock and restarts its whole transaction on a released client", async () => {

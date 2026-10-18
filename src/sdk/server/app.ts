@@ -4259,7 +4259,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       jm.startIdleTimer(activeJob);
       try {
         await jm.dispatchMessage(activeJob, body.type, body.content);
-        await jm.persistJob(activeJob);
+        await this.persistMessageSnapshot(jm, activeJob, body.type);
       } catch (error) {
         const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit);
         if (response) return response;
@@ -4400,6 +4400,24 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
   }
 
+  private async persistMessageSnapshot(
+    jm: JobManager<State, InputSchema>,
+    job: ServerJob,
+    type: MessageType
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await jm.persistJob(job);
+        return;
+      } catch (error) {
+        // Only retry the post-payment snapshot. Initial submission failures must
+        // retain their request-recovery path, and dispatch must never run twice.
+        if (type !== "payment" || !(error instanceof JobSnapshotPersistenceError) || attempt >= 2) throw error;
+        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+  }
+
   private postPaymentSnapshotFailure(
     c: Context<AppEnv>,
     error: unknown,
@@ -4462,7 +4480,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       });
     } else {
       await jm.dispatchMessage(job, body.type, body.content);
-      await jm.persistJob(job);
+      await this.persistMessageSnapshot(jm, job, body.type);
     }
   }
 

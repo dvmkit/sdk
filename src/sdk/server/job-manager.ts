@@ -1303,20 +1303,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         record.seq = Math.max(record.seq, highSeq);
       }
     }
-    for (let attempt = 0; ; attempt++) {
-      try {
-        if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
-          await this.jobStore.saveForDvm(record, this.opts.dvmId);
-        } else {
-          await this.jobStore.save(record);
-        }
-        break;
-      } catch (error) {
-        // Retry only the snapshot: payment verification, funding and job-credit
-        // CAS have already run and must never be repeated by this recovery.
-        if (attempt >= 2) throw new JobSnapshotPersistenceError(error);
-        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    try {
+      if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
+        await this.jobStore.saveForDvm(record, this.opts.dvmId);
+      } else {
+        await this.jobStore.save(record);
       }
+    } catch (error) {
+      throw new JobSnapshotPersistenceError(error);
     }
     const saved = await this.jobStore.get(job.id);
     if (saved) {
