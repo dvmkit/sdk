@@ -78,6 +78,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
     { cold: false, failures: Infinity, status: 503, prompt: false },
     { cold: true, failures: Infinity, status: 503, prompt: false },
     { cold: false, failures: 2, status: 201, prompt: true },
+    { cold: false, failures: Infinity, status: 503, prompt: true },
   ])("recovers with cold=$cold, failures=$failures, prompt=$prompt", async ({ cold, failures, status, prompt }) => {
     const creditId = randomUUID();
     const drawId = randomUUID();
@@ -172,23 +173,26 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: TOTAL, availableMicro: 0 });
       expect(await processed.get({ dvmId, rail: "x402", paymentId: txHash })).toMatchObject({ creditId, drawId, jobId: job.job_id });
       if (prompt) {
-        expect(paymentResumes).toBe(1);
+        expect(paymentResumes).toBe(status === 503 ? 0 : 1);
         const active = instance.jobManager.activeJobs.get(job.job_id);
-        expect(active?.pendingPayment).toBeNull();
+        if (status === 503) expect(active?.pendingPayment).toBeTruthy();
+        else expect(active?.pendingPayment).toBeNull();
         expect(active?.pendingPrompts.has("question")).toBe(true);
-        expect((await target.get(job.job_id))?.status).toBe("awaiting-input");
+        expect((await target.get(job.job_id))?.status).toBe(status === 503 ? "processing" : "awaiting-input");
       }
       const counters = await pool.query("SELECT next_seq, seq FROM jobs WHERE id=$1", [job.job_id]);
       expect(counters.rows[0].next_seq).toBeGreaterThan(counters.rows[0].seq);
 
-      // A replay reaches the real processed-payment marker, rather than funding
-      // again. It needs no second credential or spend to recover the work.
       target.failures = 0;
-      const replay = await send("payment", { x402_payment: payment });
-      expect(replay.status).toBe(409);
-      expect(await replay.json()).toMatchObject({ error: "replay_rejected" });
-      expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ amountMicro: TOTAL });
-      expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: TOTAL });
+      if (!(prompt && status === 503)) {
+        // Exhausted mixed waits recover through their outstanding prompt;
+        // the other cases also exercise durable payment replay rejection.
+        const replay = await send("payment", { x402_payment: payment });
+        expect(replay.status).toBe(409);
+        expect(await replay.json()).toMatchObject({ error: "replay_rejected" });
+        expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ amountMicro: TOTAL });
+        expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: TOTAL });
+      }
       if (cold) {
         expect((await send("response", { prompt_id: "resume", text: "resume accepted work" })).status).toBe(201);
       } else {
@@ -201,6 +205,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       });
       expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 0 });
       if (prompt) expect(paymentResumes).toBe(1);
+      if (prompt && status === 503) expect(verifyX402Payment).toHaveBeenCalledTimes(1);
       const funding = await pool.query("SELECT count(*)::int AS n FROM processed_payments WHERE dvm_id=$1 AND payment_id=$2", [dvmId, txHash]);
       expect(funding.rows[0].n).toBe(1);
     } finally {
