@@ -138,6 +138,13 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       expect(nonce).toBeTruthy();
       let target = store;
       if (cold) {
+        // The payment-request can commit before the yield snapshot; wait so
+        // that snapshot cannot overwrite the cold worker's processing setup.
+        await vi.waitFor(async () => {
+          expect(await store.get(job.job_id)).toMatchObject({
+            status: "awaiting-input", pendingPaymentMsats: TOPUP,
+          });
+        });
         // Stop the original worker's listeners. The later message lands on a
         // fresh manager with only the persisted snapshot and payment log.
         instance.jobManager.shutdown();
