@@ -406,6 +406,152 @@ describe("SDK terminal attribution and timing", () => {
     });
   });
 
+  it.each(["dispatch", "notify"] as const)("retains mixed payment waits through a transient %s snapshot failure", async (delivery) => {
+    const callbacks = new Set<() => void>();
+    const store = new MemoryJobStore();
+    store.subscribeNotifications = async (_id, cb) => {
+      callbacks.add(cb);
+      return () => callbacks.delete(cb);
+    };
+    let paymentResumes = 0;
+    let executions = 0;
+    const { jm } = manager(store, async (ctx) => {
+      await Promise.all([
+        ctx.prompt("question", "Continue?"),
+        ctx.requestPayment(1000, "fee").then(() => { paymentResumes++; }),
+      ]);
+      executions++;
+      ctx.complete("answered and paid");
+    });
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    await jm.persistJob(job);
+    jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
+    await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
+    await jm.persistJob(job);
+    const pending = job.pendingPayment;
+    const resolversDuringFailure: (typeof job.pendingPayment)[] = [];
+    const seq = await store.recordInbound(job.id, {
+      from: "requester", type: "payment", content: {}, timestamp: Date.now(),
+    });
+    await store.verifyAndCredit(job.id, seq, { paidMsatsDelta: 1000, clearPending: true });
+    job.paidMsats = 1000;
+    job.pendingPaymentMsats = undefined;
+    const save = store.save.bind(store);
+    let failures = 0;
+    vi.spyOn(store, "save").mockImplementation(async (record) => {
+      if (record.paidMsats === 1000 && record.status === "awaiting-input" && failures < 2) {
+        failures++;
+        resolversDuringFailure.push(job.pendingPayment);
+        throw new Error("transient partial-payment snapshot failure");
+      }
+      await save(record);
+    });
+    if (delivery === "dispatch") {
+      await jm.dispatchMessage(job, "payment", { amount_msats: 1000 });
+    } else {
+      for (const cb of callbacks) cb();
+    }
+    await vi.waitFor(() => expect(paymentResumes).toBe(1));
+    expect(failures).toBe(2);
+    for (const resolver of resolversDuringFailure) expect(resolver).toBe(pending);
+    expect(job.pendingPayment).toBeNull();
+    expect(job.pendingPrompts.has("question")).toBe(true);
+    expect((await store.get(job.id))?.status).toBe("awaiting-input");
+    await jm.dispatchMessage(job, "response", { prompt_id: "question", text: "yes" });
+    await vi.waitFor(() => expect(job.terminalWork).toBeDefined());
+    await job.terminalWork;
+    expect(executions).toBe(1);
+    expect(paymentResumes).toBe(1);
+    expect(await store.get(job.id)).toMatchObject({ status: "completed", paidMsats: 1000 });
+    expect(job.abort.signal.aborted).toBe(false);
+  });
+
+  it.each([
+    { delivery: "dispatch", recovery: "prompt" },
+    { delivery: "dispatch", recovery: "notify" },
+    { delivery: "notify", recovery: "prompt" },
+    { delivery: "notify", recovery: "notify" },
+    { delivery: "notify", recovery: "cancel" },
+  ])("recovers an exhausted $delivery payment snapshot through $recovery", async ({ delivery, recovery }) => {
+    const callbacks = new Set<() => void>();
+    const store = new MemoryJobStore();
+    store.subscribeNotifications = async (_id, cb) => {
+      callbacks.add(cb);
+      return () => callbacks.delete(cb);
+    };
+    let paymentResumes = 0;
+    let executions = 0;
+    const { jm } = manager(store, async (ctx) => {
+      await Promise.all([
+        ctx.prompt("question", "Continue?"),
+        ctx.requestPayment(1000, "fee").then(() => { paymentResumes++; }),
+      ]);
+      executions++;
+      ctx.complete("answered and paid");
+    });
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    await jm.persistJob(job);
+    jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
+    await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
+    await jm.persistJob(job);
+    const pending = job.pendingPayment;
+    const claims = vi.spyOn(store, "claimForProcessing");
+    const seq = await store.recordInbound(job.id, {
+      from: "requester", type: "payment", content: {}, timestamp: Date.now(),
+    });
+    await store.verifyAndCredit(job.id, seq, { paidMsatsDelta: 1000, clearPending: true });
+    job.paidMsats = 1000;
+    job.pendingPaymentMsats = undefined;
+    const save = store.save.bind(store);
+    let unavailable = true;
+    let failures = 0;
+    vi.spyOn(store, "save").mockImplementation(async (record) => {
+      if (unavailable && record.paidMsats === 1000 && record.status === "awaiting-input") {
+        failures++;
+        throw new Error("partial-payment snapshot unavailable");
+      }
+      await save(record);
+    });
+    if (delivery === "dispatch") {
+      await expect(jm.dispatchMessage(job, "payment", { amount_msats: 1000 })).rejects.toThrow("Job snapshot could not be persisted");
+    } else {
+      for (const cb of callbacks) cb();
+      await vi.waitFor(() => expect(failures).toBe(3));
+    }
+    expect(failures).toBe(3);
+    expect(paymentResumes).toBe(0);
+    expect(job.pendingPayment).toBe(pending);
+    expect((await store.get(job.id))?.status).toBe("processing");
+    unavailable = false;
+    if (recovery === "cancel") {
+      await store.save({ ...(await store.get(job.id))!, status: "cancelled", summary: "caller stopped" });
+      for (const cb of callbacks) cb();
+      await vi.waitFor(() => expect(job.status).toBe("cancelled"));
+      expect(job.abort.signal.aborted).toBe(true);
+      expect(job.pendingPayment).toBeNull();
+      expect(paymentResumes).toBe(0);
+      expect(executions).toBe(0);
+      expect(await store.get(job.id)).toMatchObject({ status: "cancelled", summary: "caller stopped", paidMsats: 1000 });
+      return;
+    }
+    if (recovery === "notify") {
+      for (const cb of callbacks) cb();
+      await vi.waitFor(() => expect(paymentResumes).toBe(1));
+      expect((await store.get(job.id))?.status).toBe("awaiting-input");
+      expect(job.pendingPrompts.has("question")).toBe(true);
+    }
+    await jm.dispatchMessage(job, "response", { prompt_id: "question", text: "yes" });
+    await vi.waitFor(() => expect(job.terminalWork).toBeDefined());
+    await job.terminalWork;
+    expect(executions).toBe(1);
+    expect(paymentResumes).toBe(1);
+    expect(claims).toHaveBeenCalledTimes(2);
+    expect(job.pendingPayment).toBeNull();
+    expect(job.pendingPrompts.size).toBe(0);
+    expect(job.abort.signal.aborted).toBe(false);
+    expect(await store.get(job.id)).toMatchObject({ status: "completed", paidMsats: 1000 });
+  });
+
   it("excludes a foreign payment claimant while a local prompt is also pending", async () => {
     const callbacks = new Set<() => void>();
     const store = new MemoryJobStore();

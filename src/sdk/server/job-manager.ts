@@ -611,6 +611,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   // A prompt response and a payment NOTIFY must not mistake each other for a
   // different machine's successful claim.
   private readonly inputResumeTails = new WeakMap<ServerJob, Promise<unknown>>();
+  // A failed partial-wait snapshot leaves our durable claim in processing.
+  // Retain its continuation so a later input can finish it without a new claim.
+  private readonly claimedPaymentResumes = new WeakMap<ServerJob, () => Promise<void>>();
   private readonly sessionId = randomBytes(3).toString("hex");
   private nextJobId = 1;
   private accumulatorMonitor?: AccumulatorMonitorHandle;
@@ -1155,7 +1158,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
   private async queueInputResume<T>(job: ServerJob, resume: () => Promise<T>): Promise<T> {
     const previous = this.inputResumeTails.get(job) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(resume);
+    const next = previous.catch(() => undefined).then(async () => {
+      await this.claimedPaymentResumes.get(job)?.();
+      return resume();
+    });
     this.inputResumeTails.set(job, next);
     try {
       return await next;
@@ -1170,6 +1176,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     return isStreamableJobStore(this.jobStore)
       ? this.jobStore.claimForProcessing(job.id)
       : true;
+  }
+
+  private async resumeClaimedPayment(job: ServerJob, resume: () => Promise<void>): Promise<void> {
+    const retry = async (): Promise<void> => {
+      try {
+        if (!isTerminal(job.status) && !(await this.adoptDurableTerminal(job))) await resume();
+        this.claimedPaymentResumes.delete(job);
+      } catch (error) {
+        if (!(error instanceof JobSnapshotPersistenceError)) this.claimedPaymentResumes.delete(job);
+        throw error;
+      }
+    };
+    this.claimedPaymentResumes.set(job, retry);
+    await retry();
   }
 
   private async dispatchMessageNow(job: ServerJob, type: MessageType, content: unknown): Promise<void> {
@@ -1202,10 +1222,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           return;
         }
         if (job.pendingPayment !== pp || isTerminal(job.status)) return;
-        job.pendingPayment = null;
-        job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
-        if (job.status === "awaiting-input") await this.persistJob(job);
-        await pp.resolve(pc);
+        await this.resumeClaimedPayment(job, async () => {
+          job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
+          // Keep the paid wait reachable until the remaining prompt wait is
+          // durable. Retry only this snapshot while holding the local resume queue.
+          if (job.status === "awaiting-input") await retryJobSnapshot(() => this.persistJob(job));
+          if (job.pendingPayment !== pp || isTerminal(job.status)) return;
+          job.pendingPayment = null;
+          await pp.resolve(pc);
+        });
       } else if (cap?.onPayment && ctx) {
         await cap.onPayment(ctx, pc);
       }
@@ -1303,10 +1328,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         record.seq = Math.max(record.seq, highSeq);
       }
     }
-    if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
-      await this.jobStore.saveForDvm(record, this.opts.dvmId);
-    } else {
-      await this.jobStore.save(record);
+    try {
+      if (this.opts.dvmId && isTerminalCostRecoveryStore(this.jobStore)) {
+        await this.jobStore.saveForDvm(record, this.opts.dvmId);
+      } else {
+        await this.jobStore.save(record);
+      }
+    } catch (error) {
+      throw new JobSnapshotPersistenceError(error);
     }
     const saved = await this.jobStore.get(job.id);
     if (saved) {
@@ -3232,6 +3261,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       fxFetcher: this.opts.fxFetcher,
       onTerminal: () => this.handleJobTerminal(job),
       onYield: () => this.persistJob(job),
+      onPaymentResume: () => retryJobSnapshot(() => this.persistJob(job)),
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
         : undefined,
@@ -3245,7 +3275,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               if (!pending || job.pendingPayment !== pending || isTerminal(job.status)) return false;
               if (!(await this.claimLocalInput(job))) return false;
               if (job.pendingPayment !== pending || isTerminal(job.status)) return false;
-              await resume?.();
+              await this.resumeClaimedPayment(job, async () => { await resume?.(); });
               return true;
             });
           }
@@ -4310,4 +4340,25 @@ function resolvePricingMax(
 ): { amount: number; currency: string } | undefined {
   if (raw === undefined) return undefined;
   return { amount: roundUsd(parseUsdPrice(raw, "price")), currency: "usd" };
+}
+
+/** Identifies a failed snapshot separately from handler and payment failures. */
+export class JobSnapshotPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("Job snapshot could not be persisted", { cause });
+    this.name = "JobSnapshotPersistenceError";
+  }
+}
+
+// The callback must contain only persistence, never payment verification or dispatch.
+export async function retryJobSnapshot(persist: () => Promise<void>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await persist();
+      return;
+    } catch (error) {
+      if (!(error instanceof JobSnapshotPersistenceError) || attempt >= 2) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
 }

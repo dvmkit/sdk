@@ -1,0 +1,13 @@
+{
+  "status": 503,
+  "body": {
+    "error": "job_snapshot_unavailable",
+    "message": "Payment was recorded but the job snapshot could not be persisted.",
+    "display": "Your payment was recorded. The service could not save the latest job progress.",
+    "hint": "Do not send another payment. Read the job status and messages; if the worker stopped, resume with a non-payment message.",
+    "retryable": false,
+    "payment_status": "recorded"
+  },
+  "dynamic_fields": ["job_id", "seq"],
+  "optional_fields": ["credit"]
+}
