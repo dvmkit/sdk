@@ -36,6 +36,7 @@ const RAILS = new Set<string>(catalogue.rails);
 const STAGES = new Set<string>(catalogue.stages);
 const HANDLERS = new Set<string>(catalogue.handlers);
 const CURRENCIES = new Set<string>(catalogue.currencyTokens);
+const TEMPO_CLOSE_REPORT_PRIOR_STATUSES = new Set<string>(catalogue.tempoCloseReportPriorStatuses);
 const BOOLEAN_FIELDS = new Set<string>(catalogue.booleanFields);
 const INTEGER_FIELDS = new Set<string>(catalogue.integerFields);
 const TOKEN_FIELDS = new Set<string>(catalogue.tokenFields);
@@ -213,17 +214,14 @@ export function projectSpanRow(input: unknown): SpanProjectionResult {
 
     const sampleRate = ownValue(input, "sample_rate");
     const pid = ownValue(input, "pid");
-    const rawName = ownValue(input, "name");
+    const name = projectEventName(ownValue(input, "name"));
 
     const row: SpanRow = {
       span_id: spanId,
       trace_id: traceId,
       parent_span_id: parentSpanId,
       dataset: dataset as SpanRow["dataset"],
-      name:
-        typeof rawName === "string" && EVENTS.has(rawName)
-          ? rawName
-          : "diagnostic.unknown",
+      name,
       level: level as SpanRow["level"],
       status: status as SpanRow["status"],
       started_at_ms: startedAtMs,
@@ -244,12 +242,14 @@ export function projectSpanRow(input: unknown): SpanProjectionResult {
         dataset,
         authority,
         identityAuthority,
+        name,
       ),
       attributes: projectFields(
         ownValue(input, "attributes"),
         dataset,
         authority,
         identityAuthority,
+        name,
       ),
       error_message: null,
       error_stack: null,
@@ -278,6 +278,7 @@ export function projectDiagnosticFields(
   dataset?: string,
   authority?: DiagnosticCapabilityAuthority,
   identityAuthority?: DiagnosticIdentityAuthority,
+  eventName?: string,
 ): Record<string, unknown> {
   try {
     const inheritedAuthority = isObject(input)
@@ -294,6 +295,7 @@ export function projectDiagnosticFields(
       dataset,
       effectiveAuthority,
       effectiveIdentityAuthority,
+      eventName,
     );
     bindDiagnosticCapabilityAuthority(output, effectiveAuthority);
     bindDiagnosticIdentityAuthority(output, effectiveIdentityAuthority);
@@ -316,6 +318,7 @@ function projectFields(
   dataset?: string,
   authority?: DiagnosticCapabilityAuthority,
   identityAuthority?: DiagnosticIdentityAuthority,
+  eventName?: string,
 ): Record<string, unknown> {
   if (!isObject(input)) return {};
   const output: Record<string, unknown> = {};
@@ -327,6 +330,7 @@ function projectFields(
       dataset,
       authority,
       identityAuthority,
+      eventName,
     );
     if (projected !== undefined) output[key] = projected;
   }
@@ -339,6 +343,7 @@ function projectField(
   dataset?: string,
   authority?: DiagnosticCapabilityAuthority,
   identityAuthority?: DiagnosticIdentityAuthority,
+  eventName?: string,
 ): unknown {
   const closedEnum = Object.hasOwn(PAYMENT_ENUMS, key)
     ? PAYMENT_ENUMS[key]
@@ -347,6 +352,22 @@ function projectField(
       : undefined;
   if (closedEnum)
     return typeof value === "string" && closedEnum.has(value) ? value : undefined;
+  if (dataset === "tempo") {
+    if (key === "prior_status")
+      return typeof value === "string" && TEMPO_CLOSE_REPORT_PRIOR_STATUSES.has(value) ? value : undefined;
+    const closeReportEvent = eventName === "tempo_session_close_report_written_off" ||
+      eventName === "tempo_session_close_report_reopened";
+    const payerExitEvent = eventName === "tempo_session_close_exit_resolved";
+    if (closeReportEvent || payerExitEvent) {
+      if (key === "obligation_id")
+        return typeof value === "string" && UUID_RE.test(value) ? value : undefined;
+      if (key === "channel_id")
+        return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value) ? value : undefined;
+      if ((closeReportEvent && (key === "amount_native" || key === "amount_forgone_native")) ||
+        (payerExitEvent && key === "amount_at_stake_native"))
+        return typeof value === "string" && DECIMAL_RE.test(value) ? value : undefined;
+    }
+  }
   if (BOOLEAN_FIELDS.has(key))
     return typeof value === "boolean" ? value : undefined;
   if (INTEGER_FIELDS.has(key))

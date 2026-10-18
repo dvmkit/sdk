@@ -1,0 +1,72 @@
+{
+  "list": {
+    "method": "GET",
+    "path": "/admin/credit/tempo-close-reports",
+    "response": {
+      "reports": [
+        {
+          "obligation_id": "close-report-test",
+          "channel_id": "0x3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+          "amount_native": "9007199254740993",
+          "status": "unmatched",
+          "created_at_ms": 1000,
+          "updated_at_ms": 2000,
+          "delivered_at_ms": null,
+          "retryable": true,
+          "write_off_allowed": true,
+          "written_off": false,
+          "write_off_note": null,
+          "written_off_at_ms": null
+        }
+      ]
+    }
+  },
+  "retry": {
+    "method": "POST",
+    "path": "/admin/credit/retry-tempo-close-report",
+    "request": {
+      "obligation_id": "close-report-test"
+    },
+    "response": {
+      "status": "reserved",
+      "obligation_id": "close-report-test"
+    }
+  },
+  "write_off": {
+    "method": "POST",
+    "path": "/admin/credit/write-off-tempo-close-report",
+    "request": {
+      "obligation_id": "close-report-test",
+      "note": "History irrecoverable"
+    },
+    "response": {
+      "status": "written_off",
+      "obligation_id": "close-report-test",
+      "channel_id": "0x3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "amount_forgone_native": "9007199254740993",
+      "note": "History irrecoverable"
+    }
+  },
+  "audit": {
+    "method": "GET",
+    "path": "/admin/credit/tempo-close-reports?all=1",
+    "response": {
+      "reports": [
+        {
+          "obligation_id": "close-report-retired",
+          "channel_id": "0x3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+          "amount_native": "9007199254740993",
+          "status": "no_report",
+          "created_at_ms": 1000,
+          "updated_at_ms": 2000,
+          "delivered_at_ms": null,
+          "retryable": false,
+          "write_off_allowed": false,
+          "written_off": false,
+          "write_off_note": null,
+          "written_off_at_ms": null
+        }
+      ]
+    }
+  }
+}

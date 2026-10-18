@@ -2496,3 +2496,25 @@ describe("POST /admin/credit/write-off-tempo-drain", () => {
     expect(await res.json()).toMatchObject({ error: "drain_not_wedged" });
   });
 });
+
+const CLOSE_REPORT_ROUTES = [
+  ["GET", "/admin/credit/tempo-close-reports"],
+  ["POST", "/admin/credit/retry-tempo-close-report"],
+  ["POST", "/admin/credit/write-off-tempo-close-report"],
+] as const;
+
+describe("Tempo close-report route guards", () => {
+  it.each(CLOSE_REPORT_ROUTES)("requires authentication for %s %s", async (method, path) => {
+    const { app } = makeHarness();
+    const res = await app.request(path, { method });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: "unauthorized" });
+  });
+
+  it.each(CLOSE_REPORT_ROUTES)("reports unavailable hosting for %s %s", async (method, path) => {
+    const { app } = makeHarness();
+    const res = await call(app, method, path);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "tempo_close_report_unavailable" });
+  });
+});

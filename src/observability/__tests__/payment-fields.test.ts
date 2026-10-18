@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createStdoutLogger } from "../../sdk/logger";
 import { diagnosticConsole } from "../diagnostic-console";
-import { projectDiagnosticFields } from "../projection";
+import { projectDiagnosticFields, projectSpanRow } from "../projection";
 import { DbTransport, HttpTransport, SpanWriter } from "../span-writer";
 import { formatSpanLine } from "../stdout-sink";
 import type { SpanRow } from "../types";
@@ -136,4 +136,76 @@ describe("payment diagnostic catalogue", () => {
     expect(JSON.stringify(output)).not.toContain("SENTINEL");
     if (hostile) for (const key of Object.keys(approved)) expect(JSON.stringify(output)).not.toContain(key);
   });
+});
+
+it.each([
+  "tempo_session_close_report_reopened",
+  "tempo_session_close_report_written_off",
+])("preserves bounded audit fields only for %s while rejecting arbitrary text", async (event) => {
+  const captured: SpanRow[] = [];
+  setEmitter(row => captured.push(row));
+  const attributes = {
+    obligation_id: "11111111-1111-4111-8111-111111111111",
+    channel_id: `0x${"3a".repeat(32)}`,
+    prior_status: "no_report",
+    written_off: true,
+    amount_native: "9007199254740993",
+    amount_forgone_native: "9007199254740993",
+  };
+  await withSpan({ dataset: "tempo", name: event, attrs: { ...attributes, amount_at_stake_native: "9007199254740993" } }, async () => undefined);
+  expect(captured).toEqual([expect.objectContaining({
+    name: event, attributes,
+  })]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  diagnosticConsole.warn({ dataset: "tempo", event, ...attributes, amount_at_stake_native: "9007199254740993" });
+  expect(JSON.parse(String(warn.mock.calls[0]![0]))).toEqual({ event, level: "warn", dataset: "tempo", ...attributes });
+  expect(projectDiagnosticFields({
+    obligation_id: "private free text", channel_id: "not-a-channel", prior_status: "arbitrary text",
+    written_off: "yes", amount_native: "1e9", amount_forgone_native: "-1",
+  }, "tempo", undefined, undefined, event)).toEqual({});
+});
+
+it("drops close-report identifiers and amounts on another Tempo event", async () => {
+  const attributes = {
+    channel_id: `0x${"3a".repeat(32)}`,
+    obligation_id: "11111111-1111-4111-8111-111111111111",
+    amount_native: "9007199254740993",
+    amount_forgone_native: "9007199254740993",
+    amount_at_stake_native: "9007199254740993",
+    count: 1,
+  };
+  expect(projectDiagnosticFields(attributes, "tempo")).toEqual({ count: 1 });
+  const event = "tempo_session_drain_finalized";
+  expect(projectSpanRow({ ...span(attributes), name: event })).toEqual({
+    ok: true, row: expect.objectContaining({ name: event, attributes: { count: 1 } }),
+  });
+  const captured: SpanRow[] = [];
+  setEmitter(row => captured.push(row));
+  await withSpan({ dataset: "tempo", name: event, attrs: attributes }, async () => undefined);
+  expect(captured).toEqual([expect.objectContaining({ name: event, attributes: { count: 1 } })]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  diagnosticConsole.warn({ dataset: "tempo", event, ...attributes });
+  expect(JSON.parse(String(warn.mock.calls[0]![0]))).toEqual({
+    event, level: "warn", dataset: "tempo", count: 1,
+  });
+});
+
+
+it("retains only the payer-exit report identifiers and amount", async () => {
+  const event = "tempo_session_close_exit_resolved";
+  const expected = {
+    channel_id: `0x${"3a".repeat(32)}`,
+    obligation_id: "11111111-1111-4111-8111-111111111111",
+    amount_at_stake_native: "9007199254740993",
+  };
+  const attributes = { ...expected, drain_id: "private-drain", amount_native: "123", amount_forgone_native: "456" };
+  const captured: SpanRow[] = [];
+  setEmitter(row => captured.push(row));
+  await withSpan({ dataset: "tempo", name: event, attrs: attributes }, async () => undefined);
+  expect(captured).toEqual([expect.objectContaining({ name: event, attributes: expected })]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  diagnosticConsole.warn({ dataset: "tempo", event, ...attributes });
+  expect(JSON.parse(String(warn.mock.calls[0]![0]))).toEqual({ event, level: "warn", dataset: "tempo", ...expected });
+  expect(projectDiagnosticFields({ channel_id: "not-a-channel", obligation_id: "not-a-uuid",
+    amount_at_stake_native: "-1" }, "tempo", undefined, undefined, event)).toEqual({});
 });

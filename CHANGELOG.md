@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
+
 ## [0.9.0](https://github.com/dvmkit/sdk/compare/v0.8.1...v0.9.0) (2026-10-16)
 
 

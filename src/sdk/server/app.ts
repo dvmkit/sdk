@@ -1497,6 +1497,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         // DVM wired with an in-memory session store resolves to a rail with no
         // close-intent read and the verbs answer 503.
         tempoDrainRail: () => Promise.resolve(this.opts.mpp),
+        ...(this.opts.hostedSettlementReports ? {
+          hostedSettlementReports: { store: this.opts.hostedSettlementReports },
+        } : {}),
         // Health-filtered, and read per request rather than captured: the
         // servicer picking a mint to buy a refund at wants the list that
         // excludes a mint currently failing its probe.

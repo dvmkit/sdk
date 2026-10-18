@@ -32,6 +32,7 @@ import type { DrainFulfilment } from "./credit-ledger";
 import { CreditLedgerError, DRAIN_METHODS } from "./credit-ledger";
 import { netOwedSats } from "./credit-lots";
 import { derivedFundCreditId, isDerivedCreditId } from "./funding";
+import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { LightningReceive } from "./lightning-receive";
 import type { LockPubkeyState, LockPubkeyStateLoader } from "./lock-pubkey-store";
 import { toLockPubkey } from "./lock-pubkey-store";
@@ -105,6 +106,7 @@ export interface InstallAdminCreditRoutesOpts {
    * rolls back booking; committed runs only after commit.
    */
   onTempoDrainReconciled?: TransactionalPayoutHook<TempoCloseReconciled>;
+  hostedSettlementReports?: { store: HostedSettlementReportObligations };
   walletProvider?: typeof getWallet;
   /** Override for the current time (tests). Returns ms since epoch. */
   now?: () => number;
@@ -140,6 +142,9 @@ export function installAdminCreditRoutes<E extends Env = Env, S extends BlankSch
   app.post("/admin/credit/reconcile-x402-exact-settlement", (c) =>
     handleReconcileX402Exact(c, opts)
   );
+  app.get("/admin/credit/tempo-close-reports", (c) => handleTempoCloseReports(c, opts));
+  app.post("/admin/credit/retry-tempo-close-report", (c) => handleTempoCloseReportAction(c, opts, "retry"));
+  app.post("/admin/credit/write-off-tempo-close-report", (c) => handleTempoCloseReportAction(c, opts, "write-off"));
   app.get("/admin/credit/tempo-drains", (c) => handleTempoDrains(c, opts));
   app.get("/admin/credit/tempo-losses", (c) => handleTempoLosses(c, opts));
   app.post("/admin/credit/reconcile-tempo-drain", (c) => handleReconcileTempo(c, opts));
@@ -1364,6 +1369,131 @@ async function handleWriteOffX402(
     note: outcome.intent.writeOffNote ?? null,
     replayed: !outcome.written,
   });
+}
+
+export interface TempoCloseReportSummary {
+  obligation_id: string;
+  channel_id: string;
+  /** Potential builder payout, as a decimal string in native token units. */
+  amount_native: string;
+  status: "unmatched" | "no_report";
+  created_at_ms: number;
+  updated_at_ms: number;
+  delivered_at_ms: number | null;
+  /** Snapshot of the store's retry predicate; a later state change can still cause a conflict. */
+  retryable: boolean;
+  write_off_allowed: boolean;
+  /** True when a retained write-off decision exists, including after an explicit retry. */
+  written_off: boolean;
+  write_off_note: string | null;
+  written_off_at_ms: number | null;
+}
+
+export interface TempoCloseReportsResponse {
+  reports: TempoCloseReportSummary[];
+  next_after?: string;
+}
+
+export interface RetryTempoCloseReportResponse {
+  status: "reserved";
+  obligation_id: string;
+}
+
+export interface WriteOffTempoCloseReportResponse {
+  status: "written_off";
+  obligation_id: string;
+  channel_id: string;
+  /** Builder payout abandoned, as a decimal string in native token units. */
+  amount_forgone_native: string;
+  note: string;
+}
+
+function tempoCloseReportsUnavailable(c: Context): Response {
+  return c.json({
+    error: "tempo_close_report_unavailable",
+    message: "Hosted settlement reports are not configured on this DVM.",
+  }, 503);
+}
+
+async function handleTempoCloseReports(c: Context, opts: InstallAdminCreditRoutesOpts): Promise<Response> {
+  const auth = await requireAuth(c, opts);
+  if ("response" in auth) return auth.response;
+  if (!opts.hostedSettlementReports) return tempoCloseReportsUnavailable(c);
+  const limit = parseTempoLimit(c.req.query("limit"));
+  if (limit === undefined) {
+    return c.json({ error: "invalid_query", message: "limit must be an integer in 1..50." }, 400);
+  }
+  let after: { createdAtMs: number; obligationId: string } | undefined;
+  const rawAfter = c.req.query("after");
+  if (rawAfter !== undefined) {
+    try {
+      const value: unknown = JSON.parse(Buffer.from(rawAfter, "base64url").toString("utf8"));
+      if (!Array.isArray(value) || value.length !== 2 || !Number.isSafeInteger(value[0]) ||
+        value[0] < 0 || typeof value[1] !== "string" || !value[1]) throw new Error("invalid cursor");
+      after = { createdAtMs: value[0] as number, obligationId: value[1] };
+    } catch {
+      return c.json({ error: "invalid_query", message: "after must be a next_after value from a previous response." }, 400);
+    }
+  }
+  const all = c.req.query("all");
+  if (all !== undefined && all !== "0" && all !== "1") {
+    return c.json({ error: "invalid_query", message: "all must be 0 or 1." }, 400);
+  }
+  const rows = await opts.hostedSettlementReports.store.listTempoCloseReports({ limit, after, all: all === "1" });
+  const last = rows.length === limit ? rows.at(-1) : undefined;
+  const response: TempoCloseReportsResponse = {
+    reports: rows.map(row => ({
+      obligation_id: row.id, channel_id: row.channelId, amount_native: row.amountNative,
+      status: row.status, created_at_ms: row.createdAtMs, updated_at_ms: row.updatedAtMs,
+      delivered_at_ms: row.deliveredAtMs, retryable: row.retryable,
+      write_off_allowed: row.writeOffAllowed, written_off: row.writtenOff,
+      write_off_note: row.writeOffNote, written_off_at_ms: row.writtenOffAtMs,
+    })),
+    ...(last ? { next_after: Buffer.from(JSON.stringify([last.createdAtMs, last.id])).toString("base64url") } : {}),
+  };
+  return c.json(response);
+}
+
+async function handleTempoCloseReportAction(
+  c: Context, opts: InstallAdminCreditRoutesOpts, action: "retry" | "write-off"
+): Promise<Response> {
+  const auth = await requireAuth(c, opts);
+  if ("response" in auth) return auth.response;
+  const reports = opts.hostedSettlementReports;
+  if (!reports) return tempoCloseReportsUnavailable(c);
+  const body = await c.req.json().catch(() => null) as { obligation_id?: unknown; note?: unknown } | null;
+  if (!body || typeof body.obligation_id !== "string" || !body.obligation_id.trim()) {
+    return c.json({ error: "invalid_request", message: "obligation_id must be a non-empty string." }, 400);
+  }
+  const obligationId = body.obligation_id.trim();
+  if (action === "retry") {
+    if (await reports.store.reopenTempoClose(obligationId)) {
+      const response: RetryTempoCloseReportResponse = { status: "reserved", obligation_id: obligationId };
+      return c.json(response);
+    }
+  } else {
+    if (typeof body.note !== "string" || !body.note.trim() || body.note.trim().length > 2_000) {
+      return c.json({ error: "invalid_request", message: "note must contain 1 to 2000 characters after trimming." }, 400);
+    }
+    const note = body.note.trim();
+    const result = await reports.store.writeOffTempoClose(obligationId, note);
+    if (result) {
+      const response: WriteOffTempoCloseReportResponse = {
+        status: "written_off", obligation_id: obligationId, channel_id: result.channelId,
+        amount_forgone_native: result.amount, note,
+      };
+      return c.json(response);
+    }
+  }
+  if (!await reports.store.hasTempoCloseReport(obligationId)) {
+    return c.json({ error: "tempo_close_report_not_found", message: "Close-report obligation not found.",
+      obligation_id: obligationId }, 404);
+  }
+  return c.json({ error: "tempo_close_report_conflict",
+    message: action === "retry"
+      ? "Retry requires an unsubmitted unmatched or no_report close obligation without a competing report."
+      : "Write-off requires an unsubmitted unmatched close obligation.",
+    obligation_id: obligationId }, 409);
 }
 
 /**
