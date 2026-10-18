@@ -138,6 +138,14 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       expect(nonce).toBeTruthy();
       let target = store;
       if (cold) {
+        // Only the yield snapshot copies payment-request into jobs.messages;
+        // appendOutgoing already commits the status and pending payment.
+        await vi.waitFor(async () => {
+          expect(await store.get(job.job_id)).toMatchObject({
+            status: "awaiting-input", pendingPaymentMsats: TOPUP,
+            messages: expect.arrayContaining([expect.objectContaining({ type: "payment-request" })]),
+          });
+        });
         // Stop the original worker's listeners. The later message lands on a
         // fresh manager with only the persisted snapshot and payment log.
         instance.jobManager.shutdown();
