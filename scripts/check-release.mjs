@@ -210,7 +210,7 @@ if (/--provenance/u.test(release)) {
 }
 
 const prepare = jobBlock(release, "prepare", "build");
-const build = jobBlock(release, "build", "publish");
+const build = jobBlock(release, "build", "no-publish");
 const publish = jobBlock(release, "publish", "github-release");
 const githubRelease = jobBlock(release, "github-release", undefined);
 const validation = prepare.indexOf('if [[ ! "$release_tag"');

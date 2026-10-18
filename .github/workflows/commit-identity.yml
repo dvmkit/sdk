@@ -10,7 +10,7 @@ permissions:
 jobs:
   commit-identity:
     name: commit-identity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # Execute the policy from the trusted base, never code supplied by the pull request.
