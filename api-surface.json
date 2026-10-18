@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.10.1",
+  "version": "0.8.0",
   "exports": [
     {
       "export": ".",

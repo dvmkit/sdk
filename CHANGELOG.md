@@ -4,6 +4,41 @@
 
 - Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
 
+## [0.8.0](https://github.com/dvmkit/sdk/compare/v0.10.1...v0.8.0) (2026-10-18)
+
+
+### Features
+
+* add admin routes for hosted Tempo close reports ([#16](https://github.com/dvmkit/sdk/issues/16)) ([a86a85d](https://github.com/dvmkit/sdk/commit/a86a85d6e2ac2d4474629d021bd05d6b88e750de))
+* summarize pending implicit credit draws ([4edeae0](https://github.com/dvmkit/sdk/commit/4edeae05bacd047d0cf624882cef6db112d0ef90))
+* terminalize hosted Tempo close obligations ([#9](https://github.com/dvmkit/sdk/issues/9)) ([3f306d4](https://github.com/dvmkit/sdk/commit/3f306d46f7a9adb378c577f6efb911de96dcc386))
+
+
+### Bug Fixes
+
+* bring every hosted Tempo close obligation to a terminal state ([#7](https://github.com/dvmkit/sdk/issues/7)) ([8fc12f9](https://github.com/dvmkit/sdk/commit/8fc12f9f8d10621eaeaab68a29aabc416a52d16b))
+* make concurrent job snapshots safe ([92a17a1](https://github.com/dvmkit/sdk/commit/92a17a1ce25fa801aa315beb90c41acd0e69c0d2))
+* prevent duplicate Tempo settlements from stale reads ([12bbbe1](https://github.com/dvmkit/sdk/commit/12bbbe191306139d3b8534560973fed89a8b0995))
+* recommend latest caller release in credential hint ([a3d3b0a](https://github.com/dvmkit/sdk/commit/a3d3b0a6fa9f3498236e1ed56c9ed55a35d3490d))
+* require Tempo drain proof and share close searches ([#18](https://github.com/dvmkit/sdk/issues/18)) ([cb8df3e](https://github.com/dvmkit/sdk/commit/cb8df3e9eabb50d68c99419867ecc6bc86a7c5e5))
+* **tempo:** honour proven charges when replay marking fails ([02292e5](https://github.com/dvmkit/sdk/commit/02292e5df9d26467f17685a7d726f8a47ba64804))
+
+
+### Continuous Integration
+
+* validate workflows on Ubuntu 26.04 ([#19](https://github.com/dvmkit/sdk/issues/19)) ([d29a8db](https://github.com/dvmkit/sdk/commit/d29a8db95d125bebbd129e1f9ff3f5cc5039ad0d))
+
+
+### Miscellaneous Chores
+
+* **claude:** block Claude attribution in commits and PRs ([#22](https://github.com/dvmkit/sdk/issues/22)) ([cd58d28](https://github.com/dvmkit/sdk/commit/cd58d2813a96c7d176af05a538f23c7a80df6001))
+* configure the first stable release ([#5](https://github.com/dvmkit/sdk/issues/5)) ([b795a23](https://github.com/dvmkit/sdk/commit/b795a23775c4134124fd6da88c2f2e36bdcacd6c))
+* **master:** release 0.10.0 ([#17](https://github.com/dvmkit/sdk/issues/17)) ([c59b219](https://github.com/dvmkit/sdk/commit/c59b2193b613a00bee98ca1a9ab7850cf9aaaec6))
+* **master:** release 0.10.1 ([#20](https://github.com/dvmkit/sdk/issues/20)) ([c965bee](https://github.com/dvmkit/sdk/commit/c965bee126a0c46c91cc99fdccb3bac009a9e248))
+* **master:** release 0.8.0 ([#6](https://github.com/dvmkit/sdk/issues/6)) ([33d7b34](https://github.com/dvmkit/sdk/commit/33d7b3401f139263e6e545a925ddf1fd5481365f))
+* **master:** release 0.8.1 ([#8](https://github.com/dvmkit/sdk/issues/8)) ([51995ca](https://github.com/dvmkit/sdk/commit/51995cadbd194200defc731a8ab7c9aee0b2dccd))
+* **master:** release 0.9.0 ([#10](https://github.com/dvmkit/sdk/issues/10)) ([bf8a89c](https://github.com/dvmkit/sdk/commit/bf8a89c057806c77e62a7adc5a4c50cff8b6af34))
+
 ## [0.10.1](https://github.com/dvmkit/sdk/compare/v0.10.0...v0.10.1) (2026-10-18)
 
 
