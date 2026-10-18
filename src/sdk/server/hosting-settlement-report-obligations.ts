@@ -696,6 +696,18 @@ export class HostedSettlementReportObligations {
       searchBefore: searchCursor(row.close_search_before) };
   }
 
+  /** A recorded close transaction remains refund evidence after its report is delivered. */
+  async tempoCloseTransaction(channelId: string, drainId: string): Promise<string | undefined> {
+    const result = await this.pool.query<{ tx_hash: string }>(
+      `SELECT tx_hash FROM sdk_hosted_settlement_report_obligations
+       WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
+         AND original->>'drainId'=$4 AND tx_hash IS NOT NULL
+       ORDER BY created_at_ms DESC LIMIT 1`,
+      [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
+    );
+    return result.rows[0]?.tx_hash;
+  }
+
   /**
    * Where the next search for this close obligation's transaction resumes. It
    * lives on the obligation, not the drain's close intent, because releasing

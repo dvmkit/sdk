@@ -786,13 +786,8 @@ async function completeTempoDrain(
     try {
       const state = await rail.mpp.getTempoSessionDrainState?.(expectedChannelId);
       if (state?.finalized || state?.deposit === 0n) {
-        const recovered = await rail.mpp.recoverTempoSessionClose?.(
-          expectedChannelId,
-          record.drainId
-        );
-        if (recovered) {
-          return await markTempoDrainSent(deps, rail.mpp, record, expectedChannelId, recovered);
-        }
+        const recovered = await recoverTempoDrain(deps, rail.mpp, record, expectedChannelId);
+        if (recovered) return recovered;
       }
       // A submitted close may still land after a receipt wait times out, so an
       // open snapshot alone never authorizes re-credit. Release only when the
@@ -918,6 +913,15 @@ function tempoCloseCredentialNeedsRefresh(error: unknown): boolean {
   );
 }
 
+function tempoRefundUnprovenResponse(record: CreditDrainRecord): Response {
+  return jsonPaymentError("settlement_pending", 409, {
+    message: "The full Tempo refund could not be proven yet.",
+    display: "Your funds remain held and have not been lost. The DVM operator has been alerted.",
+    hint: `Keep drain ${record.drainId}; no replacement drain is needed.`,
+    extra: { drain_registered: true, drain_id: record.drainId },
+  });
+}
+
 async function recoverTempoDrain(
   deps: CreditRouteDeps,
   mpp: NonNullable<UpfrontPaymentOpts["mpp"]>,
@@ -925,8 +929,24 @@ async function recoverTempoDrain(
   channelId: string
 ): Promise<CreditDrainRecord | Response | null> {
   try {
-    const reference = await mpp.recoverTempoSessionClose?.(channelId, record.drainId);
-    return reference ? await markTempoDrainSent(deps, mpp, record, channelId, reference) : null;
+    const result = await mpp.recoverTempoSessionClose?.(channelId, record.drainId, record.creditId);
+    const durable = await deps.ledger.getDrain({ creditId: record.creditId, drainId: record.drainId });
+    if (durable?.status === "sent") return durable;
+    if (result && typeof result === "object") {
+      return tempoRefundUnprovenResponse(durable ?? record);
+    }
+    if (!result) return null;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(result)) {
+      loggers.tempo.warn("tempo_session_drain_refund_unproven", {
+        channel_id: channelId, credit_id: record.creditId, drain_id: record.drainId,
+        amount_at_stake_native: record.drainedNative?.toString() ?? null,
+        amount_at_stake_micro: record.amountMicro, currency: record.currency,
+        reason: "close_evidence_missing", error: "Recovery returned no proven refund",
+      });
+      return tempoRefundUnprovenResponse(durable ?? record);
+    }
+    if (durable?.status === "exit_required") return null;
+    return await markTempoDrainSent(deps, mpp, durable ?? record, channelId, result);
   } catch (error) {
     const refused = tempoFloorRefusal(error, record);
     if (refused) return refused;
@@ -937,6 +957,8 @@ async function recoverTempoDrain(
     });
     return jsonPaymentError("payment_invalid", 402, {
       message: "The Tempo session close is still being reconciled; retry this drain.",
+      hint: `Retry this same drain ${record.drainId} after the service can read and persist the close evidence.`,
+      retryable: true,
     });
   }
 }
