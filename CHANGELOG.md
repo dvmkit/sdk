@@ -12,6 +12,23 @@
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [1.0.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.10.1...v1.0.0-rc.1) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* Custom CreditLedgerLike stores must implement transactional refundDraw accounting and report enqueueing.
+
+### Features
+
+* add operator decisions for held Tempo drains ([c0e1841](https://github.com/dvmkit/sdk/commit/c0e18418df914c13633a485c8abe01621c15a3b8))
+* support completed credit draw refunds ([ffd3334](https://github.com/dvmkit/sdk/commit/ffd3334101a1b9f9792a87b0b29b251906f987bd))
+
+
+### Bug Fixes
+
+* classify finalized Tempo backing loss from close evidence ([c5b17f3](https://github.com/dvmkit/sdk/commit/c5b17f3fb2ba27dc6ab62ee9b050f8082482460d))
+
 ## [0.10.1](https://github.com/dvmkit/sdk/compare/v0.10.0...v0.10.1) (2026-10-18)
 
 
