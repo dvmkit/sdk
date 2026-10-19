@@ -68,6 +68,9 @@ describe("MemoryCreditLedger", () => {
         consumedServiceMicro: 3_000,
         settledOnChainNative: 0n,
         highestVoucherNative: 3_000n,
+        refundedToPayerNative: null,
+        lossNative: 3_000n,
+        lossBasis: "caller_asserted",
         observedAt: 123,
       }),
     ]);
@@ -105,6 +108,36 @@ describe("MemoryCreditLedger", () => {
         consumedNative: 3_000n,
       })
     ).resolves.toEqual(first);
+  });
+
+  it("subtracts only verified cooperative refunds from permanent Tempo loss", async () => {
+    const ledger = make();
+    const channelId = `0x${"93".repeat(32)}`;
+    const credit = await ledger.fund({ callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
+      expiryMs: FUTURE_MS, basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100_000,
+        tempoSession: { channelId, cumulativeAmount: "100000" } } });
+    const evidence = { channelId, highestVoucherNative: 100_000n, settledOnChainNative: 30_000n, consumedNative: 30_000n };
+    expect(await ledger.terminalizeTempoCredits({ ...evidence, refundedToPayerNative: 70_000n })).toEqual([]);
+    expect(await ledger.get(credit.creditId)).toMatchObject({ status: "active" });
+    const losses = await ledger.terminalizeTempoCredits({ ...evidence, refundedToPayerNative: 20_000n });
+    expect(losses).toEqual([expect.objectContaining({ settledOnChainNative: 30_000n, refundedToPayerNative: 20_000n, lossNative: 50_000n })]);
+    expect(await ledger.get(credit.creditId)).toMatchObject({ status: "unbacked" });
+    expect(await ledger.terminalizeTempoCredits({ ...evidence, refundedToPayerNative: 70_000n })).toEqual(losses);
+  });
+
+  it("limits payer-exit loss to consumed service and keeps the refund amount unknown", async () => {
+    const ledger = make();
+    const channelId = `0x${"94".repeat(32)}`;
+    const credit = await ledger.fund({ callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
+      expiryMs: FUTURE_MS, basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100_000,
+        tempoSession: { channelId, cumulativeAmount: "100000" } } });
+    const evidence = { channelId, highestVoucherNative: 100_000n, settledOnChainNative: 30_000n,
+      consumedNative: 30_000n, closeKind: "payer_exit" as const };
+    expect(await ledger.terminalizeTempoCredits(evidence)).toEqual([]);
+    expect(await ledger.get(credit.creditId)).toMatchObject({ status: "active" });
+    expect(await ledger.terminalizeTempoCredits({ ...evidence, consumedNative: 50_000n })).toEqual([
+      expect.objectContaining({ lossNative: 20_000n, lossBasis: "payer_exit", refundedToPayerNative: null }),
+    ]);
   });
 
   it("terminalizes an x402 credit after its channel backing exits", async () => {
@@ -552,6 +585,31 @@ describe("MemoryCreditLedger", () => {
       expect(sent).toMatchObject({ replayed: false, drain: { status: "sent" } });
       expect((await ledger.markDrainSent({ creditId: credit.creditId, drainId: "d1", sentRef: {} })).replayed).toBe(true);
       expect(await ledger.get(credit.creditId)).toMatchObject({ balanceMicro: 0 });
+    });
+
+    it("retains exact and some-payment Tempo drain evidence monotonically without accounting changes", async () => {
+      const ledger = make();
+      const channelId = `0x${"93".repeat(32)}`;
+      const credit = await ledger.fund({ callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
+        expiryMs: FUTURE_MS, basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100_000,
+          tempoSession: { channelId, cumulativeAmount: "100000" } } });
+      const args = { creditId: credit.creditId, drainId: "d1" };
+      await ledger.requestDrain({ ...args, callerPubkey: CALLER, method: "tempo", payout: {} });
+      const balance = await ledger.get(credit.creditId);
+      expect(await ledger.getDrain(args)).toMatchObject({ provenRefundNative: null, refundPaymentProven: false });
+      await ledger.recordTempoDrainRefund({ ...args, refundedNative: 0n });
+      expect(await ledger.getDrain(args)).toMatchObject({ status: "pending", provenRefundNative: "0", refundPaymentProven: false });
+      await ledger.recordTempoDrainPayment(args);
+      expect(await ledger.getDrain(args)).toMatchObject({ provenRefundNative: "0", refundPaymentProven: true });
+      await ledger.recordTempoDrainRefund({ ...args, refundedNative: 9_007_199_254_740_993n });
+      await ledger.recordTempoDrainRefund({ ...args, refundedNative: "0" });
+      await ledger.recordTempoDrainPayment(args);
+      expect(await ledger.getDrain(args)).toMatchObject({ status: "pending", provenRefundNative: "9007199254740993", refundPaymentProven: true });
+      expect(await ledger.get(credit.creditId)).toEqual(balance);
+      await expectCode(ledger.recordTempoDrainRefund({ ...args, refundedNative: -1n }), "invalid_basis");
+      await ledger.markDrainSent({ ...args, sentRef: { tx_hash: "test-refund" } });
+      await ledger.recordTempoDrainRefund({ ...args, refundedNative: "9007199254740994" });
+      expect(await ledger.getDrain(args)).toMatchObject({ status: "sent", provenRefundNative: "9007199254740993", refundPaymentProven: true });
     });
 
     it("drains available balance exactly once, takes a seq, replays idempotently", async () => {

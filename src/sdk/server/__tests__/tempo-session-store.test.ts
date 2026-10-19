@@ -283,6 +283,16 @@ describe("Tempo session store invariants", () => {
     ).toThrow(/immutable field changed: payer/);
   });
 
+  it("retains positive drain payment identity across supported state replacement", () => {
+    const observed = { ...BASE, tempoDrainPaymentObservation: { creditId: "credit", drainId: "drain" } };
+    expect(() => assertMonotonicTransition(BASE, observed)).not.toThrow();
+    expect(() => assertMonotonicTransition(observed, BASE)).toThrow("cannot be erased or rebound");
+    expect(() => assertMonotonicTransition(observed, { ...observed,
+      tempoDrainPaymentObservation: { creditId: "other", drainId: "drain" } })).toThrow("cannot be erased or rebound");
+    expect(() => assertMonotonicTransition(BASE, { ...BASE,
+      tempoDrainPaymentObservation: { creditId: "credit" } })).toThrow("requires a credit and drain identity");
+  });
+
   it("allows terminal escrow reset but never reopens a finalized channel", () => {
     const finalized = {
       ...BASE,

@@ -1,3 +1,4 @@
+import tempoCreditLossContract from "../../../../protocol-fixtures/tempo-credit-losses.json";
 /* SQL is captured, not executed; these tests prove route wiring and guards, not rollback. */
 import { readFileSync } from "node:fs";
 
@@ -2024,6 +2025,18 @@ async function seedTempoWedge(
 }
 
 describe("GET /admin/credit/tempo-losses", () => {
+  it("keeps historical loss refund and residual amounts unknown", async () => {
+    const { app, ledger } = makeHarness();
+    vi.spyOn(ledger, "listTempoCreditLosses").mockResolvedValue([{
+      creditId: "old-credit", channelId: TEMPO_CHANNEL, callerPubkey: CALLER, currency: "usd",
+      formerBalanceMicro: 100, settledOnChainNative: 0n, highestVoucherNative: 100n,
+      consumedServiceMicro: 0, consumedNative: 0n, refundedToPayerNative: null, lossNative: null, observedAt: 1,
+    }]);
+    const response = await call(app, "GET", "/admin/credit/tempo-losses");
+    expect(response.status).toBe(200);
+    expect((await response.json()).losses).toEqual([expect.objectContaining(tempoCreditLossContract.historicalAmounts)]);
+  });
+
   it("lists immutable loss evidence and offers no repair action", async () => {
     const { app, ledger } = makeHarness();
     const channelId = `0x${"4b".repeat(32)}`;
@@ -2058,8 +2071,7 @@ describe("GET /admin/credit/tempo-losses", () => {
           caller_pubkey: CALLER,
           currency: "usd",
           former_balance_micro: 97_000,
-          settled_on_chain_native: "0",
-          highest_voucher_native: "3000",
+          ...tempoCreditLossContract.amounts,
           consumed_service_micro: 0,
           consumed_native: "3000",
           observed_at: 456,

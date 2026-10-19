@@ -384,7 +384,8 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
     }>(
       `SELECT channel_key, state_json, updated_at
         FROM mpp_tempo_channels
-        WHERE (state_json::jsonb ->> 'finalized') IS DISTINCT FROM 'true'
+        WHERE ((state_json::jsonb ->> 'finalized') IS DISTINCT FROM 'true'
+          OR state_json::jsonb ->> 'creditLossPending' = 'true')
           AND ($2::BIGINT IS NULL OR (updated_at, channel_key) > ($2, $3))
         ORDER BY updated_at, channel_key
         LIMIT $1`,
@@ -773,7 +774,18 @@ function closeRecord(row: {
 /** Refuse a backend or callback that attempts to roll channel authority back. */
 export function assertMonotonicTransition(current: unknown, next: unknown): void {
   if (!isRecord(next)) throw new Error("Tempo session state must be an object");
+  const observation = next.tempoDrainPaymentObservation;
+  if (observation !== undefined && (!isRecord(observation) ||
+    typeof observation.creditId !== "string" || !observation.creditId ||
+    typeof observation.drainId !== "string" || !observation.drainId)) {
+    throw new Error("Tempo drain payment observation requires a credit and drain identity");
+  }
   if (!isRecord(current)) return;
+  const retained = current.tempoDrainPaymentObservation;
+  if (retained !== undefined && (!isRecord(retained) || !isRecord(observation) ||
+    retained.creditId !== observation.creditId || retained.drainId !== observation.drainId)) {
+    throw new Error("Tempo drain payment observation cannot be erased or rebound");
+  }
   for (const field of [
     "channelId",
     "chainId",

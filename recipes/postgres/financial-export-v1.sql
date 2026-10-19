@@ -109,7 +109,8 @@ BEGIN
   EXECUTE format('SELECT COALESCE(jsonb_agg(projected ORDER BY projected::text), ''[]''::jsonb) FROM (
     SELECT (SELECT COALESCE(jsonb_object_agg(key,
       CASE WHEN key=ANY(ARRAY[''sent_ref'',''settle_response'']) THEN pg_temp.settlement_v1(value)
-           WHEN key=''proven_refund_native'' THEN CASE WHEN value #>> ''{}'' ~ ''^[0-9]+$'' THEN to_jsonb(value #>> ''{}'') ELSE NULL END
+           WHEN key=ANY(ARRAY[''proven_refund_native'',''refunded_to_payer_native'',''loss_native'']) THEN CASE WHEN value #>> ''{}'' ~ ''^[0-9]+$'' THEN to_jsonb(value #>> ''{}'') ELSE NULL END
+           WHEN key=''loss_basis'' THEN CASE WHEN value #>> ''{}'' IN (''cooperative_close'',''payer_exit'',''caller_asserted'') THEN value ELSE NULL END
            WHEN key=''operator_decision'' THEN pg_temp.drain_decision_v1(value)
            WHEN key=''result'' THEN pg_temp.draw_refund_result_v1(value)
            WHEN key=''fulfilment'' THEN pg_temp.fulfilment_v1(value)
@@ -144,7 +145,7 @@ SELECT jsonb_build_object(
   'x402_channel_tombstones', pg_temp.financial_rows_v1('x402_batch_channel_tombstones', ARRAY['channel_id','charged_cumulative_amount','signed_max_claimable','refund_nonce','deleted_at_ms']),
   'x402_batch_settlements', pg_temp.financial_rows_v1('x402_batch_settlements', ARRAY['settlement_id','channel_id','operation','effect_id','payment_id','status','submission_block','settle_response','created_at','updated_at','resolved_at']),
   'x402_exact_settlements', pg_temp.financial_rows_v1('x402_exact_settlement_intents', ARRAY['dvm_id','intent_id','network','asset','authorizer','recipient','value','status','effect','submission_block','transaction','settle_response','last_outcome','created_at','updated_at','resolved_at']),
-  'tempo_losses', pg_temp.financial_rows_v1('tempo_credit_losses', ARRAY['credit_id','channel_id','caller_pubkey','currency','former_balance_micro','settled_on_chain_native','highest_voucher_native','consumed_service_micro','consumed_native','observed_at']),
+  'tempo_losses', pg_temp.financial_rows_v1('tempo_credit_losses', ARRAY['credit_id','channel_id','caller_pubkey','currency','former_balance_micro','settled_on_chain_native','highest_voucher_native','consumed_service_micro','consumed_native','observed_at','refunded_to_payer_native','loss_native','loss_basis']),
   'x402_losses', pg_temp.financial_rows_v1('x402_credit_losses', ARRAY['credit_id','channel_id','caller_pubkey','currency','former_balance_micro','channel_balance_native','total_claimed_native','consumed_service_micro','observed_at'])
 );
 ROLLBACK;
