@@ -910,6 +910,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   } : undefined;
   server = new DVMServer(descriptor, {
     ...opts,
+    platformUrl,
     hostingControlInstance: hostingControl,
     hostedSettlementReports,
     hostingClosureSupport,
@@ -1493,6 +1494,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         enqueueCreditDrawRefund: this.opts.enqueueCreditDrawRefund,
         enqueueCreditDeposit: this.opts.enqueueCreditDeposit,
         enqueueCreditDrain: this.opts.enqueueCreditDrain,
+        requireDrainReport: !!this.opts.platformUrl,
         lightningReceive: this.opts.lightningReceive,
         // x402 repair queue rides the same surface, and resolves
         // the rail the same lazy way the verify path does — constructing the

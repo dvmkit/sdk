@@ -1,0 +1,86 @@
+{
+  "book": {
+    "method": "POST",
+    "path": "/admin/credit/book-tempo-drain",
+    "request": {
+      "credit_id": "credit-example",
+      "drain_id": "drain-example",
+      "reason": "Full refund independently confirmed",
+      "evidence": "receipt-example"
+    },
+    "response": {
+      "status": "sent",
+      "credit_id": "credit-example",
+      "drain_id": "drain-example",
+      "channel_id": "0x3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "amount_micro": 1000,
+      "amount_native": 1200,
+      "currency": "usd",
+      "decision": {
+        "source": "operator",
+        "decision": "book_refunded",
+        "reason": "Full refund independently confirmed",
+        "evidence": "receipt-example",
+        "decidedAt": 1800000001000
+      },
+      "balance_micro": 0,
+      "spendable_micro": 0,
+      "replayed": false
+    },
+    "report": {
+      "dvmId": "dvm-tempo-example",
+      "creditId": "credit-example",
+      "callerPubkey": "abababababababababababababababababababababababababababababababab",
+      "drainId": "drain-example",
+      "method": "tempo",
+      "amountMicro": 1000,
+      "creditCurrency": "usd",
+      "status": "sent",
+      "drainedAt": 1800000001000,
+      "ledgerSeq": 1
+    }
+  },
+  "release": {
+    "method": "POST",
+    "path": "/admin/credit/release-tempo-drain",
+    "request": {
+      "credit_id": "credit-example",
+      "drain_id": "drain-example",
+      "reason": "No refund was paid",
+      "evidence": "receipt-example"
+    },
+    "response": {
+      "status": "released",
+      "credit_id": "credit-example",
+      "drain_id": "drain-example",
+      "channel_id": "0x3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "amount_micro": 1000,
+      "amount_native": 1200,
+      "currency": "usd",
+      "decision": {
+        "source": "operator",
+        "decision": "release",
+        "reason": "No refund was paid",
+        "evidence": "receipt-example",
+        "decidedAt": 1800000001000
+      },
+      "balance_micro": 1000,
+      "spendable_micro": 0,
+      "replayed": false
+    }
+  },
+  "refund_evidence": {
+    "exact_zero": {
+      "proven_refund_native": "0",
+      "refund_payment_proven": false
+    },
+    "positive_lower_bound": {
+      "proven_refund_native": null,
+      "refund_payment_proven": true
+    },
+    "unknown": {
+      "proven_refund_native": null,
+      "refund_payment_proven": false
+    }
+  }
+}

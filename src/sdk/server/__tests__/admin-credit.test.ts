@@ -2131,9 +2131,10 @@ describe("GET /admin/credit/tempo-drains", () => {
     expect(tempo.reads).toEqual([]);
   });
 
-  it("hides a written-off drain until the audit view asks for it", async () => {
-    const { app, ledger } = makeHarness();
+  it("keeps a written-off drain visible because its debit is still held", async () => {
+    const { app, ledger, tempo } = makeHarness();
     await seedTempoWedge(ledger);
+    tempo.amounts = { refundedToPayer: 390_000n, settledToPayee: 110_000n };
     await ledger.writeOffDrain({
       creditId: TEMPO_CREDIT,
       drainId: TEMPO_DRAIN,
@@ -2143,7 +2144,7 @@ describe("GET /admin/credit/tempo-drains", () => {
     const live = (await (
       await callQuery(app, "/admin/credit/tempo-drains", "?min_age_ms=0")
     ).json()) as { drains: unknown[] };
-    expect(live.drains).toEqual([]);
+    expect(live.drains).toEqual([expect.objectContaining({ write_off_note: "chain paid short", held_reason: "refund_short" })]);
 
     const audit = (await (
       await callQuery(app, "/admin/credit/tempo-drains", "?include_resolved=true&min_age_ms=0")

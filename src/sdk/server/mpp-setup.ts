@@ -2170,6 +2170,16 @@ function attachTempoSessionRuntime(
         throw new TempoDrainRefundUnprovenError("close_evidence_missing", "Channel finalization has no matching refund evidence");
       }
       if (drain.drainedNative === null || refundedNative < BigInt(drain.drainedNative)) {
+        try {
+          if (found.outcome === "exit") {
+            if (refundedNative > 0n) await ledger.recordTempoDrainPayment?.({ creditId: drain.creditId, drainId: drain.drainId });
+          } else {
+            await ledger.recordTempoDrainRefund?.({ creditId: drain.creditId, drainId: drain.drainId, refundedNative });
+          }
+        } catch (error) {
+          loggers.tempo.warn("tempo_drain_refund_evidence_write_failed", { amount_micro: drain.amountMicro });
+          throw error;
+        }
         throw new TempoDrainRefundUnprovenError("refund_short", "Proven refund is below the drain debit");
       }
       const creditUnbacked = (await ledger.get(drain.creditId))?.status === "unbacked";
@@ -2189,6 +2199,11 @@ function attachTempoSessionRuntime(
       let failure = error;
       if (error instanceof TempoDrainRefundUnprovenError) {
         try {
+          try {
+            await ledger.recordTempoDrainHold?.({ creditId: drain.creditId, drainId: drain.drainId, reason: error.reason });
+          } catch {
+            loggers.tempo.warn("tempo_drain_hold_reason_write_failed", { amount_micro: drain.amountMicro });
+          }
           // The channel lock serializes the check and log. Emit before the
           // claim commits so a rollback or crash can repeat, but not lose, the alert.
           await store.update(drain.channelId, (current): Store.Change<unknown, boolean> => {

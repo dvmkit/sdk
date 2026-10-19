@@ -426,10 +426,13 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
       );
       const state = channel.rows[0] ? parseStoreValue(channel.rows[0].state_json) : null;
       const settled = (state as { settledOnChain?: unknown } | null)?.settledOnChain;
+      if (typeof settled !== "bigint" || !/^\d{1,78}$/.test(settled.toString())) {
+        throw new Error("Tempo channel settlement snapshot is unavailable or invalid; refusing close broadcast");
+      }
       await tx.query(
         `UPDATE mpp_tempo_close_intents SET settled_before_close = $3
           WHERE channel_id = $1 AND drain_id = $2`,
-        [channelId.toLowerCase(), drainId, typeof settled === "bigint" ? settled.toString() : null]
+        [channelId.toLowerCase(), drainId, settled.toString()]
       );
       return record;
     });

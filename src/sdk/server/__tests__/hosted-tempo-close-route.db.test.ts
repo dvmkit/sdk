@@ -19,6 +19,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
 import terminalCloseContract from "../../../../protocol-fixtures/tempo-close-terminal.json";
+import drainDecisionContract from "../../../../protocol-fixtures/tempo-drain-decisions.json";
 
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { Credential, Errors as MppxErrors } from "mppx";
@@ -39,6 +40,11 @@ import type { FxFetcher } from "../../pricing/index";
 import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
 import { CreditLedger } from "../credit-ledger";
+import { Hono } from "hono";
+import { buildAdminChallenge } from "../admin-cashu";
+import { installAdminCreditRoutes } from "../admin-credit";
+import { MemoryConsumedCredentialStore } from "../consumed-credential-store";
+import { toLockPubkey } from "../lock-pubkey-store";
 import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
 import { HostingControl, signHostingClosure } from "../hosting-control";
 import { retryHostedTempoCloseReport } from "../index";
@@ -405,6 +411,42 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     const searches = () => rpc.requests.filter(({ method }) => method === "eth_blockNumber").length;
     return { server, mpp: { ...mpp, sweepTempoSessions: manualSweep }, creditId, channelId, dvmId, scope, drain, broadcasts, obligations,
       ageObligations, searches, settlements, logs, chain, operator, rpc, descriptor, readChannelClose, runtimeConfig, chainOps };
+  }
+
+  function decisionAdmin(dvmId: string, scope: string) {
+    const secret = new Uint8Array(32).fill(17);
+    const lock = toLockPubkey(`02${Buffer.from(schnorr.getPublicKey(secret)).toString("hex")}`);
+    const reports = new HostedSettlementReportObligations(pool, dvmId, scope);
+    const app = new Hono();
+    installAdminCreditRoutes(app, { db: pool, dvmId, ledger, fxFetcher: stubFx,
+      getLockPubkeyState: () => Promise.resolve({ current: lock, retired: [] }),
+      nonceStore: new MemoryConsumedCredentialStore(), accumulatorWired: false, receiptIssuer: undefined,
+      creditTtlMs: () => 86_400_000, creditCurrency: () => "usd", hostedSettlementReports: { store: reports },
+      tempoDrainRail: () => Promise.resolve({ getTempoSessionCloseIntent: () => Promise.resolve(null) }) });
+    return async (path: string, body?: unknown) => {
+      const method = body === undefined ? "GET" : "POST";
+      const nonceHex = randomUUID().replaceAll("-", "");
+      const unixSeconds = Math.floor(Date.now() / 1000);
+      const digest = buildAdminChallenge({ method, path: path.split("?")[0], dvmId, nonceHex, unixSeconds });
+      return app.request(path, { method, headers: { Authorization: `P2PK ${nonceHex}.${unixSeconds}.${Buffer.from(schnorr.sign(digest, secret)).toString("hex")}`, "Content-Type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    };
+  }
+
+  async function listedDrain(admin: ReturnType<typeof decisionAdmin>, creditId: string): Promise<{ close_reports: unknown[] }> {
+    let after: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await (await admin(`/admin/credit/tempo-drains?min_age_ms=0&evidence=false&limit=50${after ? `&after=${after}` : ""}`)).json() as {
+        drains: { credit_id: string; close_reports: unknown[] }[]; next_after?: string;
+      };
+      const found = page.drains.find(row => row.credit_id === creditId);
+      if (found) return found;
+      after = page.next_after;
+      if (after && seen.has(after)) throw new Error("The drain cursor did not advance");
+      if (after) seen.add(after);
+    } while (after);
+    throw new Error("The held drain was absent from the admin listing");
   }
 
   /** The real payout and revenue reporters over this pool, posting to a stubbed platform. */
@@ -1266,7 +1308,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
           FOR EACH ROW EXECUTE FUNCTION reject_sweep_drain_report()`);
         try {
           await mpp.sweepTempoSessions!();
-          expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "exit_required" });
+          expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "exit_required", provenRefundNative: null, refundPaymentProven: true });
           expect((await pool.query("SELECT id FROM pending_dvm_reports WHERE kind='drain' AND payload->>'creditId'=$1", [creditId])).rows)
             .toEqual([]);
         } finally {
@@ -1274,7 +1316,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
         }
       }
       await mpp.sweepTempoSessions!();
-      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "sent",
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "sent", provenRefundNative: null, refundPaymentProven: true,
         sentRef: { terminal_outcome: unbacked ? "payer_exit_unbacked" : "payer_exit",
           credit_unbacked: unbacked, settled_amount: unbacked ? "200000" : "150000" } });
       if (unbacked) expect((await drain(payer)).body).toMatchObject({ drain: terminalCloseContract.unbackedFinalizedDrain });
@@ -1320,9 +1362,10 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     }
   });
 
-  it.each(["missing history", "short refund", "missing collateral"])("keeps a timed-exit drain open with %s and emits its amount", async (missing) => {
+  it.each(["missing history", "short refund", "missing collateral"].flatMap(missing =>
+    ["book", "release"].map(decision => ({ missing, decision }))))("decides a held timed-exit drain after $missing: $decision", async ({ missing, decision }) => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, mpp, channelId, creditId, drain, chain, logs } = await hostedCredit(payer);
+    const { server, mpp, channelId, creditId, dvmId, scope, drain, chain, logs, operator, readChannelClose } = await hostedCredit(payer);
     const warn = vi.spyOn(loggers.tempo, "warn");
     try {
       expect((await drain(payer, null)).status).toBe(409);
@@ -1330,9 +1373,13 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
         if (missing === "missing collateral") {
           await sessions.put(channelId, { ...await sessions.get(channelId) as Record<string, unknown>, finalized: true, deposit: 0n });
         } else {
-          chain.settled = 150_001n;
+          chain.settled = SPENT;
+          if (decision === "release") readChannelClose.mockResolvedValue({ settledToPayee: SPENT, refundedToPayer: 0n });
+          else chain.settled = 150_001n;
         }
-        logs.push({ event: "CloseRequested", block: HEAD - 900n, txHash: EXIT_TX_HASH, from: payer.address });
+        logs.push(missing === "short refund" && decision === "release"
+          ? { event: "ChannelClosed", block: HEAD - 3n, txHash: TX_HASH, from: operator.address }
+          : { event: "CloseRequested", block: HEAD - 900n, txHash: EXIT_TX_HASH, from: payer.address });
       }
       chain.deposit = 0n;
       await mpp.sweepTempoSessions!();
@@ -1340,10 +1387,141 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 0, status: missing === "short refund" ? "active" : "unbacked" });
       expect(warn).toHaveBeenCalledWith("tempo_session_drain_refund_unproven",
         expect.objectContaining({ channel_id: channelId, amount_at_stake_native: "100000" }));
+      const admin = decisionAdmin(dvmId, scope);
+      const list = await (await admin("/admin/credit/tempo-drains?min_age_ms=0&evidence=false")).json() as { drains: Record<string, unknown>[] };
+      expect(list.drains).toContainEqual(expect.objectContaining({ credit_id: creditId, held_reason:
+        missing === "missing history" ? "close_evidence_missing" : missing === "short refund" ? "refund_short" : "collateral_missing" }));
+      if (missing === "short refund") {
+        expect((await ledger.getDrain({ creditId, drainId: "d1" }))?.provenRefundNative).toBe(decision === "release" ? "0" : null);
+        expect((await ledger.getDrain({ creditId, drainId: "d1" }))?.refundPaymentProven).toBe(decision === "book");
+        expect(await listedDrain(admin, creditId)).toMatchObject(decision === "book"
+          ? drainDecisionContract.refund_evidence.positive_lower_bound : drainDecisionContract.refund_evidence.exact_zero);
+        if (decision === "book") {
+          const refused = await admin("/admin/credit/release-tempo-drain", { credit_id: creditId, drain_id: "d1", reason: "No refund was paid" });
+          expect(refused.status).toBe(409);
+          expect(await refused.json()).toMatchObject({ error: "tempo_drain_refund_paid" });
+        }
+      }
+      const response = await admin(`/admin/credit/${decision}-tempo-drain`, { credit_id: creditId, drain_id: "d1",
+        reason: decision === "book" ? "The full amount was returned off-path" : "No refund was paid" });
+      expect(response.status).toBe(200);
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: decision === "book" ? "sent" : "released",
+        operatorDecision: { source: "operator", decision: decision === "book" ? "book_refunded" : "release" } });
+      expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: decision === "book" ? 0 : 100_000,
+        status: missing === "short refund" ? "active" : "unbacked" });
     } finally {
       warn.mockRestore();
       await server.shutdown();
     }
+  });
+
+  it.each([true, false])("refuses release after a submitted close receipt times out without a saved hash, hosted=%s", async hosted => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, creditId, channelId, dvmId, scope, drain, chain } = await hostedCredit(payer,
+      { hosted, modes: ["submits-then-times-out"] });
+    await new RevenueReporter(pool, "https://platform.example.com", "local-token").init();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect((await drain(payer)).status).toBe(402);
+      expect(chain.pendingClose).toBe(true);
+      expect((await pool.query("SELECT reference, settled_before_close FROM mpp_tempo_close_intents WHERE channel_id=$1", [channelId])).rows)
+        .toEqual([{ reference: null, settled_before_close: "0" }]);
+      expect(await sessions.get(channelId)).toMatchObject({ finalized: false, closeRequestedAt: 0n });
+      const balance = (await pool.query("SELECT balance_micro, native_remaining, msats_remaining FROM credits WHERE credit_id=$1", [creditId])).rows;
+      const obligations = (await pool.query("SELECT state, tx_hash FROM sdk_hosted_settlement_report_obligations WHERE channel_id=$1", [channelId])).rows;
+      expect(obligations).toEqual(hosted ? [{ state: "reserved", tx_hash: null }] : []);
+      const reports = (await pool.query("SELECT kind, payload FROM pending_dvm_reports")).rows;
+      const response = await decisionAdmin(dvmId, scope)("/admin/credit/release-tempo-drain",
+        { credit_id: creditId, drain_id: "d1", reason: "No refund was paid" });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: "tempo_drain_close_pending", message: expect.stringContaining("may still pay") });
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "pending", operatorDecision: null });
+      expect((await pool.query("SELECT balance_micro, native_remaining, msats_remaining FROM credits WHERE credit_id=$1", [creditId])).rows).toEqual(balance);
+      expect((await pool.query("SELECT state, tx_hash FROM sdk_hosted_settlement_report_obligations WHERE channel_id=$1", [channelId])).rows).toEqual(obligations);
+      expect((await pool.query("SELECT kind, payload FROM pending_dvm_reports")).rows).toEqual(reports);
+      expect(warn.mock.calls.filter(call => JSON.stringify(call).includes("tempo_drain_released"))).toEqual([]);
+      expect((await ledger.get(creditId))?.balanceMicro).toBe(0);
+      await expect(ledger.draw({ creditId, drawId: "unsafe-spend", amountMicro: 500, nowMs: Date.now() })).rejects.toMatchObject({ code: "insufficient_credit" });
+    } finally { warn.mockRestore(); await server.shutdown(); }
+  });
+
+  it.each([49_999n, 0n, -1n])("retains only positive-payment knowledge from a payer-exit lower bound of %s", async lowerBound => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, mpp, creditId, channelId, dvmId, scope, drain, chain, logs } = await hostedCredit(payer);
+    const warning = vi.spyOn(loggers.tempo, "warn");
+    try {
+      expect((await drain(payer, null)).status).toBe(409);
+      chain.deposit = 0n; chain.settled = DEPOSIT - lowerBound;
+      logs.push({ event: "CloseRequested", block: HEAD - 900n, txHash: EXIT_TX_HASH, from: payer.address });
+      await mpp.sweepTempoSessions!();
+      const args = { creditId, drainId: "d1" };
+      expect(await ledger.getDrain(args)).toMatchObject({ status: "exit_required", holdReason: "refund_short",
+        provenRefundNative: null, refundPaymentProven: lowerBound > 0n });
+      expect(warning).toHaveBeenCalledWith("tempo_session_drain_refund_unproven", expect.objectContaining({ reason: "refund_short", channel_id: channelId }));
+      expect(warning.mock.calls.some(call => call[0] === "tempo_drain_refund_evidence_write_failed")).toBe(false);
+      const admin = decisionAdmin(dvmId, scope);
+      const release = () => admin("/admin/credit/release-tempo-drain", { credit_id: creditId, drain_id: "d1", reason: "No refund was paid" });
+      expect(await (await release()).json()).toMatchObject({ error: lowerBound > 0n ? "tempo_drain_refund_paid" : "tempo_drain_refund_unknown" });
+      expect(await listedDrain(admin, creditId)).toMatchObject(lowerBound > 0n
+        ? drainDecisionContract.refund_evidence.positive_lower_bound : drainDecisionContract.refund_evidence.unknown);
+      if (lowerBound > 0n) {
+        chain.rpcFailure = true;
+        await mpp.sweepTempoSessions!();
+        chain.rpcFailure = false; chain.settled = DEPOSIT;
+        await mpp.sweepTempoSessions!();
+        expect(await ledger.getDrain(args)).toMatchObject({ provenRefundNative: null, refundPaymentProven: true });
+        await ledger.recordTempoDrainRefund({ ...args, refundedNative: 0n });
+        expect(await ledger.getDrain(args)).toMatchObject({ provenRefundNative: "0", refundPaymentProven: true });
+        expect(await (await release()).json()).toMatchObject({ error: "tempo_drain_refund_paid" });
+      }
+      expect((await ledger.get(creditId))?.balanceMicro).toBe(0);
+    } finally { warning.mockRestore(); await server.shutdown(); }
+  });
+
+  it("retains monetary proof and the unproven alert when the held-reason label cannot be written", async () => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, mpp, creditId, channelId, dvmId, scope, drain, chain, logs } = await hostedCredit(payer);
+    const label = vi.spyOn(ledger, "recordTempoDrainHold").mockRejectedValue(new Error("label unavailable"));
+    const warning = vi.spyOn(loggers.tempo, "warn");
+    try {
+      expect((await drain(payer, null)).status).toBe(409);
+      chain.deposit = 0n; chain.settled = 150_001n;
+      logs.push({ event: "CloseRequested", block: HEAD - 900n, txHash: EXIT_TX_HASH, from: payer.address });
+      await mpp.sweepTempoSessions!();
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "exit_required", provenRefundNative: null, refundPaymentProven: true });
+      expect(warning).toHaveBeenCalledWith("tempo_drain_hold_reason_write_failed", { amount_micro: 100_000 });
+      expect(warning).toHaveBeenCalledWith("tempo_session_drain_refund_unproven", expect.objectContaining({ reason: "refund_short", channel_id: channelId }));
+      const response = await decisionAdmin(dvmId, scope)("/admin/credit/release-tempo-drain", { credit_id: creditId, drain_id: "d1", reason: "No refund was paid" });
+      expect(response.status).toBe(409);
+      expect((await ledger.get(creditId))?.balanceMicro).toBe(0);
+    } finally { label.mockRestore(); warning.mockRestore(); await server.shutdown(); }
+  });
+
+  it.each(["book", "release"].flatMap(decision => [false, true].map(writtenOff => ({ decision, writtenOff }))))(
+    "decides a held drain independently of its close report: $decision, writtenOff=$writtenOff", async ({ decision, writtenOff }) => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, mpp, channelId, creditId, dvmId, scope, drain, chain, ageObligations } = await hostedCredit(payer,
+      { modes: ["fails-before-submit"] });
+    try {
+      expect((await drain(payer)).status).toBe(402);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await ageObligations();
+        expect((await drain(payer)).status).toBe(402);
+      }
+      await ageObligations();
+      expect((await drain(payer)).status).toBe(409);
+      chain.deposit = 0n;
+      await mpp.sweepTempoSessions!();
+      const admin = decisionAdmin(dvmId, scope);
+      const id = (await pool.query("SELECT id FROM sdk_hosted_settlement_report_obligations WHERE channel_id=$1 AND state='unmatched'", [channelId])).rows[0].id;
+      if (writtenOff) expect((await admin("/admin/credit/write-off-tempo-close-report", { obligation_id: id, note: "History is irrecoverable" })).status).toBe(200);
+      const before = (await pool.query("SELECT state, close_write_off_note FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [id])).rows;
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "exit_required", sentRef: null });
+      expect((await listedDrain(admin, creditId)).close_reports).toContainEqual({ obligation_id: id, status: writtenOff ? "no_report" : "unmatched", written_off: writtenOff });
+      expect((await admin(`/admin/credit/${decision}-tempo-drain`, { credit_id: creditId, drain_id: "d1", reason: "Independently reviewed" })).status).toBe(200);
+      expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: decision === "book" ? "sent" : "released" });
+      expect((await pool.query("SELECT state, close_write_off_note FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [id])).rows).toEqual(before);
+    } finally { await server.shutdown(); }
   });
 
   it.each(["missing history", "short refund", "missing collateral", "short receipt", "proven exit", "proven close"])(
