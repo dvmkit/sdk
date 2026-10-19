@@ -1,4 +1,5 @@
-import { refundFloorEvidence } from "./credit-drain-floor";
+import { loggers } from "../../observability/loggers";
+import { DrainRefundFloorError, refundFloorEvidence } from "./credit-drain-floor";
 import { commitTerminalDrain, type DrainReportWiring } from "./credit-drain-report";
 import type { CreditLedgerLike, CreditLedgerQuerier, DrainTransitionResult } from "./credit-ledger";
 import type { MppxServer } from "./mpp-setup";
@@ -59,7 +60,7 @@ export async function completeTempoChannelDrain(args: {
   creditId: string;
   drainId: string;
   channelId: string;
-  /** What the close paid the payer, in the channel token's atomic units. */
+  /** Receipt refund, or a payer-exit lower bound, in the channel token's atomic units. */
   refundedNative: string | bigint | undefined;
   /** What the ledger is about to extinguish — the drain's rail-native debit. */
   debitedNative: number | null;
@@ -70,13 +71,34 @@ export async function completeTempoChannelDrain(args: {
   finalization?: { outcome: string; creditUnbacked: boolean };
   tx?: CreditLedgerQuerier;
 }): Promise<DrainTransitionResult> {
-  const settlementEvidence = refundFloorEvidence({
-    rail: "tempo",
-    refundedNative: args.refundedNative,
-    debitedNative: args.debitedNative,
-    creditId: args.creditId,
-    drainId: args.drainId,
-  });
+  if (!args.tx && args.refundedNative !== undefined && /^\d{1,78}$/.test(String(args.refundedNative))) {
+    try {
+      if (args.finalization?.outcome === "payer_exit" || args.finalization?.outcome === "payer_exit_unbacked") {
+        if (BigInt(args.refundedNative) > 0n) await args.deps.ledger.recordTempoDrainPayment?.({ creditId: args.creditId, drainId: args.drainId });
+      } else {
+        await args.deps.ledger.recordTempoDrainRefund?.({ creditId: args.creditId, drainId: args.drainId, refundedNative: args.refundedNative });
+      }
+    } catch (error) {
+      loggers.tempo.warn("tempo_drain_refund_evidence_write_failed", {});
+      throw error;
+    }
+  }
+  let settlementEvidence: ReturnType<typeof refundFloorEvidence>;
+  try {
+    settlementEvidence = refundFloorEvidence({
+      rail: "tempo", refundedNative: args.refundedNative, debitedNative: args.debitedNative,
+      creditId: args.creditId, drainId: args.drainId,
+    });
+  } catch (error) {
+    if (error instanceof DrainRefundFloorError && !args.tx) {
+      try {
+        await args.deps.ledger.recordTempoDrainHold?.({ creditId: args.creditId, drainId: args.drainId, reason: "refund_short" });
+      } catch {
+        loggers.tempo.warn("tempo_drain_hold_reason_write_failed", {});
+      }
+    }
+    throw error;
+  }
   // `replayed` is returned rather than dropped: it is what stops the operator
   // repair countersigning a second `sent` receipt when a concurrent poll won
   // the CAS between its status read and this transition.

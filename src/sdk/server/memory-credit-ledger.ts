@@ -1318,6 +1318,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     createdBeforeMs: number;
     rail: "tempo";
     includeResolved?: boolean;
+    includeWrittenOff?: boolean;
   }): Promise<CreditDrainRecord[]> {
     const out: CreditDrainRecord[] = [];
     for (const credit of this.credits.values()) {
@@ -1325,7 +1326,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       for (const drain of credit.drains.values()) {
         if ((drain.status !== "pending" && drain.status !== "exit_required") || drain.method !== "tempo") continue;
         if (drain.createdAt > args.createdBeforeMs) continue;
-        if (!args.includeResolved && drain.writtenOffAt !== null) continue;
+        if (!args.includeResolved && !args.includeWrittenOff && drain.writtenOffAt !== null) continue;
         out.push(drainRecord(drain, credit));
       }
     }

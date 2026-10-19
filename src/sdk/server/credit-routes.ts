@@ -937,6 +937,11 @@ async function recoverTempoDrain(
     }
     if (!result) return null;
     if (!/^0x[0-9a-fA-F]{64}$/.test(result)) {
+      try {
+        await deps.ledger.recordTempoDrainHold?.({ creditId: record.creditId, drainId: record.drainId, reason: "close_evidence_missing" });
+      } catch {
+        loggers.tempo.warn("tempo_drain_hold_reason_write_failed", { amount_micro: record.amountMicro });
+      }
       loggers.tempo.warn("tempo_session_drain_refund_unproven", {
         channel_id: channelId, credit_id: record.creditId, drain_id: record.drainId,
         amount_at_stake_native: record.drainedNative?.toString() ?? null,

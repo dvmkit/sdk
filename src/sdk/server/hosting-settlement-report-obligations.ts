@@ -528,7 +528,7 @@ export class HostedSettlementReportObligations {
   }
 
   async listTempoCloseReports(args: {
-    limit: number; after?: { createdAtMs: number; obligationId: string }; all?: boolean;
+    limit: number; after?: { createdAtMs: number; obligationId: string }; all?: boolean; channelId?: string;
   }): Promise<{
     id: string; channelId: string; amountNative: string; status: "unmatched" | "no_report";
     createdAtMs: number; updatedAtMs: number; deliveredAtMs: number | null;
@@ -547,13 +547,14 @@ export class HostedSettlementReportObligations {
          FROM sdk_hosted_settlement_report_obligations target
          WHERE target.dvm_id=$1 AND target.scope=$2 AND target.rail='tempo' AND target.operation='close'
            AND target.state IN ('unmatched','no_report')
+           AND ($7::text IS NULL OR target.channel_id=$7)
        )
        SELECT * FROM candidates
        WHERE ($6::boolean OR (state='unmatched' AND (retryable OR write_off_allowed)))
          AND ($4::bigint IS NULL OR (created_at_ms,id)>($4,$5))
        ORDER BY created_at_ms,id LIMIT $3`,
       [this.dvmId, this.scope, args.limit, args.after?.createdAtMs ?? null, args.after?.obligationId ?? null,
-        args.all ?? false]
+        args.all ?? false, args.channelId ?? null]
     );
     return result.rows.map(row => ({
       id: row.id, channelId: row.channel_id, amountNative: tempoCloseAmount(row.original), status: row.state,

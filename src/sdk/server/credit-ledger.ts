@@ -409,6 +409,10 @@ export class CreditLedger {
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS owed_sats BIGINT`);
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS lot_debits JSONB`);
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS released_at BIGINT`);
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS operator_decision JSONB`);
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS hold_reason TEXT`);
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS proven_refund_native NUMERIC(78,0)`);
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS refund_payment_proven BOOLEAN NOT NULL DEFAULT FALSE`);
     // how a parked refund was actually sourced, and what handing it
     // over cost. NULL on every row parked out of the accumulator, which is the
     // ordinary case and needs no evidence — the consumed rows are the record.
@@ -2819,8 +2823,8 @@ export class CreditLedger {
   }
 
   /**
-   * Page pending Tempo-channel drains by (created_at, credit_id, drain_id), optionally
-   * age-bounded, excluding written-off rows. Accept the legacy mpp stored method as well as
+   * Page held Tempo-channel drains by (created_at, credit_id, drain_id), optionally
+   * age-bounded. Audit reads also include terminal operator decisions. Accept the legacy mpp stored method as well as
    * tempo so pre-migration drains remain repairable. Use the compound key for both ordering
    * and continuation.
    */
@@ -2830,21 +2834,23 @@ export class CreditLedger {
     createdBeforeMs: number;
     rail: "tempo";
     includeResolved?: boolean;
+    includeWrittenOff?: boolean;
   }): Promise<CreditDrainRecord[]> {
-    const params: unknown[] = [args.createdBeforeMs, args.limit];
+    const params: unknown[] = [args.createdBeforeMs, args.limit, args.includeResolved ?? false, args.includeWrittenOff || args.includeResolved || false];
     let keyset = "";
     if (args.after) {
       params.push(args.after.createdAt, args.after.creditId, args.after.drainId);
-      keyset = ` AND (d.created_at, d.credit_id, d.drain_id) > ($3, $4, $5)`;
+      keyset = ` AND (d.created_at, d.credit_id, d.drain_id) > ($5, $6, $7)`;
     }
     const { rows } = await this.pool.query<DrainJoinRow>(
       `SELECT d.*, ${DRAIN_CREDIT_COLUMNS} FROM credit_drains d
        JOIN credits c ON c.credit_id = d.credit_id
-       WHERE d.status IN ('pending','exit_required')
+       WHERE (d.status IN ('pending','exit_required')
+              OR ($3::boolean AND d.operator_decision IS NOT NULL))
          AND d.method = 'tempo'
          AND c.tempo_channel_id IS NOT NULL
          AND d.created_at <= $1
-         ${args.includeResolved ? "" : "AND d.written_off_at IS NULL"}
+         AND ($4::boolean OR d.written_off_at IS NULL)
          ${keyset}
        ORDER BY d.created_at, d.credit_id, d.drain_id
        LIMIT $2`,
@@ -2922,12 +2928,130 @@ export class CreditLedger {
     });
   }
 
+  /** Retain an exact receipt-derived refund; a later missing/zero read cannot erase payment. */
+  async recordTempoDrainRefund(args: {
+    creditId: string; drainId: string; refundedNative: string | bigint;
+  }): Promise<void> {
+    const amount = String(args.refundedNative);
+    if (!/^\d{1,78}$/.test(amount)) throw new CreditLedgerError("invalid_basis", "Tempo refund evidence must be a bounded non-negative integer.");
+    await this.recordTempoDrainRefundEvidence(args, amount);
+  }
+
+  /** Retain trusted proof that some refund was paid, without claiming an exact amount. */
+  async recordTempoDrainPayment(args: { creditId: string; drainId: string }): Promise<void> {
+    await this.recordTempoDrainRefundEvidence(args, null);
+  }
+
+  private async recordTempoDrainRefundEvidence(args: { creditId: string; drainId: string }, amount: string | null): Promise<void> {
+    const { rows } = await this.pool.query<{ tempo_channel_id: string | null }>(
+      "SELECT tempo_channel_id FROM credits WHERE credit_id=$1", [args.creditId]);
+    const record = async (tx: CreditLedgerQuerier) => {
+      await tx.query(`UPDATE credit_drains SET proven_refund_native=
+        GREATEST(proven_refund_native, $3::numeric),
+        refund_payment_proven=refund_payment_proven OR COALESCE($3::numeric > 0, TRUE)
+        WHERE credit_id=$1 AND drain_id=$2 AND method='tempo'
+          AND status IN ('pending','exit_required') AND operator_decision IS NULL`,
+        [args.creditId, args.drainId, amount]);
+    };
+    const channelId = rows[0]?.tempo_channel_id;
+    if (channelId && this.tempoSessionStore) {
+      await this.tempoSessionStore.withDrawPlacement(channelId, record);
+    } else {
+      await record(this.pool);
+    }
+  }
+
+  /** Record the latest established proof refusal without changing the held debit. */
+  async recordTempoDrainHold(args: {
+    creditId: string; drainId: string; reason: TempoDrainHoldReason;
+  }): Promise<void> {
+    await this.pool.query(`UPDATE credit_drains SET hold_reason=
+      CASE WHEN hold_reason='refund_short' AND proven_refund_native IS NULL THEN hold_reason ELSE $3 END
+      WHERE credit_id=$1 AND drain_id=$2 AND method='tempo'
+        AND status IN ('pending','exit_required') AND operator_decision IS NULL`,
+      [args.creditId, args.drainId, args.reason]);
+  }
+
   /**
-   * Cancel an unfulfilled Tempo cooperative drain and restore the exact
-   * balance plus rail basis it removed (`pending -> released`). This is only
-   * for a close the channel reconciliation proved cannot pay; ordinary payout
-   * rails never re-credit a liability after it has been handed to a worker.
+   * An operator attests a full off-path refund or restores the exact unpaid debit. The
+   * channel lock precedes the credit and drain locks; automatic booking shares the drain
+   * CAS, so only one terminal outcome can commit. No channel lifecycle state is reopened.
+   * Direct callers own reporting: hosted booking must join the caller's drain outbox transaction.
    */
+  async decideTempoDrain(args: TempoDrainDecisionArgs): Promise<TempoDrainDecisionResult> {
+    if (!["book_refunded", "release"].includes(args.decision) ||
+      typeof args.reason !== "string" || !args.reason.trim() || args.reason.trim().length > 2000 ||
+      args.evidence !== undefined && (typeof args.evidence !== "string" || !args.evidence.trim() || args.evidence.trim().length > 4000)) {
+      throw new CreditLedgerError("invalid_drain_decision", "A decision requires a reason of 1–2000 characters and optional evidence of 1–4000 characters.");
+    }
+    const query = args.tx ?? this.pool;
+    const { rows } = await query.query<{ tempo_channel_id: string | null }>(
+      `SELECT tempo_channel_id FROM credits WHERE credit_id=$1`, [args.creditId]);
+    if (!rows[0]) throw new CreditLedgerError("credit_not_found", "The credit was not found.");
+    const channelId = rows[0].tempo_channel_id;
+    if (!channelId || !this.tempoSessionStore) {
+      throw new CreditLedgerError("drain_not_repairable", "A durable Tempo session channel is required for an operator decision.");
+    }
+    return this.tempoSessionStore.withDrawPlacement(channelId, async (tx, lifecycle) => {
+      // Forecast release locks the intent before its credit. Keep that order here as well.
+      const intent = await tx.query<{ reference: string | null; settled_before_close: string | null; forecast_pending: boolean | null }>(
+        `SELECT reference, settled_before_close, forecast_pending FROM mpp_tempo_close_intents
+          WHERE channel_id=$1 AND drain_id=$2 FOR UPDATE`, [channelId, args.drainId]);
+      const credit = await this.lockCreditRow(tx, args.creditId);
+      const { rows } = await tx.query<DrainRow>(
+        `SELECT * FROM credit_drains WHERE credit_id=$1 AND drain_id=$2 FOR UPDATE`,
+        [args.creditId, args.drainId]);
+      const row = rows[0];
+      if (!row) throw new CreditLedgerError("drain_not_found", "The drain was not found.");
+      if (row.method !== "tempo") throw new CreditLedgerError("drain_not_repairable", "Only a held Tempo session drain accepts an operator decision.");
+      const reason = args.reason.trim();
+      const evidence = args.evidence?.trim();
+      let result: DrainReleaseResult;
+      if (row.operator_decision) {
+        const prior = row.operator_decision;
+        if (prior.decision !== args.decision || prior.reason !== reason || prior.evidence !== evidence) {
+          throw new CreditLedgerError("drain_decision_conflict", "This drain already has a different immutable operator decision.");
+        }
+        result = { drain: drainRecordFromRow(row, credit),
+          credit: await this.snapshotFromRow(credit, tx, args.nowMs ?? Date.now()), replayed: true };
+      } else {
+        if (row.status !== "pending" && row.status !== "exit_required") {
+          throw new CreditLedgerError("drain_decision_conflict", "This drain has already reached another terminal outcome.");
+        }
+        if (args.decision === "release") {
+          const closeIntent = intent.rows[0];
+          const reference = closeIntent?.reference;
+          if (!lifecycle.finalized && closeIntent && (closeIntent.forecast_pending !== true || closeIntent.settled_before_close != null || reference && /^0x[0-9a-fA-F]{64}$/.test(reference))) {
+            throw new CreditLedgerError("tempo_drain_close_pending", "The close may still pay. Reconcile its final outcome before releasing this drain.");
+          }
+          if (row.refund_payment_proven || row.proven_refund_native !== null && BigInt(row.proven_refund_native) > 0n) {
+            throw new CreditLedgerError("tempo_drain_refund_paid", "A positive refund is already proven. Verify return of the full held amount, including any remainder, then book it as refunded; never release it as unpaid.");
+          }
+          if (row.hold_reason === "refund_short" && row.proven_refund_native === null) {
+            throw new CreditLedgerError("tempo_drain_refund_unknown", "This short-refund history has no retained exact amount. Recover its refund evidence before releasing it as unpaid.");
+          }
+        }
+        const decision: TempoDrainDecision = { source: "operator", decision: args.decision, reason,
+          ...(evidence === undefined ? {} : { evidence }), decidedAt: args.nowMs ?? Date.now() };
+        await tx.query(`UPDATE credit_drains SET operator_decision=$3
+          WHERE credit_id=$1 AND drain_id=$2`, [args.creditId, args.drainId, JSON.stringify(decision)]);
+        row.operator_decision = decision;
+        if (args.decision === "release") {
+          result = await this.releaseDrainLocked(tx, row, args, decision.decidedAt);
+        } else {
+          await this.clearDrainWriteOff({ creditId: args.creditId, drainId: args.drainId, tx });
+          const booked = await this.markDrainSent({ creditId: args.creditId, drainId: args.drainId,
+            sentRef: { source: "operator", channel_id: channelId }, tx, nowMs: decision.decidedAt });
+          result = { ...booked, credit: await this.snapshotFromRow(credit, tx, decision.decidedAt) };
+        }
+      }
+      const spendableMicro = lifecycle.finalized || lifecycle.closeRequestedAt !== 0n || result.credit.expired
+        ? 0 : result.credit.availableMicro;
+      return { ...result, spendableMicro };
+    }, args.tx);
+  }
+
+  /** Restore an unpaid pending drain; operator decisions also admit exit_required. */
   async releaseDrain(args: {
     creditId: string;
     drainId: string;
@@ -2937,30 +3061,24 @@ export class CreditLedger {
     const nowMs = args.nowMs ?? Date.now();
     const run = async (client: CreditLedgerQuerier, credit: CreditRow) => {
       const row = await this.readDrain(client, args.creditId, args.drainId);
-      if (!row) {
-        throw new CreditLedgerError(
-          "drain_not_found",
-          `drain ${args.drainId} on credit ${args.creditId} not found`
-        );
-      }
-      if (row.status === "released") {
-        return {
-          drain: drainRecordFromRow(row, credit),
-          credit: await this.snapshotFromRow(credit, client, nowMs),
-          replayed: true,
-        };
-      }
-      if (row.status !== "pending") {
-        throw new CreditLedgerError(
-          "invalid_drain_state",
-          `cannot release ${row.method} drain ${args.drainId} from status ${row.status}`
-        );
-      }
+      if (!row) throw new CreditLedgerError("drain_not_found", `drain ${args.drainId} on credit ${args.creditId} not found`);
+      if (row.status === "released") return { drain: drainRecordFromRow(row, credit),
+        credit: await this.snapshotFromRow(credit, client, nowMs), replayed: true };
+      if (row.status !== "pending") throw new CreditLedgerError("invalid_drain_state",
+        `cannot release ${row.method} drain ${args.drainId} from status ${row.status}`);
+      return this.releaseDrainLocked(client, row, args, nowMs);
+    };
+    if (args.tx) return run(args.tx, await this.lockCreditRow(args.tx, args.creditId));
+    return this.withCreditLock(args.creditId, run);
+  }
+
+  private async releaseDrainLocked(client: CreditLedgerQuerier, row: DrainRow,
+    args: { creditId: string; drainId: string }, nowMs: number): Promise<DrainReleaseResult> {
       const { rows } = await client.query<DrainRow>(
         `UPDATE credit_drains SET status = 'released', released_at = $3
-         WHERE credit_id = $1 AND drain_id = $2 AND status = 'pending'
+         WHERE credit_id = $1 AND drain_id = $2 AND status = $4
          RETURNING *`,
-        [args.creditId, args.drainId, nowMs]
+        [args.creditId, args.drainId, nowMs, row.status]
       );
       if (!rows[0]) {
         throw new CreditLedgerError(
@@ -2979,11 +3097,10 @@ export class CreditLedger {
          WHERE credit_id = $1`,
         [args.creditId, row.amount_micro, row.drained_msats, row.drained_native]
       );
-      // and the funding lots the drain consumed, exactly as it took
+      // Restore the funding lots the drain consumed, exactly as it took
       // them — which is why the drain records its debits rather than the
-      // release re-deriving them. No Bitcoin drain reaches this verb today
-      // (only a Tempo close the chain proved cannot pay is released, and a
-      // channel credit has no lots), but the restore is unconditional so the
+      // release re-deriving them. Channel credits have no lots, but the restore
+      // is unconditional so the
       // "lot remainders track `balance_micro`" invariant needs no exception.
       await this.applyLotDebits(client, row.lot_debits ?? [], 1);
       const restored = await this.lockCreditRow(client, args.creditId);
@@ -2992,9 +3109,6 @@ export class CreditLedger {
         credit: await this.snapshotFromRow(restored, client, nowMs),
         replayed: false,
       };
-    };
-    if (args.tx) return run(args.tx, await this.lockCreditRow(args.tx, args.creditId));
-    return this.withCreditLock(args.creditId, run);
   }
 
   /**
@@ -3725,6 +3839,7 @@ export interface CreditLedgerLike {
     createdBeforeMs: number;
     rail: "tempo";
     includeResolved?: boolean;
+    includeWrittenOff?: boolean;
   }): Promise<CreditDrainRecord[]>;
   writeOffDrain(args: {
     creditId: string;
@@ -3736,6 +3851,14 @@ export interface CreditLedgerLike {
     creditId: string;
     drainId: string;
     tx?: CreditLedgerQuerier;
+  }): Promise<void>;
+  decideTempoDrain?(args: TempoDrainDecisionArgs): Promise<TempoDrainDecisionResult>;
+  recordTempoDrainPayment?(args: { creditId: string; drainId: string }): Promise<void>;
+  recordTempoDrainRefund?(args: {
+    creditId: string; drainId: string; refundedNative: string | bigint;
+  }): Promise<void>;
+  recordTempoDrainHold?(args: {
+    creditId: string; drainId: string; reason: TempoDrainHoldReason;
   }): Promise<void>;
   requireTempoDrainExit?(args: {
     creditId: string; drainId: string; tx?: CreditLedgerQuerier;
@@ -3922,6 +4045,33 @@ export interface DrainFulfilment {
   routingFeeMsats: number | null;
 }
 
+/** Latest established refund-proof refusal; transient read failures do not replace it. */
+export type TempoDrainHoldReason = "close_history_unmatched" | "collateral_missing" | "close_evidence_missing" | "refund_short";
+
+/** Immutable full-refund attestation or unpaid-release decision, independent of chain proof. */
+export interface TempoDrainDecision {
+  source: "operator";
+  decision: "book_refunded" | "release";
+  reason: string;
+  evidence?: string;
+  decidedAt: number;
+}
+
+export interface TempoDrainDecisionArgs {
+  creditId: string;
+  drainId: string;
+  decision: TempoDrainDecision["decision"];
+  reason: string;
+  evidence?: string;
+  nowMs?: number;
+  tx?: CreditLedgerQuerier;
+}
+
+export interface TempoDrainDecisionResult extends DrainReleaseResult {
+  /** Effective new-draw availability, including channel lifecycle and expiry restrictions. */
+  spendableMicro: number;
+}
+
 /**
  * One drain liability, camel-cased, joined with its credit's `currency` and
  * `callerPubkey` so consumers (route, admin surface, batch job) never need a
@@ -4005,6 +4155,12 @@ export interface CreditDrainRecord {
    */
   writeOffNote: string | null;
   writtenOffAt: number | null;
+  operatorDecision?: TempoDrainDecision | null;
+  holdReason?: TempoDrainHoldReason | null;
+  /** Exact retained refund evidence; null/absent means unknown, not zero. */
+  provenRefundNative?: string | null;
+  /** Sticky proof that some refund was paid; false/absent does not prove zero. */
+  refundPaymentProven?: boolean;
 }
 
 /**
@@ -4527,6 +4683,12 @@ export type CreditLedgerErrorCode =
   | "drain_not_found"
   | "drain_conflict"
   | "invalid_drain_state"
+  | "tempo_drain_close_pending"
+  | "tempo_drain_refund_paid"
+  | "tempo_drain_refund_unknown"
+  | "invalid_drain_decision"
+  | "drain_not_repairable"
+  | "drain_decision_conflict"
   | "invoice_not_found"
   | "invoice_conflict"
   | "invoice_not_blocked"
@@ -4799,6 +4961,10 @@ interface DrainRow {
   released_at: string | null;
   write_off_note: string | null;
   written_off_at: string | null;
+  operator_decision: TempoDrainDecision | null;
+  hold_reason: TempoDrainHoldReason | null;
+  proven_refund_native: string | null;
+  refund_payment_proven: boolean;
 }
 
 /**
@@ -4989,6 +5155,10 @@ function drainRecordFromRow(row: DrainRow, credit: DrainCreditJoin): CreditDrain
     releasedAt: row.released_at === null ? null : toSafeInt(row.released_at),
     writeOffNote: row.write_off_note,
     writtenOffAt: row.written_off_at === null ? null : toSafeInt(row.written_off_at),
+    operatorDecision: row.operator_decision ?? null,
+    holdReason: row.hold_reason ?? null,
+    provenRefundNative: row.proven_refund_native ?? null,
+    refundPaymentProven: row.refund_payment_proven ?? false,
   };
 }
 

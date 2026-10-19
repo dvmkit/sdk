@@ -357,6 +357,17 @@ function projectField(
       return typeof value === "string" && TEMPO_CLOSE_REPORT_PRIOR_STATUSES.has(value) ? value : undefined;
     const closeReportEvent = eventName === "tempo_session_close_report_written_off" ||
       eventName === "tempo_session_close_report_reopened";
+    const drainDecisionEvent = eventName === "tempo_drain_booked_as_refunded" || eventName === "tempo_drain_released";
+    if (drainDecisionEvent) {
+      if (key === "drain_reference")
+        return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value) ? value : undefined;
+      if (key === "credit_id" || key === "drain_id")
+        return typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,512}$/.test(value) ? value : undefined;
+      if (key === "channel_id")
+        return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value) ? value : undefined;
+      if (key === "amount_native")
+        return value === null || typeof value === "string" && DECIMAL_RE.test(value) ? value : undefined;
+    }
     const payerExitEvent = eventName === "tempo_session_close_exit_resolved";
     if (closeReportEvent || payerExitEvent) {
       if (key === "obligation_id")

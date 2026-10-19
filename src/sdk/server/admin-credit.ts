@@ -1,3 +1,6 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import {
   Amount,
@@ -27,6 +30,7 @@ import type {
   CreditLedgerLike,
   DrainStatus,
   DrainTransitionResult,
+  TempoDrainDecisionArgs,
 } from "./credit-ledger";
 import type { DrainFulfilment } from "./credit-ledger";
 import { CreditLedgerError, DRAIN_METHODS } from "./credit-ledger";
@@ -83,6 +87,8 @@ export interface InstallAdminCreditRoutesOpts {
   enqueueCreditDeposit?: CreditDepositEnqueue;
   /** Reporter-owned drain outbox write, run inside the mark-sent transaction. */
   enqueueCreditDrain?: CreditDrainEnqueue;
+  /** A configured hosted platform requires an actual transactional drain reporter for new bookings. */
+  requireDrainReport?: boolean;
   enqueueCreditDrawRefund?: CreditDrawRefundEnqueue;
   /** Receive wallet — re-verifies a blocked invoice was really paid before crediting it. */
   lightningReceive?: LightningReceive;
@@ -149,6 +155,8 @@ export function installAdminCreditRoutes<E extends Env = Env, S extends BlankSch
   app.post("/admin/credit/write-off-tempo-close-report", (c) => handleTempoCloseReportAction(c, opts, "write-off"));
   app.get("/admin/credit/tempo-drains", (c) => handleTempoDrains(c, opts));
   app.get("/admin/credit/tempo-losses", (c) => handleTempoLosses(c, opts));
+  app.post("/admin/credit/book-tempo-drain", (c) => handleTempoDrainDecision(c, opts, "book_refunded"));
+  app.post("/admin/credit/release-tempo-drain", (c) => handleTempoDrainDecision(c, opts, "release"));
   app.post("/admin/credit/reconcile-tempo-drain", (c) => handleReconcileTempo(c, opts));
   app.post("/admin/credit/write-off-tempo-drain", (c) => handleWriteOffTempo(c, opts));
 }
@@ -1601,6 +1609,7 @@ async function handleTempoDrains(
     createdBeforeMs: nowMs - minAge,
     rail: "tempo",
     includeResolved: c.req.query("include_resolved") === "true",
+    includeWrittenOff: true,
   });
   const wantsEvidence = c.req.query("evidence") !== "false";
   const rows: Record<string, unknown>[] = [];
@@ -1609,7 +1618,11 @@ async function handleTempoDrains(
       wantsEvidence && drain.channelId
         ? await classifyTempoCloseEvidence(rail.rail, drain.channelId)
         : undefined;
-    rows.push(tempoDrainBody(drain, evidence));
+    const closeReports = drain.channelId && opts.hostedSettlementReports
+      ? await opts.hostedSettlementReports.store.listTempoCloseReports({ limit: 50, all: true, channelId: drain.channelId })
+      : [];
+    rows.push({ ...tempoDrainBody(drain, evidence),
+      close_reports: closeReports.map(row => ({ obligation_id: row.id, status: row.status, written_off: row.writtenOff })) });
   }
   const last = drains.length === limit ? drains[drains.length - 1] : undefined;
   return c.json({
@@ -1624,6 +1637,73 @@ async function handleTempoDrains(
         }
       : {}),
   });
+}
+
+async function handleTempoDrainDecision(
+  c: Context, opts: InstallAdminCreditRoutesOpts, decision: TempoDrainDecisionArgs["decision"]
+): Promise<Response> {
+  const auth = await requireAuth(c, opts);
+  if ("response" in auth) return auth.response;
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "invalid_body", message: "Request body must be a JSON object." }, 400);
+  }
+  const value = body as Record<string, unknown>;
+  const text = (item: unknown, max: number): item is string =>
+    typeof item === "string" && item.trim().length > 0 && item.trim().length <= max;
+  if (Object.keys(value).some(key => !["credit_id", "drain_id", "reason", "evidence"].includes(key)) ||
+    typeof value.credit_id !== "string" || value.credit_id.length === 0 || typeof value.drain_id !== "string" || value.drain_id.length === 0 || !text(value.reason, 2000) ||
+    value.evidence !== undefined && !text(value.evidence, 4000)) {
+    return c.json({ error: "invalid_body", message: "Provide credit_id, drain_id, a reason of 1–2000 characters, and optional evidence of 1–4000 characters." }, 400);
+  }
+  if (!opts.ledger.durable || !opts.ledger.decideTempoDrain) {
+    return c.json({ error: "tempo_drain_decision_unavailable", message: "A durable Tempo decision store is required." }, 503);
+  }
+  const args: TempoDrainDecisionArgs = { creditId: value.credit_id, drainId: value.drain_id,
+    decision, reason: value.reason.trim(), ...(value.evidence === undefined ? {} : { evidence: (value.evidence as string).trim() }),
+    nowMs: opts.now ? opts.now() : Date.now() };
+  if (decision === "book_refunded" && opts.requireDrainReport && !opts.enqueueCreditDrain) {
+    const existing = await opts.ledger.getDrain(args);
+    if (existing && !existing.operatorDecision && (existing.status === "pending" || existing.status === "exit_required")) {
+      return c.json({ error: "tempo_drain_decision_unavailable", message: "Hosted booking requires a transactional drain reporter. Restore its configuration, then retry the original decision." }, 503);
+    }
+  }
+  const client = await opts.db.connect();
+  let result: Awaited<ReturnType<NonNullable<CreditLedgerLike["decideTempoDrain"]>>>;
+  try {
+    await client.query("BEGIN");
+    let decided: typeof result | undefined;
+    const transition = async () => {
+      decided = await opts.ledger.decideTempoDrain!({ ...args, tx: client });
+      return decided;
+    };
+    if (decision === "book_refunded") {
+      await commitTerminalDrain({ db: opts.db, dvmId: opts.dvmId, enqueueCreditDrain: opts.enqueueCreditDrain }, transition, client);
+    } else {
+      await transition();
+    }
+    result = decided!;
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    if (error instanceof CreditLedgerError) {
+      return c.json({ error: error.code, message: error.message },
+        error.code === "drain_not_found" || error.code === "credit_not_found" ? 404 :
+          (["drain_decision_conflict", "tempo_drain_close_pending", "tempo_drain_refund_paid", "tempo_drain_refund_unknown"] as string[]).includes(error.code) ? 409 : 422);
+    }
+    throw error;
+  } finally { client.release(); }
+  if (!result.replayed) {
+    diagnosticConsole.warn({ dataset: "tempo", event: decision === "book_refunded" ? "tempo_drain_booked_as_refunded" : "tempo_drain_released",
+      credit_id: result.drain.creditId, drain_id: result.drain.drainId, channel_id: result.drain.channelId,
+      drain_reference: `sha256:${bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([result.drain.creditId, result.drain.drainId]))))}`,
+      amount_micro: result.drain.amountMicro, amount_native: result.drain.drainedNative?.toString() ?? null,
+      currency: result.drain.currency });
+  }
+  return c.json({ status: result.drain.status, credit_id: result.drain.creditId, drain_id: result.drain.drainId,
+    channel_id: result.drain.channelId, amount_micro: result.drain.amountMicro, amount_native: result.drain.drainedNative,
+    currency: result.drain.currency, decision: result.drain.operatorDecision,
+    balance_micro: result.credit.balanceMicro, spendable_micro: result.spendableMicro, replayed: result.replayed });
 }
 
 /*
@@ -1654,6 +1734,13 @@ async function handleReconcileTempo(
 
   const evidence = await classifyTempoCloseEvidence(rail.rail, channelId);
   if (evidence.chain !== "found") return tempoEvidenceRefusal(c, evidence);
+  // Persist chain evidence before a floor or report failure rolls back the accounting transaction.
+  try {
+    await opts.ledger.recordTempoDrainRefund?.({ creditId: record.creditId, drainId: record.drainId, refundedNative: evidence.refundedToPayer });
+  } catch (error) {
+    diagnosticConsole.warn({ dataset: "tempo", event: "tempo_drain_refund_evidence_write_failed", amount_micro: record.amountMicro });
+    throw error;
+  }
 
   // Ledger booking, drain report and payout report share this caller-owned transaction. A
   // refusal or enqueue failure rolls back all three.
@@ -2306,6 +2393,13 @@ function tempoDrainBody(
     created_at: drain.createdAt,
     write_off_note: drain.writeOffNote,
     written_off_at: drain.writtenOffAt,
+    decision: drain.operatorDecision ?? null,
+    proven_refund_native: drain.provenRefundNative ?? null,
+    refund_payment_proven: drain.refundPaymentProven ?? false,
+    held_reason: drain.status === "pending" || drain.status === "exit_required"
+      ? drain.holdReason ?? (evidence?.chain === "found" && drain.drainedNative !== null && BigInt(evidence.refundedToPayer) < BigInt(drain.drainedNative)
+        ? "refund_short" : drain.status === "exit_required" ? "exit_required" : "refund_unproven")
+      : null,
     ...(evidence ? { chain: evidence } : {}),
   };
 }

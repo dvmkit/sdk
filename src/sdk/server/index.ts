@@ -68,6 +68,10 @@ export type {
   InvoiceSettlement,
   InvoiceWriteOff,
   StalePendingDrawCursor,
+  TempoDrainDecision,
+  TempoDrainDecisionArgs,
+  TempoDrainDecisionResult,
+  TempoDrainHoldReason,
 } from "./credit-ledger";
 export { allocateDrawValue, CreditLedger, CreditLedgerError } from "./credit-ledger";
 export { DRAIN_DELIVERY_RESERVE_SATS } from "./credit-lots";
