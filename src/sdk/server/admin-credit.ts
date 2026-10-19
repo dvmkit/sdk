@@ -38,7 +38,7 @@ import type { LockPubkeyState, LockPubkeyStateLoader } from "./lock-pubkey-store
 import { toLockPubkey } from "./lock-pubkey-store";
 import type { TempoCloseReconciled, TransactionalPayoutHook } from "./payout-reporter";
 import type { ReceiptIssuer } from "./receipt-issuer";
-import type { CreditDepositEnqueue, CreditDrainEnqueue } from "./revenue-reporter";
+import type { CreditDepositEnqueue, CreditDrainEnqueue, CreditDrawRefundEnqueue } from "./revenue-reporter";
 import type { TempoCloseEvidence, TempoDrainRail } from "./tempo-drain-leg";
 import { classifyTempoCloseEvidence, completeTempoChannelDrain } from "./tempo-drain-leg";
 import {
@@ -83,6 +83,7 @@ export interface InstallAdminCreditRoutesOpts {
   enqueueCreditDeposit?: CreditDepositEnqueue;
   /** Reporter-owned drain outbox write, run inside the mark-sent transaction. */
   enqueueCreditDrain?: CreditDrainEnqueue;
+  enqueueCreditDrawRefund?: CreditDrawRefundEnqueue;
   /** Receive wallet — re-verifies a blocked invoice was really paid before crediting it. */
   lightningReceive?: LightningReceive;
   /**
@@ -128,6 +129,7 @@ export function installAdminCreditRoutes<E extends Env = Env, S extends BlankSch
   app: Hono<E, S>,
   opts: InstallAdminCreditRoutesOpts
 ): void {
+  app.post("/admin/credit/refund-draw", (c) => handleRefundDraw(c, opts));
   app.get("/admin/credit/pending-drains", (c) => handlePendingDrains(c, opts));
   app.get("/admin/credit/bitcoin-liability", (c) => handleBitcoinLiability(c, opts));
   app.post("/admin/credit/park-drain", (c) => handleParkDrain(c, opts));
@@ -149,6 +151,57 @@ export function installAdminCreditRoutes<E extends Env = Env, S extends BlankSch
   app.get("/admin/credit/tempo-losses", (c) => handleTempoLosses(c, opts));
   app.post("/admin/credit/reconcile-tempo-drain", (c) => handleReconcileTempo(c, opts));
   app.post("/admin/credit/write-off-tempo-drain", (c) => handleWriteOffTempo(c, opts));
+}
+
+async function handleRefundDraw(c: Context, opts: InstallAdminCreditRoutesOpts): Promise<Response> {
+  const auth = await requireAuth(c, opts);
+  if ("response" in auth) return auth.response;
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "invalid_body", message: "Request body must be a JSON object." }, 400);
+  }
+  const value = body as Record<string, unknown>;
+  const nonempty = (item: unknown): item is string => typeof item === "string" && item.length > 0;
+  const byJob = nonempty(value.jobId) && value.creditId === undefined && value.drawId === undefined;
+  const byDraw = value.jobId === undefined && nonempty(value.creditId) && nonempty(value.drawId);
+  if ((!byJob && !byDraw) || !nonempty(value.refundId) ||
+    value.amountMicro !== undefined && (typeof value.amountMicro !== "number" || !Number.isSafeInteger(value.amountMicro) || value.amountMicro <= 0) ||
+    value.reason !== undefined && (typeof value.reason !== "string" || value.reason.length > 280)) {
+    return c.json({ error: "invalid_body", message: "Provide jobId or creditId + drawId, refundId, an optional positive safe integer amountMicro, and an optional reason of at most 280 characters." }, 400);
+  }
+  if (!opts.ledger.durable || !opts.enqueueCreditDrawRefund) {
+    return c.json({ error: "credit_refund_unavailable", hint: "Configure the persistent credit store and platform refund reporter, then retry with the original refund ID." }, 503);
+  }
+  try {
+    const result = await opts.ledger.refundDraw({
+      ...(byJob ? { jobId: value.jobId as string } : { creditId: value.creditId as string, drawId: value.drawId as string }),
+      refundId: value.refundId,
+      ...(value.amountMicro === undefined ? {} : { amountMicro: value.amountMicro as number }),
+      ...(value.reason === undefined ? {} : { reason: value.reason as string }),
+      outbox: { dvmId: opts.dvmId, enqueue: opts.enqueueCreditDrawRefund },
+      ...(opts.receiptIssuer ? { trustedReceiptPubkey: opts.receiptIssuer.pubkey } : {}),
+      ...(opts.now ? { nowMs: opts.now() } : {}),
+    });
+    return c.json({ status: "refunded", refund_id: result.refundId, credit_id: result.creditId,
+      draw_id: result.drawId, job_id: result.jobId, amount_micro: result.amountMicro,
+      currency: result.currency, ledger_seq: result.ledgerSeq, refunded_at: result.refundedAt,
+      balance_after_micro: result.balanceAfterMicro, replayed: result.replayed });
+  } catch (error) {
+    if (!(error instanceof CreditLedgerError)) throw error;
+    const hints: Partial<Record<typeof error.code, string>> = {
+      draw_not_found: "Check the job ID or credit/draw IDs. If they are correct, this DVM may lack trusted ownership evidence; ask an operator to inspect that evidence. Retrying alone cannot establish ownership.",
+      draw_not_completed: "Wait for the job to complete. Failed or cancelled jobs release their pending hold automatically.",
+      refund_exceeds_draw: "Refund no more than the remaining unrefunded charge. Omit amountMicro to refund that remainder.",
+      credit_not_open: "The original credit is closed or expired. Ask an operator to inspect the original payment before arranging a refund.",
+      credit_refund_channel_unsupported: "This channel returns unused collateral through its normal exit. Ask an operator about refunding completed spending.",
+      credit_refund_basis_unavailable: "The original payment value cannot be proven automatically. Ask an operator to inspect independent original-payment evidence before arranging a repair. Retrying alone cannot establish that evidence.",
+      credit_refund_state_unavailable: "The original credit reopening order cannot be proven automatically. Ask an operator to inspect independent funding and drain evidence before arranging a repair. Retrying alone cannot establish that evidence.",
+      refund_conflict: "Repeat the original arguments, or deliberately choose a new refund ID for a different refund.",
+    };
+    const hint = hints[error.code];
+    if (!hint) throw error;
+    return c.json({ error: error.code, hint }, error.code === "draw_not_found" ? 404 : error.code === "refund_conflict" ? 409 : 422);
+  }
 }
 
 async function handleX402ExactSettlements(

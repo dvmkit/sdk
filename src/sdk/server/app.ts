@@ -176,6 +176,7 @@ import type {
   CreditDepositPayload,
   CreditDrainEnqueue,
   CreditDrawReleaseEnqueue,
+  CreditDrawRefundEnqueue,
   RevenueSkippedNoRailPayload,
   RevenueReporter,
 } from "./revenue-reporter";
@@ -488,6 +489,7 @@ interface InternalSDKServerOpts extends SDKServerOpts {
   enqueueCreditDeposit?: CreditDepositEnqueue;
   enqueueCreditDrain?: CreditDrainEnqueue;
   enqueueCreditDrawRelease?: CreditDrawReleaseEnqueue;
+  enqueueCreditDrawRefund?: CreditDrawRefundEnqueue;
   x402BatchSettlement?: X402BatchSettlementServer;
   x402BatchSettlementFactory?: () => Promise<X402BatchSettlementServer>;
   x402ExactSettlement?: X402ExactSettlementServer;
@@ -691,6 +693,9 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   // has no `onCreditFunded` analogue — so it rides the reporter alone.
   const enqueueCreditDrain = activeRevenueReporter
     ? activeRevenueReporter.enqueueCreditDrain.bind(activeRevenueReporter)
+    : undefined;
+  const enqueueCreditDrawRefund = activeRevenueReporter
+    ? activeRevenueReporter.enqueueCreditDrawRefund.bind(activeRevenueReporter)
     : undefined;
   const enqueueCreditDrawRelease = activeRevenueReporter
     ? activeRevenueReporter.enqueueCreditDrawRelease.bind(activeRevenueReporter)
@@ -919,6 +924,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
     enqueueCreditDeposit,
     enqueueCreditDrain,
     enqueueCreditDrawRelease,
+    enqueueCreditDrawRefund,
     x402BatchSettlement,
     x402BatchSettlementFactory,
     x402ExactSettlement,
@@ -1484,6 +1490,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         receiptIssuer: this.receiptIssuer,
         creditTtlMs: () => this.creditTtlMs(),
         creditCurrency: () => this.creditCurrency(),
+        enqueueCreditDrawRefund: this.opts.enqueueCreditDrawRefund,
         enqueueCreditDeposit: this.opts.enqueueCreditDeposit,
         enqueueCreditDrain: this.opts.enqueueCreditDrain,
         lightningReceive: this.opts.lightningReceive,

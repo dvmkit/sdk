@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
 import type { FundingReceipt } from "../../lib/receipt";
 import type {
   BitcoinDepositLiability,
@@ -42,6 +43,7 @@ import {
   clipEarmark,
   CreditLedgerError,
   growthRailValue,
+  isFundingRail,
   x402SettlementPending,
 } from "./credit-ledger";
 import {
@@ -79,6 +81,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
   readonly durable = false;
 
   private readonly credits = new Map<string, MemoryCredit>();
+  private readonly refunds = new Map<string, { request: string; result: CreditDrawRefundResult }>();
   private readonly fundings = new Map<string, FundingRecord>();
   private readonly invoices = new Map<string, CreditInvoiceRecord>();
   private readonly tempoLosses = new Map<string, TempoCreditLoss>();
@@ -88,7 +91,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
   /** Internal disposable transaction snapshot. The caller must serialize every ledger access. */
   forkForTransaction(): MemoryCreditLedger {
     const fork = new MemoryCreditLedger();
-    for (const name of ["credits", "fundings", "invoices", "tempoLosses", "x402Losses"] as const) {
+    for (const name of ["credits", "fundings", "invoices", "tempoLosses", "x402Losses", "refunds"] as const) {
       const target = fork[name] as Map<string, unknown>;
       for (const [key, value] of this[name]) target.set(key, structuredClone(value));
     }
@@ -111,6 +114,82 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     );
     if (wedged) throw x402SettlementPending(args.creditId ?? randomUUID(), wedged);
     return run(() => this.fundSync(args));
+  }
+
+  /** Development accounting parity; this non-durable store cannot mount admin refunds. */
+  refundDraw(args: CreditDrawRefundArgs): Promise<CreditDrawRefundResult> {
+    return run(() => {
+      const request = refundRequest(args);
+      const prior = this.refunds.get(args.refundId);
+      if (prior) {
+        if (prior.request !== request) throw new CreditLedgerError("refund_conflict", "This refundId was recorded with different arguments.");
+        return { ...prior.result, replayed: true };
+      }
+      const matches = [...this.credits.values()].flatMap(credit =>
+        [...credit.draws.values()].filter(draw => args.jobId !== undefined ?
+          draw.jobId === args.jobId : credit.creditId === args.creditId && draw.drawId === args.drawId)
+          .map(draw => ({ credit, draw })));
+      if (matches.length !== 1 || !matches[0].draw.jobId) {
+        throw new CreditLedgerError("draw_not_found", "No unique job-bound draw matches this selector.");
+      }
+      const { credit, draw } = matches[0];
+      if (draw.status !== "settled") throw new CreditLedgerError("draw_not_completed", "Only a settled completed draw can be refunded.");
+      const nowMs = args.nowMs ?? Date.now();
+      const lastDrain = [...credit.drains.values()].filter(drain => drain.status !== "released")
+        .sort((a, b) => b.ledgerSeq - a.ledgerSeq)[0];
+      const drained = lastDrain && lastDrain.balanceAfterMicro === 0 &&
+        (credit.lastFundingLedgerSeq === null || credit.lastFundingLedgerSeq < lastDrain.ledgerSeq) &&
+        ![...credit.draws.values()].some(later => later.ledgerSeq > lastDrain.ledgerSeq && later.amountMicro > 0) &&
+        ![...this.fundings.values()].some(funding => funding.creditId === credit.creditId &&
+          funding.ledgerSeq !== null && funding.ledgerSeq >= lastDrain.ledgerSeq && funding.amountMicro > 0);
+      if (credit.status !== "active" || credit.expiryMs <= nowMs) {
+        throw new CreditLedgerError("credit_not_open", "The original credit is no longer open for refunds.");
+      }
+      if (credit.tempoChannelId || credit.x402ChannelId) {
+        throw new CreditLedgerError("credit_refund_channel_unsupported", "Channel collateral cannot back a refund of settled spending.");
+      }
+      if (credit.balanceMicro === 0 && drained) {
+        if (credit.lastFundingLedgerSeq === null) {
+          throw new CreditLedgerError("credit_refund_state_unavailable", "The original credit's historical funding and drain order cannot be established.");
+        }
+        throw new CreditLedgerError("credit_not_open", "The original credit is no longer open for refunds.");
+      }
+      const before = [...this.refunds.values()].reduce((sum, refund) => sum +
+        (refund.result.creditId === credit.creditId && refund.result.drawId === draw.drawId ? refund.result.amountMicro : 0), 0);
+      const amountMicro = args.amountMicro ?? draw.amountMicro - before;
+      if (amountMicro <= 0 || amountMicro > draw.amountMicro - before) {
+        throw new CreditLedgerError("refund_exceeds_draw", "The refund exceeds the draw's remaining unrefunded charge.");
+      }
+      if (!isFundingRail(credit.rail)) throw new CreditLedgerError("credit_refund_basis_unavailable", "The original funding rail is not recorded on this older credit.");
+      const bitcoin = isNonChannelBitcoinRail(credit.rail);
+      const originalSats = draw.settledSats ?? null;
+      if (bitcoin && originalSats === null) throw new CreditLedgerError("credit_refund_basis_unavailable", "The original Bitcoin value is not provable from this older draw.");
+      const after = before + amountMicro;
+      const restoredSats = bitcoin ? refundAssetDelta(originalSats!, draw.amountMicro, before, after) : null;
+      const restoredMsats = restoredSats === null ? refundAssetDelta(draw.drawMsats, draw.amountMicro, before, after) : restoredSats * 1000;
+      const restoredNative = draw.drawNative === null ? null : refundAssetDelta(draw.drawNative, draw.amountMicro, before, after);
+      const balanceAfterMicro = credit.balanceMicro + amountMicro;
+      const ledgerSeq = credit.lastLedgerSeq + 1;
+      if (![balanceAfterMicro, ledgerSeq, credit.msatsRemaining + restoredMsats,
+        (credit.nativeRemaining ?? 0) + (restoredNative ?? 0)].every(Number.isSafeInteger)) {
+        throw new Error("credit ledger: refund exceeds safe integer range");
+      }
+      credit.balanceMicro = balanceAfterMicro;
+      credit.lastLedgerSeq = ledgerSeq;
+      credit.msatsRemaining += restoredMsats;
+      if (credit.nativeRemaining !== null) credit.nativeRemaining += restoredNative ?? 0;
+      if (bitcoin) credit.lots.push({
+        lotId: `lot:refund:${randomUUID()}`, creditId: credit.creditId, rail: credit.rail as NonChannelBitcoinRail,
+        satsFunded: restoredSats!, satsBasisKnown: true, creditedMicro: amountMicro, remainingMicro: amountMicro,
+        fundingRef: args.refundId, createdAt: nowMs,
+      });
+      const result: CreditDrawRefundResult = {
+        refundId: args.refundId, creditId: credit.creditId, drawId: draw.drawId, jobId: draw.jobId!,
+        amountMicro, currency: credit.currency, ledgerSeq, refundedAt: nowMs, balanceAfterMicro, replayed: false,
+      };
+      this.refunds.set(args.refundId, { request, result });
+      return { ...result };
+    });
   }
 
   async draw(args: Parameters<CreditLedgerLike["draw"]>[0]): Promise<DrawResult> {
@@ -610,6 +689,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       // credit can hold it — the cross-credit scan below is reachable only for
       // a credit id this ledger has never seen, which is exactly when the
       // Postgres upsert reaches its channel unique index.
+      existing.lastFundingLedgerSeq = existing.lastLedgerSeq;
       existing.balanceMicro += args.amountMicro;
       existing.expiryMs = args.expiryMs;
       applyBasis(existing, b);
@@ -643,6 +723,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       expiryMs: args.expiryMs,
       status: "active",
       lastLedgerSeq: 0,
+      lastFundingLedgerSeq: 0,
       createdAt: nowMs,
       draws: new Map(),
       rail: null,
@@ -1159,7 +1240,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       const lots = openLots(credit);
       const covered = lots.reduce((sum, lot) => sum + lot.remainingMicro, 0);
       const basisless = lots.reduce(
-        (sum, lot) => sum + (lot.satsFunded === 0 ? lot.remainingMicro : 0),
+        (sum, lot) => sum + (lot.satsFunded === 0 && !lot.satsBasisKnown ? lot.remainingMicro : 0),
         0
       );
       // Mirrors `IN_KIND_PREDICATE` — a credit the reclaim would price off a
@@ -1480,6 +1561,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         if (isNonChannelBitcoinRail(credit.rail)) {
           const depletion = depleteLots(openLots(credit), draw.amountMicro);
           const settledMsats = inKindDrawMsats(depletion, draw.amountMicro);
+          draw.settledSats = settledMsats === null ? null : settledMsats / 1000;
           if (settledMsats !== null && settledMsats !== draw.drawMsats) {
             // Keep the superseded forecast: the job's `paidMsats` counter was
             // built from it, so booking revenue swaps this draw's component
@@ -1548,6 +1630,7 @@ interface MemoryCredit {
   expiryMs: number;
   status: CreditStatus;
   lastLedgerSeq: number;
+  lastFundingLedgerSeq: number | null;
   createdAt: number;
   draws: Map<string, MemoryDraw>;
   rail: string | null;
@@ -1615,6 +1698,7 @@ interface MemoryDraw {
    * re-priced, where `drawMsats` is still the allocation.
    */
   allocatedMsats?: number;
+  settledSats?: number | null;
 }
 
 function applyBasis(credit: MemoryCredit, basis: CreditFundingBasis): void {

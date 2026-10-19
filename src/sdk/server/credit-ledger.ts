@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import type { Pool, PoolClient } from "pg";
 
-import type { FundingReceipt } from "../../lib/receipt";
+import { isSignedJobReceipt, verifyReceipt, type FundingReceipt } from "../../lib/receipt";
 import type { FundingMethod } from "../types";
 import {
   depleteLots,
@@ -16,6 +16,7 @@ import {
   netOwedSats,
   type NonChannelBitcoinRail,
 } from "./credit-lots";
+import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import type {
@@ -109,7 +110,7 @@ export interface X402CreditLoss {
  *
  * The ledger is host-wide: credit_id and caller_pubkey identify rows, without a per-mount
  * dvm_id. Draws hold funds until settlement or release, and share a gap-free per-credit
- * ledger_seq with drains.
+ * ledger_seq with drains and completed-draw refunds.
  */
 export class CreditLedger {
   /**
@@ -223,6 +224,7 @@ export class CreditLedger {
       "msats_remaining BIGINT NOT NULL DEFAULT 0",
       "native_remaining BIGINT",
       "x402_channel_id TEXT",
+      "last_funding_ledger_seq BIGINT",
     ]) {
       await this.pool.query(`ALTER TABLE credits ADD COLUMN IF NOT EXISTS ${column}`);
     }
@@ -270,9 +272,24 @@ export class CreditLedger {
       "draw_native BIGINT",
       "grown_micro BIGINT NOT NULL DEFAULT 0",
       "allocated_msats BIGINT",
+      "settled_sats BIGINT",
+      "refund_dvm_id TEXT",
     ]) {
       await this.pool.query(`ALTER TABLE credit_draws ADD COLUMN IF NOT EXISTS ${column}`);
     }
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS credit_draw_refunds (
+        refund_id TEXT PRIMARY KEY,
+        credit_id TEXT NOT NULL,
+        draw_id TEXT NOT NULL,
+        request TEXT NOT NULL,
+        amount_micro BIGINT NOT NULL CHECK (amount_micro > 0),
+        restored_sats BIGINT,
+        result JSONB NOT NULL
+      );
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS credit_draw_refunds_draw_idx
+      ON credit_draw_refunds(credit_id, draw_id)`);
     // The unique index prevents duplicate sequence ownership if a later write path violates
     // the locking protocol.
     await this.pool.query(
@@ -335,6 +352,10 @@ export class CreditLedger {
         created_at      BIGINT NOT NULL
       );
     `);
+    // Existing zero-sat lots have no recorded basis; only explicit new evidence can mark
+    // zero as known. Positive legacy lots already prove their sats denomination.
+    await this.pool.query(`ALTER TABLE credit_funding_lots
+      ADD COLUMN IF NOT EXISTS sats_basis_known BOOLEAN NOT NULL DEFAULT false`);
     // Every read here is "this credit's open lots, oldest first" — depletion
     // on settle, depletion on reclaim, and the liability rollup. Depleted lots
     // stay on the table as the deposit's audit trail but are out of the index.
@@ -643,10 +664,11 @@ export class CreditLedger {
       ({ rows } = await q.query<CreditRow>(
         `INSERT INTO credits (credit_id, caller_pubkey, currency, balance_micro, expiry_ms, status, created_at,
                             rail, native_asset, mint, funding_ref, msats_remaining, native_remaining,
-                            tempo_channel_id, x402_channel_id)
-       VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                            tempo_channel_id, x402_channel_id, last_funding_ledger_seq)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11, $12, $13, $14, 0)
        ON CONFLICT (credit_id) DO UPDATE
          SET balance_micro    = credits.balance_micro + EXCLUDED.balance_micro,
+             last_funding_ledger_seq = credits.last_ledger_seq,
              expiry_ms        = EXCLUDED.expiry_ms,
              rail             = COALESCE(credits.rail, EXCLUDED.rail),
              native_asset     = COALESCE(EXCLUDED.native_asset, credits.native_asset),
@@ -1316,6 +1338,166 @@ export class CreditLedger {
       return run(args.tx, credit);
     }
     return this.withCreditLock(args.creditId, run);
+  }
+
+  /** Restore a completed draw and its report under one durable transaction. */
+  async refundDraw(args: CreditDrawRefundArgs): Promise<CreditDrawRefundResult> {
+    const request = refundRequest(args);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Refund IDs are host-wide. Serialize even conflicting selectors before taking a
+      // credit lock, so a simultaneous reuse on another credit cannot move money twice.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [args.refundId]);
+      const prior = await client.query<{ request: string; result: CreditDrawRefundResult }>(
+        "SELECT request, result FROM credit_draw_refunds WHERE refund_id = $1", [args.refundId]);
+      if (prior.rows[0]) {
+        if (prior.rows[0].request !== request) {
+          throw new CreditLedgerError("refund_conflict", "This refundId was recorded with different arguments.");
+        }
+        await client.query("COMMIT");
+        return { ...prior.rows[0].result, replayed: true };
+      }
+      let creditId = args.creditId;
+      let drawId = args.drawId;
+      if (args.jobId !== undefined) {
+        const matches = await client.query<{ credit_id: string; draw_id: string }>(
+          "SELECT credit_id, draw_id FROM credit_draws WHERE job_id = $1 LIMIT 2", [args.jobId]);
+        if (matches.rows.length === 1) {
+          creditId = matches.rows[0].credit_id;
+          drawId = matches.rows[0].draw_id;
+        }
+      }
+      if (creditId === undefined || drawId === undefined) {
+        throw new CreditLedgerError("draw_not_found", "No unique credit draw matches this job.");
+      }
+      // Read absent credits as absent draws rather than exposing another refusal contract.
+      let credit: CreditRow;
+      try {
+        credit = await this.lockCreditRow(client, creditId);
+      } catch (error) {
+        if (error instanceof CreditLedgerError && error.code === "credit_not_found") {
+          throw new CreditLedgerError("draw_not_found", "No draw matches this credit.");
+        }
+        throw error;
+      }
+      const draw = await this.readDraw(client, creditId, drawId);
+      if (!credit || !draw || !draw.job_id || args.jobId !== undefined && draw.job_id !== args.jobId) {
+        throw new CreditLedgerError("draw_not_found", "No job-bound draw matches this selector.");
+      }
+      const owners = new Set<string>(draw.refund_dvm_id ? [draw.refund_dvm_id] : []);
+      const sources = await client.query<{ jobs: string | null; terminals: string | null }>(
+        "SELECT to_regclass('jobs')::text AS jobs, to_regclass('reported_job_terminals')::text AS terminals");
+      if (sources.rows[0].jobs) {
+        const jobs = await client.query<{ dvm_id: string | null; receipt: unknown }>(
+          "SELECT dvm_id, receipt FROM jobs WHERE id = $1", [draw.job_id]);
+        const job = jobs.rows[0];
+        if (job?.dvm_id) owners.add(job.dvm_id);
+        const receipt = job?.receipt;
+        if (args.trustedReceiptPubkey !== undefined && isSignedJobReceipt(receipt) &&
+          receipt.receipt_pubkey === args.trustedReceiptPubkey && receipt.job_id === draw.job_id && verifyReceipt(receipt)) {
+          owners.add(receipt.dvm_id);
+        }
+      }
+      if (sources.rows[0].terminals) {
+        const terminals = await client.query<{ dvm_id: string }>(
+          "SELECT dvm_id FROM reported_job_terminals WHERE job_id = $1", [draw.job_id]);
+        for (const terminal of terminals.rows) owners.add(terminal.dvm_id);
+      }
+      // Draws outlive job content. Persist only a proved namespace; NULL legacy job owners
+      // are not permission to refund through whichever DVM happens to receive the request.
+      if (owners.size !== 1 || !owners.has(args.outbox.dvmId)) {
+        throw new CreditLedgerError("draw_not_found", "No draw with proven ownership matches this DVM.");
+      }
+      if (draw.status !== "settled") {
+        throw new CreditLedgerError("draw_not_completed", "Only a settled completed draw can be refunded.");
+      }
+      const nowMs = args.nowMs ?? Date.now();
+      // A partial drain retaining pending holds did not close the credit. A later positive
+      // draw or a successful funding watermark proves a fully drained credit reopened;
+      // zero-value draws advance the sequence but restore no spendable money.
+      const drained = await client.query(`SELECT 1 FROM credit_drains d
+        WHERE d.credit_id = $1 AND d.status <> 'released' AND d.balance_after_micro = 0
+          AND (SELECT MAX(ledger_seq) FROM credit_drains WHERE credit_id = $1 AND status <> 'released') = d.ledger_seq
+          AND ($2::bigint IS NULL OR $2::bigint < d.ledger_seq)
+          AND NOT EXISTS (SELECT 1 FROM credit_draws later WHERE later.credit_id = $1
+            AND later.ledger_seq > d.ledger_seq AND later.amount_micro > 0)
+          AND NOT EXISTS (SELECT 1 FROM credit_fundings f WHERE f.credit_id = $1
+            AND f.ledger_seq >= d.ledger_seq AND f.amount_micro > 0)
+        LIMIT 1`, [creditId, credit.last_funding_ledger_seq]);
+      if (credit.status !== "active" || toSafeInt(credit.expiry_ms) <= nowMs) {
+        throw new CreditLedgerError("credit_not_open", "The original credit is no longer open for refunds.");
+      }
+      if (credit.tempo_channel_id || credit.x402_channel_id) {
+        throw new CreditLedgerError("credit_refund_channel_unsupported", "Channel collateral cannot back a refund of settled spending.");
+      }
+      if (toSafeInt(credit.balance_micro) === 0 && drained.rows.length > 0) {
+        if (credit.last_funding_ledger_seq === null) {
+          throw new CreditLedgerError("credit_refund_state_unavailable", "The original credit's historical funding and drain order cannot be established.");
+        }
+        throw new CreditLedgerError("credit_not_open", "The original credit is no longer open for refunds.");
+      }
+      const totals = await client.query<{ refunded: string }>(`SELECT COALESCE(SUM(amount_micro), 0) AS refunded
+        FROM credit_draw_refunds WHERE credit_id = $1 AND draw_id = $2`, [creditId, drawId]);
+      const before = toSafeInt(totals.rows[0].refunded);
+      const originalMicro = toSafeInt(draw.amount_micro);
+      const amountMicro = args.amountMicro ?? originalMicro - before;
+      if (amountMicro <= 0 || amountMicro > originalMicro - before) {
+        throw new CreditLedgerError("refund_exceeds_draw", "The refund exceeds the draw's remaining unrefunded charge.");
+      }
+      const after = before + amountMicro;
+      if (!isFundingRail(credit.rail)) {
+        throw new CreditLedgerError("credit_refund_basis_unavailable", "The original funding rail is not recorded on this older credit.");
+      }
+      const bitcoin = isNonChannelBitcoinRail(credit.rail);
+      // Only actual settlement records authoritative draw sats. Old repricing markers
+      // and funding receipts cannot independently prove which assets that draw consumed.
+      const originalSats = draw.settled_sats === null ? null : toSafeInt(draw.settled_sats);
+      if (bitcoin && originalSats === null) {
+        throw new CreditLedgerError("credit_refund_basis_unavailable", "The original Bitcoin value is not provable from this older draw.");
+      }
+      const restoredSats = bitcoin ? refundAssetDelta(originalSats!, originalMicro, before, after) : null;
+      const restoredMsats = restoredSats === null ?
+        refundAssetDelta(toSafeInt(draw.draw_msats), originalMicro, before, after) : restoredSats * 1000;
+      const restoredNative = draw.draw_native === null ? null :
+        refundAssetDelta(toSafeInt(draw.draw_native), originalMicro, before, after);
+      const balanceAfterMicro = toSafeInt(toSafeInt(credit.balance_micro) + amountMicro);
+      const ledgerSeq = toSafeInt(toSafeInt(credit.last_ledger_seq) + 1);
+      toSafeInt(toSafeInt(credit.msats_remaining) + restoredMsats);
+      if (credit.native_remaining !== null) toSafeInt(toSafeInt(credit.native_remaining) + (restoredNative ?? 0));
+      await client.query(`UPDATE credit_draws SET refund_dvm_id = $3
+        WHERE credit_id = $1 AND draw_id = $2`, [creditId, drawId, args.outbox.dvmId]);
+      await client.query(`UPDATE credits SET balance_micro = $2, last_ledger_seq = $3,
+        msats_remaining = msats_remaining + $4,
+        native_remaining = CASE WHEN native_remaining IS NULL THEN NULL ELSE native_remaining + $5 END
+        WHERE credit_id = $1`, [creditId, balanceAfterMicro, ledgerSeq, restoredMsats, restoredNative ?? 0]);
+      if (bitcoin) {
+        await client.query(`INSERT INTO credit_funding_lots
+          (lot_id, credit_id, rail, sats_funded, credited_micro, remaining_micro, funding_ref, created_at, sats_basis_known)
+          VALUES ($1, $2, $3, $4, $5, $5, $6, $7, true)`,
+          [`lot:refund:${randomUUID()}`, creditId, credit.rail, restoredSats, amountMicro, args.refundId, nowMs]);
+      }
+      const result: CreditDrawRefundResult = {
+        refundId: args.refundId, creditId, drawId, jobId: draw.job_id, amountMicro,
+        currency: credit.currency, ledgerSeq, refundedAt: nowMs, balanceAfterMicro, replayed: false,
+      };
+      await client.query(`INSERT INTO credit_draw_refunds
+        (refund_id, credit_id, draw_id, request, amount_micro, restored_sats, result)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [args.refundId, creditId, drawId, request, amountMicro, restoredSats, JSON.stringify(result)]);
+      await args.outbox.enqueue(client, {
+        dvmId: args.outbox.dvmId, creditId, drawId, jobId: draw.job_id, refundId: args.refundId,
+        amountMicro, creditCurrency: credit.currency, ledgerSeq, refundedAt: nowMs,
+        ...(args.reason === undefined ? {} : { reason: args.reason }),
+      });
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /**
@@ -3113,7 +3295,11 @@ export class CreditLedger {
         let settledMsats = forecastMsats;
         if (isNonChannelBitcoinRail(credit.rail)) {
           const depletion = depleteLots(await this.openLots(client, args.creditId), amountMicro);
-          settledMsats = inKindDrawMsats(depletion, amountMicro) ?? forecastMsats;
+          const inKindMsats = inKindDrawMsats(depletion, amountMicro);
+          settledMsats = inKindMsats ?? forecastMsats;
+          await client.query(`UPDATE credit_draws SET settled_sats = $3
+            WHERE credit_id = $1 AND draw_id = $2`,
+            [args.creditId, args.drawId, inKindMsats === null ? null : inKindMsats / 1000]);
           await this.applyLotDebits(client, depletion.debits, -1);
         }
         if (settledMsats !== forecastMsats) {
@@ -3392,6 +3578,7 @@ export interface CreditLedgerLike {
     tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<GrownDrawResult>;
+  refundDraw(args: CreditDrawRefundArgs): Promise<CreditDrawRefundResult>;
   settle(args: {
     creditId: string;
     drawId: string;
@@ -3897,7 +4084,7 @@ export interface CreditSnapshot {
   expired: boolean;
   status: CreditStatus;
   /**
-   * High-water sequence shared by draw placements and drains.
+   * High-water sequence shared by draw placements, drains, and completed-draw refunds.
    */
   lastLedgerSeq: number;
   createdAt: number;
@@ -3923,7 +4110,7 @@ export interface DrawResult {
    */
   balanceAfterMicro: number;
   /**
-   * Per-credit gap-free sequence shared with drains; growth keeps the original value.
+   * Per-credit gap-free sequence shared with drains and refunds; growth keeps the original value.
    */
   ledgerSeq: number;
   status: DrawStatus;
@@ -4318,6 +4505,14 @@ export type CreditLedgerErrorCode =
   | "settlement_pending"
   | "insufficient_credit"
   | "draw_conflict"
+  | "invalid_refund"
+  | "draw_not_completed"
+  | "refund_conflict"
+  | "refund_exceeds_draw"
+  | "credit_not_open"
+  | "credit_refund_channel_unsupported"
+  | "credit_refund_basis_unavailable"
+  | "credit_refund_state_unavailable"
   | "draw_not_found"
   | "invalid_draw_state"
   | "funding_replayed"
@@ -4456,6 +4651,7 @@ interface CreditRow extends CreditBasisRow {
   expiry_ms: string;
   status: string;
   last_ledger_seq: string;
+  last_funding_ledger_seq: string | null;
   created_at: string;
   msats_remaining: string;
   native_remaining: string | null;
@@ -4513,6 +4709,8 @@ interface DrawRow {
   draw_native: string | null;
   grown_micro: string;
   allocated_msats: string | null;
+  settled_sats: string | null;
+  refund_dvm_id: string | null;
 }
 
 interface FundingRow {
@@ -4544,6 +4742,7 @@ interface FundingLotRow {
   credit_id: string;
   rail: NonChannelBitcoinRail;
   sats_funded: string;
+  sats_basis_known: boolean;
   credited_micro: string;
   remaining_micro: string;
   funding_ref: string | null;
@@ -4644,8 +4843,8 @@ const BITCOIN_CREDIT_PREDICATE = `c.rail IN ('cashu', 'lightning')
  */
 const LOT_COVERAGE_LATERAL = `SELECT
             COALESCE(SUM(l.remaining_micro), 0) AS covered_micro,
-            COALESCE(SUM(l.remaining_micro) FILTER (WHERE l.sats_funded = 0), 0) AS basisless_micro,
-            COALESCE(SUM(l.sats_funded * l.remaining_micro / NULLIF(l.credited_micro, 0)), 0) AS owed_sats
+            COALESCE(SUM(l.remaining_micro) FILTER (WHERE l.sats_funded = 0 AND NOT l.sats_basis_known), 0) AS basisless_micro,
+            COALESCE(SUM(FLOOR(l.sats_funded::numeric * l.remaining_micro / NULLIF(l.credited_micro, 0))), 0) AS owed_sats
           FROM credit_funding_lots l
          WHERE l.credit_id = c.credit_id AND l.remaining_micro > 0`;
 
@@ -4808,6 +5007,7 @@ function fundingLotFromRow(row: FundingLotRow): FundingLot {
     creditId: row.credit_id,
     rail: row.rail,
     satsFunded: toSafeInt(row.sats_funded),
+    satsBasisKnown: row.sats_basis_known,
     creditedMicro: toSafeInt(row.credited_micro),
     remainingMicro: toSafeInt(row.remaining_micro),
     fundingRef: row.funding_ref,

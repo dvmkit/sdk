@@ -50,6 +50,8 @@ export interface FundingLot {
   rail: NonChannelBitcoinRail;
   /** Sats this funding delivered. `0` on a credit funded before a rail basis was recorded. */
   satsFunded: number;
+  /** Explicit original-asset evidence, including a refund whose integer share is zero sats. */
+  satsBasisKnown?: boolean;
   /** Credit micro this funding bought — the lot's denominator, never depleted. */
   creditedMicro: number;
   remainingMicro: number;
@@ -93,7 +95,7 @@ export function depleteLots(lots: FundingLot[], amountMicro: number): LotDepleti
     const sats = lotSats(lot, available) - lotSats(lot, available - micro);
     debits.push({ lotId: lot.lotId, micro, sats });
     satsOwed += sats;
-    if (lot.satsFunded > 0) backedMicro += micro;
+    if (lot.satsFunded > 0 || lot.satsBasisKnown) backedMicro += micro;
     left -= micro;
   }
   return { debits, satsOwed, uncoveredMicro: left, backedMicro };
@@ -172,5 +174,5 @@ export function isInKindDepletion(depletion: LotDepletion, amountMicro: number):
 function lotSats(lot: FundingLot, micro: number): number {
   if (lot.satsFunded <= 0 || lot.creditedMicro <= 0 || micro <= 0) return 0;
   const taken = Math.min(micro, lot.creditedMicro);
-  return Math.floor((lot.satsFunded * taken) / lot.creditedMicro);
+  return Number(BigInt(lot.satsFunded) * BigInt(taken) / BigInt(lot.creditedMicro));
 }

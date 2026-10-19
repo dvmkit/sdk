@@ -24263,6 +24263,36 @@
       "dependencies": []
     },
     {
+      "module": "src/sdk/server/credit-draw-refund.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Completed credit draw refund contracts, canonical intent, and original-asset allocation used by the supported durable and memory credit ledgers.",
+          "symbols": [
+            "CreditDrawRefundArgs",
+            "CreditDrawRefundResult",
+            "refundAssetDelta",
+            "refundRequest"
+          ],
+          "consumerEvidence": [
+            "supported:./server#CreditDrawRefundArgs",
+            "supported:./server#CreditDrawRefundResult",
+            "supported:./server#CreditLedger",
+            "supported:./server#MemoryCreditLedger"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/revenue-reporter.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/server/credit-ledger.ts",
       "allocations": [
         {
