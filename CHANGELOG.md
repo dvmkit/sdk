@@ -12,8 +12,9 @@
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
-## [1.0.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.10.1...v1.0.0-rc.1) (2026-10-19)
+## [1.0.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.10.1...v1.0.0-rc.1) (2026-10-19) — withdrawn, unpublished
 
+This candidate was withdrawn before the publish step ran and was never published to npm. Its immutable signed tag is retained as history. These notes retain the candidate's feature and breaking-change information; they do not describe a published package or GitHub release.
 
 ### ⚠ BREAKING CHANGES
 

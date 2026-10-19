@@ -46,6 +46,8 @@ Node still comes from `.nvmrc`, including tag verification and release bookkeepi
 
 Release-please turns merged Conventional Commits into a version and changelog pull request. It does not create a tag, a GitHub release, or an npm publication, and it stays switched off until the repository variable `RELEASE_PLEASE_ENABLED` is exactly `true`.
 
+Before 1.0, breaking changes advance the minor version on the 0.x line through the root package's `bump-minor-pre-major` setting. Ordinary Conventional Commit version calculation still applies. An eventual 1.0 release requires a separate explicit release decision. This version policy preserves the breaking-change disclosures, API review, and migration requirements below.
+
 The version is a decision made on that pull request, not a constant in this repository. To pin an exact version for one release — a specific release candidate, for instance — put a one-shot `Release-As: X.Y.Z-rc.N` footer on the triggering Conventional Commit. Release-please applies that footer to the next release pull request only; the checked-in configuration stays on ordinary Conventional Commit versioning and never enters prerelease mode on its own. `-rc.N` is the only prerelease shape the tag and dist-tag rules below accept, so a release candidate is always a deliberate, one-off `Release-As` decision rather than a standing configuration.
 
 For the version in this checkout, read `package.json` with `npm pkg get version`; the release tag command also requires `.release-please-manifest.json` to agree. To inspect npm publication state, use `npm view @dvmkit/sdk versions --json` for published versions and `npm view @dvmkit/sdk dist-tags --json` for the versions selected by `latest` and `next`.
@@ -121,7 +123,32 @@ The npm interface may require an existing package before it permits trusted-publ
 
 ## Recovery
 
-Never move, replace, or unpublish a release version. If the build or the pre-publish checks fail, fix only release infrastructure and rerun the same immutable tag once the correction is reviewed.
+Never move, replace, or unpublish a release version. If the build or the pre-publish checks fail, fix only release infrastructure and rerun the same immutable tag once the correction is reviewed. A candidate may instead be withdrawn only under the conditions below.
+
+### Withdraw a never-published candidate
+
+Withdrawal is available only when terminal workflow evidence proves that the publish job never started and the exact candidate version is absent from the npm registry. Evidence collected before a publication run reaches its terminal state does not count. Missing registry visibility alone does not prove that no upload happened. An unknown upload outcome, pending registry processing, or an existing version requires the read-only publication recovery below rather than withdrawal.
+
+1. Cancel or reject any waiting publication run or deployment for the candidate first.
+2. Wait for every publication run for that candidate to reach a terminal completed/cancelled state. Confirm that the publish job never started and no deployments are pending.
+3. Only then confirm that the exact candidate version is absent from the npm registry.
+4. Preserve its immutable signed tag and source history. Retain an explicit withdrawn/unpublished record in the changelog and merged release pull request, including its feature, breaking-change, and migration information.
+5. After the corrective source change is reviewed and merged, remove only the stale `autorelease: pending` label from that candidate's merged release pull request. Do not add `autorelease: tagged`, create a GitHub release, dispatch release recovery, or delete or move a tag.
+6. Rerun normal release-please generation only after retiring that pending label: a merged pending release blocks regeneration, so the source correction alone cannot prepare the next version.
+
+Never rerun `Release package` for a withdrawn candidate's tag or rerun any cancelled publication run for that candidate. The `npm-release` approvers must reject every deployment for a withdrawn version.
+
+For the withdrawn `1.0.0-rc.1` candidate, preserve this one-shot footer in the actual merged Conventional Commit that corrects the version policy:
+
+```text
+Release-As: 0.11.0-rc.1
+```
+
+Preserve the footer in the final commit when using a squash merge; a pull request body alone is insufficient. Let normal release-please generation update the existing open release-please pull request to `0.11.0-rc.1`. The current `1.0.0-rc.1` package and manifest versions need no manual reset in the corrective source change. The pre-major setting applies only while the current major version is zero, so it cannot by itself correct this manifest.
+
+A retained higher abandoned tag can narrow generated notes. Review all changes since published `0.10.1`, restore all four builder-facing headings above, and identify `1.0.0-rc.1` truthfully as withdrawn and unpublished. The merged-release-PR resolver and the human approval requirement on the `npm-release` environment remain in force.
+
+### Publication recovery
 
 Before publishing, every run queries the exact npm version. An existing version is accepted only when its downloaded registry tarball is byte-for-byte identical to the reviewed artifact and the expected `latest` or `next` dist-tag already points at it; a mismatch fails closed without a second publish attempt. That also recovers a run where npm accepted the upload before the client lost its response, or where a later smoke check failed.
 
@@ -135,7 +162,7 @@ node scripts/publish-release.mjs --archive package.tgz --dist-tag next --check
 
 Use `latest` only for a stable archive. This mode never uploads, even when metadata or the tarball is missing. It requires the exact archive bytes, package name, version, registry origin, and dist-tag to match; a listed integrity mismatch also fails closed. Unknown, duplicate, and malformed options fail before registry or publication work. A successful read-only check permits recovery of the remaining smoke checks from the immutable signed tag. Missing visibility alone is not proof that upload failed: establish the prior upload outcome before using the tag-without-npm path.
 
-The tag-without-npm recovery is the same path when a tag exists but npm publication did not happen: repair the trusted-publisher or environment configuration, then rerun `Release package` for that existing tag. Do not retag.
+The tag-without-npm recovery is the same path when a tag exists but npm publication did not happen and the version has not been withdrawn: repair the trusted-publisher or environment configuration, then rerun `Release package` for that existing tag. Do not retag.
 
 If npm has accepted a bad version, deprecate that exact version, return the affected dist-tag to the last good version, and publish a new fixed version. GitHub release creation can be rerun on its own for a successfully published tag when only the release notes or the label step failed: manually dispatch `Release package` with that existing tag and `github_release_recovery` set to true.
 
