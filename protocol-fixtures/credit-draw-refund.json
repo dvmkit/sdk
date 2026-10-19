@@ -1,0 +1,30 @@
+{
+  "request": { "jobId": "job-refund-example", "refundId": "refund-example", "amountMicro": 400, "reason": "Incomplete result" },
+  "response": {
+    "status": "refunded", "refund_id": "refund-example", "credit_id": "credit-refund-example",
+    "draw_id": "draw-refund-example", "job_id": "job-refund-example", "amount_micro": 400,
+    "currency": "usd", "ledger_seq": 2, "refunded_at": 1800000001000,
+    "balance_after_micro": 400, "replayed": false
+  },
+  "report": {
+    "dvmId": "dvm-refund-example", "creditId": "credit-refund-example", "drawId": "draw-refund-example",
+    "jobId": "job-refund-example", "refundId": "refund-example", "amountMicro": 400,
+    "creditCurrency": "usd", "ledgerSeq": 2, "refundedAt": 1800000001000, "reason": "Incomplete result"
+  },
+  "refusals": {
+    "state": {
+      "status": 422,
+      "response": {
+        "error": "credit_refund_state_unavailable",
+        "hint": "The original credit reopening order cannot be proven automatically. Ask an operator to inspect independent funding and drain evidence before arranging a repair. Retrying alone cannot establish that evidence."
+      }
+    },
+    "basis": {
+      "status": 422,
+      "response": {
+        "error": "credit_refund_basis_unavailable",
+        "hint": "The original payment value cannot be proven automatically. Ask an operator to inspect independent original-payment evidence before arranging a repair. Retrying alone cannot establish that evidence."
+      }
+    }
+  }
+}

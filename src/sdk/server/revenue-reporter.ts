@@ -251,6 +251,25 @@ export interface CreditDepositPayload {
   repaired?: boolean;
 }
 
+/** Completed-draw reversal posted to /_internal/credit-draw-refund. */
+export interface CreditDrawRefundPayload {
+  dvmId: string;
+  creditId: string;
+  drawId: string;
+  jobId: string;
+  refundId: string;
+  amountMicro: number;
+  creditCurrency: string;
+  ledgerSeq: number;
+  refundedAt: number;
+  reason?: string;
+}
+
+export type CreditDrawRefundEnqueue = (
+  tx: RevenueReporterQuerier,
+  payload: CreditDrawRefundPayload
+) => Promise<void>;
+
 /**
  * JSON wire shape POSTed to the platform's `/_internal/credit-draw-release`
  * endpoint. A released hold leaves the credit balance intact, but
@@ -545,6 +564,7 @@ type ReportKind =
   | "revenue"
   | "cost"
   | "deposit"
+  | "refund"
   | "release"
   | "drain"
   | "payout"
@@ -556,6 +576,7 @@ const ENDPOINTS: Record<ReportKind, string> = {
   cost: "/_internal/job-cost",
   deposit: "/_internal/credit-deposit",
   release: "/_internal/credit-draw-release",
+  refund: "/_internal/credit-draw-refund",
   drain: "/_internal/credit-drain",
   payout: "/_internal/payout",
   expiry_release: "/_internal/credit-expiry-release",
@@ -742,6 +763,11 @@ export class RevenueReporter {
    */
   async enqueueDeposit(tx: RevenueReporterQuerier, payload: CreditDepositPayload): Promise<void> {
     await this.insertPending(tx, "deposit", payload);
+  }
+
+  /** Persist without network delivery before the refund accounting transaction commits. */
+  async enqueueCreditDrawRefund(tx: RevenueReporterQuerier, payload: CreditDrawRefundPayload): Promise<void> {
+    await this.insertPending(tx, "refund", payload);
   }
 
   /** Join a released draw to the transaction that made the hold terminal. */
@@ -1121,6 +1147,7 @@ export class RevenueReporter {
           Partial<JobCostReportPayload> &
           Partial<CreditDepositPayload> &
           Partial<CreditDrawReleasePayload> &
+          Partial<CreditDrawRefundPayload> &
           Partial<CreditDrainPayload> &
           Partial<PayoutReportPayload> &
           Partial<CreditExpiryReleasePayload>;
@@ -1262,6 +1289,12 @@ export class RevenueReporter {
       }
       diagnosticConsole.log(`[revenue-reporter] reported ${kind} ${label}`);
       return;
+    }
+
+    // The original revenue report can arrive after its refund. Preserve this dependency
+    // failure in the durable retry queue; other client errors remain terminal.
+    if (kind === "refund" && res.status === 409) {
+      throw new Error("Original draw revenue has not arrived yet");
     }
 
     if (res.status === 401) {

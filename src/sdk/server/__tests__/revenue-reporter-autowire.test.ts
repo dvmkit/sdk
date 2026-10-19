@@ -1,3 +1,7 @@
+import { schnorr } from "@noble/curves/secp256k1.js";
+import { buildAdminAuthHeader } from "../../../lib/cashu/admin-auth";
+import { CreditLedger } from "../credit-ledger";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { configureDVM } from "../../configure";
@@ -24,6 +28,7 @@ const mockReportTempoSettlementBalance = vi.fn().mockResolvedValue(undefined);
 const mockReportTempoSettlementFailure = vi.fn().mockResolvedValue(undefined);
 const mockEnqueueDeposit = vi.fn().mockResolvedValue(undefined);
 const mockEnqueueCreditDrain = vi.fn().mockResolvedValue(undefined);
+const mockEnqueueCreditDrawRefund = vi.fn().mockResolvedValue(undefined);
 const mockEnqueueCreditDrawRelease = vi.fn().mockResolvedValue(undefined);
 const { mockChannelStorageClose, mockCreateX402BatchSettlementServer, mockSettlementStop } =
   vi.hoisted(() => {
@@ -59,6 +64,8 @@ class MockRevenueReporter {
   enqueueDeposit = mockEnqueueDeposit;
   enqueueCreditDrain = mockEnqueueCreditDrain;
   enqueueCreditDrawRelease = mockEnqueueCreditDrawRelease;
+  enqueueCreditDrawRefund = mockEnqueueCreditDrawRefund;
+  enqueueCreditExpiryRelease = vi.fn().mockResolvedValue(undefined);
   constructor(
     public db: unknown,
     public platformUrl: string,
@@ -139,6 +146,35 @@ describe("RevenueReporter auto-wiring", () => {
 
     await shutdown();
     expect(mockStop).toHaveBeenCalledOnce();
+  });
+
+  it("wires the durable refund reporter through the authenticated admin route without Cashu", async () => {
+    const privateKey = "11".repeat(32);
+    const lockPubkey = `02${Buffer.from(schnorr.getPublicKey(Buffer.from(privateKey, "hex"))).toString("hex")}`;
+    fakePgPool.query.mockImplementation(async (text: string) => ({
+      rows: text.includes("SELECT pubkey, retired_at_ms") ? [{ pubkey: lockPubkey, retired_at_ms: null }] : [], rowCount: 0,
+    }));
+    const refund = vi.spyOn(CreditLedger.prototype, "refundDraw").mockImplementation(async args => {
+      await args.outbox.enqueue(fakePgPool, { dvmId: args.outbox.dvmId, creditId: "credit", drawId: "draw", jobId: "job",
+        refundId: args.refundId, amountMicro: 100, creditCurrency: "usd", ledgerSeq: 2, refundedAt: 1_800_000_000_000 });
+      return { refundId: args.refundId, creditId: "credit", drawId: "draw", jobId: "job", amountMicro: 100,
+        currency: "usd", ledgerSeq: 2, refundedAt: 1_800_000_000_000, balanceAfterMicro: 100, replayed: false };
+    });
+    const { app, shutdown } = await createDVMServer(DESCRIPTOR, {
+      env: { DVMKIT_PLATFORM_TOKEN: "example-token", DVMKIT_PLATFORM_URL: "https://platform.example.com" },
+      store: new MemoryKVStore(), db: fakePgPool, creditLedger: new CreditLedger(fakePgPool),
+      creditExpirySweep: { intervalMs: 0, bootDelayMs: 0 }, dvmId: "example-dvm", lockPubkey, fxFetcher: stubFx,
+    });
+    const path = "/admin/credit/refund-draw";
+    try {
+      const response = await app.request(path, { method: "POST", headers: { "Content-Type": "application/json",
+        Authorization: buildAdminAuthHeader({ method: "POST", path, dvmId: "example-dvm", privkeyHex: privateKey }).header },
+        body: JSON.stringify({ jobId: "job", refundId: "refund" }) });
+      expect(response.status).toBe(200);
+      expect(refund).toHaveBeenCalledWith(expect.objectContaining({ jobId: "job", refundId: "refund" }));
+      expect(mockEnqueueCreditDrawRefund).toHaveBeenCalledWith(fakePgPool,
+        expect.objectContaining({ dvmId: "example-dvm", jobId: "job", refundId: "refund", amountMicro: 100 }));
+    } finally { await shutdown(); fakePgPool.query.mockReset(); }
   });
 
   it.each(["url", "token", "hosted"] as const)("reports terminal jobs only with complete hosted wiring (%s)", async mode => {

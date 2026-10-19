@@ -132,6 +132,8 @@
         "ContentHoldsResponse",
         "CreateSignedRequestVerifierOpts",
         "CreateX402BatchSettlementServerOpts",
+        "CreditDrawRefundArgs",
+        "CreditDrawRefundResult",
         "CreditEnvelope",
         "CreditEnvelopeError",
         "CreditFundCommitment",

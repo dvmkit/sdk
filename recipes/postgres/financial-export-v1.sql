@@ -50,6 +50,10 @@ CREATE OR REPLACE FUNCTION pg_temp.scalars_v1(value jsonb, strings text[], numbe
         OR (key=ANY(numbers) AND (jsonb_typeof(val) IN ('number','null') OR (jsonb_typeof(val)='string' AND val #>> '{}' ~ '^-?[0-9]+$')))
         OR (key=ANY(booleans) AND jsonb_typeof(val) IN ('boolean','null'))) END
 $$;
+CREATE OR REPLACE FUNCTION pg_temp.draw_refund_result_v1(value jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT pg_temp.scalars_v1(value, ARRAY['refundId','creditId','drawId','jobId','currency'],
+    ARRAY['amountMicro','ledgerSeq','refundedAt','balanceAfterMicro'])
+$$;
 CREATE OR REPLACE FUNCTION pg_temp.settlement_v1(value jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT pg_temp.scalars_v1(value,
     ARRAY['tx_hash','transaction','channel_id','network','repair_kind','payer'],
@@ -100,6 +104,7 @@ BEGIN
   EXECUTE format('SELECT COALESCE(jsonb_agg(projected ORDER BY projected::text), ''[]''::jsonb) FROM (
     SELECT (SELECT COALESCE(jsonb_object_agg(key,
       CASE WHEN key=ANY(ARRAY[''sent_ref'',''settle_response'']) THEN pg_temp.settlement_v1(value)
+           WHEN key=''result'' THEN pg_temp.draw_refund_result_v1(value)
            WHEN key=''fulfilment'' THEN pg_temp.fulfilment_v1(value)
            WHEN key=''lot_debits'' THEN pg_temp.lot_debits_v1(value)
            WHEN key=''state_json'' THEN pg_temp.tempo_state_v1(value)
@@ -117,10 +122,11 @@ BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SELECT jsonb_build_object(
   'format', 'dvmkit-financial-evidence', 'version', 1,
   'jobs', pg_temp.financial_rows_v1('jobs', ARRAY['id','dvm_id','request_id','requester_pubkey','capability','status','created_at','last_activity_at','terminal_at_ms','ended_by','receipt','receipt_seq','paid_msats','payment_rail','payment_tx_hash','payment_transaction_hash','native_amount','native_asset','credit_id','draw_id','cost_amount_micro','cost_currency']),
-  'credits', pg_temp.financial_rows_v1('credits', ARRAY['credit_id','caller_pubkey','currency','balance_micro','expiry_ms','status','last_ledger_seq','created_at','rail','native_asset','funding_ref','tempo_channel_id','x402_channel_id','msats_remaining','native_remaining']),
+  'credits', pg_temp.financial_rows_v1('credits', ARRAY['credit_id','caller_pubkey','currency','balance_micro','expiry_ms','status','last_ledger_seq','last_funding_ledger_seq','created_at','rail','native_asset','funding_ref','tempo_channel_id','x402_channel_id','msats_remaining','native_remaining']),
   'fundings', pg_temp.financial_rows_v1('credit_fundings', ARRAY['credit_id','fund_id','caller_pubkey','amount_micro','rail','created_at','balance_after_micro','ledger_seq','receipt']),
-  'funding_lots', pg_temp.financial_rows_v1('credit_funding_lots', ARRAY['lot_id','credit_id','rail','sats_funded','credited_micro','remaining_micro','funding_ref','created_at']),
-  'draws', pg_temp.financial_rows_v1('credit_draws', ARRAY['credit_id','draw_id','job_id','amount_micro','ledger_seq','status','balance_after_micro','created_at','resolved_at','draw_msats','allocated_msats','draw_native','grown_micro']),
+  'funding_lots', pg_temp.financial_rows_v1('credit_funding_lots', ARRAY['lot_id','credit_id','rail','sats_funded','sats_basis_known','credited_micro','remaining_micro','funding_ref','created_at']),
+  'draws', pg_temp.financial_rows_v1('credit_draws', ARRAY['credit_id','draw_id','job_id','amount_micro','ledger_seq','status','balance_after_micro','created_at','resolved_at','draw_msats','allocated_msats','settled_sats','refund_dvm_id','draw_native','grown_micro']),
+  'draw_refunds', pg_temp.financial_rows_v1('credit_draw_refunds', ARRAY['refund_id','credit_id','draw_id','amount_micro','restored_sats','result']),
   'drains', pg_temp.financial_rows_v1('credit_drains', ARRAY['credit_id','drain_id','method','amount_micro','balance_after_micro','drained_msats','drained_native','owed_sats','ledger_seq','status','receipts','sent_ref','fulfilment','lot_debits','created_at','parked_at','picked_up_at','sent_at','released_at','written_off_at']),
   'invoices', pg_temp.financial_rows_v1('credit_invoices', ARRAY['credit_id','fund_id','caller_pubkey','currency','amount_micro','amount_msats','payment_hash','status','expires_at','created_at','settled_at','reconciled_credit_id','reconciled_fund_id','resolved_at']),
   'expiry_releases', pg_temp.financial_rows_v1('credit_expiry_releases', ARRAY['credit_id','release_id','caller_pubkey','currency','rail','amount_micro','expiry_ms','released_at','reversed_at']),
