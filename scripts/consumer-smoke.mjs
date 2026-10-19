@@ -69,6 +69,7 @@ try {
   typecheckConsumer(consumer, "node16");
   runExamples(consumer);
   runDrainRecovery(consumer);
+  runTempoCreditLosses(consumer);
   const completedHistory = runCompletedCreditHistory(consumer);
   runContentRetention(consumer, installedRoot);
   const trustedSpanPersistence = runTrustedSpanPersistence(consumer);
@@ -89,7 +90,7 @@ try {
 
   const shape = declarations.map((entry) => `${entry.export} ${entry.names.length}`).join(", ");
   console.log(
-    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, runnable public examples, persisted drain recovery, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} accepted Cashu cases, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
+    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, runnable public examples, persisted drain recovery, Tempo loss classification, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} accepted Cashu cases, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
   );
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
@@ -144,6 +145,47 @@ function runCompletedCreditHistory(consumer) {
     timeout: 30_000,
   });
   return JSON.parse(output);
+}
+
+/** @param {string} consumer */
+function runTempoCreditLosses(consumer) {
+  const probe = join(consumer, "tempo-credit-losses.mjs");
+  writeFileSync(probe, [
+    'import assert from "node:assert/strict";',
+    `import { MemoryCreditLedger } from "${manifest.name}/server";`,
+    'async function make(suffix) {',
+    '  const ledger = new MemoryCreditLedger(); const channelId = "0x" + suffix.repeat(32);',
+    '  const credit = await ledger.fund({ callerPubkey: "ab".repeat(32), currency: "usd", amountMicro: 100000, expiryMs: Date.now() + 60000, basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100000, tempoSession: { channelId, cumulativeAmount: "100000" } } });',
+    '  return { ledger, channelId, credit };',
+    '}',
+    'let { ledger, channelId, credit } = await make("11");',
+    'assert.equal(ledger.tempoCreditLossEvidenceVersion, 1);',
+    'let evidence = { channelId, highestVoucherNative: 100000n, settledOnChainNative: 30000n, consumedNative: 30000n };',
+    'assert.deepEqual(await ledger.terminalizeTempoCredits({ ...evidence, closeKind: "cooperative_close", refundedToPayerNative: 70000n }), []);',
+    'assert.equal((await ledger.get(credit.creditId)).status, "active");',
+    'let [loss] = await ledger.terminalizeTempoCredits({ ...evidence, closeKind: "cooperative_close", refundedToPayerNative: 20000n });',
+    'assert.deepEqual([loss.refundedToPayerNative, loss.lossNative, loss.lossBasis], [20000n, 50000n, "cooperative_close"]);',
+    '({ ledger, channelId, credit } = await make("22"));',
+    'evidence = { ...evidence, channelId };',
+    'assert.deepEqual(await ledger.terminalizeTempoCredits({ ...evidence, closeKind: "payer_exit" }), []);',
+    'assert.equal((await ledger.get(credit.creditId)).status, "active");',
+    '[loss] = await ledger.terminalizeTempoCredits({ ...evidence, closeKind: "payer_exit", consumedNative: 50000n });',
+    'assert.deepEqual([loss.refundedToPayerNative, loss.lossNative, loss.lossBasis], [null, 20000n, "payer_exit"]);',
+    '({ ledger, channelId, credit } = await make("33"));',
+    '[loss] = await ledger.terminalizeTempoCredits({ ...evidence, channelId });',
+    'assert.deepEqual([loss.refundedToPayerNative, loss.lossNative, loss.lossBasis], [null, 70000n, "caller_asserted"]);',
+    '({ ledger, credit } = await make("44"));',
+    'const drain = { creditId: credit.creditId, drainId: "refund" };',
+    'await ledger.requestDrain({ ...drain, callerPubkey: "ab".repeat(32), method: "tempo", payout: {} });',
+    'await ledger.recordTempoDrainPayment(drain);',
+    'assert.deepEqual([(await ledger.getDrain(drain)).provenRefundNative, (await ledger.getDrain(drain)).refundPaymentProven], [null, true]);',
+    'await ledger.recordTempoDrainRefund({ ...drain, refundedNative: 9007199254740993n });',
+    'await ledger.recordTempoDrainRefund({ ...drain, refundedNative: 0n });',
+    'assert.deepEqual([(await ledger.getDrain(drain)).provenRefundNative, (await ledger.getDrain(drain)).refundPaymentProven], ["9007199254740993", true]);',
+    'assert.equal((await ledger.get(credit.creditId)).balanceMicro, 0);',
+  ].join("\n"));
+  execFileSync(process.execPath, [probe], { cwd: consumer, encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 });
 }
 
 /** @param {string} consumer */
@@ -248,7 +290,7 @@ function typecheckConsumer(consumer, resolution) {
     entry,
     [
       `import { configureDVM } from "${manifest.name}";`,
-      `import { readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
+      `import { readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { bindDiagnosticCapabilityAuthority, bindDiagnosticIdentityAuthority, createDiagnosticCapabilityAuthority, type CreditDepositPayload, type CreditDrainPayload, type DiagnosticCapabilityAuthority, type DiagnosticIdentityAuthority, extendDiagnosticIdentityAuthority, readX402ChannelGuardFacts, tempoChallengeAmountMicro, type StoredX402ChannelMetadata, readCompletedCreditHistory, type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage, type CompletedCreditHistoryRecord, type CompletedRefundHistoryRecord, type ExpiredCreditLossHistoryRecord, toLockPubkey } from "${manifest.name}/internal";`,
       "",
@@ -284,6 +326,18 @@ function typecheckConsumer(consumer, resolution) {
       "export const tempoPaymentProven: boolean | undefined = tempoDecisionResult.drain.refundPaymentProven;",
       "export const rememberTempoPayment: (args: { creditId: string; drainId: string }) => Promise<void> = tempoLedger.recordTempoDrainPayment.bind(tempoLedger);",
       "export const rememberTempoRefund: (args: { creditId: string; drainId: string; refundedNative: string | bigint }) => Promise<void> = tempoLedger.recordTempoDrainRefund.bind(tempoLedger);",
+      "export declare const memoryTempoLedger: MemoryCreditLedger;",
+      "export const rememberMemoryTempoPayment: (args: { creditId: string; drainId: string }) => Promise<void> = memoryTempoLedger.recordTempoDrainPayment.bind(memoryTempoLedger);",
+      "export const rememberMemoryTempoRefund: (args: { creditId: string; drainId: string; refundedNative: string | bigint }) => Promise<void> = memoryTempoLedger.recordTempoDrainRefund.bind(memoryTempoLedger);",
+      "export const tempoLossVersion: 1 = tempoLedger.tempoCreditLossEvidenceVersion;",
+      "export const tempoLossPage = tempoLedger.listTempoCreditLosses({ channelId: 'example' }, db);",
+      "export type TempoLoss = Awaited<typeof tempoLossPage>[number];",
+      "export declare const tempoLoss: TempoLoss;",
+      "export const tempoLossRefund: bigint | null | undefined = tempoLoss.refundedToPayerNative;",
+      "export const tempoLossBasis: 'cooperative_close' | 'payer_exit' | 'caller_asserted' | null | undefined = tempoLoss.lossBasis;",
+      "export const tempoLossResidual: bigint | null | undefined = tempoLoss.lossNative;",
+      "export const tempoLossRetire = tempoLedger.terminalizeTempoCredits({ channelId: 'example', settledOnChainNative: 10n, highestVoucherNative: 30n, consumedNative: 10n, closeKind: 'cooperative_close', refundedToPayerNative: 20n });",
+      "export const tempoExitRetire = tempoLedger.terminalizeTempoCredits({ channelId: 'example', settledOnChainNative: 10n, highestVoucherNative: 30n, consumedNative: 10n, closeKind: 'payer_exit' });",
       "export const tempoHeldPage = tempoLedger.listChannelDrains({ limit: 20, createdBeforeMs: 1800000001000, rail: 'tempo', includeWrittenOff: true });",
       "export declare const refundArgs: CreditDrawRefundArgs;",
       "export declare const refundResult: CreditDrawRefundResult;",

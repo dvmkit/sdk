@@ -1,0 +1,14 @@
+{
+  "amounts": {
+    "settled_on_chain_native": "0",
+    "highest_voucher_native": "3000",
+    "refunded_to_payer_native": null,
+    "loss_native": "3000",
+    "loss_basis": "caller_asserted"
+  },
+  "historicalAmounts": {
+    "refunded_to_payer_native": null,
+    "loss_native": null,
+    "loss_basis": null
+  }
+}

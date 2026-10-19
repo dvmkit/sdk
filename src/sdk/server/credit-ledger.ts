@@ -18,6 +18,7 @@ import {
 } from "./credit-lots";
 import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
 import { withSdkInitLock } from "./init-lock";
+import { parseStoreValue } from "./store-json";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import type {
   CreditDepositEnqueue,
@@ -67,6 +68,9 @@ export interface TempoCreditLossEvidence {
   settledOnChainNative: bigint;
   highestVoucherNative: bigint;
   consumedNative: bigint;
+  /** Exact same-close cooperative refund. Omission preserves the caller's loss assertion without proving zero. */
+  refundedToPayerNative?: bigint;
+  closeKind?: "cooperative_close" | "payer_exit";
   observedAt?: number;
 }
 
@@ -80,6 +84,9 @@ export interface TempoCreditLoss {
   highestVoucherNative: bigint;
   consumedServiceMicro: number;
   consumedNative: bigint;
+  refundedToPayerNative?: bigint | null;
+  lossNative?: bigint | null;
+  lossBasis?: "cooperative_close" | "payer_exit" | "caller_asserted" | null;
   observedAt: number;
 }
 
@@ -118,6 +125,7 @@ export class CreditLedger {
    * fleet, so this DVM may advertise credit.
    */
   readonly durable = true;
+  readonly tempoCreditLossEvidenceVersion = 1;
 
   private x402Settlements?: X402RefundSettlementGate;
 
@@ -190,6 +198,10 @@ export class CreditLedger {
         observed_at               BIGINT NOT NULL
       );
     `);
+    await this.pool.query(`ALTER TABLE tempo_credit_losses
+      ADD COLUMN IF NOT EXISTS refunded_to_payer_native BIGINT,
+      ADD COLUMN IF NOT EXISTS loss_native BIGINT,
+      ADD COLUMN IF NOT EXISTS loss_basis TEXT`);
     await this.pool.query(
       `CREATE INDEX IF NOT EXISTS idx_tempo_credit_losses_observed
          ON tempo_credit_losses(observed_at, credit_id);`
@@ -2354,6 +2366,18 @@ export class CreditLedger {
     channelId: string,
     observedAt: number
   ): Promise<TempoCreditLoss[]> {
+    const refunded = evidence.refundedToPayerNative ?? 0n;
+    if (refunded < 0n) throw new Error("Tempo close refund must be nonnegative");
+    const payerExit = evidence.closeKind === "payer_exit";
+    if (payerExit && evidence.refundedToPayerNative !== undefined ||
+      evidence.closeKind === "cooperative_close" && evidence.refundedToPayerNative === undefined) {
+      throw new Error("Tempo close kind requires matching exact cooperative refund evidence");
+    }
+    const lossNative = (payerExit ? evidence.consumedNative : evidence.highestVoucherNative) -
+      evidence.settledOnChainNative - (payerExit ? 0n : refunded);
+    const lossBasis = payerExit ? "payer_exit" : evidence.refundedToPayerNative === undefined
+      ? "caller_asserted" : "cooperative_close";
+    if (lossNative <= 0n) return this.readTempoCreditLosses(q, { channelId });
     const { rows: credits } = await q.query<CreditRow>(
       `SELECT * FROM credits
         WHERE tempo_channel_id = $1
@@ -2374,8 +2398,8 @@ export class CreditLedger {
         `INSERT INTO tempo_credit_losses
            (credit_id, channel_id, caller_pubkey, currency, former_balance_micro,
             settled_on_chain_native, highest_voucher_native, consumed_service_micro,
-            consumed_native, observed_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            consumed_native, observed_at, refunded_to_payer_native, loss_native, loss_basis)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          ON CONFLICT (credit_id) DO NOTHING`,
         [
           credit.credit_id,
@@ -2388,6 +2412,9 @@ export class CreditLedger {
           consumed[0]?.amount ?? "0",
           evidence.consumedNative.toString(),
           observedAt,
+          evidence.refundedToPayerNative?.toString() ?? null,
+          lossNative.toString(),
+          lossBasis,
         ]
       );
       await q.query(`UPDATE credits SET status = 'unbacked' WHERE credit_id = $1`, [
@@ -2397,8 +2424,8 @@ export class CreditLedger {
     return this.readTempoCreditLosses(q, { channelId });
   }
 
-  async listTempoCreditLosses(args?: { limit?: number }): Promise<TempoCreditLoss[]> {
-    return this.readTempoCreditLosses(this.pool, { limit: args?.limit ?? 50 });
+  async listTempoCreditLosses(args?: { limit?: number; channelId?: string }, tx?: CreditLedgerQuerier): Promise<TempoCreditLoss[]> {
+    return this.readTempoCreditLosses(tx ?? this.pool, { limit: args?.limit ?? 50, channelId: args?.channelId?.toLowerCase() });
   }
 
   /**
@@ -3024,7 +3051,13 @@ export class CreditLedger {
           if (!lifecycle.finalized && closeIntent && (closeIntent.forecast_pending !== true || closeIntent.settled_before_close != null || reference && /^0x[0-9a-fA-F]{64}$/.test(reference))) {
             throw new CreditLedgerError("tempo_drain_close_pending", "The close may still pay. Reconcile its final outcome before releasing this drain.");
           }
-          if (row.refund_payment_proven || row.proven_refund_native !== null && BigInt(row.proven_refund_native) > 0n) {
+          const channel = await tx.query<{ state_json: string }>(
+            "SELECT state_json FROM mpp_tempo_channels WHERE channel_key=$1", [channelId]);
+          const state = channel.rows[0] && parseStoreValue(channel.rows[0].state_json) as
+            { tempoDrainPaymentObservation?: { creditId?: unknown; drainId?: unknown } } | undefined;
+          const observation = state?.tempoDrainPaymentObservation;
+          const paymentObserved = observation?.creditId === args.creditId && observation.drainId === args.drainId;
+          if (paymentObserved || row.refund_payment_proven || row.proven_refund_native !== null && BigInt(row.proven_refund_native) > 0n) {
             throw new CreditLedgerError("tempo_drain_refund_paid", "A positive refund is already proven. Verify return of the full held amount, including any remainder, then book it as refunded; never release it as unpaid.");
           }
           if (row.hold_reason === "refund_short" && row.proven_refund_native === null) {
@@ -3619,6 +3652,8 @@ export interface CreditLedgerLike {
    * would get `credit_not_found`, so advertising credit there misadvertises.
    */
   readonly durable: boolean;
+  /** Close-aware loss arithmetic, truthful refund evidence, atomic mutation, and transaction-aware loss reads. */
+  readonly tempoCreditLossEvidenceVersion?: 1;
   /**
    * Bind the durable x402 settlement state spending is gated on.
    *
@@ -3812,7 +3847,7 @@ export interface CreditLedgerLike {
     evidence: TempoCreditLossEvidence,
     tx?: CreditLedgerQuerier
   ): Promise<TempoCreditLoss[]>;
-  listTempoCreditLosses(args?: { limit?: number }): Promise<TempoCreditLoss[]>;
+  listTempoCreditLosses(args?: { limit?: number; channelId?: string }, tx?: CreditLedgerQuerier): Promise<TempoCreditLoss[]>;
   terminalizeX402Credit(
     evidence: X402CreditLossEvidence,
     tx?: CreditLedgerQuerier
@@ -4833,6 +4868,9 @@ interface CreditExpiryReleaseRow {
 }
 
 interface TempoCreditLossRow {
+  refunded_to_payer_native: string | null;
+  loss_native: string | null;
+  loss_basis: string | null;
   credit_id: string;
   channel_id: string;
   caller_pubkey: string;
@@ -5109,6 +5147,10 @@ function tempoCreditLossFromRow(row: TempoCreditLossRow): TempoCreditLoss {
     highestVoucherNative: BigInt(row.highest_voucher_native),
     consumedServiceMicro: toSafeInt(row.consumed_service_micro),
     consumedNative: BigInt(row.consumed_native),
+    refundedToPayerNative: row.refunded_to_payer_native === null ? null : BigInt(row.refunded_to_payer_native),
+    lossNative: row.loss_native === null ? null : BigInt(row.loss_native),
+    lossBasis: row.loss_basis === "cooperative_close" || row.loss_basis === "payer_exit" || row.loss_basis === "caller_asserted"
+      ? row.loss_basis : null,
     observedAt: toSafeInt(row.observed_at),
   };
 }

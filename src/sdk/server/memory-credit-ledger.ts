@@ -79,6 +79,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
    * machine and drawing on another would `credit_not_found`.
    */
   readonly durable = false;
+  readonly tempoCreditLossEvidenceVersion = 1;
 
   private readonly credits = new Map<string, MemoryCredit>();
   private readonly refunds = new Map<string, { request: string; result: CreditDrawRefundResult }>();
@@ -1004,6 +1005,18 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     return run(() => {
       const channelId = evidence.channelId.toLowerCase();
       const observedAt = evidence.observedAt ?? Date.now();
+      const refunded = evidence.refundedToPayerNative ?? 0n;
+      if (refunded < 0n) throw new Error("Tempo close refund must be nonnegative");
+      const payerExit = evidence.closeKind === "payer_exit";
+      if (payerExit && evidence.refundedToPayerNative !== undefined ||
+        evidence.closeKind === "cooperative_close" && evidence.refundedToPayerNative === undefined) {
+        throw new Error("Tempo close kind requires matching exact cooperative refund evidence");
+      }
+      const lossNative = (payerExit ? evidence.consumedNative : evidence.highestVoucherNative) -
+        evidence.settledOnChainNative - (payerExit ? 0n : refunded);
+      const lossBasis = payerExit ? "payer_exit" : evidence.refundedToPayerNative === undefined
+        ? "caller_asserted" : "cooperative_close";
+      if (lossNative <= 0n) return [...this.tempoLosses.values()].filter((loss) => loss.channelId === channelId);
       for (const credit of this.credits.values()) {
         if (credit.tempoChannelId !== channelId) continue;
         if (credit.status === "unbacked") continue;
@@ -1020,6 +1033,9 @@ export class MemoryCreditLedger implements CreditLedgerLike {
           highestVoucherNative: evidence.highestVoucherNative,
           consumedServiceMicro,
           consumedNative: evidence.consumedNative,
+          refundedToPayerNative: evidence.refundedToPayerNative ?? null,
+          lossNative,
+          lossBasis,
           observedAt,
         });
         credit.status = "unbacked";
@@ -1028,9 +1044,10 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     });
   }
 
-  listTempoCreditLosses(args?: { limit?: number }): Promise<TempoCreditLoss[]> {
+  listTempoCreditLosses(args?: { limit?: number; channelId?: string }, _tx?: CreditLedgerQuerier): Promise<TempoCreditLoss[]> {
     return Promise.resolve(
       [...this.tempoLosses.values()]
+        .filter(loss => !args?.channelId || loss.channelId === args.channelId.toLowerCase())
         .sort((a, b) => b.observedAt - a.observedAt || a.creditId.localeCompare(b.creditId))
         .slice(0, args?.limit ?? 50)
     );
@@ -1198,6 +1215,8 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         releasedAt: null,
         writeOffNote: null,
         writtenOffAt: null,
+        provenRefundNative: null,
+        refundPaymentProven: false,
       };
       applyLotDebits(credit, drain.lotDebits, -1);
       credit.drains.set(args.drainId, drain);
@@ -1386,6 +1405,29 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       }
       drain.status = "exit_required";
       return { drain: drainRecord(drain, credit), replayed: false };
+    });
+  }
+
+  recordTempoDrainRefund(args: { creditId: string; drainId: string; refundedNative: string | bigint }): Promise<void> {
+    const amount = String(args.refundedNative);
+    if (!/^\d{1,78}$/.test(amount)) return Promise.reject(new CreditLedgerError("invalid_basis", "Tempo refund evidence must be a bounded non-negative integer."));
+    return this.recordTempoDrainRefundEvidence(args, amount);
+  }
+
+  recordTempoDrainPayment(args: { creditId: string; drainId: string }): Promise<void> {
+    return this.recordTempoDrainRefundEvidence(args, null);
+  }
+
+  private recordTempoDrainRefundEvidence(args: { creditId: string; drainId: string }, amount: string | null): Promise<void> {
+    return run(() => {
+      const credit = this.credits.get(args.creditId);
+      const drain = credit?.drains.get(args.drainId);
+      if (!credit?.tempoChannelId || !drain || drain.method !== "tempo" ||
+        (drain.status !== "pending" && drain.status !== "exit_required")) return;
+      if (amount !== null && (drain.provenRefundNative === null || BigInt(amount) > BigInt(drain.provenRefundNative))) {
+        drain.provenRefundNative = amount;
+      }
+      drain.refundPaymentProven ||= amount === null || BigInt(amount) > 0n;
     });
   }
 
@@ -1677,6 +1719,8 @@ interface MemoryDrain {
   releasedAt: number | null;
   writeOffNote: string | null;
   writtenOffAt: number | null;
+  provenRefundNative: string | null;
+  refundPaymentProven: boolean;
 }
 
 interface MemoryDraw {
@@ -1875,6 +1919,8 @@ function drainRecord(drain: MemoryDrain, credit: MemoryCredit): CreditDrainRecor
     releasedAt: drain.releasedAt,
     writeOffNote: drain.writeOffNote,
     writtenOffAt: drain.writtenOffAt,
+    provenRefundNative: drain.provenRefundNative,
+    refundPaymentProven: drain.refundPaymentProven,
   };
 }
 
