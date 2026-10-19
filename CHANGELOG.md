@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## Upgrade details
+
+The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
 
 - Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
 
@@ -12,11 +14,22 @@
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
-## [0.11.0-rc.1](https://github.com/dvmkit/sdk/compare/v1.0.0-rc.1...v0.11.0-rc.1) (2026-10-19)
+## [0.11.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.10.1...v0.11.0-rc.1) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* Custom CreditLedgerLike stores must implement transactional refundDraw accounting and report enqueueing.
+
+### Features
+
+* add operator decisions for held Tempo drains ([c0e1841](https://github.com/dvmkit/sdk/commit/c0e18418df914c13633a485c8abe01621c15a3b8))
+* support completed credit draw refunds ([ffd3334](https://github.com/dvmkit/sdk/commit/ffd3334101a1b9f9792a87b0b29b251906f987bd))
 
 
 ### Bug Fixes
 
+* classify finalized Tempo backing loss from close evidence ([c5b17f3](https://github.com/dvmkit/sdk/commit/c5b17f3fb2ba27dc6ab62ee9b050f8082482460d))
 * keep pre-1.0 releases on the development line ([aa0d33d](https://github.com/dvmkit/sdk/commit/aa0d33df14a3fdbcf70b8516a168df0e2dd2eb85))
 
 ## [1.0.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.10.1...v1.0.0-rc.1) (2026-10-19) — withdrawn, unpublished
