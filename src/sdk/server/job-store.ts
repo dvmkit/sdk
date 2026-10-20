@@ -224,6 +224,8 @@ export interface JobRecord {
  * the caller's own words to `ctx.signal.reason` and the `onCancel` hook.
  */
 export interface JobCounters {
+  /** The latest durable payment request was satisfied by a balance authorization. */
+  balancePaymentSatisfied?: boolean;
   status: JobStatus;
   paidMsats: number;
   pendingPaymentMsats?: number;

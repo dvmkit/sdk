@@ -34,6 +34,18 @@ describe("an unresolved x402 refund gates its credit", () => {
     );
   });
 
+  it.each(["submitting", "settled", "written_off"] as const)("refuses fresh balance growth through a %s refund but permits accepted rail growth", async (status) => {
+    const ledger = new MemoryCreditLedger();
+    await seed(ledger);
+    await ledger.draw({ creditId: CREDIT_ID, drawId: "existing", amountMicro: 10_000 });
+    ledger.useX402SettlementGate(gate(status));
+    await expectCode(ledger.growDraw({ creditId: CREDIT_ID, drawId: "existing", addAmountMicro: 1_000,
+      spendExistingBalance: true }), "settlement_pending");
+    expect((await ledger.getDraw({ creditId: CREDIT_ID, drawId: "existing" }))?.amountMicro).toBe(10_000);
+    await ledger.growDraw({ creditId: CREDIT_ID, drawId: "existing", addAmountMicro: 1_000 });
+    expect((await ledger.getDraw({ creditId: CREDIT_ID, drawId: "existing" }))?.amountMicro).toBe(11_000);
+  });
+
   it("still replays a draw placed before the wedge", async () => {
     const ledger = new MemoryCreditLedger();
     await seed(ledger);

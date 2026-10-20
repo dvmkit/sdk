@@ -221,8 +221,11 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     return this.blockingX402Refund(this.credits.get(creditId)?.x402ChannelId, statuses);
   }
 
-  growDraw(args: Parameters<CreditLedgerLike["growDraw"]>[0]): Promise<GrownDrawResult> {
-    return run(() => this.growDrawSync(args));
+  async growDraw(args: Parameters<CreditLedgerLike["growDraw"]>[0]): Promise<GrownDrawResult> {
+    const blocking = args.spendExistingBalance
+      ? await this.blockingRefundForCredit(args.creditId, X402_SPEND_BLOCKING_SETTLEMENT_STATUSES)
+      : undefined;
+    return run(() => this.growDrawSync(args, blocking));
   }
 
   settle(args: Parameters<CreditLedgerLike["settle"]>[0]): Promise<DrawResolution> {
@@ -820,7 +823,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     return { ...drawResult(draw, credit), replayed: false };
   }
 
-  private growDrawSync(args: Parameters<CreditLedgerLike["growDraw"]>[0]): GrownDrawResult {
+  private growDrawSync(args: Parameters<CreditLedgerLike["growDraw"]>[0], x402Refund?: X402UnresolvedRefund): GrownDrawResult {
     assertAmount(args.addAmountMicro, { min: 1 });
     const credit = this.requireCredit(args.creditId);
     const draw = credit.draws.get(args.drawId);
@@ -844,6 +847,16 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         `draw ${args.drawId} on credit ${args.creditId} belongs to a different job`,
         { expectedJobId: draw.jobId }
       );
+    }
+    if (args.spendExistingBalance) {
+      if (credit.expiryMs <= (args.nowMs ?? Date.now())) {
+        throw new CreditLedgerError("credit_expired", `credit ${args.creditId} expired`, {
+          expiryMs: credit.expiryMs, balanceMicro: credit.balanceMicro,
+        });
+      }
+      if (x402Refund) throw x402SettlementPending(args.creditId, x402Refund);
+      // Memory has no durable Tempo lifecycle to prove this channel is spendable.
+      if (credit.tempoChannelId) throw new CreditLedgerError("tempo_channel_closing", "Tempo balance growth requires a durable channel lifecycle");
     }
     const pending = pendingSums(credit);
     const available = credit.balanceMicro - pending.micro;

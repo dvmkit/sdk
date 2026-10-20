@@ -1,3 +1,4 @@
+import { BalancePaymentError, commitBalancePayment } from "./balance-payment";
 import { completeTempoChannelDrain } from "./tempo-drain-leg";
 import { installAdminContentRoutes } from "./admin-content";
 import { contentMetadata, isContentHoldStore } from "./content-retention";
@@ -2192,6 +2193,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     };
   }
 
+  private balancePaymentSupported(includeDisabled = false): boolean {
+    return (includeDisabled || this.opts.env.DVMKIT_BALANCE_PAYMENTS !== "false") && !!this.descriptor.credit && !!this.opts.db && this.creditLedger instanceof CreditLedger &&
+      this.jobManager.store instanceof PostgresJobStore && !!this.authAudience && !!this.descriptor.auth;
+  }
+
   /**
    * Assemble this DVM's funding menu for a response denominated in
    * `currency`. All the refusal logic — including the credits-spec
@@ -2208,7 +2214,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // have been attempted before the menu is built rather than after.
     await this.ensureTempoSessionHealth();
     const mppSplit = this.creditMppSplit();
-    return buildCreditMenu({
+    const menu = await buildCreditMenu({
       runtime: "container",
       config: this.descriptor.credit,
       currency,
@@ -2227,6 +2233,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       devMode: this.opts.devMode,
       callerPubkey,
     });
+    if (menu && this.balancePaymentSupported()) menu.balance_payment = true;
+    return menu;
   }
 
   private async handleCredit(c: Context<AppEnv>): Promise<Response> {
@@ -4226,6 +4234,54 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const id = c.req.param("id") ?? "";
     const jm = this.jobManager;
     const activeJob = jm.activeJobs.get(id);
+    const wire = await c.req.raw.clone().json().catch(() => undefined) as
+      { type?: string; content?: Record<string, unknown> } | undefined;
+    if (wire?.type === "payment" && wire.content && typeof wire.content === "object" && "credit" in wire.content) {
+      const record = await jm.store.get(id);
+      if (!record || !isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
+      if (Object.keys(wire.content).some((key) => key !== "credit")) {
+        return c.json({ error: "invalid_message", message: "Credit authorization cannot be combined with a rail payment" }, 400);
+      }
+      if (!this.balancePaymentSupported(true) || !this.opts.db || !this.descriptor.auth ||
+          !(this.creditLedger instanceof CreditLedger)) {
+        return c.json({ error: "balance_payment_unavailable" }, 409);
+      }
+      try {
+        const result = await commitBalancePayment({ pool: this.opts.db, ledger: this.creditLedger,
+          auth: this.descriptor.auth, domain: this.signedRequestDomain(c, null), jobId: id,
+          dvmId: this.opts.dvmId ?? "", raw: wire.content.credit,
+          allowFresh: this.opts.env.DVMKIT_BALANCE_PAYMENTS !== "false" });
+        try {
+          // Wake the existing claim/resume owner. A COMMIT acknowledgement may
+          // arrive after NOTIFY has already advanced the handler to another ask.
+          await this.opts.db.query("SELECT pg_notify('job_messages', $1)", [id]);
+          if (!activeJob) {
+            const fresh = await jm.store.get(id);
+            if (fresh?.status === "awaiting-input" && isStreamableJobStore(jm.store)) {
+              fresh.messages = await jm.store.getMessages(id, 0);
+              fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
+              const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
+              const authorized = wire.content.credit as { request_seq: number };
+              if (ask?.seq === authorized.request_seq && !jm.activeJobs.has(id)) {
+                const { job } = jm.reactivateJob(fresh);
+                const lock = await jm.store.tryReactivationLock(id, () =>
+                  this.runReactivation(jm, job, { type: "payment", content: wire.content! }, fresh.status));
+                if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
+              }
+            }
+          }
+        } catch {
+          // The accepted outcome is durable. A progress failure must never ask
+          // the caller to spend again; a non-payment resume can recover it.
+          diagnosticConsole.error({ level: "balance_payment_resume_unavailable", job_id: id });
+        }
+        return c.json(result.response, 201);
+      } catch (error) {
+        if (error instanceof SignedRequestError) return buildAuthErrorResponse(c, error, this.publicOrigin);
+        if (error instanceof BalancePaymentError) return c.json(error.body, error.status);
+        throw error;
+      }
+    }
 
     if (activeJob) {
       if (!isJobOwner(c, activeJob)) return c.json({ error: "Job not found" }, 404);
@@ -4322,6 +4378,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     const contentErr = validateMessageContent(body.type, body.content, this.opts.devMode === true);
     if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
+
+    if (isStreamableJobStore(jm.store)) {
+      record.messages = await jm.store.getMessages(id, 0);
+      record.seq = Math.max(record.seq, ...record.messages.map((message) => message.seq));
+    }
 
     // Credit is committed before handler dispatch. Reactivation re-verifies persisted
     // auth without drift/replay checks; failed verification terminally refuses the job.
@@ -4461,6 +4522,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     priorStatus: JobRecord["status"]
   ): Promise<void> {
     if (priorStatus === "awaiting-input") {
+      // A concurrent inbound may have replaced this recovery scaffold while
+      // the advisory lock was acquired. Never borrow that scaffold's ask.
+      if (jm.activeJobs.get(job.id) !== job) {
+        this.teardownReactivationScaffold(jm, job);
+        return;
+      }
       // A live suspended handler may claim processing after the payment notification.
       // Wait a bounded grace period and replay only after winning the durable claim,
       // preventing duplicate handler execution and conflicting snapshots.
@@ -4497,9 +4564,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    * must not persist our stale snapshot; clearing the appender prevents that.
    */
   private teardownReactivationScaffold(jm: JobManager<State, InputSchema>, job: ServerJob): void {
-    jm.clearIdleTimer(job.id);
-    jm.unwatchDurableStatus(job.id);
-    jm.activeJobs.delete(job.id);
+    if (jm.activeJobs.get(job.id) === job) {
+      jm.clearIdleTimer(job.id);
+      jm.unwatchDurableStatus(job.id);
+      jm.activeJobs.delete(job.id);
+    }
     job.messageAppender = undefined;
   }
 

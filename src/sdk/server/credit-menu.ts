@@ -11,6 +11,8 @@ import { isNonChannelBitcoinRail } from "./credit-lots";
  * whitelists this shape so later caller-specific menu fields cannot leak into /v1/info.
  */
 export interface CreditTerms {
+  /** Signed balance payments on the job messages endpoint are supported. */
+  balance_payment?: true;
   /** Smallest funding accepted, in 1e-6 units of `currency`. */
   min_micro: number;
   /** Largest residual balance a caller may hold, in 1e-6 units of `currency`. */
@@ -305,6 +307,7 @@ export function attachCreditMenu(
  */
 export function toCreditTerms(menu: CreditMenu): CreditTerms {
   return {
+    ...(menu.balance_payment && { balance_payment: true }),
     min_micro: menu.min_micro,
     max_micro: menu.max_micro,
     ttl_ms: menu.ttl_ms,

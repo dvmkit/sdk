@@ -24263,6 +24263,38 @@
       "dependencies": []
     },
     {
+      "module": "src/sdk/server/balance-payment.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Signed balance authorizations and atomic job, draw, inbound and replay accounting used by the supported Postgres host.",
+          "symbols": [
+            "BALANCE_PAYMENT_SCHEMA",
+            "BalancePaymentError",
+            "commitBalancePayment"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/signed-request-statement.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/funding.ts"
+        },
+        {
+          "module": "src/sdk/server/secp256k1-auth.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/server/credit-draw-refund.ts",
       "allocations": [
         {

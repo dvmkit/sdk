@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "discovery": {
+    "credit": {
+      "balance_payment": true
+    }
+  },
+  "request": {
+    "seq": 4,
+    "from": "provider",
+    "timestamp": 1700000000,
+    "type": "payment-request",
+    "content": {
+      "amount_msats": 1500,
+      "reason": "Additional work",
+      "credit": {
+        "amount_micro": 1500,
+        "currency": "usd"
+      }
+    }
+  },
+  "domain": {
+    "audience": {
+      "dvm_id": "example-dvm",
+      "builder_pubkey": "abababababababababababababababababababababababababababababababab"
+    },
+    "method": "POST",
+    "path": "/v1/job/example-job/messages",
+    "capability": null
+  },
+  "payment": {
+    "type": "payment",
+    "content": {
+      "credit": {
+        "pubkey": "6360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
+        "timestamp": 1700000000,
+        "nonce": "balance-fixture-nonce",
+        "credit_id": "example-credit",
+        "draw_id": "example-draw",
+        "payment_id": "example-payment",
+        "request_seq": 4,
+        "amount_micro": 1500,
+        "currency": "usd",
+        "auth_statement": {
+          "v": 2,
+          "protocol": "dvmkit",
+          "protocol_version": 1,
+          "auth": "secp256k1-schnorr-v2",
+          "audience": {
+            "dvm_id": "example-dvm",
+            "builder_pubkey": "abababababababababababababababababababababababababababababababab"
+          },
+          "method": "POST",
+          "path": "/v1/job/example-job/messages",
+          "capability": null
+        },
+        "signature": "2af5d806d10caa5123f5d16194f440f89b404c52191da1efc3d60265c8b8263d76bc888416e2d277c22d4cbb261a2aca1742e289b61f1a231e4ebe30fe78e2a1"
+      }
+    }
+  },
+  "canonical_utf8": "{\"audience\":{\"builder_pubkey\":\"abababababababababababababababababababababababababababababababab\",\"dvm_id\":\"example-dvm\"},\"auth\":\"secp256k1-schnorr-v2\",\"capability\":null,\"input\":{\"amount_micro\":1500,\"credit_id\":\"example-credit\",\"currency\":\"usd\",\"draw_id\":\"example-draw\",\"nonce\":\"balance-fixture-nonce\",\"payment_id\":\"example-payment\",\"pubkey\":\"6360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\",\"request_seq\":4,\"timestamp\":1700000000},\"method\":\"POST\",\"path\":\"/v1/job/example-job/messages\",\"protocol\":\"dvmkit\",\"protocol_version\":1,\"v\":2}",
+  "success": {
+    "status": 201,
+    "body": {
+      "seq": 5
+    }
+  },
+  "insufficient": {
+    "status": 402,
+    "body": {
+      "error": "insufficient_credit",
+      "remaining_micro": 1000,
+      "shortfall_micro": 500
+    }
+  },
+  "conflict": {
+    "status": 409,
+    "body": {
+      "error": "credit_payment_conflict"
+    }
+  }
+}

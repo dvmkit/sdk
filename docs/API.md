@@ -57,7 +57,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `JobStore` | interface | Exported declaration from the built public entry point. |
 | `KVStore` | interface | Persistent cross-job key-value storage scoped to the DVM. |
 | `Logger` | interface | Exported declaration from the built public entry point. |
-| `PaymentContent` | interface | Requester sends payment proof, or provider sends change/refund. |
+| `PaymentContent` | interface | Requester sends a rail proof or signed balance authorization; provider sends change/refund. |
 | `PaymentMethod` | type | Exported declaration from the built public entry point. |
 | `PinnedFetch` | interface | A `fetch`-compatible function pinned to a single pre-validated IP address. |
 | `PlatformFxSource` | interface | Platform-served fx source. |
