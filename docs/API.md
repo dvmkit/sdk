@@ -28,7 +28,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `Currency` | type | Currency-code identifier used throughout the SDK's pricing surface. |
 | `DEFAULT_CREDIT_MAX` | value | Platform default for CreditConfig.max — the largest residual balance a caller may hold. |
 | `DEFAULT_CREDIT_MIN` | value | Platform default for CreditConfig.min — a dust floor below which rail fees dominate. |
-| `DEFAULT_CREDIT_TTL_SECONDS` | value | Platform default for CreditConfig.ttl: 30 days. |
+| `DEFAULT_CREDIT_TTL_SECONDS` | value | Platform default for CreditConfig.ttl: 90 days. |
 | `DEFAULT_FX_CURRENCIES` | value | Default fiat set the bundled fx fetcher resolves against BTC. |
 | `DEFAULT_FX_RATE_SOURCE` | value | Default fx-rate source. |
 | `DEFAULT_JOB_RETENTION_DAYS` | value | Default lifetime of caller-controlled job content before it is redacted. |
@@ -187,7 +187,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `HostingControlCommand` | interface | Exported declaration from the built public entry point. |
 | `HostingControlConfig` | interface | Exported declaration from the built public entry point. |
 | `HostingControlStatus` | interface | Exported declaration from the built public entry point. |
-| `IMPLICIT_CREDIT_TTL_MS` | value | Lifetime of a per-call implicit credit before the ledger refuses new draws. |
+| `IMPLICIT_CREDIT_TTL_MS` | value | Default lifetime of a per-call implicit credit: 90 days before the ledger refuses new draws. |
 | `InitLockPool` | type | Pool-shaped handle the lock needs — `connect`, since the lock and the unlock must ride one pinned client, plus `pg`'s resolved config when it's there (a hand-rolled pool shape won't have it) so the size check below can run. |
 | `installAdminContentRoutes` | function | Exported declaration from the built public entry point. |
 | `InstallAdminContentRoutesOpts` | interface | Exported declaration from the built public entry point. |

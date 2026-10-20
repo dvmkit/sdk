@@ -1061,8 +1061,7 @@ async function handleReconcileInvoice(
     paidMsats: invoice.amountMsats,
     fundingRef: invoice.paymentHash,
   };
-  // `fund` overwrites expiry on top-up, so preserve any longer life already
-  // present on the target credit.
+  // Preserve the longer life in the report as well as on the target credit.
   const expiryMs = Math.max(nowMs + opts.creditTtlMs(), existing?.expiryMs ?? 0);
   try {
     const result = await opts.ledger.reconcileBlockedInvoice({

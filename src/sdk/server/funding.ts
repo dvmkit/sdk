@@ -23,7 +23,7 @@ export interface PriceFiat {
   amountMicro: number;
 }
 
-/** Implicit per-call credits expire after 30 days by default. */
+/** Implicit per-call credits expire after 90 days by default. */
 export { IMPLICIT_CREDIT_TTL_MS };
 
 /**

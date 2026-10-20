@@ -50,6 +50,7 @@ describe("prepaid credit on /v1/info", () => {
     expect(body.credit).toMatchObject({
       min_micro: 100_000,
       max_micro: 5_000_000,
+      ttl_ms: 7_776_000_000,
       currency: "usd",
       funding: ["cashu"],
     });

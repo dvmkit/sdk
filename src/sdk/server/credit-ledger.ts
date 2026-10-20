@@ -597,8 +597,8 @@ export class CreditLedger {
   }
 
   /**
-   * Funding adds balance and overwrites expiry, reviving an expired credit. It is additive,
-   * not idempotent: the caller’s rail marker or funding record must prevent replay. Owner and
+   * Funding adds balance and extends expiry without shortening it, reviving an expired credit.
+   * It is additive, not idempotent: the caller’s rail marker or funding record must prevent replay. Owner and
    * currency must match; rail and reusable-channel bindings cannot be mixed with other
    * instruments. A legacy NULL rail adopts its first typed top-up.
    *
@@ -685,7 +685,7 @@ export class CreditLedger {
        ON CONFLICT (credit_id) DO UPDATE
          SET balance_micro    = credits.balance_micro + EXCLUDED.balance_micro,
              last_funding_ledger_seq = credits.last_ledger_seq,
-             expiry_ms        = EXCLUDED.expiry_ms,
+             expiry_ms        = GREATEST(credits.expiry_ms, EXCLUDED.expiry_ms),
              rail             = COALESCE(credits.rail, EXCLUDED.rail),
              native_asset     = COALESCE(EXCLUDED.native_asset, credits.native_asset),
              mint             = COALESCE(EXCLUDED.mint, credits.mint),
@@ -1984,7 +1984,10 @@ export class CreditLedger {
         [args.creditId, args.fundId, settledAt]
       );
       if (args.depositOutbox) {
-        await args.depositOutbox.enqueue(client, args.depositOutbox.payload);
+        await args.depositOutbox.enqueue(client, {
+          ...args.depositOutbox.payload,
+          expiryMs: credit.expiryMs,
+        });
       }
       await client.query("COMMIT");
       return {
@@ -2196,7 +2199,10 @@ export class CreditLedger {
         ]
       );
       if (args.depositOutbox) {
-        await args.depositOutbox.enqueue(client, args.depositOutbox.payload);
+        await args.depositOutbox.enqueue(client, {
+          ...args.depositOutbox.payload,
+          expiryMs: credit.expiryMs,
+        });
       }
       await client.query("COMMIT");
       return {
@@ -5309,7 +5315,7 @@ const DEFAULT_EXPIRY_SWEEP_LIMIT = 200;
 
 /**
  * Key each expiry episode by expiryMs plus a sequence counted under the credit lock. fund
- * accepts the provided expiry verbatim, so a revival can reuse the same instant; expiry alone
+ * can retain the existing expiry, so a revival can reuse the same instant; expiry alone
  * would collide with its reversed release and suppress the next episode.
  */
 function expiryReleaseId(expiryMs: number, seq: number): string {

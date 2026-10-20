@@ -695,7 +695,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       // Postgres upsert reaches its channel unique index.
       existing.lastFundingLedgerSeq = existing.lastLedgerSeq;
       existing.balanceMicro += args.amountMicro;
-      existing.expiryMs = args.expiryMs;
+      existing.expiryMs = Math.max(existing.expiryMs, args.expiryMs);
       applyBasis(existing, b);
       recordLot(existing, args.amountMicro, b, nowMs);
       return this.snapshot(existing, nowMs);

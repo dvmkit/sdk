@@ -1,6 +1,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import type { ResolvedCreditConfig } from "../../types";
 import { buildCreditMenu, selectPrimaryCredit } from "../credit-menu";
@@ -45,6 +46,14 @@ function args(overrides: Partial<Parameters<typeof buildCreditMenu>[0]> = {}) {
 }
 
 describe("credit menu assembly", () => {
+  it("advertises 90 days when the builder omits credit.ttl", async () => {
+    const descriptor = configureDVM({
+      name: "credit-defaults", credit: { min: "$0.10", max: "$5.00" }, onJob(ctx) { ctx.complete("done"); },
+    });
+    const menu = await buildCreditMenu(args({ config: descriptor.credit! }));
+    expect(menu?.ttl_ms).toBe(7_776_000_000);
+  });
+
   it("advertises the configured bounds in the quote's currency", async () => {
     const menu = await buildCreditMenu(args());
     expect(menu).toEqual({

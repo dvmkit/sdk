@@ -4,7 +4,7 @@ import type { CreditFundingBasis, CreditLedgerLike } from "../../credit-ledger.j
 import { TEST_FUNDING_BASIS } from "./credit-fixtures.js";
 
 /**
- * Register the collection-read contract every shipping `CreditLedgerLike`
+ * Register the funding-expiry and collection-read contracts every shipping `CreditLedgerLike`
  * implementation must satisfy.
  *
  * Each case creates its state through the public interface. The factory may
@@ -14,6 +14,34 @@ import { TEST_FUNDING_BASIS } from "./credit-fixtures.js";
 export function describeCreditLedgerConformance(
   makeLedger: () => CreditLedgerLike | Promise<CreditLedgerLike>
 ): void {
+  describe("CreditLedgerLike funding-expiry conformance", () => {
+    it("retains a persisted 30-day expiry until top-up and never shortens a longer expiry", async () => {
+      const ledger = await makeLedger();
+      const funding = {
+        creditId: "contract-expiry",
+        callerPubkey: CALLER_A,
+        currency: "usd",
+        amountMicro: 100_000,
+        basis: TEST_FUNDING_BASIS,
+      };
+      await ledger.fund({ ...funding, expiryMs: 2_592_001_000, nowMs: 1_000 });
+
+      expect(await ledger.get(funding.creditId, { nowMs: 2_678_401_000 })).toMatchObject({
+        expiryMs: 2_592_001_000,
+        expired: true,
+      });
+      await expect(ledger.draw({ creditId: funding.creditId, drawId: "expired-draw",
+        amountMicro: 1, nowMs: 2_678_401_000 })).rejects.toMatchObject({ code: "credit_expired" });
+
+      expect(await ledger.fund({ ...funding, expiryMs: 10_454_401_000, nowMs: 2_678_401_000 }))
+        .toMatchObject({ expiryMs: 10_454_401_000, expired: false, balanceMicro: 200_000 });
+      expect(await ledger.fund({ ...funding, expiryMs: 5_270_401_000, nowMs: 2_678_401_000 }))
+        .toMatchObject({ expiryMs: 10_454_401_000, balanceMicro: 300_000 });
+      expect((await ledger.get(funding.creditId, { nowMs: 2_678_401_000 }))?.expiryMs)
+        .toBe(10_454_401_000);
+    });
+  });
+
   describe("CreditLedgerLike collection-read conformance", () => {
     it("filters pending invoices by caller, status, credit, and limit", async () => {
       const ledger = await makeLedger();
