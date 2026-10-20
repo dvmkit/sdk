@@ -34,6 +34,30 @@ async function fund(ledger: MemoryCreditLedger, amountMicro: number, expiryMs = 
 describe("MemoryCreditLedger", () => {
   describeCreditLedgerConformance(make);
 
+  it("refuses fresh balance growth after expiry while preserving accepted rail growth", async () => {
+    const ledger = make();
+    const credit = await fund(ledger, 10_000, 2_000);
+    await ledger.draw({ creditId: credit.creditId, drawId: "draw", amountMicro: 2_000, nowMs: 1_000 });
+    await expectCode(ledger.growDraw({ creditId: credit.creditId, drawId: "draw", addAmountMicro: 1_000,
+      spendExistingBalance: true, nowMs: 3_000 }), "credit_expired");
+    expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.amountMicro).toBe(2_000);
+    await ledger.growDraw({ creditId: credit.creditId, drawId: "draw", addAmountMicro: 1_000, nowMs: 3_000 });
+    expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.amountMicro).toBe(3_000);
+  });
+
+  it("requires a durable Tempo lifecycle for fresh balance growth without blocking accepted rail growth", async () => {
+    const ledger = make();
+    const credit = await ledger.fund({ callerPubkey: CALLER, currency: "usd", amountMicro: 10_000,
+      expiryMs: FUTURE_MS, basis: { rail: "tempo", paidMsats: 1, nativeAmount: 10_000,
+        nativeAsset: "pathUSD", tempoSession: { channelId: `0x${"92".repeat(32)}`, cumulativeAmount: "10000" } } });
+    await ledger.draw({ creditId: credit.creditId, drawId: "draw", amountMicro: 2_000 });
+    await expectCode(ledger.growDraw({ creditId: credit.creditId, drawId: "draw", addAmountMicro: 1_000,
+      spendExistingBalance: true }), "tempo_channel_closing");
+    expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.amountMicro).toBe(2_000);
+    await ledger.growDraw({ creditId: credit.creditId, drawId: "draw", addAmountMicro: 1_000 });
+    expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.amountMicro).toBe(3_000);
+  });
+
   it("terminalizes every credit whose Tempo backing finalized below its accepted voucher", async () => {
     const ledger = make();
     const channelId = `0x${"91".repeat(32)}`;

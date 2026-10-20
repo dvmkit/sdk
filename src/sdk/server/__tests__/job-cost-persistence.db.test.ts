@@ -449,9 +449,9 @@ describe.skipIf(!RUN)("per-job cost persistence", () => {
         `EXPLAIN (FORMAT JSON) ${text}`,
         values
       );
-      // Every relation access must go through the backlog index. A drifted
-      // predicate can still name it inside a BitmapOr with a status index
-      // that reaches reported history.
+      // Job reads stay on the backlog index. Balance acceptance is an indexed
+      // lookup by job, not a scan of every accepted payment. A drifted job
+      // predicate could otherwise reach reported history through a BitmapOr.
       const scans: string[] = [];
       const walk = (node: Record<string, unknown>): void => {
         const type = node["Node Type"] as string;
@@ -461,8 +461,11 @@ describe.skipIf(!RUN)("per-job cost persistence", () => {
         for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) walk(child);
       };
       walk((rows[0]?.["QUERY PLAN"] as { Plan: Record<string, unknown> }[])[0].Plan);
-      expect(scans).toHaveLength(1);
-      expect(scans[0]).toMatch(/Index.*Scan:idx_jobs_unreported_terminal_cost$/);
+      expect(scans).toHaveLength(2);
+      expect(scans).toEqual(expect.arrayContaining([
+        expect.stringMatching(/Index.*Scan:idx_jobs_unreported_terminal_cost$/),
+        expect.stringMatching(/Index.*Scan:credit_balance_payments_job_id_request_seq_key$/),
+      ]));
     } finally {
       await client.query("ROLLBACK");
       client.release();

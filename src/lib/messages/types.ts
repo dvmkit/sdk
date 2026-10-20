@@ -70,6 +70,8 @@ export interface ArtifactContent {
 
 /** Provider requests payment to continue. */
 export interface PaymentRequestContent {
+  /** Exact outstanding balance charge, in integer micro-units. Use this message’s seq as request_seq. */
+  credit?: { amount_micro: number; currency: string };
   amount_msats: number;
   reason: string;
   /**
@@ -119,8 +121,22 @@ export interface PaymentRequestContent {
   };
 }
 
-/** Requester sends payment proof, or provider sends change/refund. */
+/** Requester sends a rail proof or signed balance authorization; provider sends change/refund. */
 export interface PaymentContent {
+  /** Signed authorization to spend existing credit on one outstanding ask. Cannot accompany rail credentials. */
+  credit?: {
+    credit_id: string;
+    draw_id: string;
+    payment_id: string;
+    request_seq: number;
+    amount_micro: number;
+    currency: string;
+    pubkey: string;
+    signature: string;
+    timestamp: number;
+    nonce: string;
+    auth_statement: import("../signed-request-statement").SignedRequestStatementHeader;
+  };
   cashu_token?: string;
   mint?: string;
   amount_msats?: number;

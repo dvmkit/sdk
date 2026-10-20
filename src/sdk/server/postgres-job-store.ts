@@ -68,6 +68,14 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   }
 
   private async createTables(): Promise<void> {
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS credit_balance_payments (
+      payment_id TEXT PRIMARY KEY,
+      fingerprint TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      request_seq BIGINT NOT NULL,
+      response JSONB NOT NULL,
+      UNIQUE(job_id, request_seq)
+    )`);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS jobs (
         id                          TEXT PRIMARY KEY,
@@ -693,6 +701,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
    * Read terminal zero-revenue jobs whose latest declared-cost revision has
    * not yet reached the durable reporter outbox. Keep the filter in step with
    * `idx_jobs_unreported_terminal_cost`, which bounds each pass to the backlog.
+   * Completed balance-paid work carries cost through revenue even when its
+   * allocated rail value is zero; its durable acceptance excludes a cost-only replay.
    */
   async listUnreportedTerminalCosts(args: {
     dvmId: string;
@@ -707,7 +717,9 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
          AND (cost_reported_revision IS NULL OR cost_reported_revision < cost_revision)
          AND (
            status IN ('failed', 'cancelled')
-           OR (status = 'completed' AND paid_msats = 0)
+           OR (status = 'completed' AND paid_msats = 0 AND NOT EXISTS (
+             SELECT 1 FROM credit_balance_payments p WHERE p.job_id=jobs.id
+           ))
          )
          AND ($2::text IS NULL OR id > $2)
        ORDER BY id
@@ -1265,7 +1277,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
 
   async getCounters(jobId: string): Promise<JobCounters | undefined> {
     const { rows } = await this.pool.query<CountersRow>(
-      "SELECT status, paid_msats, pending_payment_msats, summary FROM jobs WHERE id = $1",
+      `SELECT status, paid_msats, pending_payment_msats, summary,
+        EXISTS (SELECT 1 FROM credit_balance_payments p WHERE p.job_id=jobs.id
+          AND p.request_seq=(SELECT MAX(m.seq) FROM job_messages m WHERE m.job_id=jobs.id
+            AND m.data->>'type'='payment-request' AND m.data->>'from'='provider'
+            AND m.status='verified')) AS balance_payment_satisfied
+       FROM jobs WHERE id = $1`,
       [jobId]
     );
     if (rows.length === 0) return undefined;
@@ -1576,11 +1593,13 @@ interface CountersRow {
   paid_msats: string | number;
   pending_payment_msats: string | number | null;
   summary: string | null;
+  balance_payment_satisfied?: boolean;
 }
 
 function rowToCounters(row: CountersRow): JobCounters {
   return {
     status: row.status,
+    ...(row.balance_payment_satisfied && { balancePaymentSatisfied: true }),
     paidMsats: Number(row.paid_msats),
     pendingPaymentMsats:
       row.pending_payment_msats == null ? undefined : Number(row.pending_payment_msats),

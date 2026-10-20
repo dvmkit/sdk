@@ -70,6 +70,7 @@ import {
   isStreamableJobStore,
 } from "./job-store";
 import { MemoryJobStore } from "./memory-job-store";
+import { PostgresJobStore } from "./postgres-job-store";
 import type { MintHealthTracker } from "./mint-health-tracker";
 import type { MppxServer } from "./mpp-setup";
 import type { CreditFundingReport, PaymentInfo, VerifiedIncomingPayment } from "./payment";
@@ -607,6 +608,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly statusChecksInFlight = new Set<string>();
   /** Job ids that were notified mid-re-read and must be re-checked. */
   private readonly statusChecksQueued = new Set<string>();
+  // Bind live resolvers and recovery scaffolds to the store-allocated ask identity.
+  private readonly paymentAskSeqs = new WeakMap<object, number>();
+  private readonly reactivationAskSeqs = new WeakMap<ServerJob, number>();
+
   // Every local input resume holds this queue through its durable wait update.
   // A prompt response and a payment NOTIFY must not mistake each other for a
   // different machine's successful claim.
@@ -1171,11 +1176,57 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async claimLocalInput(job: ServerJob): Promise<boolean> {
-    // The yield's Tx A must commit before a resume can close its wait.
     await job.messageAppenderTail;
-    return isStreamableJobStore(this.jobStore)
-      ? this.jobStore.claimForProcessing(job.id)
-      : true;
+    const askSeq = job.pendingPayment ? this.paymentAskSeqs.get(job.pendingPayment) : undefined;
+    // A failed ask append cannot borrow satisfaction from the preceding ask.
+    if (job.pendingPayment && this.opts.db && this.jobStore instanceof PostgresJobStore && askSeq === undefined) return false;
+    return this.claimInputForAsk(job.id, askSeq);
+  }
+
+  private async claimInputForAsk(jobId: string, askSeq: number | undefined): Promise<boolean> {
+    if (!isStreamableJobStore(this.jobStore)) return true;
+    if (askSeq === undefined || !this.opts.db || !(this.jobStore instanceof PostgresJobStore)) return this.jobStore.claimForProcessing(jobId);
+    const tx = await this.opts.db.connect();
+    try {
+      await tx.query("BEGIN");
+      const { rows: [record] } = await tx.query("SELECT status FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
+      const { rows: [ask] } = await tx.query(
+        `SELECT MAX(seq) AS seq FROM job_messages WHERE job_id=$1 AND status='verified'
+         AND data->>'from'='provider' AND data->>'type'='payment-request'`, [jobId]);
+      if (record?.status !== "awaiting-input" || Number(ask?.seq) !== askSeq) {
+        await tx.query("ROLLBACK");
+        return false;
+      }
+      await tx.query(
+        `UPDATE jobs SET status='processing', last_activity_at=$2,
+         caller_wait_ms=caller_wait_ms+GREATEST(0,$2-COALESCE(awaiting_input_at_ms,last_activity_at)),
+         awaiting_input_at_ms=NULL WHERE id=$1`, [jobId, Date.now()]);
+      await tx.query("COMMIT");
+      return true;
+    } catch (error) {
+      await tx.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally { tx.release(); }
+  }
+
+  private async adoptPaymentMetadata(job: ServerJob, pending: ServerJob["pendingPayment"]): Promise<boolean> {
+    const record = await this.jobStore.get(job.id);
+    if (!record || job.pendingPayment !== pending || isTerminal(job.status) || isTerminal(record.status)) return false;
+    job.paidMsats = record.paidMsats;
+    job.pendingPaymentMsats = record.pendingPaymentMsats;
+    job.creditId = record.creditId;
+    job.drawId = record.drawId;
+    job.paymentRail = record.paymentRail;
+    job.paymentMint = record.paymentMint;
+    job.paymentTxHash = record.paymentTxHash;
+    job.nativeAmount = record.nativeAmount;
+    job.nativeAsset = record.nativeAsset;
+    job.pendingPaymentFiatMicro = record.pendingPaymentFiatMicro;
+    job.pendingPaymentFiatCurrency = record.pendingPaymentFiatCurrency;
+    job.pendingMppChallengeIds = record.pendingMppChallengeIds;
+    job.pendingX402Nonce = record.pendingX402Nonce;
+    job.pendingX402AmountUsdcMicro = record.pendingX402AmountUsdcMicro;
+    return true;
   }
 
   private async resumeClaimedPayment(job: ServerJob, resume: () => Promise<void>): Promise<void> {
@@ -1668,8 +1719,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const jobId = job.id;
     job.messageAppender = (msg, opts) => {
       const prev = job.messageAppenderTail ?? Promise.resolve();
-      const next = prev.then(() =>
-        store
+      const next = prev.then(() => {
+        const pending = job.pendingPayment;
+        return store
           .appendOutgoing(
             jobId,
             {
@@ -1680,6 +1732,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             },
             opts
           )
+          .then((stored) => {
+            if (msg.type === "payment-request" && pending && job.pendingPayment === pending) {
+              this.paymentAskSeqs.set(pending, stored);
+            }
+          })
           .catch((_err: unknown) => {
             diagnosticConsole.error(
               {
@@ -1694,8 +1751,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
                 error: undefined,
               }
             );
-          })
-      );
+          });
+      });
       job.messageAppenderTail = next;
     };
   }
@@ -2579,6 +2636,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   async claimAwaitingInputForReactivation(jobId: string): Promise<boolean> {
     if (!isStreamableJobStore(this.jobStore)) return true;
     const store = this.jobStore;
+    const scaffold = this._activeJobs.get(jobId);
+    const askSeq = scaffold ? this.reactivationAskSeqs.get(scaffold) : undefined;
     // Both samples read the non-regressing clock. Off the wall this
     // is the same two-sample shape as the stale sweep, and a backwards step
     // between them holds the deadline out of reach: the loop keeps polling
@@ -2590,7 +2649,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       if (this.monotonicNowMs() >= deadline) {
         // Window elapsed; either we win the CAS (original worker absent) or a
         // just-woken original handler beat us to it (CAS returns false).
-        return store.claimForProcessing(jobId);
+        if (scaffold && this._activeJobs.get(jobId) !== scaffold) return false;
+        return this.claimInputForAsk(jobId, askSeq);
       }
       const record = await store.get(jobId);
       if (record?.status !== "awaiting-input") return false;
@@ -2712,6 +2772,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     }
 
     const job = fromJobRecord(record);
+    const ask = record.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
+    if (ask) this.reactivationAskSeqs.set(job, ask.seq);
     this._activeJobs.set(job.id, job);
     this.wireMessageAppender(job);
     this.watchDurableStatus(job);
@@ -3265,7 +3327,26 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
         : undefined,
-      getCounters: isStreamableJobStore(jobStore) ? () => jobStore.getCounters(job.id) : undefined,
+      acceptedBalancePayment: this.opts.db && jobStore instanceof PostgresJobStore
+        ? async (seq, amountMicro, currency) => {
+            const { rowCount } = await this.opts.db!.query(
+              `SELECT 1 FROM credit_balance_payments p
+               JOIN job_messages m ON m.job_id=p.job_id AND m.seq=(p.response->>'seq')::bigint AND m.status='verified'
+               JOIN job_messages a ON a.job_id=p.job_id AND a.seq=p.request_seq AND a.status='verified'
+               WHERE p.job_id=$1 AND m.seq=$2 AND a.data->>'type'='payment-request'
+                 AND (m.data->'content'->'credit'->>'request_seq')::bigint=p.request_seq
+                 AND a.data->'content'->'credit'->>'amount_micro'=$3
+                 AND a.data->'content'->'credit'->>'currency'=$4`,
+              [job.id, seq, amountMicro === undefined ? null : String(amountMicro), currency ?? null]);
+            return rowCount === 1;
+          }
+        : undefined,
+      getCounters: isStreamableJobStore(jobStore) ? async () => {
+        // Do not interpret an unpersisted yield as a paid ask. A balance payment
+        // can allocate a different msat value while satisfying the exact fiat ask.
+        await job.messageAppenderTail;
+        return jobStore.getCounters(job.id);
+      } : undefined,
       drawPool: this.opts.creditLedger ? () => this.resolveDrawPool(job) : undefined,
       pricingCurrency: this.pricingCurrency,
       claimForProcessing: isStreamableJobStore(jobStore)
@@ -3275,8 +3356,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               if (!pending || job.pendingPayment !== pending || isTerminal(job.status)) return false;
               if (!(await this.claimLocalInput(job))) return false;
               if (job.pendingPayment !== pending || isTerminal(job.status)) return false;
-              await this.resumeClaimedPayment(job, async () => { await resume?.(); });
-              return true;
+              let resumed = false;
+              await this.resumeClaimedPayment(job, async () => {
+                if (!(await this.adoptPaymentMetadata(job, pending))) return;
+                await resume?.();
+                resumed = true;
+              });
+              return resumed;
             });
           }
         : undefined,
@@ -3316,6 +3402,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * fall back on is a slice of the credit's rail value at a ratio pinned
    * whenever that credit was funded, so it cannot safely fund a new ask.
    */
+  private async hasAcceptedBalancePayment(jobId: string): Promise<boolean> {
+    return this.jobStore instanceof PostgresJobStore && !!this.opts.db && !!(await this.opts.db.query(
+      "SELECT 1 FROM credit_balance_payments WHERE job_id=$1 LIMIT 1", [jobId])).rowCount;
+  }
+
   private async resolveDrawPool(job: ServerJob): Promise<DrawPool> {
     const ledger = this.opts.creditLedger;
     // No ledger, or a job that never drew: `paidMsats` is the rail's own
@@ -3347,13 +3438,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // the `rail` arm. Erasing it here is what made the cap unenforceable on
     // essentially every job of a DVM that prices in anything but USD.
     const { rail, drawMsats, creditCurrency } = draw.railValue;
-    // A credit funded with no rail basis (legacy) allocates its draws zero
-    // rail value, and `withDrawBasis` overlays `paidMsats` only when that
-    // allocation is positive — so this job's msats are the rail's own figure and
-    // the msat comparison is apples-to-apples. Not a fallback: the same read
-    // that tells us the pool is fiat is what tells us here that it isn't.
-    if (!rail || drawMsats <= 0)
-      return { basis: "rail", creditCurrency: creditCurrency ?? undefined };
+    // Legacy rail acceptance overlays only positive allocations. A durable
+    // balance authorization instead spends exact fiat even when its rail slice
+    // rounds to zero; its accepted fact keeps that pool denominated in fiat.
+    if (!rail || drawMsats <= 0) {
+      const acceptedBalance = await this.hasAcceptedBalancePayment(job.id);
+      if (!acceptedBalance) return { basis: "rail", creditCurrency: creditCurrency ?? undefined };
+    }
     // Schema-impossible (`credits.currency` is NOT NULL) — the join's type
     // admits it, and a pool with no denomination can't be compared in.
     if (!creditCurrency) {
@@ -3873,7 +3964,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const onJobCompleted = this.opts.onJobCompleted;
     const onRevenueSkippedNoRail = this.opts.onRevenueSkippedNoRail;
     if (!onJobCompleted && !onRevenueSkippedNoRail) return false;
-    if (job.status !== "completed" || job.paidMsats <= 0) return false;
+    if (job.status !== "completed") return false;
 
     let credit: Record<string, unknown> = {};
     // `null` = a legacy row written before recorded a rail.
@@ -3964,6 +4055,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         settledAt: draw.resolvedAt ?? undefined,
       };
     }
+
+    if (job.paidMsats <= 0 && !(drawAmountMicro !== undefined && drawAmountMicro > 0 &&
+        typeof credit.creditCurrency === "string" && creditRail && isFundingRail(creditRail))) return false;
 
     if (!job.paymentRail) {
       // A job with no draw and no rail is a legitimately free/unpaid shape —

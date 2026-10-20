@@ -36,6 +36,7 @@ describe.skipIf(!RUN)("isolated SDK Postgres boundary", () => {
       [schema]
     );
     expect(result.rows.map((row) => row.name)).toEqual([
+      "credit_balance_payments",
       "job_content_hold_events",
       "job_content_holds",
       "job_messages",

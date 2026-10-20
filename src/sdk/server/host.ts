@@ -1013,7 +1013,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         lockPubkey: cashuOpts.lockPubkey,
         lockPubkeyGraceSeconds: cashuOpts.lockPubkeyGraceSeconds,
         canonicalDvmId: cashuOpts.canonicalDvmId,
-        db: hostingControl ? pgPool : cashuOpts.db,
+        db: pgPool ?? cashuOpts.db,
         hostingControl,
         hostingCleanupSingleMount: mounts.length === 1,
         hostingCleanupKnownRailStores: !mpp || tempoChargeBackend === "postgres",

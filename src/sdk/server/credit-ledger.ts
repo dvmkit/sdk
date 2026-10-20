@@ -1196,7 +1196,8 @@ export class CreditLedger {
   /**
    * Grow an accepted job’s pending hold while preserving its original ledger_seq. The balance
    * tuple is updated at that sequence, so interleaved draws need not form a monotonic balance
-   * trajectory. No expiry check applies to an already accepted job.
+   * trajectory. Existing rail top-ups retain accepted-job semantics; spending existing balance
+   * opts into fresh-spend expiry and channel gates.
    *
    * Available balance excludes every pending hold, including this one. An earmark allocates
    * the incoming funding’s rail value; absent one, growth uses the pool.
@@ -1207,6 +1208,9 @@ export class CreditLedger {
    * than throwing and rolling back accepted proofs.
    */
   async growDraw(args: {
+    /** Apply fresh-spend expiry and channel gates when consuming existing balance. */
+    spendExistingBalance?: boolean;
+    hostingPaymentSeq?: number;
     creditId: string;
     drawId: string;
     addAmountMicro: number;
@@ -1234,7 +1238,8 @@ export class CreditLedger {
     assertAmount(args.addAmountMicro, { min: 1 });
     const run = async (
       client: CreditLedgerQuerier,
-      credit: CreditRow
+      credit: CreditRow,
+      tempoLifecycle?: TempoSessionLifecycle
     ): Promise<GrownDrawResult> => {
       const existing = await this.readDraw(client, args.creditId, args.drawId);
       if (!existing) {
@@ -1262,6 +1267,16 @@ export class CreditLedger {
       // under the same `FOR UPDATE` as the write, which is what makes two
       // concurrent payments for one ask serialise: the loser sees the winner's
       // `grown_micro` and has no headroom left.
+      if (args.spendExistingBalance && toSafeInt(credit.expiry_ms) <= (args.nowMs ?? Date.now())) {
+        throw new CreditLedgerError("credit_expired", "Credit has expired");
+      }
+      if (args.spendExistingBalance && tempoLifecycle && (tempoLifecycle.finalized || tempoLifecycle.closeRequestedAt !== 0n)) {
+        throw new CreditLedgerError("tempo_channel_closing", "Credit channel is closing");
+      }
+      const refund = args.spendExistingBalance
+        ? await this.blockingX402Refund(credit.x402_channel_id, X402_SPEND_BLOCKING_SETTLEMENT_STATUSES)
+        : undefined;
+      if (refund) throw x402SettlementPending(args.creditId, refund);
       const priorGrown = toSafeInt(existing.grown_micro);
       const headroom =
         args.capMicro === undefined ? args.addAmountMicro : Math.max(0, args.capMicro - priorGrown);
@@ -1319,6 +1334,11 @@ export class CreditLedger {
       const drawMsats = priorMsats + added.drawMsats;
       const drawNative =
         added.drawNative === null ? priorNative : (priorNative ?? 0) + added.drawNative;
+      if (args.spendExistingBalance) {
+        await this.hostingCleanupFence?.assertNewIntent(client, {
+          jobId: args.jobId, paymentSeq: args.hostingPaymentSeq,
+        });
+      }
       await client.query(
         `UPDATE credit_draws
             SET amount_micro = $3, balance_after_micro = $4, draw_msats = $5, draw_native = $6,
@@ -1349,6 +1369,17 @@ export class CreditLedger {
         cappedMicro: args.addAmountMicro - grantMicro,
       };
     };
+    const query = args.tx ?? this.pool;
+    const { rows } = await query.query<{ tempo_channel_id: string | null }>(
+      "SELECT tempo_channel_id FROM credits WHERE credit_id = $1", [args.creditId]
+    );
+    const channelId = rows[0]?.tempo_channel_id;
+    if (args.spendExistingBalance && channelId && this.tempoSessionStore) {
+      return this.tempoSessionStore.withDrawPlacement(channelId, async (tx, lifecycle) => {
+        const credit = await this.lockCreditRow(tx, args.creditId);
+        return run(tx, credit, lifecycle);
+      }, args.tx);
+    }
     if (args.tx) {
       const credit = await this.lockCreditRow(args.tx, args.creditId);
       return run(args.tx, credit);
@@ -3718,6 +3749,8 @@ export interface CreditLedgerLike {
     nowMs?: number;
   }): Promise<DrawResult>;
   growDraw(args: {
+    spendExistingBalance?: boolean;
+    hostingPaymentSeq?: number;
     creditId: string;
     drawId: string;
     addAmountMicro: number;

@@ -102,6 +102,8 @@ export interface BuildContextOpts {
    * resolver re-reads counters and decides whether to wake.
    */
   getCounters?: () => Promise<JobCounters | undefined>;
+  /** Durable acceptance of this cached balance payment for the replayed fiat ask. */
+  acceptedBalancePayment?: (seq: number, amountMicro: number | undefined, currency: string | undefined) => Promise<boolean>;
   /**
    * Single-execution claim. Atomically flip the job
    * `awaiting-input → processing`, returning `true` only if this handler won.
@@ -631,6 +633,7 @@ export function buildContext(
       const paymentRequestContent: Record<string, unknown> = {
         amount_msats: amountMsats,
         reason,
+        ...(pendingFiat && { credit: { amount_micro: pendingFiat.amountMicro, currency: pendingFiat.currency } }),
         ...(fiatAmount && { fiat_amount: fiatAmount }),
         ...(payOpts?.mints && { mints: payOpts.mints }),
         ...(payOpts?.minLocktimeSeconds && { min_locktime_seconds: payOpts.minLocktimeSeconds }),
@@ -790,8 +793,18 @@ export function buildContext(
           // left pending. Do not compare `paidMsats` to this ask: an explicit
           // draw makes `paidMsats` a draw-derived rail slice while the ask is
           // live-rate msats.
-          if (job.reactivationPaymentApplied !== true) {
-            throw new Error("[internal_error] payment replay reached without credit");
+          const balance = (payment.content as PaymentContent).credit;
+          const accepted = balance
+            ? await opts.acceptedBalancePayment?.(payment.seq, pendingFiat?.amountMicro, pendingFiat?.currency)
+            : job.reactivationPaymentApplied === true;
+          if (!accepted) throw new Error("[internal_error] payment replay reached without credit");
+          if (balance) {
+            job.pendingPaymentMsats = undefined;
+            job.pendingPaymentFiatMicro = undefined;
+            job.pendingPaymentFiatCurrency = undefined;
+            job.pendingMppChallengeIds = undefined;
+            job.pendingX402Nonce = undefined;
+            job.pendingX402AmountUsdcMicro = undefined;
           }
           job.status = "processing";
           creditedToHandlerMsats += amountMsats;
@@ -927,9 +940,11 @@ export function buildContext(
               // the expression below whenever `creditedToHandlerMsats <=
               // paidMsats`, which is every non-pool job — so implicit N=1 keeps
               // the original comparison and its original behaviour.
-              const satisfied = poolBasis
+              // Balance authorization pays the pinned fiat ask, so its stored
+              // rail conversion need not reach this ask's current msat value.
+              const satisfied = counters.balancePaymentSatisfied === true || (poolBasis
                 ? counters.paidMsats - paidMsatsAtYield >= amountMsats
-                : counters.paidMsats - creditedToHandlerMsats >= amountMsats;
+                : counters.paidMsats - creditedToHandlerMsats >= amountMsats);
               if (satisfied) {
                 // Single-execution claim: win the
                 // `awaiting-input → processing` CAS before resuming, so a

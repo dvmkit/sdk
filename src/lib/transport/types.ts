@@ -111,6 +111,8 @@ export interface Quote {
 
 /** Public prepaid-credit terms advertised on `/v1/info`. Snake_case: wire shape. */
 export interface CreditTerms {
+  /** Signed balance payments on the job messages endpoint are supported. */
+  balance_payment?: true;
   /** Smallest funding accepted, in 1e-6 units of `currency`. */
   min_micro: number;
   /** Largest residual balance a caller may hold, in 1e-6 units of `currency`. */
@@ -198,6 +200,7 @@ export function parseCreditTerms(raw: unknown): CreditTerms | undefined {
   if (credit.x402 !== undefined && !x402) return undefined;
 
   return {
+    ...(credit.balance_payment === true && { balance_payment: true }),
     min_micro: credit.min_micro,
     max_micro: credit.max_micro,
     ttl_ms: credit.ttl_ms,
