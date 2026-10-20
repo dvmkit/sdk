@@ -20,6 +20,17 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.13.0](https://github.com/dvmkit/sdk/compare/v0.12.0...v0.13.0) (2026-10-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* Default prepaid and implicit credit lifetimes increase from 30 to 90 days. Set credit.ttl to 2592000 seconds to retain 30 days.
+
+### Features
+
+* extend default prepaid credit lifetime to 90 days ([312e7ae](https://github.com/dvmkit/sdk/commit/312e7ae2df30351bd5e7666f88b2b95a30afcb9a))
+
 ## [0.12.0](https://github.com/dvmkit/sdk/compare/v0.12.0-rc.1...v0.12.0) (2026-10-20)
 
 
