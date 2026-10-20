@@ -1900,7 +1900,10 @@ describe("released implicit credits", () => {
 
   it("marks expiry as lost, retains no drain fiction, and bounds loss history", () => {
     for (let i = 0; i < 10; i += 1) released({ id: String(i), now: 1_000_000 + i });
-    const afterExpiry = 1_000_000 + 30 * 24 * 60 * 60 * 1000 + 20;
+    const afterThirtyDays = listImplicitCredits(1_000_000 + 2_592_000_000);
+    expect(afterThirtyDays).toHaveLength(10);
+    expect(afterThirtyDays.every((credit) => credit.status === "active")).toBe(true);
+    const afterExpiry = 1_000_000 + 7_776_000_000 + 20;
     const rows = listImplicitCredits(afterExpiry);
     expect(rows).toHaveLength(8);
     expect(rows.every((credit) => credit.status === "lost")).toBe(true);

@@ -7,7 +7,7 @@ import { verifyFundingReceipt } from "../../../lib/receipt";
 import type { X402Config } from "../../../lib/x402/types";
 import type { FxFetcher, FxRateSnapshot } from "../../pricing/fx";
 import { CreditLedgerError } from "../credit-ledger";
-import { drawSettlementRef, fundingCommitment } from "../funding";
+import { drawSettlementRef, fundingCommitment, IMPLICIT_CREDIT_TTL_MS } from "../funding";
 import { fundingReceiptFor } from "../funding-receipt";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { verifyUpfrontPayment } from "../payment";
@@ -259,8 +259,31 @@ describe("fund and draw in one request", () => {
     expect(result.error?.body.hint).toContain("Do not pay again");
   });
 
+  it.each([
+    { previousDays: 30, expectedDays: 90 },
+    { previousDays: 180, expectedDays: 180 },
+  ])("preserves a $previousDays-day credit until top-up and reports its $expectedDays-day expiry", async ({ previousDays, expectedDays }) => {
+    const h = harness();
+    const now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await h.ledger.fund({
+      creditId: "c1", callerPubkey: CALLER, currency: "usd", amountMicro: FUNDED_MICRO,
+      expiryMs: now + previousDays * 86_400_000,
+      basis: { rail: "x402", paidMsats: FUNDED_MSATS, nativeAmount: FUNDED_USDC, nativeAsset: "USDC" },
+    });
+    expect((await pureDraw(h, "old-draw")).error).toBeUndefined();
+    expect((await h.ledger.get("c1"))?.expiryMs).toBe(now + previousDays * 86_400_000);
+
+    const result = await fundAndDraw(h, "topup-draw");
+    expect(result.error).toBeUndefined();
+    expect(result.funding?.expiryMs).toBe(now + expectedDays * 86_400_000);
+    expect((await h.ledger.get("c1"))?.expiryMs).toBe(now + expectedDays * 86_400_000);
+  });
+
   it("leaves implicit N=1 carrying the rail's own values verbatim", async () => {
     const h = harness();
+    const fundedAt = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(fundedAt);
     vi.mocked(verifyX402Payment).mockResolvedValue({
       verified: true,
       amountMsats: PRICE_MSATS,
@@ -287,5 +310,8 @@ describe("fund and draw in one request", () => {
     expect(result.nativeAmount).toBe(msatsToUsdc(PRICE_MSATS, RATE));
 
     expect(result.funding?.amountMicro).toBe(PRICE_MICRO);
+    expect(IMPLICIT_CREDIT_TTL_MS).toBe(7_776_000_000);
+    expect(result.funding?.expiryMs).toBe(fundedAt + 7_776_000_000);
+    expect((await h.ledger.get(result.funding!.creditId))?.expiryMs).toBe(fundedAt + 7_776_000_000);
   });
 });

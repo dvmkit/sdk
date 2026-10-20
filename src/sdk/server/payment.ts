@@ -368,7 +368,7 @@ export interface UpfrontPaymentOpts {
   /**
    * Credit lifetime to mint, in ms — the DVM's advertised `credit.ttl`.
    * Defaults to {@link IMPLICIT_CREDIT_TTL_MS}. Threading it keeps the
-   * funding menu honest: a DVM advertising a 7-day TTL must not mint 30-day
+   * funding menu honest: a DVM advertising a 7-day TTL must not mint 90-day
    * credits.
    */
   creditTtlMs?: number;
@@ -4629,6 +4629,7 @@ async function fundAndDrawInScope(
     const instrument = credit.rail ? storedCreditBinding(credit).instrument : undefined;
     const report: CreditFundingReport = {
       ...deposit,
+      expiryMs: credit.expiryMs,
       callerPubkey: credit.callerPubkey,
       ...(instrument && { instrument }),
     };

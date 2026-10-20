@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { configureDVM } from "../configure";
 import type { SDKJobContext } from "../types";
-import { DEFAULT_JOB_RETENTION_DAYS } from "../types";
+import { DEFAULT_CREDIT_TTL_SECONDS, DEFAULT_JOB_RETENTION_DAYS } from "../types";
 
 describe("configureDVM", () => {
   const noop = (_ctx: SDKJobContext): void => {};
@@ -173,6 +173,12 @@ describe("configureDVM", () => {
         })
       ).toThrow(/credit\.min is a number/);
     });
+  });
+
+  it("defaults credit lifetime to 90 days and preserves explicit overrides", () => {
+    expect(DEFAULT_CREDIT_TTL_SECONDS).toBe(7_776_000);
+    expect(configureDVM({ name: "X", credit: {}, onJob: noop }).credit?.ttlSeconds).toBe(7_776_000);
+    expect(configureDVM({ name: "X", credit: { ttl: 604_800 }, onJob: noop }).credit?.ttlSeconds).toBe(604_800);
   });
 
   describe("stablecoin credit policy", () => {

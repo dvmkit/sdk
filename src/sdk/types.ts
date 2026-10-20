@@ -522,7 +522,7 @@ export interface CreditConfig {
   /**
    * Credit lifetime in **seconds**, from the most recent funding. Post-TTL
    * the credit refuses new draws; the balance stays the caller's (the caller-ownership contract).
-   * Default 30 days.
+   * Default 90 days. Existing expiries change only on funding, which never shortens them.
    */
   ttl?: number;
   /**
@@ -564,8 +564,8 @@ export const DEFAULT_CREDIT_MIN: PriceValue = "$0.10";
  */
 export const DEFAULT_CREDIT_MAX: PriceValue = "$5.00";
 
-/** Platform default for {@link CreditConfig.ttl}: 30 days. */
-export const DEFAULT_CREDIT_TTL_SECONDS = 30 * 24 * 60 * 60;
+/** Platform default for {@link CreditConfig.ttl}: 90 days. */
+export const DEFAULT_CREDIT_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 /** Default lifetime of caller-controlled job content before it is redacted. */
 export const DEFAULT_JOB_RETENTION_DAYS = 730;

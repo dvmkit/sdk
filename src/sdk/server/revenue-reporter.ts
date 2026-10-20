@@ -385,7 +385,7 @@ export type CreditDrainEnqueue = (
  *
  * - **The release**, written by the expiry sweep with `reversedAt` absent.
  * - **The reversal**, written when a later funding revives the credit
- * (`CreditLedger.fund` overwrites `expiry_ms`, so the recorded remainder is
+ * (`CreditLedger.fund` extends `expiry_ms`, so the recorded remainder is
  * no longer final). It repeats the whole payload rather than sending a
  * reference, because the retry loop can deliver the two out of order and the
  * platform's upsert must be able to land either one first.

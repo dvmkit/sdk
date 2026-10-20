@@ -85,6 +85,27 @@ describe.skipIf(!RUN)("Lightning settlement (Postgres)", () => {
     expect(snap?.callerPubkey).toBe(CALLER);
   });
 
+  it("reports the preserved longer expiry when another invoice funds the same credit", async () => {
+    const creditId = await issue("f1");
+    const longerExpiry = FUTURE_MS + 180 * 86_400_000;
+    await settleLn(ledger, { creditId, fundId: "f1", expiryMs: longerExpiry });
+    await issue("f2", { creditId });
+    const seen: unknown[] = [];
+    const result = await ledger.settleInvoice({
+      creditId, fundId: "f2", expiryMs: FUTURE_MS, basis: LN_BASIS,
+      depositOutbox: {
+        enqueue: (_tx, payload) => { seen.push(payload); return Promise.resolve(); },
+        payload: {
+          dvmId: "dvm-lightning-funding", creditId, callerPubkey: CALLER, fundingId: "hash-f2",
+          rail: "lightning", paidMsats: AMOUNT_MSATS, amountMicro: AMOUNT_MICRO,
+          creditCurrency: "usd", fundedAt: Date.now(), expiryMs: FUTURE_MS,
+        },
+      },
+    });
+    expect(result.credit?.expiryMs).toBe(longerExpiry);
+    expect(seen).toEqual([expect.objectContaining({ expiryMs: longerExpiry })]);
+  });
+
   it("re-issues nothing and returns the original bolt11 for a known fund_id", async () => {
     const creditId = await issue("f1");
     const again = await ledger.recordInvoice({
@@ -323,6 +344,20 @@ describe.skipIf(!RUN)("reconciling a blocked invoice (Postgres)", () => {
       },
     };
   }
+
+  it("reports the committed expiry when reconciliation funds a longer-lived target", async () => {
+    await blocked();
+    const longerExpiry = FUTURE_MS + 180 * 86_400_000;
+    await ledger.fund({ creditId: "ln-target", callerPubkey: CALLER, currency: "usd",
+      amountMicro: AMOUNT_MICRO, expiryMs: longerExpiry, basis: LN_BASIS });
+    const seen: unknown[] = [];
+    const result = await ledger.reconcileBlockedInvoice({
+      paymentHash: HASH, targetCreditId: "ln-target", expiryMs: FUTURE_MS,
+      basis: LN_BASIS, depositOutbox: outbox(seen),
+    });
+    expect(result.credit?.expiryMs).toBe(longerExpiry);
+    expect(seen).toEqual([expect.objectContaining({ expiryMs: longerExpiry })]);
+  });
 
   it("credits the balance and enqueues the deposit exactly once under a repeated run", async () => {
     await blocked();

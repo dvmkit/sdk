@@ -19,6 +19,12 @@ Builders can pass `onPaidJobCompleted` to observe settled customer charges after
 
 Reusable x402 channels default to a 24-hour payer withdrawal grace (86400 seconds) on every network. For Base Sepolia (`eip155:84532`) acceptance tests, set `x402.batchSettlement.withdrawDelay: 900` or `DVMKIT_X402_WITHDRAW_DELAY_SECONDS=900` with `DVMKIT_X402_BATCH_SETTLEMENT=true`. Explicit delays must be integer seconds and at least 900 on Base Sepolia; Base mainnet retains the 86400 minimum even in development mode and still requires self-relay. The grace is bound into each channel's immutable configuration: changing the server setting affects new channels, not existing deposits. A shorter testnet run exercises early-withdrawal refusal and post-deadline recovery; retain a separate 24-hour run to cover next-day recovery.
 
+## Prepaid credit lifetime
+
+Prepaid balances and implicit per-call credits default to 90 days from funding. A builder can override the lifetime in seconds with `credit.ttl`; for example, `credit: { ttl: 2_592_000 }` retains 30 days. An upgrade preserves existing stored expiries. Each top-up extends expiry to the later of the current expiry and funding time plus the configured lifetime.
+
+Expiry refuses new draws. Caller balances remain reclaimable until the durable expiry sweep commits a release; increasing the default delays that release and keeps unspent balances as builder liabilities longer. Tempo-backed credits follow their channel exit lifecycle instead of expiry release. Pending draws can still settle or release after expiry.
+
 ## Refunding a completed credit-funded job
 
 Use the authenticated `POST /admin/credit/refund-draw` route to return all or part of a completed charge to its original credit. Choose a refund ID once and reuse the exact arguments after a lost response. The caller sees the restored credit through existing balance status and can spend or drain it. The [protocol notes](PROTOCOL-NOTES.md#completed-credit-draw-refunds) specify the wire contract, original Bitcoin value policy, refusals, and fleet upgrade requirements. The route requires both a durable credit ledger and the configured platform refund reporter. It refuses channel-backed credit and older Bitcoin draws missing authoritative actual-settlement basis, including draws with only a historical repricing marker. Historical credits whose closure or reopening cannot be established return `credit_refund_state_unavailable`. Both historical-evidence refusals require operator inspection before arranging a repair; retrying alone does not supply proof.

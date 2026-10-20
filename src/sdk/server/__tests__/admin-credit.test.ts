@@ -1431,8 +1431,6 @@ describe("POST /admin/credit/reconcile-invoice", () => {
   it("never shortens a target credit that has more life left on it", async () => {
     const { app, ledger } = makeHarness();
     await seedBlocked(ledger);
-    // `fund`'s upsert overwrites expiry_ms, so a bare `now + ttl` here would
-    // destroy spendable time on a longer-lived credit.
     const farFuture = Date.now() + CREDIT_TTL_MS * 4;
     await fundCredit(ledger, {
       creditId: "c-target",
