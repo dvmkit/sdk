@@ -50,6 +50,8 @@ Before 1.0, breaking changes advance the minor version on the 0.x line through t
 
 The version is a decision made on that pull request, not a constant in this repository. To pin an exact version for one release — a specific release candidate, for instance — put a one-shot `Release-As: X.Y.Z-rc.N` footer on the triggering Conventional Commit. Release-please applies that footer to the next release pull request only; the checked-in configuration stays on ordinary Conventional Commit versioning and never enters prerelease mode on its own. `-rc.N` is the only prerelease shape the tag and dist-tag rules below accept, so a release candidate is always a deliberate, one-off `Release-As` decision rather than a standing configuration.
 
+To graduate a tested release candidate to stable, use `Release-As: X.Y.Z` on a new Conventional Commit. Preserve that footer in the final squash commit, or put the complete Conventional Commit between `BEGIN_COMMIT_OVERRIDE` and `END_COMMIT_OVERRIDE` lines in the triggering pull request description. The signed stable tag publishes the stable version to `latest`; do not repoint `latest` at a prerelease version.
+
 For the version in this checkout, read `package.json` with `npm pkg get version`; the release tag command also requires `.release-please-manifest.json` to agree. To inspect npm publication state, use `npm view @dvmkit/sdk versions --json` for published versions and `npm view @dvmkit/sdk dist-tags --json` for the versions selected by `latest` and `next`.
 
 ### First release on fresh history
