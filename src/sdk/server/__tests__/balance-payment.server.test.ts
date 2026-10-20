@@ -105,8 +105,7 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     expect(replay.status).toBe(201);
     expect(await replay.json()).toEqual(original);
     expect((await ledger.get("complete-credit"))?.balanceMicro).toBe(9_000);
-    const record = (await pool.query("SELECT receipt FROM jobs WHERE id=$1", [job.job_id])).rows[0];
-    expect(record.receipt.credit.amount).toBe(1_000);
+    await expect.poll(async () => (await pool.query("SELECT receipt FROM jobs WHERE id=$1", [job.job_id])).rows[0]?.receipt?.credit?.amount).toBe(1_000);
     expect(completions - before).toBe(1);
     expect(completionWorkers.at(-1)).toBe(1);
   }, 20_000);
@@ -204,9 +203,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     }
     await expect.poll(async () => (await ledger.getDraw({ creditId, drawId }))?.status).toBe("settled");
     expect(completions).toBe(before + 1);
-    const record = (await pool.query("SELECT receipt,paid_msats FROM jobs WHERE id=$1", [job.job_id])).rows[0];
-    expect(record.receipt.credit.amount).toBe(1000);
-    expect(record.paid_msats).toBe("0");
+    await expect.poll(async () => (await pool.query("SELECT receipt,paid_msats FROM jobs WHERE id=$1", [job.job_id])).rows[0])
+      .toMatchObject({ receipt: { credit: { amount: 1000 } }, paid_msats: "0" });
     await expect.poll(async () => (await pool.query("SELECT payload FROM pending_dvm_reports WHERE kind='revenue' AND payload->>'jobId'=$1", [job.job_id])).rowCount).toBe(1);
     const reports = (await pool.query("SELECT kind,payload FROM pending_dvm_reports WHERE payload->>'jobId'=$1", [job.job_id])).rows;
     expect(reports.filter((report) => report.kind === "revenue")).toEqual([expect.objectContaining({ payload: expect.objectContaining({
