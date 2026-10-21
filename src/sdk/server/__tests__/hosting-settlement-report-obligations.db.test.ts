@@ -5,7 +5,7 @@ import { BATCH_SETTLEMENT_ADDRESS } from "@x402/evm";
 import pg from "pg";
 import { Session as TempoSession } from "mppx/tempo";
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, parseAbiItem } from "viem";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const chainClient = vi.hoisted(() => ({
   getChainId: vi.fn(), getBlock: vi.fn(), getTransactionReceipt: vi.fn(),
@@ -95,6 +95,7 @@ interface Fixture {
   control: HostingControl;
   obligations: HostedSettlementReportObligations;
   channelStore: PostgresX402ChannelStorage;
+  initializeState(): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -119,14 +120,26 @@ async function bookmarkRefund(pool: pg.Pool,
   );
 }
 
-async function fixture(preexistingChannelTable = false, certificateReady = false): Promise<Fixture> {
+async function prepareFixture(preexistingChannelTable = false, certificateReady = false): Promise<Fixture> {
   const schema = `hosted_effect_${randomUUID().slice(0, 8)}`;
   const admin = new pg.Pool({ connectionString: DATABASE_URL });
-  await admin.query(`CREATE SCHEMA ${schema}`);
   const pool = new pg.Pool({ connectionString: DATABASE_URL, options: `-c search_path=${schema}` });
   const channelStore = new PostgresX402ChannelStorage(pool,
     certificateReady ? { hostedNetwork: NETWORK } : undefined);
+  let schemaCreated = false;
+  const cleanup = async () => {
+    try { await channelStore.close(); }
+    finally {
+      try { await pool.end(); }
+      finally {
+        try { if (schemaCreated) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+        finally { await admin.end(); }
+      }
+    }
+  };
   try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    schemaCreated = true;
     if (preexistingChannelTable) await channelStore.init();
     const dvmId = `effect-${randomUUID()}`;
     const scope = `deployment-${randomUUID()}`;
@@ -150,30 +163,37 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     if (!preexistingChannelTable) await channelStore.init();
     obligations.attachX402SettlementStore(channelStore);
     await new PostgresX402BatchStore(pool).init();
-    expect(await control.transition({ action: "resume", version: 2, dvmId, scope,
-      generation: 1, leaseExpiresAtMs: Date.now() + 60_000,
-      deadlineMs: Date.now() + 90_000, timestampMs: Date.now(),
-      nonce: `nonce_${randomUUID().replaceAll("-", "")}` })).toBe("ok");
-    await channelStore.updateChannel(CHANNEL, () => ({
-      channelId: CHANNEL, channelConfig: CONFIG,
-      chargedCumulativeAmount: certificateReady ? "0" : "100",
-      signedMaxClaimable: certificateReady ? "0" : "100",
-      signature: certificateReady ? "0x" : SIGNATURE,
-      balance: "300", totalClaimed: "0",
-      withdrawRequestedAt: 0, refundNonce: 0, onchainSyncedAt: Date.now(),
-      lastRequestTimestamp: Date.now(),
-    }));
-    return { pool, dvmId, scope, control, obligations, channelStore, cleanup: async () => {
-      await channelStore.close();
-      await pool.end();
-      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
-      await admin.end();
-    } };
+    return { pool, dvmId, scope, control, obligations, channelStore, cleanup,
+      initializeState: async () => {
+        expect(await control.transition({ action: "resume", version: 2, dvmId, scope,
+          generation: 1, leaseExpiresAtMs: Date.now() + 60_000,
+          deadlineMs: Date.now() + 90_000, timestampMs: Date.now(),
+          nonce: `nonce_${randomUUID().replaceAll("-", "")}` })).toBe("ok");
+        await channelStore.updateChannel(CHANNEL, () => ({
+          channelId: CHANNEL, channelConfig: CONFIG,
+          chargedCumulativeAmount: certificateReady ? "0" : "100",
+          signedMaxClaimable: certificateReady ? "0" : "100",
+          signature: certificateReady ? "0x" : SIGNATURE,
+          balance: "300", totalClaimed: "0",
+          withdrawRequestedAt: 0, refundNonce: 0, onchainSyncedAt: Date.now(),
+          lastRequestTimestamp: Date.now(),
+        }));
+      } };
   } catch (error) {
-    await channelStore.close().catch(() => undefined);
-    await pool.end().catch(() => undefined);
-    await admin.query(`DROP SCHEMA ${schema} CASCADE`).catch(() => undefined);
-    await admin.end();
+    try { await cleanup(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], "Fixture preparation and cleanup failed"); }
+    throw error;
+  }
+}
+
+async function fixture(preexistingChannelTable = false, certificateReady = false): Promise<Fixture> {
+  const current = await prepareFixture(preexistingChannelTable, certificateReady);
+  try {
+    await current.initializeState();
+    return current;
+  } catch (error) {
+    try { await current.cleanup(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], "Fixture initialization and cleanup failed"); }
     throw error;
   }
 }
@@ -233,71 +253,90 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
       .rejects.toThrow("original signed authorization is unknown");
   });
 
-  it("refuses a public terminal certificate when a discharged row loses its original signed call", async () => {
-    const current = await fixture(false, true); fixtures.push(current);
-    await bookmarkRefund(current.pool, CONFIG, CHANNEL, "0", true);
-    const reserved = await current.obligations.reserveX402(CHANNEL, "refund", {
-      authorizationPayload: { type: "refund", channelConfig: CONFIG, amount: "300",
-        refundNonce: "0", claims: [], refundAuthorizerSignature: REFUND_AUTHORIZER },
-      authorizationRequirements: AUTH_REQUIREMENTS,
-      refundNonce: "0", refundAmount: "300", voucherSignature: "0x",
-      signedMax: "0",
+  describe("public terminal certificates", () => {
+    let preparation: Promise<Fixture>;
+    let assertions: Promise<void> | undefined;
+    beforeEach(async () => {
+      assertions = undefined;
+      preparation = prepareFixture(false, true);
+      await preparation;
     });
-    await current.obligations.recordSubmitted(reserved!.id, TX);
-    chainClient.getChainId.mockResolvedValue(84532);
-    chainClient.getBlock.mockImplementation(async (args: { blockTag?: string; blockNumber?: bigint }) =>
-      args.blockTag === "finalized" || args.blockNumber === 11n
-        ? { number: 11n, hash: `0x${"cc".repeat(32)}` }
-        : { number: 10n, hash: BLOCK });
-    chainClient.readContract.mockImplementation(async (args: { functionName: string }) =>
-      args.functionName === "channels" ? [0n, 0n] :
-        args.functionName === "pendingWithdrawals" ? [0n, 0] : 1n);
-    chainClient.getTransactionReceipt.mockResolvedValue({
-      status: "success", blockNumber: 10n, blockHash: BLOCK, transactionHash: TX,
-      logs: [{ address: BATCH_SETTLEMENT_ADDRESS,
-        topics: encodeEventTopics({ abi: [parseAbiItem(
-          "event Refunded(bytes32 indexed channelId,address indexed sender,uint128 amount)"
-        )], eventName: "Refunded", args: { channelId: CHANNEL, sender: CONFIG.payer } }),
-        data: encodeAbiParameters([{ type: "uint128" }], [300n]) }],
+    afterEach(async () => {
+      // A Vitest timeout does not stop pending database work; let it finish before closing the pools.
+      await assertions?.catch(() => undefined);
+      const current = await preparation.catch(() => undefined);
+      await current?.cleanup();
     });
-    chainClient.getTransaction.mockResolvedValue({ to: BATCH_SETTLEMENT_ADDRESS,
-      input: encodeFunctionData({ abi: REFUND_ABI, functionName: "refundWithSignature",
-        args: [CONFIG, 300n, 0n, REFUND_AUTHORIZER as `0x${string}`] }) });
-    expect(await current.obligations.observeCanonical(reserved!.id))
-      .toMatchObject({ blockHash: BLOCK, deltaNative: "0" });
-    await current.pool.query(
-      "UPDATE x402_batch_settlements SET status='complete' WHERE channel_id=$1 AND operation='refund'",
-      [CHANNEL]
-    );
-    await current.channelStore.updateChannel(CHANNEL, () => undefined);
-    const support = { singleMount: true, durableLedger: true, durableJobStore: true,
-      durableReporter: true, durablePaymentReplay: true, knownRailStores: true };
-    const command = { version: 3 as const, action: "close" as const,
-      dvmId: current.dvmId, scope: current.scope, generation: 2,
-      operationId: `operation_${randomUUID().replaceAll("-", "")}`,
-      timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` };
-    expect(await current.control.close(command, support)).toBe("ok");
-    const certificate = () => current.control.certificate(
-      { ...command, action: "certificate" }, support
-    );
-    expect(await certificate()).toMatchObject({ complete: true, eligible: true,
-      dvmId: current.dvmId, scope: current.scope, operationId: command.operationId });
-    const original = (await current.pool.query<{ original: Record<string, unknown> }>(
-      "SELECT original FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved!.id]
-    )).rows[0].original;
-    for (const state of ["no_report", "delivered"] as const) {
-      await current.pool.query(
-        "UPDATE sdk_hosted_settlement_report_obligations SET state=$2,original=original-'authorizationCallData' WHERE id=$1",
-        [reserved!.id, state]
-      );
-      expect(await certificate()).toMatchObject({ complete: false, eligible: false,
-        reasons: expect.arrayContaining(["settlement_reports_unresolved"]) });
-    }
-    await current.pool.query(
-      "UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',original=$2 WHERE id=$1",
-      [reserved!.id, JSON.stringify(original)]
-    );
-    expect(await certificate()).toMatchObject({ complete: true, eligible: true });
+
+    it("refuses a public terminal certificate when a discharged row loses its original signed call", () => {
+      assertions = preparation.then(async (current) => {
+        await current.initializeState();
+        await bookmarkRefund(current.pool, CONFIG, CHANNEL, "0", true);
+        const reserved = await current.obligations.reserveX402(CHANNEL, "refund", {
+          authorizationPayload: { type: "refund", channelConfig: CONFIG, amount: "300",
+            refundNonce: "0", claims: [], refundAuthorizerSignature: REFUND_AUTHORIZER },
+          authorizationRequirements: AUTH_REQUIREMENTS,
+          refundNonce: "0", refundAmount: "300", voucherSignature: "0x",
+          signedMax: "0",
+        });
+        await current.obligations.recordSubmitted(reserved!.id, TX);
+        chainClient.getChainId.mockResolvedValue(84532);
+        chainClient.getBlock.mockImplementation(async (args: { blockTag?: string; blockNumber?: bigint }) =>
+          args.blockTag === "finalized" || args.blockNumber === 11n
+            ? { number: 11n, hash: `0x${"cc".repeat(32)}` }
+            : { number: 10n, hash: BLOCK });
+        chainClient.readContract.mockImplementation(async (args: { functionName: string }) =>
+          args.functionName === "channels" ? [0n, 0n] :
+            args.functionName === "pendingWithdrawals" ? [0n, 0] : 1n);
+        chainClient.getTransactionReceipt.mockResolvedValue({
+          status: "success", blockNumber: 10n, blockHash: BLOCK, transactionHash: TX,
+          logs: [{ address: BATCH_SETTLEMENT_ADDRESS,
+            topics: encodeEventTopics({ abi: [parseAbiItem(
+              "event Refunded(bytes32 indexed channelId,address indexed sender,uint128 amount)"
+            )], eventName: "Refunded", args: { channelId: CHANNEL, sender: CONFIG.payer } }),
+            data: encodeAbiParameters([{ type: "uint128" }], [300n]) }],
+        });
+        chainClient.getTransaction.mockResolvedValue({ to: BATCH_SETTLEMENT_ADDRESS,
+          input: encodeFunctionData({ abi: REFUND_ABI, functionName: "refundWithSignature",
+            args: [CONFIG, 300n, 0n, REFUND_AUTHORIZER as `0x${string}`] }) });
+        expect(await current.obligations.observeCanonical(reserved!.id))
+          .toMatchObject({ blockHash: BLOCK, deltaNative: "0" });
+        await current.pool.query(
+          "UPDATE x402_batch_settlements SET status='complete' WHERE channel_id=$1 AND operation='refund'",
+          [CHANNEL]
+        );
+        await current.channelStore.updateChannel(CHANNEL, () => undefined);
+        const support = { singleMount: true, durableLedger: true, durableJobStore: true,
+          durableReporter: true, durablePaymentReplay: true, knownRailStores: true };
+        const command = { version: 3 as const, action: "close" as const,
+          dvmId: current.dvmId, scope: current.scope, generation: 2,
+          operationId: `operation_${randomUUID().replaceAll("-", "")}`,
+          timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` };
+        expect(await current.control.close(command, support)).toBe("ok");
+        const certificate = () => current.control.certificate(
+          { ...command, action: "certificate" }, support
+        );
+        expect(await certificate()).toMatchObject({ complete: true, eligible: true,
+          dvmId: current.dvmId, scope: current.scope, operationId: command.operationId });
+        const original = (await current.pool.query<{ original: Record<string, unknown> }>(
+          "SELECT original FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved!.id]
+        )).rows[0].original;
+        for (const state of ["no_report", "delivered"] as const) {
+          await current.pool.query(
+            "UPDATE sdk_hosted_settlement_report_obligations SET state=$2,original=original-'authorizationCallData' WHERE id=$1",
+            [reserved!.id, state]
+          );
+          expect(await certificate()).toMatchObject({ complete: false, eligible: false,
+            reasons: expect.arrayContaining(["settlement_reports_unresolved"]) });
+        }
+        await current.pool.query(
+          "UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',original=$2 WHERE id=$1",
+          [reserved!.id, JSON.stringify(original)]
+        );
+        expect(await certificate()).toMatchObject({ complete: true, eligible: true });
+      });
+      return assertions;
+    });
   });
 
   it("does not deliver or acknowledge a report from submitted hashes without canonical proof", async () => {
