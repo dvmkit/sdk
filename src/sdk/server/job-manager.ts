@@ -3023,7 +3023,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           job.pendingX402AmountUsdcMicro = undefined;
         }
       }
-      if (counters.pendingPaymentMsats === undefined && job.status === "awaiting-input") {
+      // An outstanding prompt keeps the durable wait: its response can only be
+      // claimed from `awaiting-input`, and a balance-paid ask leaves the
+      // counter undefined, so an excess payment would otherwise strand it.
+      if (
+        counters.pendingPaymentMsats === undefined &&
+        job.status === "awaiting-input" &&
+        job.pendingPrompts.size === 0
+      ) {
         job.status = "processing";
       }
     } else {

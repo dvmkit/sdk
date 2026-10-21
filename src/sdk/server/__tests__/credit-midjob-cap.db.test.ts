@@ -466,6 +466,62 @@ describe.skipIf(!RUN)("the mid-job draw growth cap", () => {
     });
   });
 
+  it("keeps an outstanding prompt claimable after a duplicate payment for a satisfied ask", async () => {
+    // A balance-paid ask leaves the pending counter NULL (not 0); the duplicate's
+    // Tx C then reports it undefined, which used to demote the awaiting-input
+    // row to processing and strand the prompt response.
+    const jobId = "cap-prompt-wait-1";
+    const { job, creditId, drawId } = await seedBoundJob(jobId);
+    facilitatorSettlesPerHeader({
+      "header-a": { txHash: "captx-promptwait-a", msats: ASK_MSATS },
+      "header-b": { txHash: "captx-promptwait-b", msats: ASK_MSATS },
+    });
+    const jm = manager(ledgerA, paymentsA);
+
+    let duplicate;
+    let resolved: string[] = [];
+    try {
+      await pay(jm, job, "header-a");
+      await poolA.query("UPDATE jobs SET pending_payment_msats = NULL WHERE id = $1", [jobId]);
+      const waiting = await reload(job);
+      expect(waiting.pendingPaymentMsats).toBeUndefined();
+      waiting.status = "awaiting-input";
+      const prompt = new Promise<string>((resolve) => {
+        waiting.pendingPrompts.set("prompt-1", {
+          resolve: (r) => resolve(r.text),
+          reject: () => undefined,
+        });
+      });
+      await jm.persistJob(waiting);
+
+      duplicate = await pay(jm, waiting, "header-b");
+      await jm.persistJob(waiting);
+      expect((await jobStore.get(jobId))?.status).toBe("awaiting-input");
+      expect(waiting.status).toBe("awaiting-input");
+
+      await jm.dispatchMessage(waiting, "response", { prompt_id: "prompt-1", text: "go" });
+      resolved = [await prompt];
+      expect(waiting.status).toBe("processing");
+      expect((await jobStore.get(jobId))?.status).toBe("processing");
+    } finally {
+      jm.shutdown();
+    }
+
+    expect(resolved).toEqual(["go"]);
+    expect(duplicate.error).toBeUndefined();
+    expect(duplicate.unappliedCredit).toMatchObject({
+      credit_id: creditId,
+      credited_micro: ASK_MICRO,
+    });
+    const draw = await drawRow(creditId, drawId);
+    expect(Number(draw.amount_micro)).toBe(UPFRONT_MICRO + ASK_MICRO);
+    const row = await jobStore.get(jobId);
+    expect(row?.paidMsats).toBe(UPFRONT_MSATS + ASK_MSATS);
+    const credit = await ledgerA.get(creditId);
+    expect(credit?.balanceMicro).toBe(UPFRONT_MICRO + 2 * ASK_MICRO);
+    expect(credit?.availableMicro).toBe(ASK_MICRO);
+  });
+
   it("funds a settlement larger than the ask at the ask, so nothing needs clipping", async () => {
     // x402 funds the pinned ask even if the facilitator overreports; Cashu clipping is covered in credit-ledger.db.test.ts.
     const jobId = "cap-over-1";
