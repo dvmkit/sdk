@@ -1,5 +1,5 @@
 import type { Message, MessageType, MppxChallenge, MppxCredential } from "../messages/types";
-import type { FundingReceipt, JobReceipt as SignedJobReceipt } from "../receipt";
+import type { DrawFundingReceipt, FundingReceipt, JobReceipt as SignedJobReceipt } from "../receipt";
 import type { ReceiptTrustAnchor } from "../receipt-verify";
 import type { SignedRequestAudience } from "../signed-request-statement";
 import type { PaymentRequired, X402Version } from "../x402/spec";
@@ -536,6 +536,26 @@ export interface JobStatus {
   fundingReceiptParseError?: ReceiptParseError;
   fundedMicro?: number;
   credit?: CreditWire;
+  /**
+   * Signed mid-job funding evidence for this job's draw (`draw_funding_receipts`),
+   * oldest first. The recovery surface for an acknowledgement that never
+   * arrived: the provider reissues every artifact from its committed rows.
+   */
+  drawFundingReceipts?: DrawFundingReceipt[];
+  /** Present when an offered draw funding receipt failed the structural guard. */
+  drawFundingReceiptParseError?: ReceiptParseError;
+}
+
+/**
+ * What a provider's `201` to a job message carries, when the transport
+ * surfaces it. `seq` names the durable inbound message; `drawFundingReceipt`
+ * is the signed fact a mid-job rail payment funded the job's own draw.
+ */
+export interface SendMessageResult {
+  seq: number;
+  drawFundingReceipt?: DrawFundingReceipt;
+  /** Present when the response offered a `draw_funding_receipt` that failed the structural guard. */
+  drawFundingReceiptParseError?: ReceiptParseError;
 }
 
 /**
@@ -842,12 +862,13 @@ export interface Transport {
     provider?: ProviderRef,
     options?: MessagePollOptions
   ): Promise<Message[]>;
+  /** Resolves with the acknowledgement when the transport parses one; older transports resolve `void`. */
   sendMessage(
     jobId: string,
     message: OutboundMessage,
     provider?: ProviderRef,
     options?: SendMessageOptions
-  ): Promise<void>;
+  ): Promise<SendMessageResult | void>;
   cancel(
     jobId: string,
     reason?: string,

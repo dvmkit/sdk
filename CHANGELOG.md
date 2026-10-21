@@ -6,6 +6,10 @@
 
 - Prepaid and implicit per-call credits now default to 90 days instead of 30 days. Builders hold unspent balances longer before expiry release. Existing credits retain their stored expiry until their next top-up; funding extends expiry to the later of its current value and funding time plus the configured TTL. Set `credit: { ttl: 2_592_000 }` to keep a 30-day lifetime. Explicit TTL overrides remain supported; no database migration is required.
 
+### Features
+
+- Mid-job rail payments that fund a job's credit against its pending draw now leave signed evidence. The server fixes a `credit_fundings` row (with new nullable `job_id`, `draw_id`, `payment_seq` columns) inside the rail transaction and issues a `credit_draw_funding` receipt from it: returned as `draw_funding_receipt` on the payment `201`, on the `503` snapshot-failure and `500` unapplied bodies, on a `409 replay_rejected` for the same payment, and as `draw_funding_receipts` on every authenticated job read, including after a restart. The caller credit store admits verified evidence with `recordDrawFunding` (or inline on `applyReceiptCredit`) and compares a completed draw as prior remaining plus eligible funding minus the draw, so a self-funded grown draw no longer raises a false balance warning while a contradictory terminal balance still does. `CreditLedgerLike` gains optional `listDrawFundings` and optional `recordFunding` bindings; `FundingRecord.receipt` and `saveFundingReceipt` now carry `CreditFundingEvidence`, the union of opening and draw funding receipts discriminated by `kind`. The portable contract is `protocol-fixtures/credit-draw-funding-v1.json`.
+
 ### Bug fixes
 
 - Replaying an older job receipt no longer changes a newer stored credit projection. The comparison now happens inside the credit-store lock that applies the receipt, so last price, receipt attribution, flags, and update time stay with the newest settled draw, including when another process settles it mid-recovery.

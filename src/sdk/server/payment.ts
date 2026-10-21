@@ -44,6 +44,7 @@ import type {
   CreditLedgerQuerier,
   CreditSnapshot,
   DrawResult,
+  FundingRecord,
 } from "./credit-ledger";
 import { CreditLedgerError, isFundingRail } from "./credit-ledger";
 import {
@@ -178,6 +179,12 @@ export interface PaymentInfo {
    * told or they will re-send. Absent on every ordinary payment.
    */
   unappliedMicro?: number;
+  /**
+   * The ledger's own record of a mid-job funding accepted against the job's
+   * pending draw, fixed inside the rail transaction. Carries the immutable
+   * signing inputs for the caller-facing draw funding receipt.
+   */
+  drawFunding?: FundingRecord;
 }
 
 /**
@@ -2587,6 +2594,12 @@ export interface VerifiedIncomingPayment {
    * `null` delta.
    */
   unappliedMicro?: number;
+  /**
+   * The ledger funding row a mid-job top-up fixed for this payment, when the
+   * job already held a draw. The route issues the signed draw funding receipt
+   * from it; absent when the payment ran ledger-less or opened a fresh credit.
+   */
+  drawFunding?: FundingRecord;
 }
 
 /**
@@ -2610,6 +2623,8 @@ export async function verifyIncomingPayment(
      * still a deposit, still reported. See `PaymentErrorDetail`.
      */
     funding?: CreditFundingReport;
+    /** The rail payment id a `replay_rejected` collided on, so the route can return its original evidence. */
+    replayPaymentId?: string;
   };
 }> {
   return withPaymentDiagnostics(() => verifyIncomingPaymentInScope(body, opts, snapshot));
@@ -2629,6 +2644,8 @@ async function verifyIncomingPaymentInScope(
      * still a deposit, still reported. See `PaymentErrorDetail`.
      */
     funding?: CreditFundingReport;
+    /** The rail payment id a `replay_rejected` collided on, so the route can return its original evidence. */
+    replayPaymentId?: string;
   };
 }> {
   if (body.type !== "payment") return {};
@@ -2810,7 +2827,13 @@ async function verifyIncomingPaymentInScope(
           const mapped = mapLedgerCommitError(err, undefined, true);
           if (mapped?.error) {
             logCredentialRejected("x402", "mid-job", err);
-            return { error: { body: mapped.error.body, status: mapped.error.status } };
+            return {
+              error: {
+                body: mapped.error.body,
+                status: mapped.error.status,
+                ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
+              },
+            };
           }
           throw err;
         }
@@ -2946,7 +2969,13 @@ async function verifyIncomingPaymentInScope(
           const mapped = mapLedgerCommitError(err, undefined, true);
           if (mapped?.error) {
             logCredentialRejected("tempo", "mid-job", err);
-            return { error: { body: mapped.error.body, status: mapped.error.status } };
+            return {
+              error: {
+                body: mapped.error.body,
+                status: mapped.error.status,
+                ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
+              },
+            };
           }
           throw err;
         }
@@ -3124,8 +3153,18 @@ async function acceptDurableExactIncoming(args: {
         drawId: replayedDrawId,
       })) !== undefined;
   }
+  // A replayed mid-job settlement recovers as a verified result rather than a
+  // 409, so the original funding row is what carries its evidence back.
+  const replayedDrawFunding =
+    accepted.replayed && ledgerCtx?.topUp && accepted.receipt.txHash
+      ? await ledgerCtx.ledger.getFunding({
+          creditId: ledgerCtx.topUp.creditId,
+          fundId: accepted.receipt.txHash,
+        })
+      : undefined;
   const info = withDrawBasis(
     {
+      ...(replayedDrawFunding && { drawFunding: replayedDrawFunding }),
       paidMsats: args.snapshot.pendingPaymentMsats ?? accepted.receipt.amountMsats,
       paymentRail: "x402",
       receivedProofs: [],
@@ -3175,12 +3214,13 @@ async function acceptDurableExactIncoming(args: {
 function topUpBinding(
   info: PaymentInfo,
   snapshot: VerifyIncomingSnapshot
-): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro"> {
+): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro" | "drawFunding"> {
   const fresh = !snapshot.creditId && info.creditId && info.drawId;
   return {
     ...(fresh && { creditId: info.creditId, drawId: info.drawId }),
     ...(info.funding && { funding: info.funding }),
     ...(info.unappliedMicro !== undefined && { unappliedMicro: info.unappliedMicro }),
+    ...(info.drawFunding && { drawFunding: info.drawFunding }),
   };
 }
 
@@ -3661,6 +3701,10 @@ async function verifyAccumulatorReceipt(
       error: {
         body: paymentErrorBody(result.code, { message: result.message, extra: { mints } }),
         status,
+        // The accumulator keys replay on the request id, which is also the
+        // funding id a mid-job top-up committed under, so the route can hand
+        // back the original draw funding evidence beside the 409.
+        ...(status === 409 && requestId && { replayPaymentId: requestId }),
       },
     };
   }
@@ -3936,7 +3980,12 @@ interface LedgerContext {
    * second one. One job keeps one draw, so the receipt's `ReceiptCredit` block
    * sums to the job's full cost and `revenue_events` still books one row.
    */
-  topUp?: { creditId: string; drawId: string };
+  /**
+   * `ledgerSeq` is the draw's own sequence, read with the draw in the preflight.
+   * Optional because a persisted x402 settlement effect from before it was
+   * recorded carries none; the funding leg then reads it off the draw.
+   */
+  topUp?: { creditId: string; drawId: string; ledgerSeq?: number };
   /**
    * Ceiling on this job's cumulative draw growth, in fiat micro of
    * {@link priceFiat}'s currency — what the job has cumulatively
@@ -4086,7 +4135,7 @@ async function resolveTopUpLedgerContext(
     logTopUp("credit_topup_skipped", { reason, ...extra });
   };
 
-  let topUp: { creditId: string; drawId: string } | undefined;
+  let topUp: { creditId: string; drawId: string; ledgerSeq?: number } | undefined;
   let callerId: string;
   let currency: string;
   let drawBasis = false;
@@ -4158,7 +4207,7 @@ async function resolveTopUpLedgerContext(
       });
       return undefined;
     }
-    topUp = { creditId: snapshot.creditId, drawId: snapshot.drawId };
+    topUp = { creditId: snapshot.creditId, drawId: snapshot.drawId, ledgerSeq: draw.ledgerSeq };
     callerId = credit.callerPubkey;
     currency = credit.currency;
     // Inherit the job's revenue basis. An explicit fund-and-draw stamped a
@@ -4445,6 +4494,7 @@ function withDrawBasis(
     ...(committed.unappliedMicro !== undefined && {
       unappliedMicro: committed.unappliedMicro,
     }),
+    ...(committed.drawFunding && { drawFunding: committed.drawFunding }),
   };
   // A `/v1/credit` top-up funds and stops: it is a deposit with no
   // job to draw for, so there is no revenue basis to overlay — but the deposit
@@ -4505,6 +4555,8 @@ interface CommittedFunding {
    * find out.
    */
   unappliedMicro?: number;
+  /** The `credit_fundings` row a mid-job top-up fixed beside its fund/grow leg. */
+  drawFunding?: FundingRecord;
   deposit: CreditFundingReport;
 }
 
@@ -4674,6 +4726,24 @@ async function fundAndDrawInScope(
   }
   if (ctx.topUp) {
     const { creditId, drawId } = ctx.topUp;
+    // The funding row is the durable home of the mid-job funding evidence:
+    // recorded under the rail payment id before the balance moves, completed
+    // with the committed tuple after it, all inside the rail's transaction.
+    // The row's job/draw bindings are what let a job read or a replayed
+    // payment re-issue the same artifact after a lost acknowledgement.
+    await ctx.ledger.recordFunding({
+      creditId,
+      fundId: funding.paymentId,
+      amountMicro: fundedMicro,
+      rail: funding.rail,
+      hostingAdmissionId: ctx.hostingAdmissionId,
+      hostingJobId: ctx.jobId,
+      hostingPaymentSeq: ctx.hostingPaymentSeq,
+      jobId: ctx.jobId,
+      drawId,
+      paymentSeq: ctx.hostingPaymentSeq,
+      tx,
+    });
     const credit = await ctx.ledger.fund({
       creditId,
       callerPubkey: ctx.callerId,
@@ -4686,13 +4756,38 @@ async function fundAndDrawInScope(
       basis,
       tx,
     });
+    // `ledgerSeq` is the draw's own sequence, never the credit high-water
+    // mark: another draw or drain can sit above it, and the terminal receipt
+    // names the draw's sequence, which is what the caller reconciles against.
+    // A draw whose sequence cannot be established leaves the row incomplete,
+    // which withholds the artifact rather than signing a guess.
+    const drawLedgerSeq = async (): Promise<number | undefined> =>
+      ctx.topUp?.ledgerSeq ?? (await ctx.ledger.getDraw({ creditId, drawId }))?.ledgerSeq;
+    const completeDrawFunding = async (
+      balanceAfterMicro: number,
+      ledgerSeq: number | undefined
+    ): Promise<FundingRecord | undefined> =>
+      ledgerSeq === undefined
+        ? undefined
+        : ctx.ledger.completeFunding({
+            creditId,
+            fundId: funding.paymentId,
+            callerPubkey: credit.callerPubkey,
+            balanceAfterMicro,
+            ledgerSeq,
+            tx,
+          });
     // the ask this payment was for is already paid. There is nothing
     // to grow and nothing to price against, so the money is a deposit — the
     // fund-and-stop shape above, reached for the opposite reason.
     if (ctx.askSatisfied) {
-      return commitDeposit({ creditId, unappliedMicro: fundedMicro }, credit);
+      const drawFunding = await completeDrawFunding(credit.availableMicro, await drawLedgerSeq());
+      return commitDeposit({ creditId, unappliedMicro: fundedMicro, drawFunding }, credit);
     }
-    if (shortMidJob) return commitDeposit({ creditId }, credit);
+    if (shortMidJob) {
+      const drawFunding = await completeDrawFunding(credit.availableMicro, await drawLedgerSeq());
+      return commitDeposit({ creditId, drawFunding }, credit);
+    }
     const grown = await ctx.ledger.growDraw({
       creditId,
       drawId,
@@ -4715,14 +4810,17 @@ async function fundAndDrawInScope(
     if (grown.addedAmountMicro <= 0) {
       // The cap refused the whole growth: the draw already covers every ask
       // this job has made. Report it as a deposit and leave the draw alone.
-      return commitDeposit({ creditId, unappliedMicro: grown.cappedMicro }, credit);
+      const drawFunding = await completeDrawFunding(credit.availableMicro, grown.ledgerSeq);
+      return commitDeposit({ creditId, unappliedMicro: grown.cappedMicro, drawFunding }, credit);
     }
+    const drawFunding = await completeDrawFunding(grown.balanceAfterMicro, grown.ledgerSeq);
     return commitDeposit(
       {
         creditId,
         draw: grown,
         added: { amountMicro: grown.addedAmountMicro, ...grown.addedRailValue },
         ...(grown.cappedMicro > 0 && { unappliedMicro: grown.cappedMicro }),
+        drawFunding,
       },
       credit
     );

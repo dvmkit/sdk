@@ -188,6 +188,58 @@ export interface FundingReceipt {
 export type UnsignedFundingReceipt = Omit<FundingReceipt, "signature">;
 
 /**
+ * A DVM-signed proof that one rail payment accepted **during a running job**
+ * funded the job's credit while its draw was still pending. Distinct from
+ * {@link FundingReceipt}: that artifact describes an opening or top-up funding
+ * at a committed ledger position, whereas this one binds the funding to the
+ * job, the draw it grew and the payment that carried it, so a caller can prove
+ * which accepted mid-job money belongs to a completed draw and reconcile the
+ * terminal `balance_after` without guessing.
+ *
+ * `funded_micro` is the provider's native credited amount after its own FX
+ * and fee logic — never the caller's request figure. `ledger_seq` is the
+ * **draw's** sequence (growth allocates none), which is what the terminal
+ * `ReceiptCredit.ledger_seq` names, so a consumer can line the two up exactly.
+ * The tuple is fixed inside the rail's commit transaction; retries and later
+ * job reads return the same artifact.
+ */
+export interface DrawFundingReceipt {
+  v: 1;
+  /** Discriminator separating mid-job draw funding from opening funding evidence. */
+  kind: "credit_draw_funding";
+  credit_id: string;
+  /** The job whose pending draw this funding belongs to. */
+  job_id: string;
+  /** The draw the funding was accepted against. */
+  draw_id: string;
+  /** The rail payment id the funding committed under (tx hash, challenge id, request id). */
+  fund_id: string;
+  /** Sequence of the accepted `payment` message, when the job store numbers inbound messages. */
+  payment_seq?: number;
+  /** Currency the credit is denominated in; `funded_micro` is 1e-6 of it. */
+  currency: string;
+  /** Amount credited to the credit by this payment, in micro-units of `currency`. */
+  funded_micro: number;
+  /** Available balance immediately after this funding and any draw growth committed. */
+  balance_after_micro: number;
+  /** The draw's per-credit ledger sequence; growth keeps the placement value. */
+  ledger_seq: number;
+  /** Unix seconds at which the artifact was first issued. */
+  issued_at: number;
+  /** The credit owner's x-only request-signing pubkey. */
+  caller_pubkey: string;
+  /** Immutable DVM identity bound into the builder attestation. */
+  dvm_id: string;
+  /** DVM slug, as bound in the builder attestation. */
+  dvm: string;
+  receipt_pubkey: string;
+  /** BIP-340 Schnorr signature over the canonical receipt minus `signature`. */
+  signature: string;
+}
+
+export type UnsignedDrawFundingReceipt = Omit<DrawFundingReceipt, "signature">;
+
+/**
  * Hash the delivered result so a receipt binds to *what* was returned, not
  * just that something was.
  *
@@ -328,6 +380,56 @@ export function isFundingReceipt(value: unknown): value is FundingReceipt {
 }
 
 export function verifyFundingReceipt(receipt: FundingReceipt): boolean {
+  try {
+    const { signature, ...unsigned } = receipt;
+    const bytes = canonicaliseForSigning(unsigned as unknown as JsonValue);
+    return schnorr.verify(hexToBytes(signature), bytes, hexToBytes(receipt.receipt_pubkey));
+  } catch {
+    return false;
+  }
+}
+
+/** Sign an unsigned draw funding receipt using the common receipt canonicalisation. */
+export function signDrawFundingReceipt(
+  unsigned: UnsignedDrawFundingReceipt,
+  secretHex: string
+): DrawFundingReceipt {
+  const bytes = canonicaliseForSigning(unsigned as unknown as JsonValue);
+  const signature = bytesToHex(schnorr.sign(bytes, hexToBytes(secretHex)));
+  return { ...unsigned, signature };
+}
+
+/**
+ * Structural guard on a draw funding receipt from outside this process — off a
+ * mid-job payment response, a job read, or back out of `~/.dvm/credits.json`.
+ * Same contract as {@link isFundingReceipt}: the signature covers the whole
+ * canonical body, so refusing a body missing a load-bearing field costs no proof.
+ */
+export function isDrawFundingReceipt(value: unknown): value is DrawFundingReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  return (
+    r.v === 1 &&
+    r.kind === "credit_draw_funding" &&
+    typeof r.credit_id === "string" &&
+    typeof r.job_id === "string" &&
+    typeof r.draw_id === "string" &&
+    typeof r.fund_id === "string" &&
+    (r.payment_seq === undefined || typeof r.payment_seq === "number") &&
+    typeof r.currency === "string" &&
+    typeof r.funded_micro === "number" &&
+    typeof r.balance_after_micro === "number" &&
+    typeof r.ledger_seq === "number" &&
+    typeof r.issued_at === "number" &&
+    typeof r.caller_pubkey === "string" &&
+    typeof r.dvm_id === "string" &&
+    typeof r.dvm === "string" &&
+    typeof r.receipt_pubkey === "string" &&
+    typeof r.signature === "string"
+  );
+}
+
+export function verifyDrawFundingReceipt(receipt: DrawFundingReceipt): boolean {
   try {
     const { signature, ...unsigned } = receipt;
     const bytes = canonicaliseForSigning(unsigned as unknown as JsonValue);

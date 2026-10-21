@@ -9,11 +9,14 @@ import { type AttestationPayload, verifyAttestation } from "./builder-identity";
 import type { JsonValue } from "./cast-auth";
 import {
   computeResultHash,
+  type DrawFundingReceipt,
   type FundingReceipt,
   isDrainReceipt,
+  isDrawFundingReceipt,
   isFundingReceipt,
   type JobReceipt as SignedJobReceipt,
   verifyDrainReceipt,
+  verifyDrawFundingReceipt,
   verifyFundingReceipt,
   verifyReceipt,
 } from "./receipt";
@@ -36,11 +39,13 @@ export type ReceiptVerification = "verified" | "verified_unattested" | "invalid"
 export type ReceiptInvalidReason =
   | "job_id_mismatch"
   | "drain_id_mismatch"
+  | "draw_id_mismatch"
   | "credit_id_mismatch"
   | "fund_id_mismatch"
   | "funding_amount_mismatch"
   | "funding_balance_mismatch"
   | "funding_ledger_seq_mismatch"
+  | "funding_currency_mismatch"
   | "caller_pubkey_mismatch"
   | "signature_invalid"
   | "attestation_invalid"
@@ -184,6 +189,26 @@ export interface FundingReceiptVerifyResult {
   checks: FundingReceiptChecks;
   reason?: ReceiptInvalidReason;
   receipt?: FundingReceipt;
+}
+
+export interface DrawFundingReceiptChecks {
+  credit_id: "ok" | "mismatch" | "unchecked";
+  job_id: "ok" | "mismatch" | "unchecked";
+  draw_id: "ok" | "mismatch" | "unchecked";
+  fund_id: "ok" | "mismatch" | "unchecked";
+  currency: "ok" | "mismatch" | "unchecked";
+  funded_micro: "ok" | "mismatch" | "unchecked";
+  ledger_seq: "ok" | "mismatch" | "unchecked";
+  caller_pubkey: "ok" | "mismatch" | "unchecked";
+  signature: boolean;
+  attestation: ReceiptChecks["attestation"];
+}
+
+export interface DrawFundingReceiptVerifyResult {
+  status: ReceiptVerification;
+  checks: DrawFundingReceiptChecks;
+  reason?: ReceiptInvalidReason;
+  receipt?: DrawFundingReceipt;
 }
 
 export interface VerifyJobReceiptArgs {
@@ -374,6 +399,74 @@ export function verifyFundingReceiptChain(args: {
     ["fund_id", "fund_id_mismatch"],
     ["funded_micro", "funding_amount_mismatch"],
     ["balance_after_micro", "funding_balance_mismatch"],
+    ["ledger_seq", "funding_ledger_seq_mismatch"],
+    ["caller_pubkey", "caller_pubkey_mismatch"],
+  ];
+  for (const [field, reason] of mismatch) {
+    if (checks[field] === "mismatch") return { status: "invalid", checks, reason, receipt: named };
+  }
+  if (!named || !checks.signature) {
+    return { status: "invalid", checks, reason: "signature_invalid", receipt: named };
+  }
+  checks.attestation = checkReceiptAttestation(named, args.builder);
+  if (checks.attestation === "invalid") {
+    return { status: "invalid", checks, reason: "attestation_invalid", receipt: named };
+  }
+  if (checks.attestation === "identity_mismatch") {
+    return { status: "invalid", checks, reason: "dvm_identity_mismatch", receipt: named };
+  }
+  if (checks.attestation === "key_mismatch") {
+    return { status: "invalid", checks, reason: "receipt_key_mismatch", receipt: named };
+  }
+  return {
+    status: checks.attestation === "ok" ? "verified" : "verified_unattested",
+    checks,
+    receipt: named,
+  };
+}
+
+/**
+ * Walk the trust chain for one mid-job **draw funding** receipt, in the same
+ * verdict vocabulary as {@link verifyFundingReceiptChain}. Bindings are checked
+ * before the signature for the reason the drain walk gives: the dangerous
+ * artifact is a validly signed one filed against someone else's credit, job,
+ * draw or payment, which every later link would wave through. A funding fact
+ * that cannot be bound exactly must never raise an expected balance.
+ */
+export function verifyDrawFundingReceiptChain(args: {
+  receipt: unknown;
+  builder?: ReceiptTrustAnchor;
+  expectedCreditId?: string;
+  expectedJobId?: string;
+  expectedDrawId?: string;
+  expectedFundId?: string;
+  expectedCurrency?: string;
+  expectedFundedMicro?: number;
+  expectedLedgerSeq?: number;
+  expectedCallerPubkey?: string;
+}): DrawFundingReceiptVerifyResult {
+  const named = isDrawFundingReceipt(args.receipt) ? args.receipt : undefined;
+  const check = <T>(actual: T | undefined, expected: T | undefined) =>
+    expected === undefined ? "unchecked" : actual === expected ? "ok" : "mismatch";
+  const checks: DrawFundingReceiptChecks = {
+    credit_id: check(named?.credit_id, args.expectedCreditId),
+    job_id: check(named?.job_id, args.expectedJobId),
+    draw_id: check(named?.draw_id, args.expectedDrawId),
+    fund_id: check(named?.fund_id, args.expectedFundId),
+    currency: check(named?.currency, args.expectedCurrency),
+    funded_micro: check(named?.funded_micro, args.expectedFundedMicro),
+    ledger_seq: check(named?.ledger_seq, args.expectedLedgerSeq),
+    caller_pubkey: check(named?.caller_pubkey, args.expectedCallerPubkey),
+    signature: named !== undefined && verifyDrawFundingReceipt(named),
+    attestation: "absent",
+  };
+  const mismatch: [keyof DrawFundingReceiptChecks, ReceiptInvalidReason][] = [
+    ["credit_id", "credit_id_mismatch"],
+    ["job_id", "job_id_mismatch"],
+    ["draw_id", "draw_id_mismatch"],
+    ["fund_id", "fund_id_mismatch"],
+    ["currency", "funding_currency_mismatch"],
+    ["funded_micro", "funding_amount_mismatch"],
     ["ledger_seq", "funding_ledger_seq_mismatch"],
     ["caller_pubkey", "caller_pubkey_mismatch"],
   ];
