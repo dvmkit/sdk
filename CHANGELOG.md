@@ -28,6 +28,20 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.14.0](https://github.com/dvmkit/sdk/compare/v0.13.0...v0.14.0) (2026-10-21)
+
+
+### Features
+
+* sign mid-job funding evidence and reconcile funded draws ([d1aed67](https://github.com/dvmkit/sdk/commit/d1aed6734f0956197f5221c5ed0437a4f8a2221b))
+
+
+### Bug Fixes
+
+* ignore older receipt replay under the credit lock ([755d35a](https://github.com/dvmkit/sdk/commit/755d35a3ae7de8bd6734f47c5087f8671b790352))
+* keep pending prompts awaiting input after duplicate rail payments ([f632c62](https://github.com/dvmkit/sdk/commit/f632c62f254ddfa9baaf0307100df8362223ee8f))
+* preserve pending prompts during development payments ([35cd6ad](https://github.com/dvmkit/sdk/commit/35cd6ad537bfc830f8878728faa06863b75d8a51))
+
 ## [0.13.0](https://github.com/dvmkit/sdk/compare/v0.12.0...v0.13.0) (2026-10-20)
 
 
