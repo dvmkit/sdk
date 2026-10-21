@@ -71,6 +71,7 @@ function awaitingJob(): ServerJob {
     requesterId: "dev-anonymous",
     paidMsats: 0,
     pendingPaymentMsats: ASK_MSATS,
+    pendingPrompts: new Map(),
     status: "awaiting-input",
   } as ServerJob;
 }
@@ -110,6 +111,21 @@ describe("hasPaymentProof", () => {
 });
 
 describe("the mid-job skip reads the same predicate as the upfront one", () => {
+  it.each([false, true])("keeps a prompt waiting when the fallback skips payment with dev_auto=%s", async (explicit) => {
+    const jm = manager({ devMode: true, ...(explicit ? { mints: [MINT] } : {}) });
+    const job = awaitingJob();
+    job.pendingPrompts.set("question", { resolve: () => undefined, reject: () => undefined });
+    try {
+      await jm.processPayment(job, { type: "payment", content: explicit ? { dev_auto: true } : {} }, null);
+      expect(job.status).toBe("awaiting-input");
+      expect(job.paidMsats).toBe(ASK_MSATS);
+      expect(job.pendingPaymentMsats).toBeUndefined();
+      expect(job.reactivationPaymentApplied).toBe(true);
+    } finally {
+      jm.shutdown();
+    }
+  });
+
   it("auto-credits a dev server with no mints, without touching the rail", async () => {
     const jm = manager({ devMode: true });
     const job = awaitingJob();
