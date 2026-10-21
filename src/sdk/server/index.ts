@@ -53,6 +53,7 @@ export type {
   CreditLedgerErrorDetails,
   CreditLedgerLike,
   CreditLedgerPool,
+  CreditFundingEvidence,
   CreditLedgerQuerier,
   CreditSnapshot,
   CreditStatus,

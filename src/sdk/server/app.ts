@@ -21,7 +21,7 @@ import { shortSha } from "../../lib/git-sha";
 import { JOB_IDENTITY_HEADER, isJobIdentityValue } from "../../lib/job-identity-header";
 import type { Message, MessageType } from "../../lib/messages/types";
 import { withPostgresRecoveryContext } from "../../lib/pg-retry";
-import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
+import type { DrawFundingReceipt, FundingReceipt, JobReceipt } from "../../lib/receipt";
 import { attestedDvmIdentity } from "../../lib/receipt-verify";
 import { isPublicRequestId } from "../../lib/request-id";
 import {
@@ -4052,6 +4052,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       await this.jobManager.ensureReceipt(job);
       const res: Record<string, unknown> = { job_id: job.id, status: job.status };
       Object.assign(res, terminalResponseFields(job), await this.contentFields(job));
+      Object.assign(res, await this.drawFundingFields(job));
       removeUnavailableContent(res);
     return c.json(res);
     }
@@ -4062,8 +4063,22 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     await this.jobManager.ensureReceipt(record);
     const res: Record<string, unknown> = { job_id: record.id, status: record.status };
     Object.assign(res, terminalResponseFields(record), await this.contentFields(record));
+    Object.assign(res, await this.drawFundingFields(record));
     removeUnavailableContent(res);
     return c.json(res);
+  }
+
+  /**
+   * Recoverable mid-job funding evidence for an authenticated job read: every
+   * signed draw funding receipt the ledger holds for the job's draw, reissued
+   * from the committed rows when an acknowledgement was lost or the process
+   * restarted. Omitted entirely when the job holds no draw or none exist.
+   */
+  private async drawFundingFields(
+    job: Pick<JobRecord, "id" | "creditId" | "drawId">
+  ): Promise<Record<string, unknown>> {
+    const receipts = await this.jobManager.drawFundingReceipts(job);
+    return receipts.length > 0 ? { draw_funding_receipts: receipts } : {};
   }
 
   private async handleGetMessages(c: Context<AppEnv>): Promise<Response> {
@@ -4306,6 +4321,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       const lockPubkeys = await this.resolveLockPubkeysForReceive();
       let unappliedCredit: UnappliedCredit | undefined;
+      let drawFundingReceipt: DrawFundingReceipt | undefined;
       if (body.type === "payment") {
         const outcome = await jm.processPayment(activeJob, body, inboundSeq, {
           lockPubkeys,
@@ -4316,6 +4332,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         if (outcome.error)
           return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
         unappliedCredit = outcome.unappliedCredit;
+        drawFundingReceipt = outcome.drawFundingReceipt;
       } else {
         // Non-payment inbound: flip status to verified so cross-machine
         // SSE readers see the row.
@@ -4327,7 +4344,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         await jm.dispatchMessage(activeJob, body.type, body.content);
         await this.persistMessageSnapshot(jm, activeJob, body.type);
       } catch (error) {
-        const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit);
+        const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit, drawFundingReceipt);
         if (response) return response;
         throw error;
       }
@@ -4335,8 +4352,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // `credit` is present only when this payment funded a credit the
       // job row didn't take — a concurrent free-then-paid top-up that lost the
       // set-if-null bind. The payment succeeded; the money is simply the
-      // caller's balance rather than this job's.
-      return c.json({ seq: lastMsg.seq, ...(unappliedCredit && { credit: unappliedCredit }) }, 201);
+      // caller's balance rather than this job's. `draw_funding_receipt` is the
+      // signed fact a mid-job funding against the job's own draw leaves behind.
+      return c.json({
+        seq: lastMsg.seq,
+        ...(unappliedCredit && { credit: unappliedCredit }),
+        ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+      }, 201);
     }
 
     const record = await jm.store.get(id);
@@ -4419,6 +4441,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     const lockPubkeys = await this.resolveLockPubkeysForReceive();
     let unappliedCredit: UnappliedCredit | undefined;
+    let drawFundingReceipt: DrawFundingReceipt | undefined;
     if (body.type === "payment") {
       const outcome = await jm.processPayment(job, body, inboundSeq, {
         lockPubkeys,
@@ -4429,10 +4452,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
       }
       unappliedCredit = outcome.unappliedCredit;
+      drawFundingReceipt = outcome.drawFundingReceipt;
     } else {
       await jm.markInboundVerified(job.id, inboundSeq);
     }
-    const creditBlock = unappliedCredit ? { credit: unappliedCredit } : {};
+    const creditBlock = {
+      ...(unappliedCredit && { credit: unappliedCredit }),
+      ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+    };
 
     const elapsed = Date.now() - record.lastActivityAt;
     if (elapsed >= this.descriptor.idleTimeout * 1000) {
@@ -4462,7 +4489,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         await this.runReactivation(jm, job, body, record.status);
       }
     } catch (error) {
-      const response = this.postPaymentSnapshotFailure(c, error, job, body.type, inboundSeq, unappliedCredit);
+      const response = this.postPaymentSnapshotFailure(c, error, job, body.type, inboundSeq, unappliedCredit, drawFundingReceipt);
       if (response) return response;
       throw error;
     }
@@ -4489,7 +4516,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     job: ServerJob,
     type: MessageType,
     inboundSeq: number | null,
-    unappliedCredit?: UnappliedCredit
+    unappliedCredit?: UnappliedCredit,
+    drawFundingReceipt?: DrawFundingReceipt
   ): Response | undefined {
     if (!(error instanceof JobSnapshotPersistenceError) || type !== "payment" ||
       inboundSeq === null || !isStreamableJobStore(this.jobManager.store)) return undefined;
@@ -4506,6 +4534,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       job_id: job.id,
       seq: inboundSeq,
       ...(unappliedCredit && { credit: unappliedCredit }),
+      ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
     }, 503);
   }
 

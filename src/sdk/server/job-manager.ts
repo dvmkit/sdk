@@ -15,7 +15,7 @@ import type {
   ResponseContent,
 } from "../../lib/messages/types";
 import { createMonotonicClock } from "../../lib/monotonic-clock";
-import type { JobReceipt, ReceiptCredit } from "../../lib/receipt";
+import type { DrawFundingReceipt, JobReceipt, ReceiptCredit } from "../../lib/receipt";
 import type {
   SignedRequestAudience,
   SignedRequestDomain,
@@ -42,6 +42,7 @@ import {
   CreditLedgerError,
   type CreditLedgerLike,
   type DrawRecord,
+  type FundingRecord,
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
@@ -83,6 +84,7 @@ import {
   verifyIncomingPayment,
 } from "./payment";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
+import { drawFundingReceiptFor } from "./funding-receipt";
 import type { ReceiptIssuer } from "./receipt-issuer";
 import { isReceiptableStatus } from "./receipt-issuer";
 import { stripProtocolEnvelope } from "./request-envelope";
@@ -537,8 +539,21 @@ export interface UnappliedCredit {
  * carrying an {@link UnappliedCredit} to fold into the 201.
  */
 export type ProcessPaymentOutcome =
-  | { error: { body: Record<string, unknown>; status: number }; unappliedCredit?: undefined }
-  | { error?: undefined; unappliedCredit?: UnappliedCredit };
+  | {
+      error: { body: Record<string, unknown>; status: number };
+      unappliedCredit?: undefined;
+      drawFundingReceipt?: undefined;
+    }
+  | {
+      error?: undefined;
+      unappliedCredit?: UnappliedCredit;
+      /**
+       * Signed evidence that this payment funded the job's credit against its
+       * pending draw. Absent when the payment ran ledger-less, opened a fresh
+       * credit, or the DVM has no receipt key.
+       */
+      drawFundingReceipt?: DrawFundingReceipt;
+    };
 
 /**
  * What `bookRevenue` reads off a job. Structural rather than `ServerJob` or
@@ -2915,11 +2930,26 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // the deposit is booked here too. Skipping it because the request failed
       // would leave the platform holding an unrecorded liability.
       this.reportCreditDeposit(verifyResult.error.funding);
-      return { error: { body: verifyResult.error.body, status: verifyResult.error.status } };
+      // A replayed mid-job payment is the retry after a lost acknowledgement.
+      // The money moved once; hand back the original funding evidence so the
+      // caller can reconcile without paying again.
+      const replayed = await this.replayedDrawFundingReceipt(job, verifyResult.error.replayPaymentId);
+      return {
+        error: {
+          body: { ...verifyResult.error.body, ...(replayed && { draw_funding_receipt: replayed }) },
+          status: verifyResult.error.status,
+        },
+      };
     }
 
     const info = verifyResult.verified;
     if (!info) return {};
+    // Issued before Tx C: the funding row committed with the rail leg, so the
+    // artifact exists whether or not the job row write below succeeds, and a
+    // `payment_unapplied` answer can still carry it. Never fatal — an issuance
+    // or save failure must not turn an accepted payment into a refusal; the
+    // job read re-issues from the same row.
+    const drawFundingReceipt = await this.drawFundingReceiptFor(info.drawFunding, info.funding?.currency);
 
     let unappliedCredit: UnappliedCredit | undefined;
     // the whole payment landed on the credit and grew no draw — a
@@ -2957,7 +2987,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               }
         );
       } catch (err) {
-        return { error: await this.reportUnappliedPayment(job, inboundSeq, info, err) };
+        const unapplied = await this.reportUnappliedPayment(job, inboundSeq, info, err);
+        return {
+          error: {
+            body: { ...unapplied.body, ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }) },
+            status: unapplied.status,
+          },
+        };
       }
       const { counters } = result;
       job.paidMsats = counters.paidMsats;
@@ -3077,7 +3113,95 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // `/v1/credit` legs. Fire-and-forget: a reporting hiccup must never fail the
     // payment that just succeeded.
     this.reportCreditDeposit(info.funding);
-    return { ...(unappliedCredit && { unappliedCredit }) };
+    return {
+      ...(unappliedCredit && { unappliedCredit }),
+      ...(drawFundingReceipt && { drawFundingReceipt }),
+    };
+  }
+
+  /** Issue (or reuse) the signed draw funding receipt for a committed funding row; never throws. */
+  private async drawFundingReceiptFor(
+    funding: FundingRecord | undefined,
+    currency: string | undefined
+  ): Promise<DrawFundingReceipt | undefined> {
+    const ledger = this.opts.creditLedger;
+    if (!funding || !ledger || currency === undefined) return undefined;
+    try {
+      return await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, currency);
+    } catch (err) {
+      diagnosticConsole.error({
+        level: "error",
+        event: "draw_funding_receipt_unavailable",
+        credit_id: funding.creditId,
+        fund_id: funding.fundId,
+        error: errText(err),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Every signed draw funding receipt for a job's draw, oldest first, reissuing
+   * any the acknowledgement never carried. Empty when the ledger cannot list
+   * draw fundings or the job holds no draw; a lookup failure is logged and
+   * answered as empty rather than failing the read.
+   */
+  async drawFundingReceipts(job: Pick<JobRecord, "id" | "creditId" | "drawId">): Promise<DrawFundingReceipt[]> {
+    const ledger = this.opts.creditLedger;
+    // Without an issuer nothing can be signed, so the read costs no lookup at
+    // all; with one, the credit is read only once a draw funding row exists,
+    // which keeps the common poll of an unfunded job to a single list.
+    if (!ledger?.listDrawFundings || !this.opts.receiptIssuer || !job.creditId || !job.drawId) {
+      return [];
+    }
+    try {
+      const fundings = (
+        await ledger.listDrawFundings({ creditId: job.creditId, drawId: job.drawId })
+      ).filter((funding) => funding.jobId === job.id);
+      if (fundings.length === 0) return [];
+      const credit = await ledger.get(job.creditId);
+      if (!credit) return [];
+      const receipts: DrawFundingReceipt[] = [];
+      for (const funding of fundings) {
+        const receipt = await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, credit.currency);
+        if (receipt) receipts.push(receipt);
+      }
+      return receipts;
+    } catch (err) {
+      diagnosticConsole.error({
+        level: "error",
+        event: "draw_funding_receipts_unavailable",
+        job_id: job.id,
+        error: errText(err),
+      });
+      return [];
+    }
+  }
+
+  /** The stored evidence for a replayed mid-job payment, looked up by the payment id the marker collided on. */
+  private async replayedDrawFundingReceipt(
+    job: ServerJob,
+    replayPaymentId: string | undefined
+  ): Promise<DrawFundingReceipt | undefined> {
+    const ledger = this.opts.creditLedger;
+    if (!replayPaymentId || !ledger || !job.creditId) return undefined;
+    try {
+      const [credit, funding] = await Promise.all([
+        ledger.get(job.creditId),
+        ledger.getFunding({ creditId: job.creditId, fundId: replayPaymentId }),
+      ]);
+      if (!credit || !funding || funding.jobId !== job.id) return undefined;
+      return await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, credit.currency);
+    } catch (err) {
+      diagnosticConsole.error({
+        level: "error",
+        event: "draw_funding_receipt_unavailable",
+        job_id: job.id,
+        fund_id: replayPaymentId,
+        error: errText(err),
+      });
+      return undefined;
+    }
   }
 
   /**

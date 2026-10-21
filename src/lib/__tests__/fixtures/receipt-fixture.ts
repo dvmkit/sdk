@@ -7,15 +7,18 @@ import {
 } from "../../builder-identity";
 import type {
   DrainReceipt,
+  DrawFundingReceipt,
   FundingReceipt,
   JobReceipt,
   UnsignedDrainReceipt,
+  UnsignedDrawFundingReceipt,
   UnsignedFundingReceipt,
   UnsignedJobReceipt,
 } from "../../receipt";
 import {
   computeResultHash,
   signDrainReceipt,
+  signDrawFundingReceipt,
   signFundingReceipt,
   signReceipt,
 } from "../../receipt";
@@ -109,6 +112,30 @@ export function unsignedFundingReceipt(
   };
 }
 
+export function unsignedDrawFundingReceipt(
+  overrides: Partial<UnsignedDrawFundingReceipt> = {}
+): UnsignedDrawFundingReceipt {
+  return {
+    v: 1,
+    kind: "credit_draw_funding",
+    credit_id: "credit-1",
+    job_id: "job-a7571b-1",
+    draw_id: "draw-1",
+    fund_id: "0xabc123",
+    payment_seq: 3,
+    currency: "usd",
+    funded_micro: 50_000,
+    balance_after_micro: 400_000,
+    ledger_seq: 6,
+    issued_at: 1789300000,
+    caller_pubkey: "bb".repeat(32),
+    dvm_id: WORDCOUNT_DVM_ID,
+    dvm: "wordcount",
+    receipt_pubkey: receiptPubkeyFromSecret(deriveReceiptSecret(BUILDER_SECRET, WORDCOUNT_DVM_ID)),
+    ...overrides,
+  };
+}
+
 export interface AttestedDvm {
   identity: { secret: string; pubkey: string };
   receiptKey: { secret: string; pubkey: string };
@@ -117,6 +144,7 @@ export interface AttestedDvm {
   sign: (overrides?: Partial<UnsignedJobReceipt>) => JobReceipt;
   signDrain: (overrides?: Partial<UnsignedDrainReceipt>) => DrainReceipt;
   signFunding: (overrides?: Partial<UnsignedFundingReceipt>) => FundingReceipt;
+  signDrawFunding: (overrides?: Partial<UnsignedDrawFundingReceipt>) => DrawFundingReceipt;
 }
 
 export function attestedDvm(slug = "wordcount"): AttestedDvm {
@@ -164,6 +192,16 @@ export function attestedDvm(slug = "wordcount"): AttestedDvm {
     signFunding: (overrides = {}) =>
       signFundingReceipt(
         unsignedFundingReceipt({
+          dvm_id: dvmId,
+          dvm: slug,
+          receipt_pubkey: receiptKey.pubkey,
+          ...overrides,
+        }),
+        receiptKey.secret
+      ),
+    signDrawFunding: (overrides = {}) =>
+      signDrawFundingReceipt(
+        unsignedDrawFundingReceipt({
           dvm_id: dvmId,
           dvm: slug,
           receipt_pubkey: receiptKey.pubkey,

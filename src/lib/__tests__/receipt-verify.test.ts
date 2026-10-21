@@ -8,6 +8,7 @@ import {
   authenticatedBuilderPubkey,
   checkReceiptAttestation,
   verifyDrainReceiptChain,
+  verifyDrawFundingReceiptChain,
   verifyFundingReceiptChain,
   verifyJobReceipt,
   weakestReceiptVerdict
@@ -451,6 +452,81 @@ describe("verifyFundingReceiptChain", () => {
     expect(result.reason).toBe(reason);
     expect(result.checks[field]).toBe("mismatch");
     expect(result.checks.signature).toBe(true);
+  });
+});
+
+describe("verifyDrawFundingReceiptChain", () => {
+  const dvm = attestedDvm();
+
+  it("verifies every binding of a mid-job funding fact through the builder attestation", () => {
+    const receipt = dvm.signDrawFunding();
+    const result = verifyDrawFundingReceiptChain({
+      receipt,
+      builder: dvm.anchor,
+      expectedCreditId: "credit-1",
+      expectedJobId: "job-a7571b-1",
+      expectedDrawId: "draw-1",
+      expectedFundId: "0xabc123",
+      expectedCurrency: "usd",
+      expectedFundedMicro: 50_000,
+      expectedLedgerSeq: 6,
+      expectedCallerPubkey: "bb".repeat(32),
+    });
+    expect(result.status).toBe("verified");
+    expect(result.checks).toMatchObject({
+      credit_id: "ok",
+      job_id: "ok",
+      draw_id: "ok",
+      fund_id: "ok",
+      currency: "ok",
+      funded_micro: "ok",
+      ledger_seq: "ok",
+      caller_pubkey: "ok",
+      signature: true,
+      attestation: "ok",
+    });
+  });
+
+  it.each([
+    [{ expectedCreditId: "credit-2" }, "credit_id", "credit_id_mismatch"],
+    [{ expectedJobId: "job-other" }, "job_id", "job_id_mismatch"],
+    [{ expectedDrawId: "draw-2" }, "draw_id", "draw_id_mismatch"],
+    [{ expectedFundId: "0xother" }, "fund_id", "fund_id_mismatch"],
+    [{ expectedCurrency: "eur" }, "currency", "funding_currency_mismatch"],
+    [{ expectedFundedMicro: 50_001 }, "funded_micro", "funding_amount_mismatch"],
+    [{ expectedLedgerSeq: 7 }, "ledger_seq", "funding_ledger_seq_mismatch"],
+    [{ expectedCallerPubkey: "cc".repeat(32) }, "caller_pubkey", "caller_pubkey_mismatch"],
+  ] as const)("rejects a signed draw funding receipt with a mismatched %s", (expected, field, reason) => {
+    const result = verifyDrawFundingReceiptChain({
+      receipt: dvm.signDrawFunding(),
+      builder: dvm.anchor,
+      ...expected,
+    });
+    expect(result.status).toBe("invalid");
+    expect(result.reason).toBe(reason);
+    expect(result.checks[field]).toBe("mismatch");
+    expect(result.checks.signature).toBe(true);
+  });
+
+  it("refuses an opening funding receipt presented as draw funding evidence", () => {
+    const result = verifyDrawFundingReceiptChain({ receipt: dvm.signFunding(), builder: dvm.anchor });
+    expect(result.status).toBe("invalid");
+    expect(result.reason).toBe("signature_invalid");
+    expect(result.receipt).toBeUndefined();
+  });
+
+  it("refuses a body missing its draw binding even when the rest is signed", () => {
+    const { draw_id: _drawId, ...withoutDraw } = dvm.signDrawFunding();
+    const result = verifyDrawFundingReceiptChain({ receipt: withoutDraw, builder: dvm.anchor });
+    expect(result.status).toBe("invalid");
+    expect(result.reason).toBe("signature_invalid");
+  });
+
+  it("marks a key the attestation does not name as a provider mismatch", () => {
+    const other = attestedDvm();
+    const result = verifyDrawFundingReceiptChain({ receipt: other.signDrawFunding(), builder: dvm.anchor });
+    expect(result.status).toBe("invalid");
+    expect(result.reason).toBe("receipt_key_mismatch");
   });
 });
 

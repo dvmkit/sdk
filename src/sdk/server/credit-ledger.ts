@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import type { Pool, PoolClient } from "pg";
 
-import { isSignedJobReceipt, verifyReceipt, type FundingReceipt } from "../../lib/receipt";
+import { isSignedJobReceipt, verifyReceipt, type DrawFundingReceipt, type FundingReceipt } from "../../lib/receipt";
 import type { FundingMethod } from "../types";
 import {
   depleteLots,
@@ -345,6 +345,10 @@ export class CreditLedger {
       "balance_after_micro BIGINT",
       "ledger_seq BIGINT",
       "receipt JSONB",
+      // Mid-job draw funding bindings; null on opening and `/v1/credit` fundings.
+      "job_id TEXT",
+      "draw_id TEXT",
+      "payment_seq BIGINT",
     ]) {
       await this.pool.query(`ALTER TABLE credit_fundings ADD COLUMN IF NOT EXISTS ${column}`);
     }
@@ -1664,6 +1668,10 @@ export class CreditLedger {
     hostingPaymentSeq?: number;
     hostingInvoicePaymentHash?: string;
     hostingInvoiceRepairPaymentHash?: string;
+    /** Mid-job draw funding bindings, fixed with the row so a replay or read can reissue its evidence. */
+    jobId?: string;
+    drawId?: string;
+    paymentSeq?: number;
     /** External transaction handle — caller owns BEGIN/COMMIT (spec condition 3). */
     tx?: CreditLedgerQuerier;
     nowMs?: number;
@@ -1697,11 +1705,21 @@ export class CreditLedger {
     });
     const nowMs = args.nowMs ?? Date.now();
     const { rows } = await q.query<FundingRow>(
-      `INSERT INTO credit_fundings (credit_id, fund_id, amount_micro, rail, created_at)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO credit_fundings
+         (credit_id, fund_id, amount_micro, rail, created_at, job_id, draw_id, payment_seq)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (credit_id, fund_id) DO NOTHING
        RETURNING *`,
-      [args.creditId, args.fundId, args.amountMicro, args.rail ?? null, nowMs]
+      [
+        args.creditId,
+        args.fundId,
+        args.amountMicro,
+        args.rail ?? null,
+        nowMs,
+        args.jobId ?? null,
+        args.drawId ?? null,
+        args.paymentSeq ?? null,
+      ]
     );
     if (rows.length === 0) {
       throw new CreditLedgerError(
@@ -1724,6 +1742,20 @@ export class CreditLedger {
       [args.creditId, args.fundId]
     );
     return rows.length > 0 ? fundingRecordFromRow(rows[0]) : undefined;
+  }
+
+  /**
+   * Every funding accepted against one job's draw, oldest first. The order is
+   * stable across reads so a job read lists the same evidence each time.
+   */
+  async listDrawFundings(args: { creditId: string; drawId: string }): Promise<FundingRecord[]> {
+    const { rows } = await this.pool.query<FundingRow>(
+      `SELECT * FROM credit_fundings
+        WHERE credit_id = $1 AND draw_id = $2
+        ORDER BY created_at ASC, fund_id ASC`,
+      [args.creditId, args.drawId]
+    );
+    return rows.map(fundingRecordFromRow);
   }
 
   /** Fix the funding-time receipt tuple inside the rail's open transaction. */
@@ -1758,8 +1790,8 @@ export class CreditLedger {
   async saveFundingReceipt(args: {
     creditId: string;
     fundId: string;
-    receipt: FundingReceipt;
-  }): Promise<FundingReceipt> {
+    receipt: CreditFundingEvidence;
+  }): Promise<CreditFundingEvidence> {
     const { rows } = await this.pool.query<FundingRow>(
       `UPDATE credit_fundings SET receipt = COALESCE(receipt, $3::jsonb)
         WHERE credit_id = $1 AND fund_id = $2
@@ -3790,10 +3822,19 @@ export interface CreditLedgerLike {
     hostingPaymentSeq?: number;
     hostingInvoicePaymentHash?: string;
     hostingInvoiceRepairPaymentHash?: string;
+    jobId?: string;
+    drawId?: string;
+    paymentSeq?: number;
     tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<FundingRecord>;
   getFunding(args: { creditId: string; fundId: string }): Promise<FundingRecord | undefined>;
+  /**
+   * Fundings accepted mid-job against one draw, oldest first. Optional so existing
+   * custom ledgers keep compiling; without it a DVM cannot recover mid-job funding
+   * evidence on job reads or replayed payments, only on the original acknowledgement.
+   */
+  listDrawFundings?(args: { creditId: string; drawId: string }): Promise<FundingRecord[]>;
   completeFunding(args: {
     creditId: string;
     fundId: string;
@@ -3805,8 +3846,8 @@ export interface CreditLedgerLike {
   saveFundingReceipt(args: {
     creditId: string;
     fundId: string;
-    receipt: FundingReceipt;
-  }): Promise<FundingReceipt>;
+    receipt: CreditFundingEvidence;
+  }): Promise<CreditFundingEvidence>;
   recordInvoice(args: {
     creditId: string;
     fundId: string;
@@ -4620,6 +4661,12 @@ export function clipEarmark(
   };
 }
 
+/**
+ * The signed artifact a funding row holds: an opening or `/v1/credit` funding
+ * receipt, or a mid-job draw funding receipt. Discriminated by `kind`.
+ */
+export type CreditFundingEvidence = FundingReceipt | DrawFundingReceipt;
+
 export interface FundingRecord {
   creditId: string;
   fundId: string;
@@ -4630,9 +4677,17 @@ export interface FundingRecord {
   /** Original funding-time tuple, fixed atomically with the ledger credit. */
   callerPubkey: string | null;
   balanceAfterMicro: number | null;
+  /**
+   * The committed ledger position: the credit high-water mark for an opening or
+   * `/v1/credit` funding, the draw's own sequence for a mid-job draw funding.
+   */
   ledgerSeq: number | null;
   /** First signed artifact; write-once so retries are byte-stable. */
-  receipt: FundingReceipt | null;
+  receipt: CreditFundingEvidence | null;
+  /** Job, draw and accepted payment message this funding grew; absent on fundings that grew no draw. */
+  jobId?: string | null;
+  drawId?: string | null;
+  paymentSeq?: number | null;
 }
 
 /**
@@ -4961,7 +5016,10 @@ interface FundingRow {
   caller_pubkey: string | null;
   balance_after_micro: string | null;
   ledger_seq: string | null;
-  receipt: FundingReceipt | null;
+  receipt: CreditFundingEvidence | null;
+  job_id?: string | null;
+  draw_id?: string | null;
+  payment_seq?: string | null;
 }
 
 interface BitcoinLiabilityRow {
@@ -5277,6 +5335,9 @@ function fundingRecordFromRow(row: FundingRow): FundingRecord {
     balanceAfterMicro: row.balance_after_micro === null ? null : toSafeInt(row.balance_after_micro),
     ledgerSeq: row.ledger_seq === null ? null : toSafeInt(row.ledger_seq),
     receipt: row.receipt,
+    jobId: row.job_id ?? null,
+    drawId: row.draw_id ?? null,
+    paymentSeq: row.payment_seq === null || row.payment_seq === undefined ? null : toSafeInt(row.payment_seq),
   };
 }
 

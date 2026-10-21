@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
-import type { FundingReceipt } from "../../lib/receipt";
 import type {
+  CreditFundingEvidence,
   BitcoinDepositLiability,
   BlockedInvoiceCursor,
   ChannelDrainCursor,
@@ -266,6 +266,9 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         balanceAfterMicro: null,
         ledgerSeq: null,
         receipt: null,
+        jobId: args.jobId ?? null,
+        drawId: args.drawId ?? null,
+        paymentSeq: args.paymentSeq ?? null,
       };
       this.fundings.set(key, record);
       return record;
@@ -274,6 +277,14 @@ export class MemoryCreditLedger implements CreditLedgerLike {
 
   getFunding(args: { creditId: string; fundId: string }): Promise<FundingRecord | undefined> {
     return run(() => this.fundings.get(fundingKey(args.creditId, args.fundId)));
+  }
+
+  listDrawFundings(args: { creditId: string; drawId: string }): Promise<FundingRecord[]> {
+    return run(() =>
+      [...this.fundings.values()]
+        .filter((funding) => funding.creditId === args.creditId && funding.drawId === args.drawId)
+        .sort((a, b) => a.createdAt - b.createdAt || a.fundId.localeCompare(b.fundId))
+    );
   }
 
   completeFunding(
@@ -297,7 +308,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
 
   saveFundingReceipt(
     args: Parameters<CreditLedgerLike["saveFundingReceipt"]>[0]
-  ): Promise<FundingReceipt> {
+  ): Promise<CreditFundingEvidence> {
     return run(() => {
       const record = this.fundings.get(fundingKey(args.creditId, args.fundId));
       if (!record) {

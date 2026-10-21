@@ -6,6 +6,8 @@ import { initLoggers } from "../../../observability/loggers";
 import { SpanWriter } from "../../../observability/span-writer";
 import type { SpanRow } from "../../../observability/types";
 import { setEmitter } from "../../../observability/with-span";
+import { isDrawFundingReceipt, verifyDrawFundingReceipt } from "../../../lib/receipt";
+import { receiptPubkeyFromSecret } from "../../../lib/receipt-key";
 import { configureDVM } from "../../configure";
 import type { FxFetcher, FxRateSnapshot } from "../../pricing/fx";
 import { createFxFetcher, FxRateUnavailableError } from "../../pricing/fx";
@@ -20,6 +22,7 @@ import { MemoryJobStore } from "../memory-job-store";
 import type { VerifyIncomingSnapshot } from "../payment";
 import { verifyIncomingPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
+import { ReceiptIssuer } from "../receipt-issuer";
 
 vi.mock("../../../lib/x402", () => ({ verifyX402Payment: vi.fn() }));
 vi.mock("../wallet-accumulator-receive", () => ({ acceptAccumulatorPayment: vi.fn() }));
@@ -277,6 +280,180 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
     const draw = await h.ledger.getDraw({ creditId: "c1", drawId: "d1" });
     expect(draw?.amountMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
     expect((await h.ledger.get("c1"))?.balanceMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
+  });
+
+  describe("the draw funding row fixed with the ledger leg", () => {
+    it("records the provider's credited amount, not a figure derived from the caller's rate", async () => {
+      const h = harness();
+      await upfrontDraw(h);
+      // The caller's wallet and this DVM disagree about BTC/USD; the pinned
+      // ask denomination is what the ledger credits, so that is what the
+      // artifact must state.
+      const callerRate: FxFetcher = {
+        ...warmFetcher(),
+        fetch: () => Promise.resolve({ rates: { usd: RATE * 2 } as FxRateSnapshot["rates"], as_of: new Date(0).toISOString() }),
+      };
+
+      const { verified, error } = await payMidJob(h, explicitJob(), callerRate);
+      expect(error).toBeUndefined();
+      expect(verified?.drawFunding).toMatchObject({
+        creditId: "c1",
+        fundId: TOPUP_TX,
+        jobId: JOB_ID,
+        drawId: "d1",
+        amountMicro: TOPUP_MICRO,
+        rail: "x402",
+        callerPubkey: CALLER,
+        // 100k funded + 50k funded, 150k held by the grown draw.
+        balanceAfterMicro: 0,
+        ledgerSeq: 1,
+        receipt: null,
+      });
+      expect(await h.ledger.listDrawFundings({ creditId: "c1", drawId: "d1" })).toHaveLength(1);
+    });
+
+    it("binds the draw's own sequence even when a later draw raised the credit high-water mark", async () => {
+      const h = harness();
+      await h.ledger.fund({
+        creditId: "c1",
+        callerPubkey: CALLER,
+        currency: "usd",
+        amountMicro: UPFRONT_MICRO * 3,
+        expiryMs: FUTURE_MS,
+        basis: { rail: "x402", paidMsats: UPFRONT_MSATS * 3, fundingRef: "0xupfront" }
+      });
+      await h.ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: UPFRONT_MICRO, jobId: JOB_ID });
+      await h.ledger.draw({ creditId: "c1", drawId: "sib", amountMicro: UPFRONT_MICRO, jobId: "job-sib" });
+      expect((await h.ledger.get("c1"))?.lastLedgerSeq).toBe(2);
+
+      const { verified } = await payMidJob(h, explicitJob());
+      expect(verified?.drawFunding?.ledgerSeq).toBe(1);
+      expect(verified?.drawFunding?.balanceAfterMicro).toBe(UPFRONT_MICRO);
+    });
+
+    it("fixes a row for a payment that grew nothing, because the balance still moved", async () => {
+      const h = harness();
+      await upfrontDraw(h);
+
+      const { verified, error } = await payMidJob(h, explicitJob({ pendingPaymentMsats: 0, pendingPaymentFiatMicro: undefined }));
+      expect(error).toBeUndefined();
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect(verified?.drawFunding).toMatchObject({
+        fundId: TOPUP_TX,
+        drawId: "d1",
+        amountMicro: TOPUP_MICRO,
+        balanceAfterMicro: TOPUP_MICRO,
+        ledgerSeq: 1,
+      });
+    });
+
+    it("leaves exactly one row behind a replayed payment and names the payment it collided on", async () => {
+      const h = harness();
+      await upfrontDraw(h);
+      const first = await payMidJob(h, explicitJob());
+
+      const replay = await payMidJob(h, explicitJob());
+      expect(replay.error?.status).toBe(409);
+      expect(replay.error?.replayPaymentId).toBe(TOPUP_TX);
+      const rows = await h.ledger.listDrawFundings({ creditId: "c1", drawId: "d1" });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(first.verified?.drawFunding);
+    });
+
+    describe("through JobManager.processPayment", () => {
+      const RECEIPT_SECRET = "13".repeat(32);
+
+      function manager(h: Harness) {
+        const descriptor = configureDVM({
+          name: "midjob-evidence-test",
+          capability: "test",
+          tag: "test",
+          onJob: () => undefined
+        });
+        return new JobManager(descriptor, {
+          env: {},
+          store: new MemoryKVStore(),
+          jobStore: new MemoryJobStore(),
+          fxFetcher: warmFetcher(),
+          dvmId: DVM_ID,
+          x402: X402,
+          creditLedger: h.ledger,
+          processedPayments: h.processedPayments,
+          receiptIssuer: new ReceiptIssuer({ secret: RECEIPT_SECRET, dvm: "evidence", dvmId: DVM_ID })
+        });
+      }
+
+      function boundJob(): ServerJob {
+        return {
+          id: JOB_ID,
+          requesterId: "requester-1",
+          requesterPubkey: CALLER,
+          status: "awaiting-input",
+          messages: [],
+          pendingPrompts: new Map(),
+          paidMsats: UPFRONT_MSATS,
+          pendingPaymentMsats: TOPUP_MSATS,
+          pendingPaymentFiatMicro: TOPUP_MICRO,
+          pendingPaymentFiatCurrency: "usd",
+          paymentRail: "x402",
+          creditId: "c1",
+          drawId: "d1",
+          paymentTxHash: drawSettlementRef(DVM_ID, "c1", "d1")
+        } as unknown as ServerJob;
+      }
+
+      it("signs the fact once and hands the same bytes back on a replay", async () => {
+        const h = harness();
+        await upfrontDraw(h);
+        const jm = manager(h);
+        try {
+          const body = { type: "payment" as const, content: { x402_payment: "base64_header" } };
+          const first = await jm.processPayment(boundJob(), body, null);
+          expect(first.error).toBeUndefined();
+          const receipt = first.drawFundingReceipt;
+          if (!receipt) throw new Error("no draw funding receipt on the accepted payment");
+          expect(verifyDrawFundingReceipt(receipt)).toBe(true);
+          expect(receipt).toMatchObject({
+            kind: "credit_draw_funding",
+            credit_id: "c1",
+            job_id: JOB_ID,
+            draw_id: "d1",
+            fund_id: TOPUP_TX,
+            currency: "usd",
+            funded_micro: TOPUP_MICRO,
+            balance_after_micro: 0,
+            ledger_seq: 1,
+            caller_pubkey: CALLER,
+            dvm_id: DVM_ID,
+            receipt_pubkey: receiptPubkeyFromSecret(RECEIPT_SECRET)
+          });
+          expect(receipt.payment_seq).toBeUndefined();
+
+          const replay = await jm.processPayment(boundJob(), body, null);
+          expect(replay.error?.status).toBe(409);
+          expect(replay.error?.body.error).toBe("replay_rejected");
+          expect(JSON.stringify(replay.error?.body.draw_funding_receipt)).toBe(JSON.stringify(receipt));
+
+          const stored = await h.ledger.getFunding({ creditId: "c1", fundId: TOPUP_TX });
+          expect(isDrawFundingReceipt(stored?.receipt)).toBe(true);
+          const recovered = await jm.drawFundingReceipts({ id: JOB_ID, creditId: "c1", drawId: "d1" });
+          expect(JSON.stringify(recovered)).toBe(JSON.stringify([receipt]));
+        } finally {
+          jm.shutdown();
+        }
+      });
+
+      it("issues nothing without a receipt key and lists nothing for a job that holds no draw", async () => {
+        const h = harness();
+        await upfrontDraw(h);
+        const jm = manager(h);
+        try {
+          expect(await jm.drawFundingReceipts({ id: JOB_ID })).toEqual([]);
+        } finally {
+          jm.shutdown();
+        }
+      });
+    });
   });
 
   describe("a short mid-job pay", () => {

@@ -2,6 +2,7 @@ import type { JsonValue } from "../../lib/cast-auth";
 import type {
   DrainReceipt,
   DrainReceiptEvent,
+  DrawFundingReceipt,
   FundingReceipt,
   JobReceipt,
   ReceiptCredit,
@@ -11,6 +12,7 @@ import type {
 import {
   computeResultHash,
   signDrainReceipt,
+  signDrawFundingReceipt,
   signFundingReceipt,
   signReceipt,
 } from "../../lib/receipt";
@@ -140,6 +142,47 @@ export class ReceiptIssuer {
         kind: "credit_funding",
         credit_id: args.creditId,
         fund_id: args.fundId,
+        funded_micro: args.fundedMicro,
+        balance_after_micro: args.balanceAfterMicro,
+        ledger_seq: args.ledgerSeq,
+        issued_at: args.issuedAt ?? Math.floor(Date.now() / 1000),
+        caller_pubkey: args.callerPubkey,
+        dvm_id: this.dvmId,
+        dvm: this.dvm,
+        receipt_pubkey: this.pubkey,
+      },
+      this.secret
+    );
+  }
+
+  /**
+   * Countersign the immutable tuple captured when a mid-job payment funded a
+   * job's credit against its pending draw. `ledgerSeq` is the draw's own
+   * sequence so the artifact lines up with the terminal receipt's credit block.
+   */
+  issueDrawFunding(args: {
+    creditId: string;
+    jobId: string;
+    drawId: string;
+    fundId: string;
+    paymentSeq?: number;
+    currency: string;
+    fundedMicro: number;
+    balanceAfterMicro: number;
+    ledgerSeq: number;
+    callerPubkey: string;
+    issuedAt?: number;
+  }): DrawFundingReceipt {
+    return signDrawFundingReceipt(
+      {
+        v: 1,
+        kind: "credit_draw_funding",
+        credit_id: args.creditId,
+        job_id: args.jobId,
+        draw_id: args.drawId,
+        fund_id: args.fundId,
+        ...(args.paymentSeq !== undefined && { payment_seq: args.paymentSeq }),
+        currency: args.currency,
         funded_micro: args.fundedMicro,
         balance_after_micro: args.balanceAfterMicro,
         ledger_seq: args.ledgerSeq,

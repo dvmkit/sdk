@@ -29,9 +29,14 @@ import {
   archiveCompletedCreditRecords, completedRefund, completedLoss, readCreditHistoryPage,
   type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage,
 } from "./credit-history";
-import type { ReceiptCredit } from "./receipt";
+import { type DrawFundingReceipt, isDrawFundingReceipt, type ReceiptCredit } from "./receipt";
 import type { TrustAnchorRead } from "./receipt-contracts";
-import type { AttestedDvmIdentity, ReceiptTrustAnchor } from "./receipt-verify";
+import {
+  type AttestedDvmIdentity,
+  type ReceiptInvalidReason,
+  type ReceiptTrustAnchor,
+  verifyDrawFundingReceiptChain,
+} from "./receipt-verify";
 import { type CreditMenu, type CreditWire, parseCreditMenu } from "./transport/types";
 // Type-only: the instrument vocabulary is the server's, and importing the
 // declaration keeps this store free of x402's runtime stack.
@@ -167,12 +172,69 @@ export interface StoredDrainEvidence {
   };
 }
 
+/**
+ * One verified mid-job funding fact, held until the draw it grew settles.
+ *
+ * The caller's projection never sees money accepted while a job runs: the
+ * DVM funds the credit and grows the pending draw in one ledger step that
+ * allocates no sequence, so the terminal receipt's `balance_after` includes it
+ * while `remainingMicro − amount` does not. A fact is admitted only after
+ * {@link verifyDrawFundingReceiptChain} binds it to this caller, credit and
+ * provider, and it is spent exactly once, by the terminal receipt whose
+ * `draw_id` and `ledger_seq` it names.
+ */
+export interface StoredDrawFunding {
+  /** Rail payment id the funding committed under; the at-most-once key. */
+  fundId: string;
+  jobId: string;
+  drawId: string;
+  /** Provider-credited micro-units of the credit currency. */
+  fundedMicro: number;
+  /** The draw's ledger sequence — what the terminal receipt's credit block names. */
+  ledgerSeq: number;
+  /** Available balance the DVM signed immediately after the funding committed. */
+  balanceAfterMicro: number;
+  /** Epoch ms the fact was admitted locally. */
+  recordedAt: number;
+  /** The verbatim signed artifact, retained as evidence. */
+  receipt: DrawFundingReceipt;
+}
+
+/** Why {@link recordDrawFunding} refused an artifact. */
+export type DrawFundingRejection =
+  /** Not a structurally valid, correctly signed draw funding receipt (see `verifyReason`). */
+  | "invalid"
+  /** No tracked credit for this caller matches the receipt's credit at this provider. */
+  | "unknown_credit"
+  /** The receipt names a different caller pubkey. */
+  | "caller_mismatch"
+  /** The receipt's DVM identity or signing key does not chain to the provider this record is bound to. */
+  | "provider_mismatch"
+  /** The receipt is denominated in a different currency than the tracked credit. */
+  | "currency_mismatch"
+  /** A fact with this fund id is already held. */
+  | "duplicate"
+  /** The projection is already anchored at or beyond the funding's draw sequence. */
+  | "already_reflected";
+
+export interface RecordDrawFundingResult {
+  /** The record the fact was judged against, when one exists. */
+  credit?: StoredCredit;
+  /** True when the fact is now held and eligible for reconciliation. */
+  recorded: boolean;
+  reason?: DrawFundingRejection;
+  /** The chain verdict's reason when `reason` is `invalid` or `provider_mismatch`. */
+  verifyReason?: ReceiptInvalidReason;
+}
+
 /** A detected disagreement between the local projection and a signed receipt. */
 export interface CreditDiscrepancy {
   /** Epoch ms the mismatch was detected. */
   atMs: number;
   /** What the local projection said the balance should be after the draw. */
   expectedMicro: number;
+  /** Verified mid-job funding the expectation credited before subtracting the draw. */
+  fundedMicro?: number;
   /** What the DVM's countersigned receipt reported. */
   reportedMicro: number;
   /** The draw whose receipt disagreed. */
@@ -366,6 +428,12 @@ export interface StoredCredit extends DvmLocated {
   drainEvidence?: StoredDrainEvidence[];
   /** Most recent balance mismatch, kept until the next clean receipt. */
   discrepancy?: CreditDiscrepancy;
+  /**
+   * Verified mid-job funding facts awaiting the terminal receipt of the draw
+   * they grew. Pruned once that draw settles or releases, or once the
+   * projection re-anchors at or beyond their sequence.
+   */
+  drawFundings?: StoredDrawFunding[];
 }
 
 /**
@@ -390,6 +458,8 @@ export interface ApplyReceiptResult {
   credit?: StoredCredit;
   /** Present when the signed `balance_after` contradicted the local projection. */
   mismatch?: CreditDiscrepancy;
+  /** Verified mid-job funding the comparison credited to this draw, when any applied. */
+  fundedMicro?: number;
 }
 
 /** Result of folding an implicit credit receipt into its separate local namespace. */
@@ -988,6 +1058,8 @@ export function recordFundResponse(args: {
     // sequence backwards. Different credit: `adoptCreditId` has already zeroed
     // the mark, so the incoming per-credit sequence is taken verbatim.
     record.ledgerSeq = Math.max(record.ledgerSeq, args.credit.ledger_seq);
+    // A balance stated at or beyond a funding's draw sequence already nets it.
+    pruneDrawFundings(record, record.ledgerSeq);
     record.expiryMs = args.credit.expiry_ms;
     record.targetMicro = args.targetMicro;
     record.status =
@@ -1131,6 +1203,13 @@ export function applyReceiptCredit(args: {
   jobId: string;
   outcome: "completed" | "failed" | "cancelled";
   credit: ReceiptCredit;
+  /**
+   * Mid-job funding evidence in hand at reconciliation time, admitted under the
+   * same lock before the comparison so no sibling process can settle the draw
+   * between the two. Each entry is judged exactly as {@link recordDrawFunding}
+   * judges it; a refused entry is simply not credited.
+   */
+  drawFundings?: { receipt: unknown; builder?: ReceiptTrustAnchor }[];
   now?: number;
 }): ApplyReceiptResult {
   const now = args.now ?? Date.now();
@@ -1143,13 +1222,33 @@ export function applyReceiptCredit(args: {
       where: (c) => c.callerPubkey === args.callerPubkey && c.creditId === args.credit.credit_id,
     });
     if (!record) return {};
+    let admitted = false;
+    for (const evidence of args.drawFundings ?? []) {
+      const verdict = admitDrawFunding(record, {
+        callerPubkey: args.callerPubkey,
+        identity: args.identity,
+        receipt: evidence.receipt,
+        builder: evidence.builder,
+        now,
+      });
+      admitted ||= verdict.recorded;
+    }
     // Checked here, under the lock that also applies the receipt: a caller's
     // earlier read proves nothing once another process may have settled a newer
     // draw. Replayed evidence must not touch any field of the newer projection.
-    if (args.credit.ledger_seq < record.ledgerSeq) return { credit: record };
+    if (args.credit.ledger_seq < record.ledgerSeq) {
+      if (admitted) {
+        // Exactly what recordDrawFunding would have persisted for the same facts.
+        attachDvmLocation(record, key, args.identity);
+        record.updatedAt = now;
+        saveStore(store);
+      }
+      return { credit: record };
+    }
     attachDvmLocation(record, key, args.identity);
 
     let mismatch: CreditDiscrepancy | undefined;
+    let fundedMicro: number | undefined;
     const sequential = args.credit.ledger_seq === record.ledgerSeq + 1;
     if (
       sequential &&
@@ -1158,11 +1257,23 @@ export function applyReceiptCredit(args: {
       !record.provisional &&
       !record.unsequencedBalance
     ) {
-      const expected = record.remainingMicro - args.credit.amount;
+      // Only facts bound to this exact draw at this exact sequence count. A
+      // sequential receipt proves the projection predates the draw's placement,
+      // and therefore every funding accepted against it; the signed facts are
+      // what the projection was missing, not a reason to skip the comparison.
+      const eligible = (record.drawFundings ?? []).filter(
+        (fact) =>
+          fact.drawId === args.credit.draw_id && fact.ledgerSeq === args.credit.ledger_seq
+      );
+      if (eligible.length > 0) {
+        fundedMicro = eligible.reduce((sum, fact) => sum + fact.fundedMicro, 0);
+      }
+      const expected = record.remainingMicro + (fundedMicro ?? 0) - args.credit.amount;
       if (args.credit.balance_after !== expected) {
         mismatch = {
           atMs: now,
           expectedMicro: expected,
+          ...(fundedMicro !== undefined ? { fundedMicro } : {}),
           reportedMicro: args.credit.balance_after,
           drawId: args.credit.draw_id,
           ledgerSeq: args.credit.ledger_seq,
@@ -1175,6 +1286,10 @@ export function applyReceiptCredit(args: {
 
     record.remainingMicro = args.credit.balance_after;
     record.ledgerSeq = args.credit.ledger_seq;
+    // This draw's facts are spent whatever the outcome: a released draw
+    // restores the balance the receipt states, and a repeated terminal
+    // reconciliation at an equal sequence must not credit them again.
+    pruneDrawFundings(record, record.ledgerSeq, args.credit.draw_id);
     // Anchored again: this figure and the mark it sits at came from the same
     // countersigned block.
     delete record.unsequencedBalance;
@@ -1188,8 +1303,147 @@ export function applyReceiptCredit(args: {
     record.lastReceiptJobId = args.jobId;
     record.updatedAt = now;
     saveStore(store);
-    return { credit: record, ...(mismatch ? { mismatch } : {}) };
+    return {
+      credit: record,
+      ...(mismatch ? { mismatch } : {}),
+      ...(fundedMicro !== undefined ? { fundedMicro } : {}),
+    };
   });
+}
+
+/**
+ * Admit one signed mid-job funding fact for later reconciliation.
+ *
+ * Verification happens here, not at the call site: an artifact that raises an
+ * expected balance can hide a real shortfall, so nothing reaches
+ * {@link StoredCredit.drawFundings} unless its signature holds, it names this
+ * caller and credit, and it chains to the provider the record is bound to. An
+ * attested record requires a `verified` chain under its own attested builder;
+ * an unattested record accepts `verified_unattested`, the same standard its job
+ * receipts meet. A fact the projection has already passed is refused as
+ * `already_reflected` rather than held for a comparison that can never arm.
+ */
+export function recordDrawFunding(args: {
+  endpoint: string;
+  identity?: AttestedDvmIdentity;
+  callerPubkey: string;
+  receipt: unknown;
+  /** `/v1/info#builder` of the issuing endpoint, when the caller has it. */
+  builder?: ReceiptTrustAnchor;
+  now?: number;
+}): RecordDrawFundingResult {
+  const now = args.now ?? Date.now();
+  return withCreditLock(() => {
+    const store = loadStore();
+    const key = normalizeCreditEndpoint(args.endpoint);
+    if (!isDrawFundingReceipt(args.receipt)) {
+      return { recorded: false, reason: "invalid", verifyReason: "signature_invalid" };
+    }
+    const named = args.receipt;
+    const record = findDvmLocated(store.credits, {
+      endpoint: key,
+      ...(args.identity ? { identity: args.identity } : {}),
+      where: (c) => c.callerPubkey === args.callerPubkey && c.creditId === named.credit_id,
+    });
+    if (!record) return { recorded: false, reason: "unknown_credit" };
+    const verdict = admitDrawFunding(record, {
+      callerPubkey: args.callerPubkey,
+      identity: args.identity,
+      receipt: named,
+      builder: args.builder,
+      now,
+    });
+    if (verdict.recorded) {
+      attachDvmLocation(record, key, args.identity);
+      record.updatedAt = now;
+      saveStore(store);
+    }
+    return { credit: record, ...verdict };
+  });
+}
+
+/** The shared admission judgement behind {@link recordDrawFunding} and {@link applyReceiptCredit}. */
+function admitDrawFunding(
+  record: StoredCredit,
+  args: {
+    callerPubkey: string;
+    identity?: AttestedDvmIdentity;
+    receipt: unknown;
+    builder?: ReceiptTrustAnchor;
+    now: number;
+  }
+): Omit<RecordDrawFundingResult, "credit"> {
+  const verdict = verifyDrawFundingReceiptChain({
+    receipt: args.receipt,
+    builder: args.builder,
+    expectedCallerPubkey: args.callerPubkey,
+    expectedCreditId: record.creditId,
+  });
+  const named = verdict.receipt;
+  if (!named) return { recorded: false, reason: "invalid", verifyReason: "signature_invalid" };
+  if (verdict.reason === "caller_pubkey_mismatch") return { recorded: false, reason: "caller_mismatch" };
+  if (verdict.reason === "credit_id_mismatch") return { recorded: false, reason: "unknown_credit" };
+  if (verdict.status === "invalid") {
+    const provider =
+      verdict.reason === "dvm_identity_mismatch" ||
+      verdict.reason === "receipt_key_mismatch" ||
+      verdict.reason === "attestation_invalid";
+    return {
+      recorded: false,
+      reason: provider ? "provider_mismatch" : "invalid",
+      ...(verdict.reason ? { verifyReason: verdict.reason } : {}),
+    };
+  }
+  if (args.identity && named.dvm_id !== args.identity.dvmId) {
+    return { recorded: false, reason: "provider_mismatch", verifyReason: "dvm_identity_mismatch" };
+  }
+  if (record.dvmId !== undefined && named.dvm_id !== record.dvmId) {
+    return { recorded: false, reason: "provider_mismatch", verifyReason: "dvm_identity_mismatch" };
+  }
+  const attested = dvmLocationIdentity(record);
+  if (attested) {
+    // The record knows which builder stands behind this DVM. Evidence must
+    // chain to that builder — a self-consistent anchor under some other key
+    // proves only that someone owns a key.
+    const anchorPubkey = args.builder?.pubkey?.trim().toLowerCase();
+    if (verdict.status !== "verified" || anchorPubkey !== attested.builderPubkey) {
+      return { recorded: false, reason: "provider_mismatch", verifyReason: "receipt_key_mismatch" };
+    }
+  }
+  if (named.currency !== record.currency) return { recorded: false, reason: "currency_mismatch" };
+  if (named.ledger_seq <= record.ledgerSeq) return { recorded: false, reason: "already_reflected" };
+  const held = record.drawFundings ?? [];
+  if (held.some((fact) => fact.fundId === named.fund_id)) {
+    return { recorded: false, reason: "duplicate" };
+  }
+  held.push({
+    fundId: named.fund_id,
+    jobId: named.job_id,
+    drawId: named.draw_id,
+    fundedMicro: named.funded_micro,
+    ledgerSeq: named.ledger_seq,
+    balanceAfterMicro: named.balance_after_micro,
+    recordedAt: args.now,
+    receipt: named,
+  });
+  held.sort((a, b) => a.ledgerSeq - b.ledgerSeq || a.recordedAt - b.recordedAt);
+  record.drawFundings = held;
+  return { recorded: true };
+}
+
+/**
+ * Drop facts the projection can no longer use: those of the named draw, and
+ * every fact whose draw sequence the projection has reached. A sequential
+ * comparison can only arm beyond `ledgerSeq`, so what remains is exactly what
+ * a future terminal receipt could still need.
+ */
+function pruneDrawFundings(record: StoredCredit, ledgerSeq: number, drawId?: string): void {
+  if (!record.drawFundings) return;
+  const kept = record.drawFundings.filter(
+    (fact) => fact.ledgerSeq > ledgerSeq && (drawId === undefined || fact.drawId !== drawId)
+  );
+  if (kept.length === 0) delete record.drawFundings;
+  else record.drawFundings = kept;
 }
 
 /**
@@ -1831,6 +2085,7 @@ function adoptCreditId(record: StoredCredit, creditId: string): void {
   delete record.refillDrainNoticed;
   delete record.discrepancy;
   delete record.lastReceiptJobId;
+  delete record.drawFundings;
 }
 
 /**

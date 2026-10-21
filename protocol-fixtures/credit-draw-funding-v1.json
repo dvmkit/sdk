@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "description": "Signed mid-job draw funding evidence: a rail payment accepted while a job runs funds the job's credit against its pending draw. The provider issues this artifact from the committed ledger row and returns the same bytes on the acknowledgement, on a replayed payment, and on every later authenticated job read.",
+  "signing": {
+    "builder_secret": "1111111111111111111111111111111111111111111111111111111111111111",
+    "receipt_secret_derivation": "HKDF-SHA256(builder_secret, salt='dvmkit/receipt/v1', info='dvmkit/receipt/v1/<dvm_id>')",
+    "canonical_utf8": "{\"balance_after_micro\":400000,\"caller_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"credit_id\":\"9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a\",\"currency\":\"usd\",\"draw_id\":\"5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4\",\"dvm\":\"wordcount\",\"dvm_id\":\"dvm-wordcount\",\"fund_id\":\"0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c\",\"funded_micro\":50000,\"issued_at\":1789300000,\"job_id\":\"job-a7571b-6\",\"kind\":\"credit_draw_funding\",\"ledger_seq\":6,\"payment_seq\":3,\"receipt_pubkey\":\"ee74b9b20ea382ffd5203d0997786c0300b359f8c0cec870c719a215c59cb04f\",\"v\":1}"
+  },
+  "receipt": {
+    "v": 1,
+    "kind": "credit_draw_funding",
+    "credit_id": "9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a",
+    "job_id": "job-a7571b-6",
+    "draw_id": "5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4",
+    "fund_id": "0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+    "payment_seq": 3,
+    "currency": "usd",
+    "funded_micro": 50000,
+    "balance_after_micro": 400000,
+    "ledger_seq": 6,
+    "issued_at": 1789300000,
+    "caller_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dvm_id": "dvm-wordcount",
+    "dvm": "wordcount",
+    "receipt_pubkey": "ee74b9b20ea382ffd5203d0997786c0300b359f8c0cec870c719a215c59cb04f",
+    "signature": "3e16eaa9665eab6aa2ad0db2c79790f9525f1671634459858178586648178268593466a639b65536455b5ce8bea9cbdb267b3c0516afe9ced67f2291f79ea4b6"
+  },
+  "payment_acknowledgement": {
+    "status": 201,
+    "body": {
+      "seq": 3,
+      "draw_funding_receipt": {
+        "v": 1,
+        "kind": "credit_draw_funding",
+        "credit_id": "9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a",
+        "job_id": "job-a7571b-6",
+        "draw_id": "5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4",
+        "fund_id": "0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+        "payment_seq": 3,
+        "currency": "usd",
+        "funded_micro": 50000,
+        "balance_after_micro": 400000,
+        "ledger_seq": 6,
+        "issued_at": 1789300000,
+        "caller_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dvm_id": "dvm-wordcount",
+        "dvm": "wordcount",
+        "receipt_pubkey": "ee74b9b20ea382ffd5203d0997786c0300b359f8c0cec870c719a215c59cb04f",
+        "signature": "3e16eaa9665eab6aa2ad0db2c79790f9525f1671634459858178586648178268593466a639b65536455b5ce8bea9cbdb267b3c0516afe9ced67f2291f79ea4b6"
+      }
+    }
+  },
+  "replayed_payment": {
+    "status": 409,
+    "body": {
+      "error": "replay_rejected",
+      "message": "Payment 0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c on rail x402 was already processed at this DVM.",
+      "draw_funding_receipt": {
+        "v": 1,
+        "kind": "credit_draw_funding",
+        "credit_id": "9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a",
+        "job_id": "job-a7571b-6",
+        "draw_id": "5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4",
+        "fund_id": "0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+        "payment_seq": 3,
+        "currency": "usd",
+        "funded_micro": 50000,
+        "balance_after_micro": 400000,
+        "ledger_seq": 6,
+        "issued_at": 1789300000,
+        "caller_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dvm_id": "dvm-wordcount",
+        "dvm": "wordcount",
+        "receipt_pubkey": "ee74b9b20ea382ffd5203d0997786c0300b359f8c0cec870c719a215c59cb04f",
+        "signature": "3e16eaa9665eab6aa2ad0db2c79790f9525f1671634459858178586648178268593466a639b65536455b5ce8bea9cbdb267b3c0516afe9ced67f2291f79ea4b6"
+      }
+    }
+  },
+  "job_read": {
+    "status": 200,
+    "body": {
+      "job_id": "job-a7571b-6",
+      "status": "completed",
+      "draw_funding_receipts": [
+        {
+          "v": 1,
+          "kind": "credit_draw_funding",
+          "credit_id": "9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a",
+          "job_id": "job-a7571b-6",
+          "draw_id": "5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4",
+          "fund_id": "0x4f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+          "payment_seq": 3,
+          "currency": "usd",
+          "funded_micro": 50000,
+          "balance_after_micro": 400000,
+          "ledger_seq": 6,
+          "issued_at": 1789300000,
+          "caller_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "dvm_id": "dvm-wordcount",
+          "dvm": "wordcount",
+          "receipt_pubkey": "ee74b9b20ea382ffd5203d0997786c0300b359f8c0cec870c719a215c59cb04f",
+          "signature": "3e16eaa9665eab6aa2ad0db2c79790f9525f1671634459858178586648178268593466a639b65536455b5ce8bea9cbdb267b3c0516afe9ced67f2291f79ea4b6"
+        }
+      ],
+      "receipt": {
+        "credit": {
+          "credit_id": "9e107d9d-0a1b-4c6e-8f2a-3b5c7d9e1f2a",
+          "draw_id": "5c2f8a1e-7b3d-4e9f-a1c2-d4e6f8a0b2c4",
+          "amount": 150000,
+          "balance_after": 400000,
+          "ledger_seq": 6
+        }
+      }
+    }
+  },
+  "reconciliation": {
+    "prior_projection": {
+      "remaining_micro": 500000,
+      "ledger_seq": 5
+    },
+    "expected_balance_after": "remaining_micro + sum(funded_micro of verified facts bound to receipt.credit.draw_id at receipt.credit.ledger_seq) - receipt.credit.amount",
+    "example": "500000 + 50000 - 150000 = 400000",
+    "eligibility": "A fact applies only to the terminal receipt whose draw_id and ledger_seq it names, and only once; a fact whose ledger_seq is at or below the projection's anchor is already reflected and must be refused."
+  }
+}

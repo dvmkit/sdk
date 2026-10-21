@@ -44,6 +44,7 @@ import {
   recordBalanceResponse,
   recordCreditX402Instrument,
   recordDrainReceipts,
+  recordDrawFunding,
   recordFundingMenuSnapshot,
   recordFundResponse,
   recordPendingDrain,
@@ -55,7 +56,7 @@ import {
 } from "../credit-store";
 import type { ReceiptTrustAnchor } from "../receipt-verify";
 import type { CreditMenu, CreditWire } from "../transport/types";
-import { unsignedDrainReceipt } from "./fixtures/receipt-fixture";
+import { attestedDvm, unsignedDrainReceipt } from "./fixtures/receipt-fixture";
 
 const ENDPOINT = "https://wordcount.example";
 const ALIAS_ENDPOINT = "https://wordcount-alt.example";
@@ -2806,5 +2807,335 @@ describe("pending funding provider boundaries", () => {
     expect(loadPendingFunding(ALIAS_ENDPOINT, PUBKEY)).toBeUndefined();
     clearPendingFunding(`${ENDPOINT}/v1/credit`, PUBKEY, "credit-shared", "fund-shared");
     expect(listPendingFundings()).toEqual([second]);
+  });
+});
+
+describe("mid-job draw funding evidence", () => {
+  // Real keys: the store verifies the artifact itself, so a forged or
+  // re-bound fact must fail here, not at some caller's discretion.
+  const dvm = attestedDvm();
+  const ATTESTED = { dvmId: "dvm-wordcount", builderPubkey: dvm.identity.pubkey };
+
+  function seeded(remaining: number, seq: number, identity: typeof ATTESTED | null = ATTESTED): void {
+    recordFundResponse({
+      endpoint: ENDPOINT,
+      ...(identity ? { identity } : {}),
+      callerPubkey: PUBKEY,
+      credit: wire({ balance_micro: remaining, remaining_micro: remaining, ledger_seq: seq }),
+      targetMicro: 500_000,
+      now: 1_000,
+    });
+  }
+
+  function evidence(overrides: Parameters<typeof dvm.signDrawFunding>[0] = {}) {
+    return dvm.signDrawFunding({
+      credit_id: "credit-1",
+      job_id: "job-6",
+      draw_id: "draw-6",
+      fund_id: "0xfund-6",
+      currency: "usd",
+      funded_micro: 50_000,
+      balance_after_micro: 400_000,
+      ledger_seq: 6,
+      caller_pubkey: PUBKEY,
+      ...overrides,
+    });
+  }
+
+  function record(receipt: unknown, opts: { builder?: ReceiptTrustAnchor; identity?: typeof ATTESTED } = {}) {
+    return recordDrawFunding({
+      endpoint: ENDPOINT,
+      identity: "identity" in opts ? opts.identity : ATTESTED,
+      callerPubkey: PUBKEY,
+      receipt,
+      builder: "builder" in opts ? opts.builder : dvm.anchor,
+      now: 2_000,
+    });
+  }
+
+  function terminal(args: {
+    seq: number;
+    drawId?: string;
+    amount: number;
+    balanceAfter: number;
+    outcome?: "completed" | "failed" | "cancelled";
+    identity?: typeof ATTESTED;
+    drawFundings?: { receipt: unknown; builder?: ReceiptTrustAnchor }[];
+  }) {
+    return applyReceiptCredit({
+      endpoint: ENDPOINT,
+      identity: "identity" in args ? args.identity : ATTESTED,
+      callerPubkey: PUBKEY,
+      jobId: `job-${String(args.seq)}`,
+      outcome: args.outcome ?? "completed",
+      credit: {
+        credit_id: "credit-1",
+        draw_id: args.drawId ?? `draw-${String(args.seq)}`,
+        amount: args.amount,
+        balance_after: args.balanceAfter,
+        ledger_seq: args.seq,
+      },
+      ...(args.drawFundings ? { drawFundings: args.drawFundings } : {}),
+      now: 3_000,
+    });
+  }
+
+  it("reconciles a funded, grown draw across two jobs without a false warning", () => {
+    seeded(500_000, 5);
+    expect(record(evidence())).toMatchObject({ recorded: true });
+
+    const first = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+    expect(first.mismatch).toBeUndefined();
+    expect(first.fundedMicro).toBe(50_000);
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toMatchObject({
+      remainingMicro: 400_000,
+      ledgerSeq: 6,
+    });
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.drawFundings).toBeUndefined();
+
+    expect(
+      record(evidence({ job_id: "job-7", draw_id: "draw-7", fund_id: "0xfund-7", ledger_seq: 7, balance_after_micro: 300_000 }))
+    ).toMatchObject({ recorded: true });
+    const second = terminal({ seq: 7, amount: 150_000, balanceAfter: 300_000 });
+    expect(second.mismatch).toBeUndefined();
+    expect(second.fundedMicro).toBe(50_000);
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.remainingMicro).toBe(300_000);
+  });
+
+  it("without evidence the same trajectory still warns — the comparison is not loosened", () => {
+    seeded(500_000, 5);
+    const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+    expect(result.mismatch).toMatchObject({ expectedMicro: 350_000, reportedMicro: 400_000 });
+    expect(result.fundedMicro).toBeUndefined();
+  });
+
+  it("admits evidence handed to the terminal reconciliation under the same lock", () => {
+    seeded(500_000, 5);
+    const result = terminal({
+      seq: 6,
+      amount: 150_000,
+      balanceAfter: 400_000,
+      drawFundings: [{ receipt: evidence(), builder: dvm.anchor }],
+    });
+    expect(result.mismatch).toBeUndefined();
+    expect(result.fundedMicro).toBe(50_000);
+  });
+
+  it("sums every fact bound to the draw and applies each fund id once", () => {
+    seeded(500_000, 5);
+    expect(record(evidence())).toMatchObject({ recorded: true });
+    expect(record(evidence({ fund_id: "0xfund-6b", funded_micro: 20_000 }))).toMatchObject({ recorded: true });
+    expect(record(evidence())).toMatchObject({ recorded: false, reason: "duplicate" });
+
+    const result = terminal({ seq: 6, amount: 170_000, balanceAfter: 400_000 });
+    expect(result.mismatch).toBeUndefined();
+    expect(result.fundedMicro).toBe(70_000);
+  });
+
+  it("still warns on a contradictory terminal balance and cites the funding it credited", () => {
+    seeded(500_000, 5);
+    record(evidence());
+    const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 399_000 });
+    expect(result.mismatch).toMatchObject({
+      expectedMicro: 400_000,
+      fundedMicro: 50_000,
+      reportedMicro: 399_000,
+      drawId: "draw-6",
+      ledgerSeq: 6,
+    });
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toMatchObject({
+      remainingMicro: 399_000,
+      discrepancy: { expectedMicro: 400_000, fundedMicro: 50_000 },
+    });
+  });
+
+  describe("evidence that cannot hide a real mismatch", () => {
+    const other = attestedDvm();
+
+    it.each([
+      {
+        name: "a tampered amount",
+        receipt: () => ({ ...evidence(), funded_micro: 60_000 }),
+        reason: "invalid",
+      },
+      {
+        name: "a receipt for another caller",
+        receipt: () => evidence({ caller_pubkey: "cc".repeat(32) }),
+        reason: "caller_mismatch",
+      },
+      {
+        name: "a receipt for another credit",
+        receipt: () => evidence({ credit_id: "credit-2" }),
+        reason: "unknown_credit",
+      },
+      {
+        name: "a receipt signed by another builder for the same dvm id",
+        receipt: () =>
+          other.signDrawFunding({
+            credit_id: "credit-1",
+            job_id: "job-6",
+            draw_id: "draw-6",
+            fund_id: "0xfund-6",
+            currency: "usd",
+            funded_micro: 50_000,
+            balance_after_micro: 400_000,
+            ledger_seq: 6,
+            caller_pubkey: PUBKEY,
+          }),
+        builder: () => other.anchor,
+        reason: "provider_mismatch",
+      },
+      {
+        name: "a receipt naming a different dvm id",
+        receipt: () => evidence({ dvm_id: "dvm-other" }),
+        reason: "provider_mismatch",
+      },
+      {
+        name: "a receipt with no attestation for an attested record",
+        receipt: () => evidence(),
+        builder: () => undefined,
+        reason: "provider_mismatch",
+      },
+      {
+        name: "a receipt in another currency",
+        receipt: () => evidence({ currency: "eur" }),
+        reason: "currency_mismatch",
+      },
+      {
+        name: "a receipt the projection already passed",
+        receipt: () => evidence({ ledger_seq: 5 }),
+        reason: "already_reflected",
+      },
+    ])("refuses $name and the mismatch still fires", ({ receipt, builder, reason }) => {
+      seeded(500_000, 5);
+      const admitted = record(receipt(), builder ? { builder: builder() } : {});
+      expect(admitted).toMatchObject({ recorded: false, reason });
+      expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.drawFundings).toBeUndefined();
+
+      const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+      expect(result.mismatch).toMatchObject({ expectedMicro: 350_000, reportedMicro: 400_000 });
+      expect(result.fundedMicro).toBeUndefined();
+    });
+
+    it("does not spend a fact bound to a different draw", () => {
+      seeded(500_000, 5);
+      expect(record(evidence({ draw_id: "draw-other" }))).toMatchObject({ recorded: true });
+
+      const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+      expect(result.mismatch).toMatchObject({ expectedMicro: 350_000 });
+      expect(result.fundedMicro).toBeUndefined();
+    });
+
+    it("keeps colliding credit ids at two providers apart", () => {
+      seeded(500_000, 5);
+      const otherIdentity = { dvmId: "dvm-wordcount", builderPubkey: other.identity.pubkey };
+      recordFundResponse({
+        endpoint: IMPOSTOR_ENDPOINT,
+        identity: otherIdentity,
+        callerPubkey: PUBKEY,
+        credit: wire({ balance_micro: 500_000, remaining_micro: 500_000, ledger_seq: 5 }),
+        targetMicro: 500_000,
+      });
+      const foreign = other.signDrawFunding({
+        credit_id: "credit-1",
+        job_id: "job-6",
+        draw_id: "draw-6",
+        fund_id: "0xfund-6",
+        currency: "usd",
+        funded_micro: 50_000,
+        balance_after_micro: 400_000,
+        ledger_seq: 6,
+        caller_pubkey: PUBKEY,
+      });
+
+      expect(
+        recordDrawFunding({
+          endpoint: IMPOSTOR_ENDPOINT,
+          identity: otherIdentity,
+          callerPubkey: PUBKEY,
+          receipt: foreign,
+          builder: other.anchor,
+        })
+      ).toMatchObject({ recorded: true });
+      expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.drawFundings).toBeUndefined();
+      expect(terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 }).mismatch).toMatchObject({
+        expectedMicro: 350_000,
+      });
+    });
+  });
+
+  it("accepts an unattested artifact only for a record bound to no builder", () => {
+    seeded(500_000, 5, null);
+    expect(record(evidence(), { builder: undefined, identity: undefined })).toMatchObject({ recorded: true });
+    const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000, identity: undefined });
+    expect(result.mismatch).toBeUndefined();
+    expect(result.fundedMicro).toBe(50_000);
+  });
+
+  it("a released draw spends its facts without a warning", () => {
+    seeded(500_000, 5);
+    record(evidence());
+    const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 550_000, outcome: "failed" });
+    expect(result.mismatch).toBeUndefined();
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toMatchObject({ remainingMicro: 550_000, ledgerSeq: 6 });
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.drawFundings).toBeUndefined();
+  });
+
+  it("a replayed older receipt leaves held facts and the projection alone", () => {
+    seeded(400_000, 7);
+    record(evidence({ job_id: "job-8", draw_id: "draw-8", fund_id: "0xfund-8", ledger_seq: 8 }));
+    const before = loadCredit(ENDPOINT, PUBKEY, ATTESTED);
+
+    const replay = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+    expect(replay.mismatch).toBeUndefined();
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toEqual(before);
+    expect(before?.drawFundings).toHaveLength(1);
+
+    // Evidence carried inline on the stale replay is still admitted, and
+    // persisted exactly as recordDrawFunding would persist it.
+    const inline = terminal({
+      seq: 6,
+      amount: 150_000,
+      balanceAfter: 400_000,
+      drawFundings: [
+        {
+          receipt: evidence({ job_id: "job-9", draw_id: "draw-9", fund_id: "0xfund-9", ledger_seq: 9 }),
+          builder: dvm.anchor,
+        },
+      ],
+    });
+    expect(inline.mismatch).toBeUndefined();
+    const after = loadCredit(ENDPOINT, PUBKEY, ATTESTED);
+    expect(after).toMatchObject({ remainingMicro: 400_000, ledgerSeq: 7, updatedAt: 3_000 });
+    expect(after?.drawFundings?.map((fact) => fact.fundId)).toEqual(["0xfund-8", "0xfund-9"]);
+  });
+
+  it("a balance read after the funding supersedes the fact and the terminal receipt anchors cleanly", () => {
+    seeded(500_000, 5);
+    record(evidence());
+    // The server's live balance already nets the grown hold and the funding.
+    recordBalanceResponse({
+      endpoint: ENDPOINT,
+      identity: ATTESTED,
+      callerPubkey: PUBKEY,
+      credits: [wire({ balance_micro: 550_000, remaining_micro: 400_000, ledger_seq: 6 })],
+    });
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.drawFundings).toBeUndefined();
+
+    const result = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+    expect(result.mismatch).toBeUndefined();
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toMatchObject({ remainingMicro: 400_000, ledgerSeq: 6 });
+  });
+
+  it("repeated terminal reconciliation neither re-credits the funding nor re-admits it", () => {
+    seeded(500_000, 5);
+    record(evidence());
+    terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+
+    const again = terminal({ seq: 6, amount: 150_000, balanceAfter: 400_000 });
+    expect(again.mismatch).toBeUndefined();
+    expect(again.fundedMicro).toBeUndefined();
+    expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)?.remainingMicro).toBe(400_000);
+    expect(record(evidence())).toMatchObject({ recorded: false, reason: "already_reflected" });
   });
 });
