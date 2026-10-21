@@ -7,6 +7,11 @@ import type { ReceiptIssuer } from "./receipt-issuer";
  * Without an issuer, return undefined. Reuse a stored artifact; otherwise issue only when
  * the original funding tuple is complete, using its creation time. Return the store’s
  * write-once winner.
+ *
+ * A row bound to a job or draw is mid-job evidence and belongs to
+ * {@link drawFundingReceiptFor}: the receipt slot is write-once, so signing it
+ * here as an opening receipt would misstate the draw's sequence and the
+ * post-growth balance and leave the draw funding artifact unissuable forever.
  */
 export async function fundingReceiptFor(
   ledger: CreditLedgerLike,
@@ -18,7 +23,8 @@ export async function fundingReceiptFor(
   if (
     funding.callerPubkey === null ||
     funding.balanceAfterMicro === null ||
-    funding.ledgerSeq === null
+    funding.ledgerSeq === null ||
+    isDrawBound(funding)
   ) {
     return undefined;
   }
@@ -37,6 +43,10 @@ export async function fundingReceiptFor(
     receipt,
   });
   return isFundingReceipt(saved) ? saved : undefined;
+}
+
+function isDrawBound(funding: FundingRecord): boolean {
+  return Boolean(funding.jobId) || Boolean(funding.drawId);
 }
 
 /**

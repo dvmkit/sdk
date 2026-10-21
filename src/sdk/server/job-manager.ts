@@ -3148,16 +3148,21 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   async drawFundingReceipts(job: Pick<JobRecord, "id" | "creditId" | "drawId">): Promise<DrawFundingReceipt[]> {
     const ledger = this.opts.creditLedger;
-    if (!ledger?.listDrawFundings || !job.creditId || !job.drawId) return [];
+    // Without an issuer nothing can be signed, so the read costs no lookup at
+    // all; with one, the credit is read only once a draw funding row exists,
+    // which keeps the common poll of an unfunded job to a single list.
+    if (!ledger?.listDrawFundings || !this.opts.receiptIssuer || !job.creditId || !job.drawId) {
+      return [];
+    }
     try {
-      const [credit, fundings] = await Promise.all([
-        ledger.get(job.creditId),
-        ledger.listDrawFundings({ creditId: job.creditId, drawId: job.drawId }),
-      ]);
+      const fundings = (
+        await ledger.listDrawFundings({ creditId: job.creditId, drawId: job.drawId })
+      ).filter((funding) => funding.jobId === job.id);
+      if (fundings.length === 0) return [];
+      const credit = await ledger.get(job.creditId);
       if (!credit) return [];
       const receipts: DrawFundingReceipt[] = [];
       for (const funding of fundings) {
-        if (funding.jobId !== job.id) continue;
         const receipt = await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, credit.currency);
         if (receipt) receipts.push(receipt);
       }

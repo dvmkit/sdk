@@ -1237,7 +1237,12 @@ export function applyReceiptCredit(args: {
     // earlier read proves nothing once another process may have settled a newer
     // draw. Replayed evidence must not touch any field of the newer projection.
     if (args.credit.ledger_seq < record.ledgerSeq) {
-      if (admitted) saveStore(store);
+      if (admitted) {
+        // Exactly what recordDrawFunding would have persisted for the same facts.
+        attachDvmLocation(record, key, args.identity);
+        record.updatedAt = now;
+        saveStore(store);
+      }
       return { credit: record };
     }
     attachDvmLocation(record, key, args.identity);

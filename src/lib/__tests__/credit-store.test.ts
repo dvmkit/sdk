@@ -3090,6 +3090,24 @@ describe("mid-job draw funding evidence", () => {
     expect(replay.mismatch).toBeUndefined();
     expect(loadCredit(ENDPOINT, PUBKEY, ATTESTED)).toEqual(before);
     expect(before?.drawFundings).toHaveLength(1);
+
+    // Evidence carried inline on the stale replay is still admitted, and
+    // persisted exactly as recordDrawFunding would persist it.
+    const inline = terminal({
+      seq: 6,
+      amount: 150_000,
+      balanceAfter: 400_000,
+      drawFundings: [
+        {
+          receipt: evidence({ job_id: "job-9", draw_id: "draw-9", fund_id: "0xfund-9", ledger_seq: 9 }),
+          builder: dvm.anchor,
+        },
+      ],
+    });
+    expect(inline.mismatch).toBeUndefined();
+    const after = loadCredit(ENDPOINT, PUBKEY, ATTESTED);
+    expect(after).toMatchObject({ remainingMicro: 400_000, ledgerSeq: 7, updatedAt: 3_000 });
+    expect(after?.drawFundings?.map((fact) => fact.fundId)).toEqual(["0xfund-8", "0xfund-9"]);
   });
 
   it("a balance read after the funding supersedes the fact and the terminal receipt anchors cleanly", () => {
