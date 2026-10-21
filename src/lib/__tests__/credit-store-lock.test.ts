@@ -37,7 +37,13 @@ vi.mock("../../defaults", () => ({
 }));
 vi.mock("../output", () => ({ info: vi.fn() }));
 
-import { listCredits, loadCredit, recordFundResponse, withCreditLock } from "../credit-store";
+import {
+  applyReceiptCredit,
+  listCredits,
+  loadCredit,
+  recordFundResponse,
+  withCreditLock,
+} from "../credit-store";
 import { DvmError } from "../errors";
 import type { CreditWire } from "../transport/types";
 
@@ -71,7 +77,7 @@ beforeEach(() => {
   // The fixture's rendezvous markers, too: a stale `drains.done` from an
   // earlier run in this dir would let the churner exit after one iteration and
   // the concurrency test would pass having never overlapped.
-  for (const marker of ["churn.ready", "drains.ready", "drains.done"]) {
+  for (const marker of ["churn.ready", "drains.ready", "drains.done", "stale.ready", "stale.go"]) {
     rmSync(path.join(tmp.configDir, marker), { force: true });
   }
 });
@@ -295,6 +301,53 @@ describe("concurrent dvm processes", { timeout: 60_000 }, () => {
     // More churn writes than there were drains: proof the two windows really
     // overlapped, rather than the churner exiting on a stale `drains.done`.
     expect(record?.ledgerSeq).toBeGreaterThan(DRAIN_IDS.length);
+  });
+});
+
+// The consumer's pre-check releases its lookup lock before the receipt is
+// applied, so a newer draw can settle in between. The older recovery must then
+// leave every field of the newer projection alone.
+describe("older receipt recovery racing a newer settlement", { timeout: 60_000 }, () => {
+  it("keeps the newer balance, price, attribution and update time", async () => {
+    recordFundResponse({
+      endpoint: ENDPOINT,
+      callerPubkey: PUBKEY,
+      credit: { ...WIRE, balance_micro: 500_000, remaining_micro: 500_000, ledger_seq: 1 },
+      targetMicro: 500_000,
+    });
+
+    const stale = runWriter("stale", 1);
+    const deadline = Date.now() + 20_000;
+    while (!existsSync(path.join(tmp.configDir, "stale.ready"))) {
+      if (Date.now() > deadline) throw new Error("older recovery never reached its pause");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    for (const [seq, amount, balanceAfter] of [
+      [2, 150_000, 350_000],
+      [3, 200_000, 150_000],
+    ] as const) {
+      applyReceiptCredit({
+        endpoint: ENDPOINT,
+        callerPubkey: PUBKEY,
+        jobId: `job-${String(seq)}`,
+        outcome: "completed",
+        credit: {
+          credit_id: CREDIT_ID,
+          draw_id: `draw-${String(seq)}`,
+          amount,
+          balance_after: balanceAfter,
+          ledger_seq: seq,
+        },
+        now: 1_000 * seq,
+      });
+    }
+    const settled = loadCredit(ENDPOINT, PUBKEY);
+
+    writeFileSync(path.join(tmp.configDir, "stale.go"), "");
+    await stale;
+
+    expect(settled).toMatchObject({ lastPriceMicro: 200_000, lastReceiptJobId: "job-3" });
+    expect(loadCredit(ENDPOINT, PUBKEY)).toEqual(settled);
   });
 });
 

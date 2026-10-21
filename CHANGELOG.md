@@ -6,6 +6,10 @@
 
 - Prepaid and implicit per-call credits now default to 90 days instead of 30 days. Builders hold unspent balances longer before expiry release. Existing credits retain their stored expiry until their next top-up; funding extends expiry to the later of its current value and funding time plus the configured TTL. Set `credit: { ttl: 2_592_000 }` to keep a 30-day lifetime. Explicit TTL overrides remain supported; no database migration is required.
 
+### Bug fixes
+
+- Replaying an older job receipt no longer changes a newer stored credit projection. The comparison now happens inside the credit-store lock that applies the receipt, so last price, receipt attribution, flags, and update time stay with the newest settled draw, including when another process settles it mid-recovery.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

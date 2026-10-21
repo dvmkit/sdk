@@ -1739,6 +1739,101 @@ describe("applyReceiptCredit", () => {
     expect(loadCredit(ENDPOINT, PUBKEY)?.lastPriceMicro).toBeUndefined();
   });
 
+  describe("a receipt older than the stored sequence", () => {
+    const receipt = (
+      seq: number,
+      amount: number,
+      balanceAfter: number,
+      overrides: Partial<Parameters<typeof applyReceiptCredit>[0]> = {}
+    ): Parameters<typeof applyReceiptCredit>[0] => ({
+      endpoint: ENDPOINT,
+      callerPubkey: PUBKEY,
+      jobId: `job-${String(seq)}`,
+      outcome: "completed",
+      credit: {
+        credit_id: "credit-1",
+        draw_id: `draw-${String(seq)}`,
+        amount,
+        balance_after: balanceAfter,
+        ledger_seq: seq,
+      },
+      ...overrides,
+    });
+
+    it("leaves the newer projection untouched, including price, attribution and location", () => {
+      recordFundResponse({
+        endpoint: ENDPOINT,
+        identity: IDENTITY,
+        callerPubkey: PUBKEY,
+        credit: wire({ balance_micro: 500_000, remaining_micro: 500_000, ledger_seq: 1 }),
+        targetMicro: 500_000,
+        now: 1_000,
+      });
+      applyReceiptCredit(receipt(2, 150_000, 350_000, { identity: IDENTITY, now: 2_000 }));
+      applyReceiptCredit(receipt(3, 200_000, 150_000, { identity: IDENTITY, now: 3_000 }));
+      const before = loadCredit(ENDPOINT, PUBKEY, IDENTITY);
+      expect(before).toMatchObject({ lastPriceMicro: 200_000, lastReceiptJobId: "job-3" });
+
+      const replay = applyReceiptCredit(
+        receipt(2, 150_000, 350_000, { endpoint: ALIAS_ENDPOINT, identity: IDENTITY, now: 9_000 })
+      );
+
+      expect(replay.mismatch).toBeUndefined();
+      expect(loadCredit(ENDPOINT, PUBKEY, IDENTITY)).toEqual(before);
+      expect(JSON.parse(readFileSync(join(TEST_DIR, "credits.json"), "utf-8")).credits).toEqual([
+        before,
+      ]);
+    });
+
+    it("ignores a stale released draw and keeps projection flags and discrepancy", () => {
+      writeStore({
+        ledgerSeq: 3,
+        remainingMicro: 150_000,
+        lastPriceMicro: 200_000,
+        lastReceiptJobId: "job-3",
+        provisional: true,
+        unsequencedBalance: true,
+        discrepancy: {
+          atMs: 3_000,
+          expectedMicro: 160_000,
+          reportedMicro: 150_000,
+          drawId: "draw-3",
+          ledgerSeq: 3,
+          jobId: "job-3",
+        },
+        updatedAt: 3_000,
+      });
+      const before = loadCredit(ENDPOINT, PUBKEY);
+
+      const replay = applyReceiptCredit(receipt(2, 150_000, 350_000, { outcome: "failed", now: 9_000 }));
+
+      expect(replay.mismatch).toBeUndefined();
+      expect(loadCredit(ENDPOINT, PUBKEY)).toEqual(before);
+    });
+
+    it("still anchors an unsequenced balance at an equal sequence", () => {
+      writeStore({
+        ledgerSeq: 3,
+        remainingMicro: 150_000,
+        provisional: true,
+        unsequencedBalance: true,
+      });
+
+      applyReceiptCredit(receipt(3, 200_000, 140_000, { now: 9_000 }));
+
+      const after = loadCredit(ENDPOINT, PUBKEY);
+      expect(after).toMatchObject({
+        remainingMicro: 140_000,
+        ledgerSeq: 3,
+        lastPriceMicro: 200_000,
+        lastReceiptJobId: "job-3",
+        updatedAt: 9_000,
+      });
+      expect(after?.unsequencedBalance).toBeUndefined();
+      expect(after?.provisional).toBeUndefined();
+    });
+  });
+
   it("an unknown credit id is a no-op (implicit N=1 receipts never match)", () => {
     seeded();
     const result = applyReceiptCredit({

@@ -3,7 +3,13 @@
 import { existsSync, writeFileSync } from "fs";
 import { join } from "path";
 
-import { recordDrainReceipts, recordFundResponse, recordPendingDrain } from "../../credit-store";
+import {
+  applyReceiptCredit,
+  loadCredit,
+  recordDrainReceipts,
+  recordFundResponse,
+  recordPendingDrain,
+} from "../../credit-store";
 
 const [role, endpoint, callerPubkey, creditId, iterationsRaw] = process.argv.slice(2);
 const iterations = Number(iterationsRaw);
@@ -64,6 +70,30 @@ if (role === "churn") {
     sleepSync(25);
   }
   writeFileSync(join(configDir, "drains.done"), "");
+} else if (role === "stale") {
+  // Recovery of an older receipt: the preliminary read happens outside any
+  // lock, then the process stalls until the test has settled a newer draw.
+  if (!loadCredit(endpoint, callerPubkey)) throw new Error("credit missing at preliminary read");
+  writeFileSync(join(configDir, "stale.ready"), "");
+  const deadline = Date.now() + 20_000;
+  while (!existsSync(join(configDir, "stale.go"))) {
+    if (Date.now() > deadline) throw new Error("newer receipt was never settled");
+    sleepSync(5);
+  }
+  applyReceiptCredit({
+    endpoint,
+    callerPubkey,
+    jobId: "job-2",
+    outcome: "completed",
+    credit: {
+      credit_id: creditId,
+      draw_id: "draw-2",
+      amount: 150_000,
+      balance_after: 350_000,
+      ledger_seq: 2,
+    },
+    now: 9_000,
+  });
 } else {
   throw new Error(`unknown role: ${role}`);
 }
