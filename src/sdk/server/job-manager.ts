@@ -2842,14 +2842,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         ) {
           job.reactivationPaymentApplied = true;
         }
-        if (counters.pendingPaymentMsats === undefined && job.status === "awaiting-input") {
+        if (
+          counters.pendingPaymentMsats === undefined &&
+          job.status === "awaiting-input" &&
+          job.pendingPrompts.size === 0
+        ) {
           job.status = "processing";
         }
       } else if (delta) {
         job.paidMsats += delta;
         job.pendingPaymentMsats = undefined;
         if (hadPendingPayment) job.reactivationPaymentApplied = true;
-        if (job.status === "awaiting-input") job.status = "processing";
+        if (job.status === "awaiting-input" && job.pendingPrompts.size === 0) job.status = "processing";
       }
       return {};
     }
