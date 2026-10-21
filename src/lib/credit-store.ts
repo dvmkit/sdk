@@ -1143,6 +1143,10 @@ export function applyReceiptCredit(args: {
       where: (c) => c.callerPubkey === args.callerPubkey && c.creditId === args.credit.credit_id,
     });
     if (!record) return {};
+    // Checked here, under the lock that also applies the receipt: a caller's
+    // earlier read proves nothing once another process may have settled a newer
+    // draw. Replayed evidence must not touch any field of the newer projection.
+    if (args.credit.ledger_seq < record.ledgerSeq) return { credit: record };
     attachDvmLocation(record, key, args.identity);
 
     let mismatch: CreditDiscrepancy | undefined;
@@ -1169,14 +1173,11 @@ export function applyReceiptCredit(args: {
       }
     }
 
-    if (args.credit.ledger_seq >= record.ledgerSeq) {
-      record.remainingMicro = args.credit.balance_after;
-      record.ledgerSeq = args.credit.ledger_seq;
-      // Anchored again: this figure and the mark it sits at came from the same
-      // countersigned block. A receipt too stale to adopt leaves the flag, since
-      // the unanchored figure is still the current one.
-      delete record.unsequencedBalance;
-    }
+    record.remainingMicro = args.credit.balance_after;
+    record.ledgerSeq = args.credit.ledger_seq;
+    // Anchored again: this figure and the mark it sits at came from the same
+    // countersigned block.
+    delete record.unsequencedBalance;
     // The countersigned figure re-anchors the projection either way.
     delete record.provisional;
     if (args.outcome === "completed") record.lastPriceMicro = args.credit.amount;
