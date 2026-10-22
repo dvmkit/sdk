@@ -647,7 +647,10 @@ export interface StreamableJobStore extends JobStore {
    * lands when the job is still non-terminal AND `last_activity_at <=
    * expectedActivityBefore`. Returns true when this caller claimed the
    * transition, false when another machine got there first OR the job's
-   * activity bumped (recovered). Mirrors `save`'s terminal cleanup by
+   * activity bumped (recovered). Caller cancellations additionally require a
+   * row whose outstanding stamped deadline has elapsed;
+   * processing failures remain governed by the activity cutoff.
+   * Mirrors `save`'s terminal cleanup by
    * deleting incremental `job_messages` rows once the snapshot is final.
    */
   cancelStaleJob(

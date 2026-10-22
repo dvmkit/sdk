@@ -446,10 +446,35 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
     );
   });
 
+  it("emits a fresh ask after a replayed wait is paid on another machine", async () => {
+    const job = blankJob();
+    job.status = "awaiting-input";
+    job.messages = [{ seq: 1, from: "provider", type: "payment-request", timestamp: 0,
+      content: { amount_msats: 1000, reason: "First block", expires_at_ms: Date.now() + 60000 } }];
+    job.seq = 1;
+    job.replayHighSeq = 1;
+    const notify = notifyHarness({ status: "awaiting-input", paidMsats: 0, pendingPaymentMsats: 1000 });
+    const ctx = buildContext(job, { store: new MemoryKVStore(), env: {}, fxFetcher: fxAt(100_000), ...notify.opts });
+    const first = ctx.requestPayment(1000, "First block");
+    await tick();
+    notify.set({ status: "processing", paidMsats: 1000, pendingPaymentMsats: undefined });
+    await notify.fire();
+    await first;
+    const second = watch(ctx.requestPayment(2000, "Second block"));
+    await tick();
+    expect(second.settled()).toBe(false);
+    expect(job.pendingPaymentMsats).toBe(2000);
+    expect(job.messages.filter((m) => m.type === "payment-request").map((m) => m.content.amount_msats)).toEqual([1000, 2000]);
+    notify.set({ paidMsats: 3000, pendingPaymentMsats: undefined });
+    await notify.fire();
+    expect(second.settled()).toBe(true);
+  });
+
   it("does not let a cached prompt mask an unapplied replay payment", async () => {
     const job = blankJob(500_000);
     job.status = "awaiting-input";
     job.messages = [
+      { seq: 0, type: "prompt", from: "provider", content: { id: "confirm", text: "Confirm" }, timestamp: 0 },
       {
         seq: 1,
         type: "response",

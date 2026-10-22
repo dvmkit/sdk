@@ -38,6 +38,8 @@ export interface TextContent {
 
 /** Provider prompt requesting input from the requester. */
 export interface PromptContent {
+  /** Caller response deadline in integer Unix milliseconds; absent on older servers. */
+  expires_at_ms?: number;
   id: string;
   text: string;
   options?: string[];
@@ -70,6 +72,8 @@ export interface ArtifactContent {
 
 /** Provider requests payment to continue. */
 export interface PaymentRequestContent {
+  /** Caller response deadline in integer Unix milliseconds; absent on older servers. */
+  expires_at_ms?: number;
   /** Exact outstanding balance charge, in integer micro-units. Use this message’s seq as request_seq. */
   credit?: { amount_micro: number; currency: string };
   amount_msats: number;

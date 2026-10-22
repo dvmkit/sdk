@@ -52,6 +52,14 @@ describe("configureDVM", () => {
     expect(dvm.tags).toEqual(["web", "api"]);
   });
 
+  it.each([0, -1, 1.5, NaN, Infinity, 604801])("rejects unsafe idleTimeout %s", (idleTimeout) => {
+    expect(() => configureDVM({ name: "X", onJob: noop, idleTimeout })).toThrow(/idleTimeout.*1.*604800/);
+  });
+
+  it.each([1, 604800])("accepts idleTimeout boundary %s", (idleTimeout) => {
+    expect(configureDVM({ name: "X", onJob: noop, idleTimeout }).idleTimeout).toBe(idleTimeout);
+  });
+
   it("accepts custom idleTimeout", () => {
     const dvm = configureDVM({
       name: "X",

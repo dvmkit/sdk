@@ -1,5 +1,16 @@
 # Protocol notes
 
+## Caller response deadlines
+
+Every newly emitted `prompt` and `payment-request` carries `content.expires_at_ms`, an integer Unix millisecond deadline equal to emission time plus the DVM's `idleTimeout` in milliseconds. The window starts when the handler asks, and ends when the matching response or verified payment satisfies that ask. Text and unrelated responses do not extend it. This includes event-driven requests emitted through `ctx.sendMessage`, which keep callback dispatch semantics. Processing without an outstanding ask has no idle timer; worker liveness remains governed by `processingWatchdog`.
+
+`configureDVM` accepts `idleTimeout` as a whole number of seconds from 1 through 604800 (seven days), defaulting to 3600. Replayed requests retain their original deadline and payment challenge. With concurrent prompts, the earliest outstanding deadline governs cancellation; answering one does not extend the others. Expiry is attributed to the caller.
+
+If a worker dies after input verifies but before claiming it, recovery can fail the abandoned job as a provider failure and release its pending draw. This waits for both the stale-wait threshold and processing watchdog grace period; verified input remains in the terminal history.
+
+The wire field is optional for compatibility with older servers; callers may ignore it. Legacy persisted waits without a stamp retain their timeout fallback, and older server versions cannot enforce the new semantics during a mixed-version rollout. No storage migration is required. Portable examples are in `protocol-fixtures/caller-deadline-v1.json`.
+
+
 ## Balance-backed mid-job payments
 
 A server advertising `credit.balance_payment: true` accepts a signed balance authorization on the existing `POST /v1/job/:id/messages` endpoint with the existing job token. This capability requires the SDK's Postgres job store and credit ledger on the same database, descriptor authentication, and an audience verified from the builder attestation. The normal Postgres host wires these together. In-memory development stores and custom job stores withhold the capability; ordinary messages and rail payments keep their existing contract. The memory ledger enforces expiry and its configured x402 refund gate for `growDraw({ spendExistingBalance: true })`. Fresh growth on Tempo-bound memory credit returns `tempo_channel_closing` because this store cannot verify the durable channel lifecycle; ordinary accepted rail growth retains its existing behavior.

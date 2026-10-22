@@ -1,3 +1,4 @@
+import { callerDeadline, hasCallerDeadline } from "./job";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
@@ -1275,8 +1276,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         job.status =
           job.pendingPrompts.size > 0 || job.pendingPayment ? "awaiting-input" : "processing";
         if (job.status === "awaiting-input") await this.persistJob(job);
+        this.startIdleTimer(job);
         pending.resolve(rc);
       } else if (cap?.onResponse && ctx) {
+        this.startIdleTimer(job);
         await cap.onResponse(ctx, rc);
       }
     } else if (type === "payment") {
@@ -1298,6 +1301,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           await pp.resolve(pc);
         });
       } else if (cap?.onPayment && ctx) {
+        this.startIdleTimer(job);
         await cap.onPayment(ctx, pc);
       }
     } else if (type === "approval" && cap?.onApproval && ctx) {
@@ -1772,9 +1776,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     };
   }
 
-  startIdleTimer(job: ServerJob): void {
+  startIdleTimer(job: ServerJob, deadline = callerDeadline(job, this.descriptor.idleTimeout * 1000)): void {
     this.clearIdleTimer(job.id);
-    const timeoutMs = this.descriptor.idleTimeout * 1000;
+    if (deadline === undefined) return;
+    const timeoutMs = Math.min(2_147_483_647, Math.max(0, deadline - Date.now()));
     const timer = setTimeout(() => {
       void this.cancelJobIdle(job).catch(() => undefined);
     }, timeoutMs);
@@ -1800,7 +1805,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // paid_msats / status / messages from our stale local view, and the
     // `providerMessage("cancel", …)` call would inject a phantom Tx A cancel
     // into the cross-machine stream.
-    const current = await this.jobStore.get(job.id).catch(() => undefined);
+    const current = await this.jobStore.get(job.id);
     if (current && isTerminal(current.status)) {
       const reason = `Job reached terminal status "${current.status}" elsewhere`;
       for (const [, p] of job.pendingPrompts) p.reject(new Error(reason));
@@ -1813,12 +1818,34 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return;
     }
 
+    const waiting = current ?? job;
+    if (current && isStreamableJobStore(this.jobStore)) {
+      const messages = await this.jobStore.getMessages(job.id, 0);
+      if (messages.length) waiting.messages = messages;
+    }
+    const deadline = callerDeadline(waiting, this.descriptor.idleTimeout * 1000);
+    if (deadline === undefined) {
+      this.clearIdleTimer(job.id);
+      return;
+    }
+    if (Date.now() < deadline) {
+      this.startIdleTimer(job, deadline);
+      return;
+    }
+    if (current && isStreamableJobStore(this.jobStore)) {
+      const claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled");
+      if (claimed) await this.finalizeStoredTerminal(job.id);
+      await this.adoptDurableTerminal(job);
+      if (!claimed && !isTerminal(job.status)) this.startIdleTimer(job, Date.now() + 1);
+      return;
+    }
+
     for (const [, p] of job.pendingPrompts) p.reject(new Error("Job timed out (idle)"));
     if (job.pendingPayment) job.pendingPayment.reject(new Error("Job timed out (idle)"));
     job.pendingPrompts.clear();
     job.pendingPayment = null;
 
-    job.endedBy = (current?.status ?? job.status) === "awaiting-input" ? "caller" : "provider";
+    job.endedBy = "caller";
     job.status = "cancelled";
     abortJob(job, "Job timed out (idle)");
     providerMessage(job, "cancel", { reason: "Job timed out (idle)" });
@@ -1914,10 +1941,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       );
       let swept = 0;
       for (const record of stale) {
-        const awaiting = record.status === "awaiting-input";
+        const messages = await this.jobStore.getMessages(record.id, 0);
+        const history = messages.length ? messages : record.messages;
+        const deadline = callerDeadline({ ...record, messages: history });
+        if (deadline !== undefined && now < deadline) continue;
+        const orphanedInput = record.status === "awaiting-input" && deadline === undefined && hasCallerDeadline(history);
+        const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !orphanedInput);
         const terminalStatus = awaiting ? "cancelled" : "failed";
         const reason = awaiting ? "stale_no_terminal_status" : "worker_died_mid_job";
-        const expectedActivityBefore = awaiting ? awaitingThreshold : processingThreshold;
+        // Accepted input is no longer the caller's responsibility. A worker
+        // that never claims it gets the processing grace period before failure.
+        const expectedActivityBefore = awaiting && record.status === "awaiting-input" ? awaitingThreshold : processingThreshold;
+        if (expectedActivityBefore < 0 || record.lastActivityAt > expectedActivityBefore) continue;
         const claimed = await this.jobStore.cancelStaleJob(
           record.id,
           expectedActivityBefore,
@@ -3447,6 +3482,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   private buildContextOpts(job: ServerJob): Parameters<typeof buildContext>[1] {
     const jobStore = this.jobStore;
+    job.idleTimeoutMs = this.descriptor.idleTimeout * 1000;
     return {
       mints: this.opts.mints,
       store: this.opts.store,
@@ -3457,7 +3493,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       mpp: this.opts.mpp,
       fxFetcher: this.opts.fxFetcher,
       onTerminal: () => this.handleJobTerminal(job),
-      onYield: () => this.persistJob(job),
+      onYield: () => {
+        this.startIdleTimer(job);
+        return this.persistJob(job);
+      },
+      onCallerResume: () => this.startIdleTimer(job),
       onPaymentResume: () => retryJobSnapshot(() => this.persistJob(job)),
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)

@@ -27,6 +27,7 @@ import {
  */
 export { CAPABILITY_NAME_RE };
 
+/** Configure a DVM; idleTimeout limits each caller answer/payment window (1–604800 seconds), not processing time. */
 export function configureDVM<
   State = Record<string, unknown>,
   InputSchema extends ZodLike | undefined = undefined,
@@ -54,7 +55,7 @@ export function configureDVM<
     price: onlyCapability?.price,
     inputSchema: onlyCapability?.input as InputSchema,
     state: (onlyCapability?.state ?? ({} as State)) as State,
-    idleTimeout: config.idleTimeout ?? 3600,
+    idleTimeout: resolveIdleTimeout(config.idleTimeout),
     processingWatchdog: config.processingWatchdog,
     jobRetentionDays,
     config,
@@ -69,6 +70,14 @@ export function configureDVM<
   CONFIGURED_DVM_DESCRIPTORS.add(descriptor);
 
   return Object.freeze(descriptor);
+}
+
+function resolveIdleTimeout(raw: number | undefined): number {
+  const seconds = raw === undefined ? 3600 : raw;
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 604800) {
+    throw new Error(`configureDVM: idleTimeout must be an integer from 1 through 604800 seconds; received ${String(raw)}`);
+  }
+  return seconds;
 }
 
 function resolveJobRetentionDays(raw: number | undefined): number {

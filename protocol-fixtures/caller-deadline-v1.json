@@ -1,0 +1,15 @@
+{
+  "idle_timeout_seconds": 3,
+  "emitted_at_ms": 1700000002500,
+  "prompt": {
+    "id": "q1",
+    "text": "Continue?",
+    "options": ["keep", "wait", "switch"],
+    "expires_at_ms": 1700000005500
+  },
+  "payment_request": {
+    "amount_msats": 1000,
+    "reason": "Next block",
+    "expires_at_ms": 1700000005500
+  }
+}

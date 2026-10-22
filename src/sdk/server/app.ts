@@ -1,3 +1,4 @@
+import { callerDeadline } from "./job";
 import { BalancePaymentError, commitBalancePayment } from "./balance-payment";
 import { completeTempoChannelDrain } from "./tempo-drain-leg";
 import { installAdminContentRoutes } from "./admin-content";
@@ -3643,7 +3644,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       const sdkCtx = jm.buildAndAttachContext(job, parsedInput);
 
-      jm.startIdleTimer(job);
       jm.runHandler(job, sdkCtx);
 
       await new Promise((resolve) => {
@@ -4339,7 +4339,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         await jm.markInboundVerified(activeJob.id, inboundSeq);
       }
 
-      jm.startIdleTimer(activeJob);
       try {
         await jm.dispatchMessage(activeJob, body.type, body.content);
         await this.persistMessageSnapshot(jm, activeJob, body.type);
@@ -4461,11 +4460,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
     };
 
-    const elapsed = Date.now() - record.lastActivityAt;
-    if (elapsed >= this.descriptor.idleTimeout * 1000) {
+    const deadline = callerDeadline(record, this.descriptor.idleTimeout * 1000);
+    if (deadline !== undefined && Date.now() >= deadline) {
       await jm.cancelJobIdle(job);
-      const lastMsg = job.messages[job.messages.length - 1];
-      return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
+      if (isTerminal(job.status)) {
+        const lastMsg = job.messages[job.messages.length - 1];
+        return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
+      }
     }
     jm.startIdleTimer(job);
 

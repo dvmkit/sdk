@@ -771,7 +771,7 @@ export interface DVMConfig<
   example?: ExampleType<InputSchema>;
   /** Per-job state shape and defaults. Flat shape only. */
   state?: State;
-  /** Seconds before an idle job is auto-cancelled. Default: 3600. DVM-level. */
+  /** Caller answer/payment window from emission, in whole seconds (1–604800). Default: 3600. Processing time is excluded. */
   idleTimeout?: number;
   /**
    * Seconds a job may sit in `processing`/`working` with no SDK liveness
