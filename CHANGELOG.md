@@ -8,6 +8,8 @@
 
 ### Features
 
+- Accepted job responses and request recovery now expose optional `upfront_payment` metadata with the original credit hold or rail payment, exact recorded amounts and credit/draw correlation. The snapshot survives later payments, draw growth and exchange-rate changes; historical jobs remain unknown and explicit zero stays distinct. Job stores gain an optional, insert-only `upfrontPayment` fact backed by a nullable Postgres column. See `protocol-fixtures/upfront-payment-v1.json`.
+
 - Mid-job rail payments that fund a job's credit against its pending draw now leave signed evidence. The server fixes a `credit_fundings` row (with new nullable `job_id`, `draw_id`, `payment_seq` columns) inside the rail transaction and issues a `credit_draw_funding` receipt from it: returned as `draw_funding_receipt` on the payment `201`, on the `503` snapshot-failure and `500` unapplied bodies, on a `409 replay_rejected` for the same payment, and as `draw_funding_receipts` on every authenticated job read, including after a restart. The caller credit store admits verified evidence with `recordDrawFunding` (or inline on `applyReceiptCredit`) and compares a completed draw as prior remaining plus eligible funding minus the draw, so a self-funded grown draw no longer raises a false balance warning while a contradictory terminal balance still does. `CreditLedgerLike` gains optional `listDrawFundings` and optional `recordFunding` bindings; `FundingRecord.receipt` and `saveFundingReceipt` now carry `CreditFundingEvidence`, the union of opening and draw funding receipts discriminated by `kind`. The portable contract is `protocol-fixtures/credit-draw-funding-v1.json`.
 
 ### Bug fixes

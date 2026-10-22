@@ -1,3 +1,5 @@
+import { upfrontPaymentFromDraw } from "./upfront-payment";
+import type { UpfrontPayment } from "../../lib/upfront-payment";
 import { callerDeadline } from "./job";
 import { BalancePaymentError, commitBalancePayment } from "./balance-payment";
 import { completeTempoChannelDrain } from "./tempo-drain-leg";
@@ -4760,6 +4762,7 @@ function recordedDrawPayment(
     ...(rail === "cashu" ? { cashuFlow: "p2pk_accumulator" as const } : {}),
     creditId: draw.creditId,
     drawId: draw.drawId,
+    upfrontPayment: upfrontPaymentFromDraw(draw),
     drawAmountMicro: draw.amountMicro,
     ...(draw.railValue.creditCurrency ? { creditCurrency: draw.railValue.creditCurrency } : {}),
   };
@@ -4884,6 +4887,7 @@ async function awaitTerminalWork(job: ServerJob): Promise<void> {
 }
 
 interface TerminalFieldSource {
+  upfrontPayment?: UpfrontPayment;
   id: string;
   status: JobStatus;
   messages: Message[];
@@ -4910,6 +4914,7 @@ function removeUnavailableContent(fields: Record<string, unknown>): void {
  */
 function terminalResponseFields(job: TerminalFieldSource): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
+  if (job.upfrontPayment !== undefined) fields.upfront_payment = job.upfrontPayment;
   if (job.status === "completed") {
     if (job.summary !== undefined) fields.summary = job.summary;
     const artifactCount = job.messages.filter((m) => m.type === "artifact").length;

@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import type { UpfrontPayment } from "../../../lib/upfront-payment";
 
 import { encodePayment, X402_V1_VERSION } from "../../../lib/x402/spec";
 import type { X402Config } from "../../../lib/x402/types";
@@ -19,6 +21,9 @@ import { expectJobIdentity, expectNoJobIdentity } from "./__helpers__/job-identi
 vi.mock("../../../lib/x402", () => ({ verifyX402Payment: vi.fn() }));
 
 const { verifyX402Payment } = await import("../../../lib/x402");
+const upfrontFixture = JSON.parse(readFileSync(
+  new URL("../../../../protocol-fixtures/upfront-payment-v1.json", import.meta.url), "utf8"
+)) as { stored: UpfrontPayment; implicit: UpfrontPayment; free_response: { upfront_payment: UpfrontPayment } };
 
 const schema = z
   .object({
@@ -76,6 +81,93 @@ beforeEach(() => {
 });
 
 describe("public request recovery", () => {
+  it("distinguishes an accepted free job from historical missing evidence", async () => {
+    const h = await startServer({ free: true });
+    const requestId = "free-or-unknown";
+    const body = () => requestBody(requestId, "go");
+    const accepted = await submit(h.url, body());
+    const original = await accepted.json() as { job_id: string; job_token?: string; upfront_payment?: UpfrontPayment };
+    expect(accepted.status).toBe(200);
+    expect(original.upfront_payment).toEqual(upfrontFixture.free_response.upfront_payment);
+    expect(await (await lookup(h.url, requestId, body())).json()).toMatchObject({ upfront_payment: { amount_msats: 0 } });
+
+    // A historical job has no acceptance snapshot even when its payment total
+    // happens to be zero. Recovery must not manufacture evidence from totals.
+    const record = await h.jobStore.get(original.job_id);
+    if (!record) throw new Error("accepted job missing");
+    await h.jobStore.delete(original.job_id);
+    await h.jobStore.save({ ...record, upfrontPayment: undefined });
+    const historical = await lookup(h.url, requestId, body());
+    expect(historical.status).toBe(200);
+    expect(await historical.json()).not.toHaveProperty("upfront_payment");
+  });
+
+  it.each(["stored", "implicit"] as const)("keeps the %s upfront hold on active recovery, resume and later payment", async (kind) => {
+    let rate = 100_000;
+    const ledger = new MemoryCreditLedger();
+    const h = await startServer({ ledger, x402: true, fxFetcher: {
+      fetch: () => Promise.resolve({ rates: { usd: rate }, as_of: new Date().toISOString() }),
+      supportedCurrencies: () => ["usd"],
+    } });
+    if (kind === "stored") {
+      await ledger.fund({
+        creditId: "stored-credit", callerPubkey: CALLER_PUBKEY, currency: "usd",
+        amountMicro: 100_000, expiryMs: Date.now() + 60_000,
+        basis: { rail: "x402", paidMsats: 150_000, nativeAmount: 100_000, nativeAsset: "usdc" },
+      });
+    }
+    const requestId = `${kind}-active-payment`;
+    const creditId = kind === "stored" ? "stored-credit" : `imp:x402:${TX_HASH}`;
+    const drawId = kind === "stored" ? "stored-draw" : TX_HASH;
+    const body = () => requestBody(requestId, "metered", PRIVKEY,
+      kind === "stored" ? { credit_id: creditId, draw_id: drawId } : {});
+    const accepted = await submit(h.url, body(), kind === "implicit" ? { "X-PAYMENT": X402_HEADER } : {});
+    const original = await accepted.json() as { job_id: string; job_token?: string; upfront_payment?: UpfrontPayment };
+    const expected = upfrontFixture[kind];
+    expect(accepted.status).toBe(202);
+    expect(original.upfront_payment).toEqual(expected);
+    expect((await ledger.getDraw({ creditId, drawId }))?.status).toBe("pending");
+
+    rate = 200_000;
+    for (const recover of [lookup, resume]) {
+      const response = await recover(h.url, requestId, body());
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ job_id: original.job_id, upfront_payment: expected });
+    }
+    expect((await ledger.get(creditId))?.lastLedgerSeq).toBe(1);
+    expect(h.handled()).toBe(1);
+    expect(verifyX402Payment).toHaveBeenCalledTimes(kind === "implicit" ? 1 : 0);
+
+    const jobHeaders = { "X-Job-Token": original.job_token! };
+    const messages = await (await fetch(`${h.url}/v1/job/${original.job_id}/messages`, { headers: jobHeaders })).json() as {
+      messages: { type: string; content: { x402?: { nonce?: string } } }[];
+    };
+    const nonce = messages.messages.find((m) => m.type === "payment-request")?.content.x402?.nonce;
+    expect(nonce).toBeDefined();
+    vi.mocked(verifyX402Payment).mockResolvedValue({
+      verified: true, amountMsats: 500_000, amountUsdcMicro: 500_000, txHash: `0x${"dc".repeat(32)}`,
+    });
+    const payment = encodePayment({
+      x402Version: X402_V1_VERSION, scheme: "exact", network: X402.network,
+      payload: { signature: `0x${"cd".repeat(32)}`, authorization: {
+        from: "0x2222222222222222222222222222222222222222", to: X402.payTo,
+        value: "500000", validAfter: "0", validBefore: "99999999999", nonce: nonce!,
+      } },
+    });
+    const paid = await fetch(`${h.url}/v1/job/${original.job_id}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json", ...jobHeaders },
+      body: JSON.stringify({ type: "payment", content: { x402_payment: payment } }),
+    });
+    expect(paid.status).toBe(201);
+    await vi.waitFor(async () => expect((await h.jobStore.get(original.job_id))?.status).toBe("completed"));
+    expect((await ledger.getDraw({ creditId, drawId }))?.amountMicro).toBe(600_000);
+    const recovered = await lookup(h.url, requestId, body());
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toMatchObject({ upfront_payment: expected });
+    expect((await h.jobStore.get(original.job_id))?.paidMsats).toBeGreaterThan(expected.amount_msats);
+    expect(h.handled()).toBe(1);
+  });
+
   it("recovers a lost x402 response read-only and refuses caller/body mismatches without a token", async () => {
     const h = await startServer({ x402: true });
     const requestId = "x402-lost-response";
@@ -92,6 +184,7 @@ describe("public request recovery", () => {
     const accepted = await submit(h.url, original, { "X-PAYMENT": X402_HEADER });
     const acceptedBody = (await accepted.json()) as Record<string, unknown>;
     expect(accepted.status).toBe(200);
+    expect(acceptedBody.upfront_payment).toMatchObject({ amount_msats: 100_000, amount_micro: 100_000, currency: "usd" });
     expect(acceptedBody.job_id).toEqual(expect.any(String));
     expect(verifyX402Payment).toHaveBeenCalledTimes(1);
     expect(h.handled()).toBe(1);
@@ -115,6 +208,7 @@ describe("public request recovery", () => {
       job_token: "sensitive-job-token",
       status: "completed",
       transaction_hash: TX_HASH,
+      upfront_payment: acceptedBody.upfront_payment,
     });
     expect(verifyX402Payment).toHaveBeenCalledTimes(1);
     expect(h.handled()).toBe(1);
@@ -246,7 +340,7 @@ describe("job identity on recovery responses", () => {
   });
 });
 
-async function startServer(opts: { x402?: boolean; ledger?: MemoryCreditLedger }): Promise<{
+async function startServer(opts: { x402?: boolean; ledger?: MemoryCreditLedger; fxFetcher?: FxFetcher; free?: boolean }): Promise<{
   url: string;
   jobStore: MemoryJobStore;
   saveSpy: ReturnType<typeof vi.spyOn>;
@@ -260,9 +354,14 @@ async function startServer(opts: { x402?: boolean; ledger?: MemoryCreditLedger }
     capabilities: {
       run: {
         input: schema,
-        price: "$0.10",
-        onJob(ctx) {
+        ...(opts.free
+          ? { onQuote: { schema: z.object({ action: z.string() }), handler: async () => ({ upfront: { amount: 0, currency: "usd" as const }, description: "No upfront charge" }) } }
+          : { price: "$0.10" }),
+        async onJob(ctx) {
           handled += 1;
+          if ((ctx.input as { action?: string }).action === "metered") {
+            await ctx.requestPayment(500_000, "additional work");
+          }
           // "hold" leaves the job running so recovery reads see a non-terminal job.
           if ((ctx.input as { action?: string }).action !== "hold") ctx.complete("done");
         },
@@ -274,7 +373,7 @@ async function startServer(opts: { x402?: boolean; ledger?: MemoryCreditLedger }
     env: {},
     store: new MemoryKVStore(),
     jobStore,
-    fxFetcher: stubFx,
+    fxFetcher: opts.fxFetcher ?? stubFx,
     receiptKey: "11".repeat(32),
     ...(opts.x402 ? { x402: X402 } : {}),
     ...(opts.ledger ? { creditLedger: opts.ledger } : {}),

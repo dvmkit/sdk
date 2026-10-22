@@ -1,3 +1,4 @@
+import type { UpfrontPayment } from "../upfront-payment";
 import type { Message, MessageType, MppxChallenge, MppxCredential } from "../messages/types";
 import type { DrawFundingReceipt, FundingReceipt, JobReceipt as SignedJobReceipt } from "../receipt";
 import type { ReceiptTrustAnchor } from "../receipt-verify";
@@ -421,6 +422,8 @@ export interface CreditOpResult {
  * response; that one is a single block inside it.
  */
 export interface JobReceipt {
+  /** Original accepted payment/hold. Absent means unknown, never zero. */
+  upfrontPayment?: UpfrontPayment;
   jobId: string;
   status:
     | "completed"
@@ -507,6 +510,8 @@ export interface OutboundMessage {
 }
 
 export interface JobStatus {
+  /** Original accepted payment/hold, unchanged by later payments or settlement. */
+  upfrontPayment?: UpfrontPayment;
   jobId: string;
   status: "processing" | "completed" | "failed" | "awaiting-input" | "cancelled";
   /** Human-readable summary of the completed job (one-liner; not the payload). Present when status is `completed`. */

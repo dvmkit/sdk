@@ -1,3 +1,4 @@
+import type { UpfrontPayment } from "../../lib/upfront-payment";
 import type { ProofLike } from "@cashu/cashu-ts";
 
 import type { Message, MessageType } from "../../lib/messages/types";
@@ -81,6 +82,8 @@ export interface JobRecord {
   summary?: string;
   messages: Message[];
   seq: number;
+  /** Original acceptance snapshot; absent for historical records. INSERT-only. */
+  upfrontPayment?: UpfrontPayment;
   paidMsats: number;
   paymentMint?: string;
   /** Rail of the most recent successful credit (cashu / x402 / tempo). */

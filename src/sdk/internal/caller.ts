@@ -1,3 +1,4 @@
+export type { UpfrontPayment } from "../../lib/upfront-payment";
 // Unstable shared runtime and type contracts for package consumers.
 export {
   AGENT_MNEMONIC_FILE,

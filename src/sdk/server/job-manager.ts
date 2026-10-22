@@ -1066,6 +1066,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       status: "processing",
       messages: [],
       seq: 0,
+      upfrontPayment: payment.upfrontPayment ? structuredClone(payment.upfrontPayment) : undefined,
       paidMsats: payment.paidMsats,
       paymentMint: payment.paymentMint,
       paymentRail: payment.paymentRail,

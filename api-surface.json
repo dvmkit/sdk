@@ -9,6 +9,13 @@
         "payment-request.content.expires_at_ms"
       ],
       "unit": "integer Unix milliseconds"
+    },
+    "upfrontPayment": {
+      "fixture": "protocol-fixtures/upfront-payment-v1.json",
+      "optionalFields": [
+        "upfront_payment"
+      ],
+      "unit": "integer millisatoshis; optional integer credit micro-units and native atomic units"
     }
   },
   "exports": [
@@ -81,6 +88,7 @@
         "SignedRequestVerifier",
         "UnsupportedCurrencyError",
         "Upfront",
+        "UpfrontPayment",
         "ZodLike",
         "assertSafeUrl",
         "buildUpfront",
@@ -258,6 +266,7 @@
         "TempoDrainDecisionArgs",
         "TempoDrainDecisionResult",
         "TempoDrainHoldReason",
+        "UpfrontPayment",
         "WriteOffTempoCloseReportResponse",
         "X402BatchAcceptance",
         "X402BatchFunding",
@@ -614,6 +623,7 @@
         "UnsignedDrawFundingReceipt",
         "UnsignedFundingReceipt",
         "UnsignedJobReceipt",
+        "UpfrontPayment",
         "UpfrontPaymentOpts",
         "V1InfoCapability",
         "V1InfoResponse",

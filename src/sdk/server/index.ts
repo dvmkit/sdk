@@ -1,3 +1,4 @@
+export type { UpfrontPayment } from "../../lib/upfront-payment";
 export type { CreditDrawRefundArgs, CreditDrawRefundResult } from "./credit-draw-refund";
 export type {
   SignedRequestAudience,

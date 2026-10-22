@@ -143,6 +143,16 @@ describe("fund and draw in one request", () => {
     expect(result.creditCurrency).toBe("usd");
     expect(result.creditId).toBe("c1");
     expect(result.drawId).toBe("d1");
+    expect(result.upfrontPayment).toEqual({
+      amount_msats: 100_000,
+      amount_micro: 100_000,
+      currency: "usd",
+      rail: "x402",
+      native_amount: 100_000,
+      native_asset: "usdc",
+      credit_id: "c1",
+      draw_id: "d1",
+    });
     expect(result.fundingCredit).toMatchObject({
       availableMicro: FUNDED_MICRO,
       lastLedgerSeq: 0,
@@ -180,7 +190,35 @@ describe("fund and draw in one request", () => {
     expect(second.funding).toBeUndefined();
     expect(second.paidMsats).toBe(PRICE_MSATS);
     expect(second.nativeAmount).toBe(FUNDED_USDC / 20);
+    expect(second.upfrontPayment).toMatchObject({
+      amount_msats: 100_000, amount_micro: 100_000, currency: "usd",
+      credit_id: "c1", draw_id: "d2",
+    });
     expect(second.paymentTxHash).toBe(drawSettlementRef(DVM_ID, "c1", "d2"));
+  });
+
+  it("reports the committed pooled value even when the current price has a different msat value", async () => {
+    const h = harness();
+    await h.ledger.fund({
+      creditId: "c1", callerPubkey: CALLER, currency: "usd",
+      amountMicro: 1_000_000, expiryMs: Date.now() + 86_400_000,
+      basis: { rail: "x402", paidMsats: 1_500_000, nativeAmount: 1_000_000, nativeAsset: "usdc" },
+    });
+    const result = await pureDraw(h, "different-rate");
+    expect(result.upfrontPayment).toEqual({
+      amount_msats: 150_000, amount_micro: 100_000, currency: "usd",
+      rail: "x402", native_amount: 100_000, native_asset: "usdc",
+      credit_id: "c1", draw_id: "different-rate",
+    });
+    expect(verifyX402Payment).not.toHaveBeenCalled();
+  });
+
+  it("records a successful zero-price gate without pretending a failed gate accepted zero", async () => {
+    const free = await verifyUpfrontPayment({ requiredMsats: 0 });
+    expect(free.upfrontPayment).toEqual({ amount_msats: 0 });
+    const unpaid = await verifyUpfrontPayment({ requiredMsats: 100_000 });
+    expect(unpaid.error?.status).toBe(402);
+    expect(unpaid.upfrontPayment).toBeUndefined();
   });
 
   it("conserves the funding's rail value across the twenty jobs it bought", async () => {
@@ -280,14 +318,14 @@ describe("fund and draw in one request", () => {
     expect((await h.ledger.get("c1"))?.expiryMs).toBe(now + expectedDays * 86_400_000);
   });
 
-  it("leaves implicit N=1 carrying the rail's own values verbatim", async () => {
+  it.each([100_000, 2_000_000])("retains the accepted implicit debit and existing rail accounting for %i micro-units", async (acceptedAmount) => {
     const h = harness();
     const fundedAt = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockReturnValue(fundedAt);
     vi.mocked(verifyX402Payment).mockResolvedValue({
       verified: true,
-      amountMsats: PRICE_MSATS,
-      amountUsdcMicro: msatsToUsdc(PRICE_MSATS, RATE),
+      amountMsats: acceptedAmount,
+      amountUsdcMicro: acceptedAmount,
       txHash: TX_HASH,
       settleResponseHeader: "hdr",
     });
@@ -305,11 +343,15 @@ describe("fund and draw in one request", () => {
       jobId: "job-implicit",
     });
 
-    expect(result.paidMsats).toBe(PRICE_MSATS);
+    expect(result.paidMsats).toBe(acceptedAmount);
     expect(result.paymentTxHash).toBe(TX_HASH);
-    expect(result.nativeAmount).toBe(msatsToUsdc(PRICE_MSATS, RATE));
+    expect(result.upfrontPayment).toMatchObject({
+      amount_msats: acceptedAmount, amount_micro: acceptedAmount, currency: "usd",
+      credit_id: result.creditId, draw_id: result.drawId,
+    });
+    expect(result.nativeAmount).toBe(acceptedAmount);
 
-    expect(result.funding?.amountMicro).toBe(PRICE_MICRO);
+    expect(result.funding?.amountMicro).toBe(acceptedAmount);
     expect(IMPLICIT_CREDIT_TTL_MS).toBe(7_776_000_000);
     expect(result.funding?.expiryMs).toBe(fundedAt + 7_776_000_000);
     expect((await h.ledger.get(result.funding!.creditId))?.expiryMs).toBe(fundedAt + 7_776_000_000);

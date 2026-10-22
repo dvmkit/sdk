@@ -1,3 +1,4 @@
+export type { UpfrontPayment } from "../lib/upfront-payment";
 export { configureDVM, isConfiguredDVMDescriptor } from "./configure";
 export { envFlag } from "./env";
 export type { ProgressHeartbeatOpts } from "./heartbeat";

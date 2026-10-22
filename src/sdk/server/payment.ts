@@ -1,3 +1,5 @@
+import { upfrontPaymentFromDraw } from "./upfront-payment";
+import type { UpfrontPayment } from "../../lib/upfront-payment";
 import { withPaymentDiagnostics, withPaymentStage } from "../../observability/payment-diagnostics";
 import { paymentFailureFields } from "./payment-diagnostics";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
@@ -98,6 +100,8 @@ const UPFRONT_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const CONSUMED_CREDENTIAL_TTL_MS = 2 * UPFRONT_CHALLENGE_TTL_MS;
 
 export interface PaymentInfo {
+  /** Immutable acceptance fact, separate from cumulative job accounting. */
+  upfrontPayment?: UpfrontPayment;
   /**
    * Rail value this payment contributes to the job, in millisatoshis.
    *
@@ -617,7 +621,19 @@ export async function issueUpfrontChallenges(
 }
 
 export async function verifyUpfrontPayment(opts: UpfrontPaymentOpts): Promise<PaymentResult> {
-  return withPaymentDiagnostics(() => verifyUpfrontPaymentInScope(opts));
+  const result = await withPaymentDiagnostics(() => verifyUpfrontPaymentInScope(opts));
+  if (!result.error && !result.replayedDraw && !result.upfrontPayment && !opts.fundOnly) {
+    // Credit-backed results carry the committed draw separately. Legacy rail
+    // payments use verified rail facts; a successful unpaid gate knows zero.
+    result.upfrontPayment = {
+      amount_msats: result.paidMsats,
+      ...(result.paymentRail && { rail: result.paymentRail }),
+      ...(result.nativeAmount !== undefined && result.nativeAsset !== undefined && {
+        native_amount: result.nativeAmount, native_asset: result.nativeAsset,
+      }),
+    };
+  }
+  return result;
 }
 
 async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<PaymentResult> {
@@ -1672,6 +1688,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         drawId: draw.drawId,
         drawAmountMicro: draw.amountMicro,
         creditCurrency: ledgerCtx.priceFiat.currency,
+        upfrontPayment: upfrontPaymentFromDraw(draw),
       };
     } catch (err) {
       if (err instanceof CreditLedgerError) return creditLedgerErrorResult(err, x402Requirements);
@@ -4507,6 +4524,7 @@ function withDrawBasis(
     ...base,
     drawId,
     drawAmountMicro: draw.amountMicro,
+    ...(!ctx.midJob && !ctx.fundOnly && { upfrontPayment: upfrontPaymentFromDraw(draw) }),
   };
   if (!ctx.drawBasis) return withDraw;
   // What THIS leg contributed: the whole draw upfront, the increment on a

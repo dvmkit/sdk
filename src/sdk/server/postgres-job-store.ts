@@ -180,6 +180,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       -- with a fund-and-draw response. INSERT-only for replay stability.
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS funding_receipt JSONB;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS funding_credit JSONB;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS upfront_payment JSONB;
       -- the outstanding mid-job ask, denominated in fiat micro at the
       -- instant it was emitted. The top-up's ledger leg funds and grows the
       -- draw in this figure, so it must not move with the BTC/USD rate between
@@ -510,8 +511,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         last_activity_at, next_seq, requester_token_hash, requester_token,
         request_fingerprint, requester_pubkey, request_id, credit_id, draw_id,
         pending_payment_fiat_micro, pending_payment_fiat_currency, auth_request_path,
-        funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51)
+        funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52)
       ON CONFLICT (id) DO UPDATE SET
         terminal_at_ms = COALESCE(jobs.terminal_at_ms, EXCLUDED.terminal_at_ms),
         ended_by = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.ended_by ELSE EXCLUDED.ended_by END,
@@ -651,6 +652,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         isTerminalStatus(record.status) && record.status !== "completed" ? record.endedBy ?? "provider" : null,
         now,
         record.timingKnown ?? true,
+        record.upfrontPayment ? JSON.stringify(record.upfrontPayment) : null,
       ]
     );
     let rowCount: number | null;
@@ -1673,6 +1675,7 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     summary: row.summary as string | undefined,
     messages: row.messages as JobRecord["messages"],
     seq: row.seq as number,
+    upfrontPayment: (row.upfront_payment ?? undefined) as JobRecord["upfrontPayment"],
     paidMsats: Number(row.paid_msats),
     paymentMint: row.payment_mint as string | undefined,
     paymentRail: (row.payment_rail ?? undefined) as JobRecord["paymentRail"],
