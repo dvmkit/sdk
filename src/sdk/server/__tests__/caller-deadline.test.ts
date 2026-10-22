@@ -106,7 +106,7 @@ describe("caller deadlines", () => {
     expect(replay.status).toBe("cancelled");
   });
 
-  it.each([false, true])("requires a new payment after a recovered ask resolves live (concurrent prompt: %s)", async (withPrompt) => {
+  it.each(["none", "immediate", "delayed"])("requires a new payment after a recovered ask resolves live (concurrent prompt: %s)", async (promptMode) => {
     let paidBlocks = 0;
     const handler = async (ctx: SDKJobContext<unknown, unknown>) => {
       const work = async () => {
@@ -115,11 +115,16 @@ describe("caller deadlines", () => {
         await ctx.requestPayment(2000, "Second block");
         paidBlocks++;
       };
-      await Promise.all([work(), ...(withPrompt ? [ctx.prompt("q", "Continue?")] : [])]);
+      const prompt = async () => {
+        if (promptMode === "delayed") await delay(100);
+        await ctx.prompt("q", "Continue?");
+      };
+      await Promise.all([work(), ...(promptMode !== "none" ? [prompt()] : [])]);
       ctx.complete("done");
     };
     const { jm, store } = manager(handler);
     const job = await start(jm);
+    await vi.advanceTimersByTimeAsync(100);
     const originalPrompt = job.messages.find((m) => m.type === "prompt");
     jm.shutdown();
     await store.shutdownStreaming();
@@ -146,7 +151,8 @@ describe("caller deadlines", () => {
     expect(paidBlocks).toBe(1);
     expect(replay.pendingPaymentMsats).toBe(2000);
     expect(replay.messages.filter((m) => m.type === "payment-request").map((m) => m.content.amount_msats)).toEqual([1000, 2000]);
-    if (withPrompt) {
+    if (promptMode !== "none") {
+      await vi.advanceTimersByTimeAsync(100);
       expect(replay.messages.filter((m) => m.type === "prompt")).toEqual([originalPrompt]);
       const content = { prompt_id: "q", text: "yes" };
       const responseSeq = await recovery.recordInboundPending(replay, "response", content);

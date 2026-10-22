@@ -204,6 +204,16 @@ export function buildContext(
     });
   };
 
+  // Concurrent branches can reach their persisted prompts after another
+  // branch has moved past payment replay. Keep each prompt available once,
+  // independently of that mutable replay cursor.
+  let replayPrompts: ServerJob["messages"] | undefined;
+  const captureReplayPrompts = (): void => {
+    if (replayPrompts === undefined && job.replayHighSeq !== null) {
+      replayPrompts = job.messages.filter((m) => m.from === "provider" && m.type === "prompt" && m.seq <= job.replayHighSeq!);
+    }
+  };
+
   // Per-context running counters of what the handler has consumed via
   // successful `requestPayment` calls. Subtracted from the job's pool to find
   // its remaining balance — when the pool covers the next request, auto-credit
@@ -350,9 +360,9 @@ export function buildContext(
         return Promise.reject(new JobCancelledError(`Job already ${job.status}`));
       }
       job.status = "awaiting-input";
-      const original = job.replayHighSeq === null ? undefined : job.messages.find(
-        (m) => m.from === "provider" && m.type === "prompt" && m.content.id === id && m.seq <= job.replayHighSeq!
-      );
+      captureReplayPrompts();
+      const originalIndex = replayPrompts?.findIndex((m) => m.type === "prompt" && m.content.id === id) ?? -1;
+      const original = originalIndex < 0 ? undefined : replayPrompts!.splice(originalIndex, 1)[0];
       if (original) {
         // Each concurrent ask consumes its own history slot. An unanswered
         // prompt does not end replay for its still-pending siblings.
@@ -388,6 +398,7 @@ export function buildContext(
       return p;
     },
     requestPayment: async (amount, reason, payOpts) => {
+      captureReplayPrompts();
       // Same reasoning as `prompt` — a cancelled job will never be paid.
       if (terminated("requestPayment")) {
         throw new JobCancelledError(`Job already ${job.status}`);
