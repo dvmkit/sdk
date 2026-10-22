@@ -10,6 +10,24 @@ If a worker dies after input verifies but before claiming it, recovery can fail 
 
 The wire field is optional for compatibility with older servers; callers may ignore it. Legacy persisted waits without a stamp retain their timeout fallback, and older server versions cannot enforce the new semantics during a mixed-version rollout. No storage migration is required. Portable examples are in `protocol-fixtures/caller-deadline-v1.json`.
 
+## Durable steps
+
+`ctx.step(id, fn)` caches a completed operation's result and cost declarations for handler replay. With Postgres, or a custom `JobStore` implementing optional `saveStep`, the SDK waits for the step record's durable write before resolving the step. Each write updates only the step cache; it does not rewrite the message log. Writes are attempted at most three times, with 50 ms and 100 ms backoffs. If all attempts fail, the SDK emits `step_persist_failed` and returns the result anyway: the external action may already have happened. That result remains available to later yield and terminal snapshots, but is not yet guaranteed durable. Custom stores without `saveStep` retain yield/terminal snapshot persistence. In-memory stores cannot survive process death.
+
+Steps have **at-least-once** execution semantics. A body can run more than once if the process dies mid-body, after an external side effect but before the result is stored, or after exhausted persistence retries. For irreversible actions, pass `${ctx.jobId}:${stepId}` as an idempotency key to an external API that honours it, or check that system for a prior result before acting:
+
+```ts
+const stepId = "reserve-instrument";
+const reservation = await ctx.step(stepId, () =>
+  instrument.reserve({
+    idempotencyKey: `${ctx.jobId}:${stepId}`,
+  })
+);
+```
+
+The job id and step id stay stable across replay. A cached step returns its stored value and replays its cost declarations without calling the body. Step ids must be unique within a job. This does not add recovery of abandoned processing jobs; their existing watchdog behavior is unchanged.
+
+Compatibility: `JobStore.saveStep` is additive and optional, and uses the existing `step_cache` column without a migration. Implementations preserve the first stored record for each step id, keep those records through later snapshots, and reject writes to missing, terminal or redacted jobs.
 
 ## Balance-backed mid-job payments
 

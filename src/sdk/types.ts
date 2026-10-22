@@ -249,9 +249,23 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
   /**
    * Cache the result of an async operation for durable replay.
    *
-   * Step results are batch-persisted at yield points (prompt, payment-request)
-   * and terminal states (complete, fail). On re-invocation after a process restart,
-   * cached steps return their stored value without re-executing the function.
+   * With a store supporting per-step writes (including Postgres), the result and
+   * captured costs are persisted before this promise resolves. After three failed
+   * write attempts, the SDK logs `step_persist_failed` and returns the result anyway.
+   * Custom stores without that support persist steps at yield and terminal snapshots;
+   * in-memory stores provide no durability across process death.
+   *
+   * Cached replay skips the body, but execution is at-least-once: a crash during the
+   * body or between its side effect and persistence, or exhausted writes, can repeat
+   * the action. For irreversible actions, use an external idempotency key stable
+   * across replay, or check the external system for a prior result before acting.
+   * @example
+   * ```ts
+   * const stepId = "reserve";
+   * const reservation = await ctx.step(stepId, () =>
+   *   instrument.reserve({ idempotencyKey: `${ctx.jobId}:${stepId}` })
+   * );
+   * ```
    */
   step<T>(id: string, fn: () => Promise<T>): Promise<T>;
 

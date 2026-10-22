@@ -199,6 +199,7 @@
     "job_heartbeat_failed",
     "job_id",
     "job_message_append_failed",
+    "step_persist_failed",
     "job_messages_listen_connect_failed",
     "job_messages_listen_lost",
     "job_retention_alert_failed",
