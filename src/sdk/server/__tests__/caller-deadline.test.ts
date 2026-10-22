@@ -106,6 +106,58 @@ describe("caller deadlines", () => {
     expect(replay.status).toBe("cancelled");
   });
 
+  it.each([false, true])("requires a new payment after a recovered ask resolves live (concurrent prompt: %s)", async (withPrompt) => {
+    let paidBlocks = 0;
+    const handler = async (ctx: SDKJobContext<unknown, unknown>) => {
+      const work = async () => {
+        await ctx.requestPayment(1000, "First block");
+        paidBlocks++;
+        await ctx.requestPayment(2000, "Second block");
+        paidBlocks++;
+      };
+      await Promise.all([work(), ...(withPrompt ? [ctx.prompt("q", "Continue?")] : [])]);
+      ctx.complete("done");
+    };
+    const { jm, store } = manager(handler);
+    const job = await start(jm);
+    const originalPrompt = job.messages.find((m) => m.type === "prompt");
+    jm.shutdown();
+    await store.shutdownStreaming();
+    await vi.advanceTimersByTimeAsync(1000);
+    const recovery = manager(handler, 3, store).jm;
+    const record = (await store.get(job.id))!;
+    record.messages = await store.getMessages(job.id, 0);
+    const { job: replay, sdkCtx } = recovery.reactivateJob(record);
+    const seq = await recovery.recordInboundPending(replay, "text", { text: "thinking" });
+    await recovery.markInboundVerified(job.id, seq);
+    await store.claimForProcessing(job.id);
+    replay.replayHighSeq = replay.seq;
+    replay.replayProviderSkip = record.messages.filter((m) => m.from === "provider" && m.type !== "payment-request").length;
+    recovery.runHandler(replay, sdkCtx);
+    await vi.advanceTimersByTimeAsync(0);
+    const pay = async (amount_msats: number) => {
+      const content = { amount_msats };
+      const paymentSeq = await recovery.recordInboundPending(replay, "payment", content);
+      expect((await recovery.processPayment(replay, { type: "payment", content }, paymentSeq, { lockPubkeys: [] })).error).toBeUndefined();
+      await recovery.dispatchMessage(replay, "payment", content);
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    await pay(1000);
+    expect(paidBlocks).toBe(1);
+    expect(replay.pendingPaymentMsats).toBe(2000);
+    expect(replay.messages.filter((m) => m.type === "payment-request").map((m) => m.content.amount_msats)).toEqual([1000, 2000]);
+    if (withPrompt) {
+      expect(replay.messages.filter((m) => m.type === "prompt")).toEqual([originalPrompt]);
+      const content = { prompt_id: "q", text: "yes" };
+      const responseSeq = await recovery.recordInboundPending(replay, "response", content);
+      await recovery.markInboundVerified(replay.id, responseSeq);
+      await recovery.dispatchMessage(replay, "response", content);
+    }
+    await pay(2000);
+    expect(paidBlocks).toBe(2);
+    expect(replay.status).toBe("completed");
+  });
+
   it("fails an abandoned verified response after the worker grace period", async () => {
     const handler = async (ctx: SDKJobContext<unknown, unknown>) => { await ctx.prompt("q1", "Continue?"); ctx.complete("done"); };
     const ledger = new MemoryCreditLedger();

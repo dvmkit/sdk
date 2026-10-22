@@ -636,7 +636,7 @@ export function buildContext(
 
       const replayedPaymentRequest = job.replayHighSeq !== null &&
         job.replayPaymentIndex >= job.messages.filter((m) => m.from === "requester" && m.type === "payment").length
-        ? job.messages.findLast((m) => m.from === "provider" && m.type === "payment-request" &&
+        ? job.messages.findLast((m) => m.from === "provider" && m.type === "payment-request" && m.seq <= job.replayHighSeq! &&
           m.seq > (job.messages.findLast((message) => message.from === "requester" && message.type === "payment")?.seq ?? -1))
         : undefined;
       const originalAsk = replayedPaymentRequest?.type === "payment-request" ? replayedPaymentRequest.content : undefined;
@@ -800,6 +800,9 @@ export function buildContext(
         job.pendingMppChallengeIds = mppChallengeIds;
       }
 
+      // Only recovered history can satisfy replay. A payment arriving after a
+      // replayed wait suspends is consumed by its live resolver, never again
+      // by the next requestPayment call.
       // Replay: if this payment was already received, resolve immediately
       // (positional match). The `payment-request` is NOT re-emitted here —
       // it's already in history and the replay resolves from the cached
@@ -810,7 +813,7 @@ export function buildContext(
       // would consume a skip slot that the auto-credit short-circuit above
       // silently steals — the stale skip then swallowed the artifact.
       if (job.replayHighSeq !== null) {
-        const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester");
+        const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!);
         if (job.replayPaymentIndex < payments.length) {
           const payment = payments[job.replayPaymentIndex];
           job.replayPaymentIndex++;
@@ -920,6 +923,10 @@ export function buildContext(
             if (resolved) return;
             job.pendingPayment = null;
           }
+          // A live settlement moves execution beyond recovered history, even
+          // when NOTIFY supplied counters without a local payment message.
+          job.replayHighSeq = null;
+          job.replayProviderSkip = 0;
           opts.onCallerResume?.();
           resolved = true;
           cleanup();
@@ -1144,7 +1151,7 @@ function warnPinLost(
  */
 function advanceReplayPaymentIndex(job: ServerJob): void {
   if (job.replayHighSeq === null) return;
-  const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester");
+  const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!);
   if (job.replayPaymentIndex < payments.length) {
     job.replayPaymentIndex++;
   }
