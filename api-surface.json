@@ -1,10 +1,13 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "wireContracts": {
     "callerDeadline": {
       "fixture": "protocol-fixtures/caller-deadline-v1.json",
-      "optionalFields": ["prompt.content.expires_at_ms", "payment-request.content.expires_at_ms"],
+      "optionalFields": [
+        "prompt.content.expires_at_ms",
+        "payment-request.content.expires_at_ms"
+      ],
       "unit": "integer Unix milliseconds"
     }
   },
