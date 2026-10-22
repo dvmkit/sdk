@@ -1,3 +1,4 @@
+import type { UpfrontPayment } from "../../lib/upfront-payment";
 import type { ProofLike } from "@cashu/cashu-ts";
 
 import type {
@@ -70,6 +71,8 @@ export interface ServerJob {
   summary?: string;
   messages: Message[];
   seq: number;
+  /** Original acceptance snapshot; absent for historical records. INSERT-only. */
+  upfrontPayment?: UpfrontPayment;
   paidMsats: number;
   paymentMint?: string;
   /** Rail of the most recent successful credit. Set on each credit branch in payment processing. */
@@ -262,6 +265,7 @@ export function toJobRecord(job: ServerJob): JobRecord {
     awaitingInputAtMs: job.awaitingInputAtMs,
     messages: job.messages,
     seq: job.seq,
+    upfrontPayment: job.upfrontPayment,
     paidMsats: job.paidMsats,
     paymentMint: job.paymentMint,
     paymentRail: job.paymentRail,
@@ -315,6 +319,7 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     awaitingInputAtMs: record.awaitingInputAtMs,
     messages: [...record.messages],
     seq: record.seq,
+    upfrontPayment: record.upfrontPayment,
     paidMsats: record.paidMsats,
     paymentMint: record.paymentMint,
     paymentRail: record.paymentRail,

@@ -68,6 +68,7 @@ describe("toJobRecord / fromJobRecord", () => {
       summary: "done",
       seq: 5,
       paidMsats: 1000,
+      upfrontPayment: { amount_msats: 750, amount_micro: 23, currency: "eur", credit_id: "c", draw_id: "d" },
       paymentMint: "https://mint.example",
       paymentRail: "cashu",
       pendingPaymentMsats: 500,
@@ -84,6 +85,7 @@ describe("toJobRecord / fromJobRecord", () => {
     expect(record.summary).toBe("done");
     expect(record.seq).toBe(5);
     expect(record.paidMsats).toBe(1000);
+    expect(record.upfrontPayment).toEqual({ amount_msats: 750, amount_micro: 23, currency: "eur", credit_id: "c", draw_id: "d" });
     expect(record.paymentMint).toBe("https://mint.example");
     expect(record.paymentRail).toBe("cashu");
     expect(record.pendingMppChallengeIds).toEqual(["ch-1", "ch-2"]);
@@ -98,6 +100,7 @@ describe("toJobRecord / fromJobRecord", () => {
     expect(record.lastActivityAt).toBe(2000);
 
     const restored = fromJobRecord(record);
+    expect(restored.upfrontPayment).toEqual(job.upfrontPayment);
     expect(restored.id).toBe("job-abc-1");
     expect(restored.status).toBe("completed");
     expect(restored.summary).toBe("done");
@@ -156,6 +159,17 @@ describe("toJobRecord / fromJobRecord", () => {
 });
 
 describe("MemoryJobStore", () => {
+  it.each([undefined, { amount_msats: 0 }, {
+    amount_msats: 321, amount_micro: 123, currency: "eur", credit_id: "c", draw_id: "d",
+  }])("keeps the original upfront fact through later snapshots (%j)", async (upfrontPayment) => {
+    const store = new MemoryJobStore();
+    await store.save(makeRecord({ upfrontPayment }));
+    await store.save(makeRecord({ paidMsats: 5000, upfrontPayment: { amount_msats: 5000 } }));
+    expect((await store.get("job-abc-1"))?.upfrontPayment).toEqual(upfrontPayment);
+    await store.save(makeRecord({ status: "completed", paidMsats: 5000 }));
+    expect((await store.get("job-abc-1"))?.upfrontPayment).toEqual(upfrontPayment);
+  });
+
   it("returns undefined for missing keys", async () => {
     const store = new MemoryJobStore();
     expect(await store.get("nope")).toBeUndefined();

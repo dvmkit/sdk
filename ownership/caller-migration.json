@@ -85,6 +85,7 @@
       "src/lib/submission-policy.ts",
       "src/lib/traceparent.ts",
       "src/lib/transport/types.ts",
+      "src/lib/upfront-payment.ts",
       "src/lib/url-redact.ts",
       "src/lib/wallet-agent/agent-mnemonic-file.ts",
       "src/lib/wallet-agent/denominations.ts",
@@ -217,6 +218,7 @@
       "src/sdk/server/tempo-session-store.ts",
       "src/sdk/server/tempo-settlement-readiness-store.ts",
       "src/sdk/server/tempo-settlement-readiness.ts",
+      "src/sdk/server/upfront-payment.ts",
       "src/sdk/server/wallet-accumulator-monitor.ts",
       "src/sdk/server/wallet-accumulator-receive.ts",
       "src/sdk/server/wallet-accumulator-store.ts",
@@ -34575,6 +34577,49 @@
         },
         {
           "module": "src/sdk/server/secp256k1-auth.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/lib/upfront-payment.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared acceptance contract used by public job records and caller transport results.",
+          "symbols": [
+            "UpfrontPayment"
+          ],
+          "consumerEvidence": [
+            "supported:.#UpfrontPayment",
+            "supported:./server#UpfrontPayment"
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "module": "src/sdk/server/upfront-payment.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Server acceptance projects committed credit allocation without current pricing or cumulative job counters.",
+          "symbols": [
+            "upfrontPaymentFromDraw"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/upfront-payment.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
         }
       ]
     }

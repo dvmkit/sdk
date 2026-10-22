@@ -419,6 +419,10 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     currentIntent = requestIntent(requestId, endpoint);
     const resumed = await requestResume(requestId);
     expect(resumed).toMatchObject({ job_id: originalJobId, status: "completed" });
+    expect(resumed.upfront_payment).toMatchObject({
+      amount_msats: 100_000, amount_micro: 100_000, currency: "usd",
+      credit_id: marker.rows[0].credit_id, draw_id: marker.rows[0].draw_id,
+    });
     expect(verifyX402Payment).toHaveBeenCalledTimes(1);
     expect(paymentMutations).toBe(1);
     expect(handled.count).toBe(1);
@@ -440,6 +444,7 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
       job_id: originalJobId,
       status: "completed",
       transaction_hash: TX_HASH,
+      upfront_payment: resumed.upfront_payment,
     });
   });
 
@@ -623,6 +628,10 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
     currentIntent = requestIntent(requestId, endpoint, { credit_id: creditId, draw_id: drawId });
     const resumed = await requestResume(requestId);
     expect(resumed).toMatchObject({ job_id: originalJobId, status: "completed" });
+    expect(resumed.upfront_payment).toMatchObject({
+      amount_msats: 100_000, amount_micro: 100_000, currency: "usd",
+      credit_id: creditId, draw_id: drawId,
+    });
     expect(verifyX402Payment).not.toHaveBeenCalled();
     expect(handled.count).toBe(1);
     expect(

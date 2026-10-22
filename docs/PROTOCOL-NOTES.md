@@ -1,5 +1,27 @@
 # Protocol notes
 
+## Accepted upfront payments
+
+Successful submit (`POST /v1/job`), request-resume and request-result responses, and authenticated job reads, may carry `upfront_payment`. It records the original accepted payment before the handler runs. `amount_msats` is an integer millisatoshi value from the accepted payment or committed credit allocation, not a new quote or conversion at the current exchange rate. When a draw exists, `amount_micro` and `currency` preserve its exact credit denomination in integer millionths; `native_amount` and `native_asset`, when present, describe its allocated rail-native atomic units. A funding deposit may exceed all of these job amounts.
+
+`credit_id` and `draw_id` together identify credit consumption, including an implicit credit opened by a per-call payment. `rail` identifies the rail that funded that credit, not a fresh payment on recovery. Without a credit draw, the block reports the verified per-call rail payment. No payment credentials are included. The portable examples are in [upfront-payment-v1.json](../protocol-fixtures/upfront-payment-v1.json).
+
+For a credit-backed job the block describes the **hold at acceptance**. Completion settles the draw; failure or cancellation releases it. Later top-ups, draw growth, settlement repricing, refunds and exchange-rate changes do not rewrite the acceptance snapshot. It is neither a current balance nor a signed terminal receipt. Use the terminal receipt for final settlement evidence; do not count the funding deposit and its job draw as two payments for the same service.
+
+An explicit `amount_msats: 0` is known zero in that unit; a positive `amount_micro` can still describe a credit hold whose allocated millisatoshi value rounded to zero. An absent block means unknown, including jobs accepted by older servers and development submissions that bypass verification. Callers must not substitute zero for absence. Caller transport result types expose this block as optional `upfrontPayment`, retaining snake_case inside the block.
+
+The additive nullable `jobs.upfront_payment` column is written only when the job is first inserted. Existing records are not backfilled from cumulative totals or current draws. Custom job stores must preserve this field through reads and snapshot saves without replacing the first stored value, including its absence. Deploy the upgraded writer to obtain the field on new jobs; older writers and older job records can still omit it.
+
+The supported public type is available without a deep import:
+
+```ts
+import type { JobRecord, UpfrontPayment } from "@dvmkit/sdk";
+
+function originalHold(job: JobRecord): UpfrontPayment | undefined {
+  return job.upfrontPayment;
+}
+```
+
 ## Caller response deadlines
 
 Every newly emitted `prompt` and `payment-request` carries `content.expires_at_ms`, an integer Unix millisecond deadline equal to emission time plus the DVM's `idleTimeout` in milliseconds. The window starts when the handler asks, and ends when the matching response or verified payment satisfies that ask. Text and unrelated responses do not extend it. This includes event-driven requests emitted through `ctx.sendMessage`, which keep callback dispatch semantics. Processing without an outstanding ask has no idle timer; worker liveness remains governed by `processingWatchdog`.

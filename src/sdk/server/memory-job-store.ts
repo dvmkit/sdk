@@ -141,7 +141,10 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     // store, whose `save` statement simply doesn't list those columns. Without
     // this, a snapshot taken before the receipt was signed would clear it.
     const snapshot = structuredClone(record);
-    if (existing) snapshot.createdAt = existing.createdAt;
+    if (existing) {
+      snapshot.createdAt = existing.createdAt;
+      snapshot.upfrontPayment = structuredClone(existing.upfrontPayment);
+    }
     if (existing && isTerminal(existing.status)) snapshot.lastActivityAt = existing.lastActivityAt;
     if (existing?.receipt) snapshot.receipt = existing.receipt;
     snapshot.timingKnown = existing ? existing.timingKnown ?? false : record.timingKnown ?? true;
