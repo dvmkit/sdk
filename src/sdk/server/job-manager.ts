@@ -1859,8 +1859,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * • `awaiting-input` past `staleJobTimeoutMs` → `cancelled`
    * (`stale_no_terminal_status`) — the caller never paid / responded.
    * • `processing`/`working` past `processingWatchdogMs` → `failed`
-   * (`worker_died_mid_job`) — the worker died mid-job. The heartbeat keeps
-   * live workers fresh, so a stale row here means a dead process.
+   * (`worker_died_mid_job`) — the worker died mid-job. Before claiming a
+   * processing row, skip and heartbeat it if this manager still holds a live
+   * `processing`/`working` job. After a process pause, the sweep may run before
+   * the heartbeat timer; stale activity alone does not prove a local worker
+   * died. Superseded handlers leave `_activeJobs` and receive no protection.
    *
    * Fires on a timer (wired in the constructor) and also callable on demand
    * (tests, ops). The CAS in `cancelStaleJob` makes this safe to run
@@ -1868,6 +1871,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * JobManager owns so multi-mount hosts don't steal stuck rows from sibling
    * descriptors — the local activeJobs teardown only makes sense on the
    * JobManager that actually hosted the zombie handler.
+   * Local liveness prevents this manager's claim; the activity CAS continues
+   * to protect against other machines claiming a row refreshed after find.
    *
    * **Both cutoffs float off the wall clock.** Each is one
    * `Date.now()` sample compared against `last_activity_at`, stamped from a
@@ -1953,6 +1958,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         // that never claims it gets the processing grace period before failure.
         const expectedActivityBefore = awaiting && record.status === "awaiting-input" ? awaitingThreshold : processingThreshold;
         if (expectedActivityBefore < 0 || record.lastActivityAt > expectedActivityBefore) continue;
+        const local = this._activeJobs.get(record.id);
+        if (
+          (record.status === "processing" || record.status === "working") &&
+          local && (local.status === "processing" || local.status === "working")
+        ) {
+          // Use the store write directly: the timer heartbeat may already be
+          // in flight, in which case heartbeatActiveJobs() returns early.
+          await this.jobStore.heartbeatActiveJobs([record.id], Date.now());
+          diagnosticConsole.warn({
+            level: "stale_job_local_live_skipped",
+            ageMs: monoNow - record.lastActivityAt,
+          });
+          continue;
+        }
         const claimed = await this.jobStore.cancelStaleJob(
           record.id,
           expectedActivityBefore,
