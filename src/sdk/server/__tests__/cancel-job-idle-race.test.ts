@@ -125,7 +125,8 @@ describe("JobManager.cancelJobIdle cross-machine race", () => {
 
   it("still cancels normally when the store has not moved on", async () => {
     const store = new MemoryJobStore();
-    await store.save(seedRecord());
+    await store.save(seedRecord({ messages: [{ seq: 1, from: "provider", type: "prompt", timestamp: 1,
+      content: { id: "q1", text: "Continue?", expires_at_ms: Date.now() - 1 } }], seq: 1 }));
     const jm = buildManager(store);
 
     try {

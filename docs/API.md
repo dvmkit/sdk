@@ -17,7 +17,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `CancelContent` | interface | Requester or provider cancels the job. |
 | `CanonicalEnvelope` | interface | Exported declaration from the built public entry point. |
 | `CapabilityRate` | interface | One line of a capability's published rate card, declared on `CapabilityConfig.rates`. |
-| `configureDVM` | function | Exported declaration from the built public entry point. |
+| `configureDVM` | function | Configure a DVM; idleTimeout limits each caller answer/payment window (1–604800 seconds), not processing time. |
 | `createFxFetcher` | function | Build the default fx fetcher backed by `DVMKIT_FX_SOURCE` (or CoinGecko). |
 | `CreateFxFetcherOpts` | interface | Options for `createFxFetcher`. |
 | `createPinnedFetch` | function | Resolve the URL's host once, validate every answer against the same denylist `assertSafeUrl` applies, then return a `fetch` whose `connect.lookup` replays that frozen, pre-validated address set (see buildPinnedLookup). |

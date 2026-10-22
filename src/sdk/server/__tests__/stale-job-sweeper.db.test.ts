@@ -6,7 +6,7 @@
  * MemoryJobStore-only unit suite.
  */
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { JobRecord } from "../job-store";
 import { PostgresJobStore } from "../postgres-job-store";
@@ -25,6 +25,7 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await pool.query("DELETE FROM job_messages");
     await pool.query("DELETE FROM jobs");
   });
@@ -72,6 +73,34 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
     );
     return Number(rows[0].last_activity_at);
   }
+
+  it("checks an incremental prompt deadline under the cancellation lock", async () => {
+    const now = Date.now();
+    await seedJob("deadline", "awaiting-input", now - 100000);
+    await store.appendOutgoing("deadline", {
+      from: "provider", type: "prompt", timestamp: Math.floor(now / 1000),
+      content: { id: "q", text: "Continue?", expires_at_ms: now + 3000 },
+    }, { awaitingInput: true });
+    expect(await store.cancelStaleJob("deadline", now + 1000, "stale", "cancelled")).toBe(false);
+    expect(await statusOf("deadline")).toBe("awaiting-input");
+    vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+    expect(await store.cancelStaleJob("deadline", now + 1000, "stale", "cancelled")).toBe(true);
+    expect((await store.get("deadline"))?.endedBy).toBe("caller");
+  });
+
+  it("still reaps a dead worker after a stamped caller turn was answered", async () => {
+    const now = Date.now();
+    await seedJob("resumed", "awaiting-input", now);
+    await store.appendOutgoing("resumed", { from: "provider", type: "prompt", timestamp: 1,
+      content: { id: "q", text: "Continue?", expires_at_ms: now + 3000 } }, { awaitingInput: true });
+    const seq = await store.recordInbound("resumed", { from: "requester", type: "response", timestamp: 1,
+      content: { prompt_id: "q", text: "yes" } });
+    await store.verifyAndCredit("resumed", seq, null);
+    expect(await store.claimForProcessing("resumed")).toBe(true);
+    vi.spyOn(Date, "now").mockReturnValue(now + 5000);
+    expect(await store.cancelStaleJob("resumed", now + 1000, "worker_died_mid_job", "failed")).toBe(true);
+    expect((await store.get("resumed"))?.endedBy).toBe("provider");
+  });
 
   it("findStaleJobs applies the tight processing cutoff and the long awaiting cutoff independently", async () => {
     const now = Date.now();

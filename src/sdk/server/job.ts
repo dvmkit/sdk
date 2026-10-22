@@ -23,6 +23,8 @@ export interface PaymentResolver {
 }
 
 export interface ServerJob {
+  /** Runtime configuration; persisted deadlines live in the emitted messages. */
+  idleTimeoutMs?: number;
   id: string;
   tags: string[];
   /**
@@ -394,6 +396,9 @@ export function providerMessage(
     job.replayProviderSkip--;
     return; // suppressed during replay — message already in job.messages from the record
   }
+  if (type === "prompt" || type === "payment-request") {
+    content = { ...content, expires_at_ms: Date.now() + (job.idleTimeoutMs ?? 3600_000) };
+  }
   const msg = localMessage(job, "provider", type, content);
   // Tx A semantics: for payment-request messages, the pending amount
   // and per-rail bindings land in the same tx as the message insert. The
@@ -479,4 +484,33 @@ export function isYieldMessage(msg: Message): boolean {
     msg.type === "complete" ||
     msg.type === "cancel"
   );
+}
+
+type WaitingJob = Pick<JobRecord, "status" | "messages" | "pendingPaymentMsats" | "lastActivityAt" | "awaitingInputAtMs">;
+
+/** Recover outstanding asks from verified history; text and unrelated responses never extend a turn. */
+export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): number | undefined {
+  if (job.status !== "awaiting-input") return undefined;
+  const prompts = new Map<string, Message & { type: "prompt" }>();
+  let payment: (Message & { type: "payment-request" }) | undefined;
+  for (const message of job.messages) {
+    if (message.from === "provider" && message.type === "prompt") prompts.set(message.content.id, message);
+    if (message.from === "provider" && message.type === "payment-request") payment = message;
+    if (message.from === "requester" && message.type === "response") prompts.delete(message.content.prompt_id);
+  }
+  const asks = [...prompts.values(), ...(payment && (job.pendingPaymentMsats ?? 0) > 0 ? [payment] : [])];
+  const deadlines = asks.map((ask) => ask.content.expires_at_ms).filter((stamp): stamp is number => Number.isSafeInteger(stamp));
+  if (deadlines.length > 0) return Math.min(...deadlines);
+  // Legacy snapshots did not carry millisecond emission timestamps.
+  if (legacyTimeoutMs !== undefined && (asks.length > 0 || job.messages.length === 0)) {
+    return (job.awaitingInputAtMs ?? job.lastActivityAt) + legacyTimeoutMs;
+  }
+  return undefined;
+}
+
+/** Distinguish completed stamped waits from legacy rows without deadline evidence. */
+export function hasCallerDeadline(messages: Message[]): boolean {
+  return messages.some((message) => message.from === "provider" &&
+    (message.type === "prompt" || message.type === "payment-request") &&
+    Number.isSafeInteger(message.content.expires_at_ms));
 }

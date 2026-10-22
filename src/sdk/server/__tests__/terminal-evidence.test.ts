@@ -117,6 +117,11 @@ describe("SDK terminal attribution and timing", () => {
     const awaiting = path.endsWith("awaiting");
     const { jm, store } = manager();
     const rec = record(awaiting ? "awaiting-input" : "processing");
+    if (path === "idle-awaiting") {
+      rec.messages = [{ seq: 1, from: "provider", type: "prompt", timestamp: 1,
+        content: { id: "q", text: "Continue?", expires_at_ms: 1500 } }];
+      rec.seq = 1;
+    }
     await store.save(rec);
     const job = fromJobRecord((await store.get(rec.id))!);
     vi.setSystemTime(1500);
@@ -125,6 +130,11 @@ describe("SDK terminal attribution and timing", () => {
       await jm.cancelJobIdle(job);
       await job.terminalWork;
     } else await jm.sweepStaleJobs();
+    if (path === "idle-processing") {
+      expect((await store.get(rec.id))?.status).toBe("processing");
+      expect((await store.get(rec.id))?.receipt).toBeUndefined();
+      return;
+    }
     const receipt = (await store.get(rec.id))?.receipt;
     expect(receipt?.ended_by).toBe(path === "cancel" || awaiting ? "caller" : "provider");
     expect(receipt?.timing).toEqual({

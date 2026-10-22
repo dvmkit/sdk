@@ -1,3 +1,4 @@
+import { callerDeadline, hasCallerDeadline } from "./job";
 import { applyContentHoldMutation, ContentHoldError, type ContentHoldHistory, type ContentHoldMutation } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { createHash } from "node:crypto";
@@ -1466,8 +1467,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const { rows } = await client.query<{ next_seq: number }>(
-        `SELECT next_seq FROM jobs
+      const { rows } = await client.query<Record<string, unknown> & { next_seq: number }>(
+        `SELECT * FROM jobs
          WHERE id = $1
            AND status IN ('processing', 'working', 'awaiting-input')
            ${staleOnly ? "AND last_activity_at <= $2" : ""}
@@ -1477,6 +1478,18 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       if (rows.length === 0) {
         await client.query("ROLLBACK");
         return false;
+      }
+      if (staleOnly) {
+        const record = rowToRecord(rows[0]);
+        const { rows: messages } = await client.query<{ data: Message }>(
+          "SELECT data FROM job_messages WHERE job_id=$1 AND status='verified' ORDER BY seq", [jobId]);
+        const history = messages.length ? messages.map((row) => row.data) : record.messages;
+        const deadline = callerDeadline({ ...record, messages: history });
+        if ((terminalStatus === "cancelled") !== (record.status === "awaiting-input") ||
+            (record.status === "awaiting-input" && (deadline === undefined ? hasCallerDeadline(history) : Date.now() < deadline))) {
+          await client.query("ROLLBACK");
+          return false;
+        }
       }
       const nextSeq = rows[0].next_seq;
       const now = Date.now();

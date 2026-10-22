@@ -1,3 +1,4 @@
+import { callerDeadline, hasCallerDeadline } from "./job";
 import { applyContentHoldMutation, ContentHoldError, type ContentHoldHistory, type ContentHoldMutation } from "./content-retention";
 import type { Message } from "../../lib/messages/types";
 import type { JobReceipt } from "../../lib/receipt";
@@ -558,6 +559,13 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
     if (!eligible) return Promise.resolve(false);
+    if (expectedActivityBefore !== null) {
+      if ((terminalStatus === "cancelled") !== (record.status === "awaiting-input")) return Promise.resolve(false);
+      const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
+      const history = messages.length ? messages : record.messages;
+      const deadline = callerDeadline({ ...record, messages: history });
+      if (record.status === "awaiting-input" && (deadline === undefined ? hasCallerDeadline(history) : Date.now() < deadline)) return Promise.resolve(false);
+    }
     const seq = this.allocateSeq(jobId);
     const cancelMsg: Message = {
       seq,

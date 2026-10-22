@@ -74,6 +74,7 @@ export interface BuildContextOpts {
   onTerminal?: () => void | Promise<void>;
   /** Called at yield points (prompt, payment-request) and terminal states to persist job state. */
   onYield?: () => Promise<void>;
+  onCallerResume?: () => void;
   /** Persist a remaining prompt wait after accepted payment, without repeating verification. */
   onPaymentResume?: () => Promise<void>;
   paymentMethods?: PaymentMethod[];
@@ -361,7 +362,8 @@ export function buildContext(
           (m) => m.type === "response" && m.from === "requester" && m.content.prompt_id === id
         );
         if (response) {
-          job.status = "processing";
+          job.status = job.pendingPrompts.size > 0 || job.pendingPayment ? "awaiting-input" : "processing";
+          opts.onCallerResume?.();
           return Promise.resolve(response.content as ResponseContent);
         }
         // No cached response — replay is over, this is a genuine new yield
@@ -620,157 +622,179 @@ export function buildContext(
               }
             : { poolRemaining: job.paidMsats - creditedToHandlerMsats }),
         });
+        if (job.replayHighSeq !== null) {
+          job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
+          opts.onCallerResume?.();
+        }
         advanceReplayPaymentIndex(job);
         return { amount_msats: amountMsats };
       }
 
-      const pendingFiat = await pinAsk();
+      const replayedPaymentRequest = job.replayHighSeq !== null &&
+        job.replayPaymentIndex >= job.messages.filter((m) => m.from === "requester" && m.type === "payment").length
+        ? job.messages.findLast((m) => m.from === "provider" && m.type === "payment-request" &&
+          m.seq > (job.messages.findLast((message) => message.from === "requester" && message.type === "payment")?.seq ?? -1))
+        : undefined;
+      const originalAsk = replayedPaymentRequest?.type === "payment-request" ? replayedPaymentRequest.content : undefined;
+      if (originalAsk) amountMsats = originalAsk.amount_msats;
+      const pendingFiat = originalAsk
+        ? (originalAsk.credit ? { amountMicro: originalAsk.credit.amount_micro, currency: originalAsk.credit.currency } : undefined)
+        : await pinAsk();
       job.pendingPaymentMsats = amountMsats;
       job.pendingPaymentFiatMicro = pendingFiat?.amountMicro;
       job.pendingPaymentFiatCurrency = pendingFiat?.currency;
 
-      // Build the payment-request content, resolving x402/MPP from explicit opts or server config
-      const paymentRequestContent: Record<string, unknown> = {
-        amount_msats: amountMsats,
-        reason,
-        ...(pendingFiat && { credit: { amount_micro: pendingFiat.amountMicro, currency: pendingFiat.currency } }),
-        ...(fiatAmount && { fiat_amount: fiatAmount }),
-        ...(payOpts?.mints && { mints: payOpts.mints }),
-        ...(payOpts?.minLocktimeSeconds && { min_locktime_seconds: payOpts.minLocktimeSeconds }),
-        ...(!payOpts?.mints && opts.mints && { mints: opts.mints }),
-      };
+      // Replay reuses the original challenge bindings as well as its deadline.
+      let paymentRequestContent: Record<string, unknown>;
+      if (originalAsk) {
+        paymentRequestContent = { ...originalAsk };
+        job.pendingX402Nonce = originalAsk.x402?.nonce;
+        job.pendingX402AmountUsdcMicro = originalAsk.x402?.required_usdc_micro;
+        job.pendingMppChallengeIds = originalAsk.tempo?.challenges.map((challenge) => challenge.id);
+      } else {
+        // Build the payment-request content, resolving x402/MPP from explicit opts or server config
+        paymentRequestContent = {
+          amount_msats: amountMsats,
+          reason,
+          ...(pendingFiat && { credit: { amount_micro: pendingFiat.amountMicro, currency: pendingFiat.currency } }),
+          ...(fiatAmount && { fiat_amount: fiatAmount }),
+          ...(payOpts?.mints && { mints: payOpts.mints }),
+          ...(payOpts?.minLocktimeSeconds && { min_locktime_seconds: payOpts.minLocktimeSeconds }),
+          ...(!payOpts?.mints && opts.mints && { mints: opts.mints }),
+        };
 
-      // x402 payment option
-      let paymentRate: number | undefined;
-      let x402Nonce: string | undefined;
-      let x402AmountUsdcMicro: string | undefined;
-      const hasExplicitX402 = Boolean(payOpts?.x402);
-      // USDC can state a USD-denominated ask exactly. On any other DVM
-      // currency it would require a fresh FX conversion, so x402 is withheld
-      // even when the handler supplies an explicit per-ask override.
-      if ((opts.pricingCurrency ?? "usd") === "usd") {
-        if (payOpts?.x402) {
-          paymentRequestContent.x402 = payOpts.x402;
-        } else if (
-          opts.paymentMethods?.includes("x402") &&
-          opts.x402 &&
-          (opts.x402FacilitatorHealth?.support().available ?? true)
-        ) {
-          paymentRequestContent.x402 = {
-            pay_to: opts.x402.payTo,
-            network: opts.x402.network,
-            asset: opts.x402.asset ?? "USDC",
-            ...(opts.x402.facilitator && { facilitator: opts.x402.facilitator }),
+        // x402 payment option
+        let paymentRate: number | undefined;
+        let x402Nonce: string | undefined;
+        let x402AmountUsdcMicro: string | undefined;
+        const hasExplicitX402 = Boolean(payOpts?.x402);
+        // USDC can state a USD-denominated ask exactly. On any other DVM
+        // currency it would require a fresh FX conversion, so x402 is withheld
+        // even when the handler supplies an explicit per-ask override.
+        if ((opts.pricingCurrency ?? "usd") === "usd") {
+          if (payOpts?.x402) {
+            paymentRequestContent.x402 = payOpts.x402;
+          } else if (
+            opts.paymentMethods?.includes("x402") &&
+            opts.x402 &&
+            (opts.x402FacilitatorHealth?.support().available ?? true)
+          ) {
+            paymentRequestContent.x402 = {
+              pay_to: opts.x402.payTo,
+              network: opts.x402.network,
+              asset: opts.x402.asset ?? "USDC",
+              ...(opts.x402.facilitator && { facilitator: opts.x402.facilitator }),
+            };
+          }
+        }
+        // Per-job x402 binding: stamp a fresh 32-byte CSPRNG nonce on
+        // the outbound x402 envelope and capture it on the job. The caller signs
+        // the EIP-3009 `TransferWithAuthorization` against this exact `bytes32`;
+        // `processIncomingPayment` rejects credentials whose decoded
+        // authorization nonce differs, blocking a cross-job replay of a payload
+        // signed for the right `(payTo, value)` against an unrelated job before
+        // its `transferWithAuthorization` lands on chain. Mirrors the MPP
+        // `pendingMppChallengeIds` shape; single scalar because x402 carries one
+        // credential per payment-request.
+        if (paymentRequestContent.x402) {
+          paymentRate = (await resolveServerBtcUsdRate(opts.fxFetcher)).rate;
+          x402Nonce = `0x${randomBytes(32).toString("hex")}`;
+          x402AmountUsdcMicro = msatsToUsdc(amountMsats, paymentRate).toString();
+          const x402Request = paymentRequestContent.x402 as {
+            pay_to: string;
+            network: string;
+            asset?: string;
+            facilitator?: string;
           };
-        }
-      }
-      // Per-job x402 binding: stamp a fresh 32-byte CSPRNG nonce on
-      // the outbound x402 envelope and capture it on the job. The caller signs
-      // the EIP-3009 `TransferWithAuthorization` against this exact `bytes32`;
-      // `processIncomingPayment` rejects credentials whose decoded
-      // authorization nonce differs, blocking a cross-job replay of a payload
-      // signed for the right `(payTo, value)` against an unrelated job before
-      // its `transferWithAuthorization` lands on chain. Mirrors the MPP
-      // `pendingMppChallengeIds` shape; single scalar because x402 carries one
-      // credential per payment-request.
-      if (paymentRequestContent.x402) {
-        paymentRate = (await resolveServerBtcUsdRate(opts.fxFetcher)).rate;
-        x402Nonce = `0x${randomBytes(32).toString("hex")}`;
-        x402AmountUsdcMicro = msatsToUsdc(amountMsats, paymentRate).toString();
-        const x402Request = paymentRequestContent.x402 as {
-          pay_to: string;
-          network: string;
-          asset?: string;
-          facilitator?: string;
-        };
-        const challengeConfig: X402Config = {
-          payTo: x402Request.pay_to,
-          network: x402Request.network,
-          ...(x402Request.asset ? { asset: x402Request.asset } : {}),
-          ...(x402Request.facilitator ? { facilitator: x402Request.facilitator } : {}),
-        };
-        Object.assign(x402Request, {
-          nonce: x402Nonce,
-          required_usdc_micro: x402AmountUsdcMicro,
-          ...(hasExplicitX402 || (opts.x402FacilitatorHealth?.support().exact.v2 ?? true)
-            ? {
-                payment_required: buildPaymentRequiredV2({
-                  x402Config: challengeConfig,
-                  requiredUsdcMicro: BigInt(x402AmountUsdcMicro),
-                  resource: `/v1/job/${job.id}/messages`,
-                  description: reason,
-                }),
-              }
-            : {}),
-        });
-      }
-      // Always assign — `undefined` clears any stale binding from a prior
-      // payment-request that included x402 but is now superseded.
-      job.pendingX402Nonce = x402Nonce;
-      job.pendingX402AmountUsdcMicro = x402AmountUsdcMicro;
-
-      // MPP payment option — issue one mppx challenge per registered method.
-      // Each Challenge carries its own HMAC-bound id, recipient, currency,
-      // and amount, so no flat fields beside it. Multi-rail = multiple
-      // entries; clients pick the one matching their wallet's method.
-      //
-      // Capture the issued challenge ids on the job so
-      // `processIncomingPayment` can reject a credential whose challenge
-      // wasn't issued for *this* job — mppx HMAC-binds challenges to
-      // realm/method/amount/expiry but not to the dvmkit job-id, so
-      // without this binding a credential lifted from a sibling job that
-      // requested the same fields could satisfy this payment-request.
-      let mppChallengeIds: string[] | undefined;
-      if (payOpts?.mpp) {
-        // Pre-issued challenges get the same session filter as the issuer
-        // below: a builder handing `requestPayment` its own list
-        // would otherwise advertise a reusable channel both mid-job verifiers
-        // are now obliged to refuse.
-        const challenges = payOpts.mpp.challenges.filter((c) => c.intent !== "session");
-        if (challenges.length > 0) {
-          paymentRequestContent.tempo = { challenges };
-          mppChallengeIds = challenges.map((c) => c.id);
-        }
-      } else if (opts.paymentMethods?.includes("tempo") && opts.mpp) {
-        // Degrades to the last rate this process saw when the provider is down,
-        // and raises a typed `fx_rate_unavailable` (code/display/hint) when it
-        // has none — a mid-job charge priced at `0` would give the work away
-        const rate = paymentRate ?? (await resolveServerBtcUsdRate(opts.fxFetcher)).rate;
-        const challenges: MppxChallenge[] = [];
-        for (const m of opts.mpp.methods) {
-          // Method.AnyServer collapses to `any`; narrow to the structural
-          // shape guaranteed at runtime so the lookup stays well-typed.
-          const meta = m as { name: string; intent: string };
-          // Reusable channels fund credits and nothing else. mppx
-          // charges a session channel *before* the handler runs and disclaims
-          // charge-only-on-success, which is exactly the pre-handler semantics
-          // the `/v1/credit`-only confinement exists to avoid — and a mid-job
-          // ask is per-job work, not a credit top-up instrument. The upfront
-          // issuer partitions the same way (`issueUpfrontChallenges`), and both
-          // mid-job verifiers now refuse a session credential outright — but
-          // the emitted id would otherwise land in `pendingMppChallengeIds`,
-          // so the job would be advertising an instrument it must then reject.
-          if (meta.intent === "session") continue;
-          const amount =
-            pendingFiat?.currency === "usd"
-              ? fiatMicroToMethodAmount(pendingFiat.amountMicro, meta.name)
-              : msatsToMethodAmount(amountMsats, meta.name, rate);
-          const ch = await opts.mpp.issueChallenge(meta.name, meta.intent, {
-            amount,
-            description: reason,
+          const challengeConfig: X402Config = {
+            payTo: x402Request.pay_to,
+            network: x402Request.network,
+            ...(x402Request.asset ? { asset: x402Request.asset } : {}),
+            ...(x402Request.facilitator ? { facilitator: x402Request.facilitator } : {}),
+          };
+          Object.assign(x402Request, {
+            nonce: x402Nonce,
+            required_usdc_micro: x402AmountUsdcMicro,
+            ...(hasExplicitX402 || (opts.x402FacilitatorHealth?.support().exact.v2 ?? true)
+              ? {
+                  payment_required: buildPaymentRequiredV2({
+                    x402Config: challengeConfig,
+                    requiredUsdcMicro: BigInt(x402AmountUsdcMicro),
+                    resource: `/v1/job/${job.id}/messages`,
+                    description: reason,
+                  }),
+                }
+              : {}),
           });
-          challenges.push(ch);
         }
-        // A handle whose only method is session-intent leaves nothing to ask
-        // for — omit the block rather than advertise an empty challenge list.
-        if (challenges.length > 0) {
-          paymentRequestContent.tempo = { challenges };
-          mppChallengeIds = challenges.map((c) => c.id);
+        // Always assign — `undefined` clears any stale binding from a prior
+        // payment-request that included x402 but is now superseded.
+        job.pendingX402Nonce = x402Nonce;
+        job.pendingX402AmountUsdcMicro = x402AmountUsdcMicro;
+
+        // MPP payment option — issue one mppx challenge per registered method.
+        // Each Challenge carries its own HMAC-bound id, recipient, currency,
+        // and amount, so no flat fields beside it. Multi-rail = multiple
+        // entries; clients pick the one matching their wallet's method.
+        //
+        // Capture the issued challenge ids on the job so
+        // `processIncomingPayment` can reject a credential whose challenge
+        // wasn't issued for *this* job — mppx HMAC-binds challenges to
+        // realm/method/amount/expiry but not to the dvmkit job-id, so
+        // without this binding a credential lifted from a sibling job that
+        // requested the same fields could satisfy this payment-request.
+        let mppChallengeIds: string[] | undefined;
+        if (payOpts?.mpp) {
+          // Pre-issued challenges get the same session filter as the issuer
+          // below: a builder handing `requestPayment` its own list
+          // would otherwise advertise a reusable channel both mid-job verifiers
+          // are now obliged to refuse.
+          const challenges = payOpts.mpp.challenges.filter((c) => c.intent !== "session");
+          if (challenges.length > 0) {
+            paymentRequestContent.tempo = { challenges };
+            mppChallengeIds = challenges.map((c) => c.id);
+          }
+        } else if (opts.paymentMethods?.includes("tempo") && opts.mpp) {
+          // Degrades to the last rate this process saw when the provider is down,
+          // and raises a typed `fx_rate_unavailable` (code/display/hint) when it
+          // has none — a mid-job charge priced at `0` would give the work away
+          const rate = paymentRate ?? (await resolveServerBtcUsdRate(opts.fxFetcher)).rate;
+          const challenges: MppxChallenge[] = [];
+          for (const m of opts.mpp.methods) {
+            // Method.AnyServer collapses to `any`; narrow to the structural
+            // shape guaranteed at runtime so the lookup stays well-typed.
+            const meta = m as { name: string; intent: string };
+            // Reusable channels fund credits and nothing else. mppx
+            // charges a session channel *before* the handler runs and disclaims
+            // charge-only-on-success, which is exactly the pre-handler semantics
+            // the `/v1/credit`-only confinement exists to avoid — and a mid-job
+            // ask is per-job work, not a credit top-up instrument. The upfront
+            // issuer partitions the same way (`issueUpfrontChallenges`), and both
+            // mid-job verifiers now refuse a session credential outright — but
+            // the emitted id would otherwise land in `pendingMppChallengeIds`,
+            // so the job would be advertising an instrument it must then reject.
+            if (meta.intent === "session") continue;
+            const amount =
+              pendingFiat?.currency === "usd"
+                ? fiatMicroToMethodAmount(pendingFiat.amountMicro, meta.name)
+                : msatsToMethodAmount(amountMsats, meta.name, rate);
+            const ch = await opts.mpp.issueChallenge(meta.name, meta.intent, {
+              amount,
+              description: reason,
+            });
+            challenges.push(ch);
+          }
+          // A handle whose only method is session-intent leaves nothing to ask
+          // for — omit the block rather than advertise an empty challenge list.
+          if (challenges.length > 0) {
+            paymentRequestContent.tempo = { challenges };
+            mppChallengeIds = challenges.map((c) => c.id);
+          }
         }
+        // Always assign — `undefined` clears any stale binding from a prior
+        // payment-request that included MPP but is now superseded.
+        job.pendingMppChallengeIds = mppChallengeIds;
       }
-      // Always assign — `undefined` clears any stale binding from a prior
-      // payment-request that included MPP but is now superseded.
-      job.pendingMppChallengeIds = mppChallengeIds;
 
       // Replay: if this payment was already received, resolve immediately
       // (positional match). The `payment-request` is NOT re-emitted here —
@@ -798,15 +822,14 @@ export function buildContext(
             ? await opts.acceptedBalancePayment?.(payment.seq, pendingFiat?.amountMicro, pendingFiat?.currency)
             : job.reactivationPaymentApplied === true;
           if (!accepted) throw new Error("[internal_error] payment replay reached without credit");
-          if (balance) {
-            job.pendingPaymentMsats = undefined;
-            job.pendingPaymentFiatMicro = undefined;
-            job.pendingPaymentFiatCurrency = undefined;
-            job.pendingMppChallengeIds = undefined;
-            job.pendingX402Nonce = undefined;
-            job.pendingX402AmountUsdcMicro = undefined;
-          }
-          job.status = "processing";
+          job.pendingPaymentMsats = undefined;
+          job.pendingPaymentFiatMicro = undefined;
+          job.pendingPaymentFiatCurrency = undefined;
+          job.pendingMppChallengeIds = undefined;
+          job.pendingX402Nonce = undefined;
+          job.pendingX402AmountUsdcMicro = undefined;
+          job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
+          opts.onCallerResume?.();
           creditedToHandlerMsats += amountMsats;
           creditedToHandlerMicro += pendingFiat?.amountMicro ?? 0;
           return payment.content as PaymentContent;
@@ -828,35 +851,35 @@ export function buildContext(
       // above would double the in-memory total on every reactivation while the
       // durable column stayed put — and the phantom headroom would let the next
       // ask's duplicate grow the draw, which is the bug the cap exists to stop.
-      const askedTotal = accumulateAskedTopUp(
-        {
-          micro: job.askedTopUpMicro,
-          currency: job.askedTopUpCurrency,
-          reason: job.topUpCapUnenforcedReason,
-        },
-        { micro: pendingFiat?.amountMicro, currency: pendingFiat?.currency }
-      );
-      job.askedTopUpMicro = askedTotal.micro;
-      job.askedTopUpCurrency = askedTotal.currency;
-      // the ceiling just went away, and this is the only moment that
-      // knows why. The reason rides Tx A onto the job row so the affected jobs
-      // are a query rather than a log grep; the span is what an alarm counts.
-      // If that counter stays at zero the remaining door is theoretical.
-      if (askedTotal.reason && !job.topUpCapUnenforcedReason) {
-        job.topUpCapUnenforcedReason = askedTotal.reason;
-        loggers.isolate.warn("dvm.topup_cap_unenforceable", {
-          job_id: job.id,
-          reason: askedTotal.reason,
-          ask_currency: askCurrency,
-          ask_msats: amountMsats,
-        });
-      }
+      if (!originalAsk) {
+        const askedTotal = accumulateAskedTopUp(
+          {
+            micro: job.askedTopUpMicro,
+            currency: job.askedTopUpCurrency,
+            reason: job.topUpCapUnenforcedReason,
+          },
+          { micro: pendingFiat?.amountMicro, currency: pendingFiat?.currency }
+        );
+        job.askedTopUpMicro = askedTotal.micro;
+        job.askedTopUpCurrency = askedTotal.currency;
+        // the ceiling just went away, and this is the only moment that
+        // knows why. The reason rides Tx A onto the job row so the affected jobs
+        // are a query rather than a log grep; the span is what an alarm counts.
+        // If that counter stays at zero the remaining door is theoretical.
+        if (askedTotal.reason && !job.topUpCapUnenforcedReason) {
+          job.topUpCapUnenforcedReason = askedTotal.reason;
+          loggers.isolate.warn("dvm.topup_cap_unenforceable", {
+            job_id: job.id,
+            reason: askedTotal.reason,
+            ask_currency: askCurrency,
+            ask_msats: amountMsats,
+          });
+        }
 
-      // Genuine new yield (live, or replay just exhausted): emit the
-      // payment-request and suspend. Reached only with `replayHighSeq === null`,
-      // so this `providerMessage` is never subject to replay suppression.
+      }
+      // An unanswered replay keeps the original message and payment bindings.
       job.status = "awaiting-input";
-      providerMessage(job, "payment-request", paymentRequestContent);
+      if (!originalAsk) providerMessage(job, "payment-request", paymentRequestContent);
 
       // Register resolver synchronously. Wrap `resolve` so the upfront-pool
       // counter advances when the agent's payment satisfies this yield —
@@ -891,6 +914,7 @@ export function buildContext(
             if (resolved) return;
             job.pendingPayment = null;
           }
+          opts.onCallerResume?.();
           resolved = true;
           cleanup();
           creditedToHandlerMsats += amountMsats;
