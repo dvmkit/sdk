@@ -8,6 +8,7 @@ import type { Pool, PoolClient } from "pg";
 import { ListenChannel } from "../../lib/listen-channel";
 import type { Message } from "../../lib/messages/types";
 import type { JobReceipt } from "../../lib/receipt";
+import type { StepRecord } from "../step-cache";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import type {
@@ -434,6 +435,19 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     held.client.release();
   }
 
+  async saveStep(jobId: string, record: StepRecord): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE jobs SET step_cache = CASE
+         WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(step_cache) AS step
+                      WHERE step->>'id' = $2::jsonb->>'id') THEN step_cache
+         ELSE step_cache || jsonb_build_array($2::jsonb) END
+       WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
+         AND redacted_at IS NULL`,
+      [jobId, JSON.stringify(record)],
+    );
+    if (result.rowCount !== 1) throw new Error("Step persistence requires a live job");
+  }
+
   async save(record: JobRecord): Promise<void> {
     const dvmId = (record as DvmScopedJobRecord)[JOB_DVM_ID];
     for (let attempt = 0; ; attempt++) {
@@ -548,7 +562,17 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         pending_x402_nonce = EXCLUDED.pending_x402_nonce,
         pending_x402_amount_usdc_micro = EXCLUDED.pending_x402_amount_usdc_micro,
         required_msats = EXCLUDED.required_msats,
-        step_cache = EXCLUDED.step_cache,
+        -- A stale snapshot must not erase a step committed by saveStep.
+        -- First stored result wins for each id, matching cached replay.
+        step_cache = (
+          SELECT COALESCE(jsonb_agg(entry ORDER BY position), '[]'::jsonb)
+          FROM (
+            SELECT DISTINCT ON (entry->>'id') entry, position
+            FROM jsonb_array_elements(jobs.step_cache || EXCLUDED.step_cache)
+              WITH ORDINALITY AS steps(entry, position)
+            ORDER BY entry->>'id', position
+          ) AS merged_steps
+        ),
         state = EXCLUDED.state,
         last_activity_at = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.last_activity_at ELSE EXCLUDED.last_activity_at END
       -- terminal is terminal. On a multi-machine DVM a DELETE can

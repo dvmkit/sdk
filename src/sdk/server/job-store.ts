@@ -417,6 +417,13 @@ export interface JobStore {
    */
   releaseRequestIdClaim?(claim: RequestIdClaim): Promise<void>;
 
+  /**
+   * Durably add a completed step, including its costs, without rewriting the job snapshot.
+   * Existing step ids keep their first stored record. Implementations must preserve
+   * these records in later snapshots and reject missing, terminal or redacted jobs.
+   * Stores without this method retain yield-time step persistence.
+   */
+  saveStep?(jobId: string, record: StepRecord): Promise<void>;
   save(record: JobRecord): Promise<void>;
   delete(id: string): Promise<void>;
 }

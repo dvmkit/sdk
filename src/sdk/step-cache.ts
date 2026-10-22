@@ -12,10 +12,9 @@ export interface StepRecord {
 /**
  * In-memory cache of step results for durable replay.
  *
- * serialize() is called at yield points and terminal states to batch-persist
- * step results, and deserialize() restores them on re-invocation — enabling
- * handlers to replay deterministically through cached steps and resume from
- * where they left off.
+ * Completed records are persisted before a step returns when the store supports
+ * per-step writes. serialize() also includes them in yield and terminal snapshots;
+ * deserialize() restores them for replay without repeating completed bodies.
  */
 export class StepCache {
   private cache = new Map<string, StepRecord>();

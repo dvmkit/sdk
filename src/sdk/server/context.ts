@@ -16,6 +16,7 @@ import {
   UnsupportedCurrencyError,
   validateCurrency,
 } from "../pricing/index";
+import type { StepRecord } from "../step-cache";
 import type { JobCost, KVStore, PaymentMethod, SDKJobContext } from "../types";
 import { resolveServerBtcUsdRate } from "./btc-rate";
 import type { FiatDenominationFailure, PriceFiat } from "./funding";
@@ -75,6 +76,8 @@ export interface BuildContextOpts {
   /** Called at yield points (prompt, payment-request) and terminal states to persist job state. */
   onYield?: () => Promise<void>;
   onCallerResume?: () => void;
+  /** Persist a completed step before returning its value to the handler. */
+  onStep?: (record: StepRecord) => Promise<void>;
   /** Persist a remaining prompt wait after accepted payment, without repeating verification. */
   onPaymentResume?: () => Promise<void>;
   paymentMethods?: PaymentMethod[];
@@ -273,6 +276,7 @@ export function buildContext(
   let declaredCostCurrency: Currency | undefined;
   let declaredCostRevision = 0;
   let costPoisoned = false;
+  const stepWrites = new Map<string, Promise<void>>();
   const stepCostOwner = {};
 
   const declareCost = (declared: JobCost): void => {
@@ -1097,6 +1101,7 @@ export function buildContext(
 
     step: async <T>(id: string, fn: () => Promise<T>): Promise<T> => {
       if (job.stepCache.has(id)) {
+        await stepWrites.get(id);
         const record = job.stepCache.getRecord(id);
         for (const declared of record.costs ?? []) declareCost(declared);
         return record.value as T;
@@ -1109,6 +1114,15 @@ export function buildContext(
         fn
       );
       job.stepCache.set(id, result, costs);
+      if (opts.onStep) {
+        const persistence = opts.onStep(job.stepCache.getRecord(id));
+        stepWrites.set(id, persistence);
+        try {
+          await persistence;
+        } finally {
+          stepWrites.delete(id);
+        }
+      }
       return result;
     },
 

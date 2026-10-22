@@ -3498,6 +3498,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         return this.persistJob(job);
       },
       onCallerResume: () => this.startIdleTimer(job),
+      onStep: jobStore.saveStep ? async (record) => {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await jobStore.saveStep!(job.id, record);
+            return;
+          } catch {
+            if (attempt >= 2) {
+              diagnosticConsole.warn({ event: "step_persist_failed" });
+              return;
+            }
+            await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+          }
+        }
+      } : undefined,
       onPaymentResume: () => retryJobSnapshot(() => this.persistJob(job)),
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
