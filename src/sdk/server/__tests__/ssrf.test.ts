@@ -349,6 +349,165 @@ describe("createPinnedFetch — DNS-rebind closure", () => {
   });
 });
 
+describe("pinned redirects", () => {
+  it.each(["validation", "wrapper"])("cancels an unsent upload after %s failure", async (failure) => {
+    let canceled = false;
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: async (host) => [{ address: host === "private.example.com" ? "10.0.0.1" : "93.184.216.34", family: 4 }],
+      baseFetch: async () => { throw new Error("wrapper failed"); },
+    });
+    try {
+      await expect(pinned.fetch(failure === "validation" ? "https://private.example.com/" : "https://source.example.com/", {
+        method: "POST", duplex: "half",
+        body: new ReadableStream({ cancel() { canceled = true; } }),
+      } as RequestInit)).rejects.toThrow(failure === "validation" ? "blocked address" : "wrapper failed");
+      expect(canceled).toBe(true);
+    } finally {
+      await pinned.close();
+    }
+  });
+
+  it.each([
+    [301, "POST", "GET"], [302, "POST", "GET"], [303, "PUT", "GET"],
+    [301, "HEAD", "HEAD"], [302, "GET", "GET"], [303, "HEAD", "HEAD"],
+    [307, "GET", "GET"], [308, "HEAD", "HEAD"],
+  ])("applies %s method rules to %s", async (status, method, expected) => {
+    const calls: Request[] = [];
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: stubResolver(["93.184.216.34"]),
+      baseFetch: async (input) => {
+        calls.push(input as Request);
+        return calls.length === 1
+          ? new Response(null, { status: Number(status), headers: { location: "/next" } })
+          : new Response("accepted");
+      },
+    });
+    try {
+      const response = await pinned.fetch("https://source.example.com/", {
+        method: String(method),
+        ...(method === "POST" || method === "PUT"
+          ? { body: "payload", headers: { "content-type": "text/plain", "content-length": "7" } }
+          : {}),
+      });
+      expect(await response.text()).toBe("accepted");
+      expect(calls[1]!.method).toBe(expected);
+      expect(calls[1]!.body).toBeNull();
+      expect(calls[1]!.headers.has("content-type")).toBe(false);
+      expect(calls[1]!.headers.has("content-length")).toBe(false);
+    } finally {
+      await pinned.close();
+    }
+  });
+
+  it.each([301, 302, 307, 308])("refuses a body-preserving %s before resolving its target", async (status) => {
+    const events: string[] = [];
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: async (host) => { events.push(host); return [{ address: "93.184.216.34", family: 4 }]; },
+      baseFetch: async () => new Response(new ReadableStream({
+        cancel() { events.push("response canceled"); },
+      }), { status, headers: { location: "https://target.example.com/" } }),
+      onRedirectFollowed: () => { events.push("followed"); },
+    });
+    try {
+      await expect(pinned.fetch("https://source.example.com/", {
+        method: "PUT",
+        body: new ReadableStream({ cancel() { events.push("upload canceled"); } }),
+        duplex: "half",
+      } as RequestInit)).rejects.toThrow("cannot safely replay");
+      expect(events).toEqual(["source.example.com", "upload canceled", "response canceled"]);
+    } finally {
+      await pinned.close();
+    }
+  });
+
+  it.each([false, true])("binds credentials to their origin (cross-origin: %s)", async (crossOrigin) => {
+    const requests: Request[] = [];
+    const events: string[] = [];
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: async (host) => { events.push(host); return [{ address: "93.184.216.34", family: 4 }]; },
+      baseFetch: async (input) => {
+        requests.push(input as Request);
+        return requests.length === 1
+          ? new Response(new ReadableStream({ cancel() { events.push("discarded"); } }), {
+            status: 302, headers: { location: crossOrigin ? "https://target.example.com/" : "/next" },
+          })
+          : new Response(null, { status: 204 });
+      },
+      onRedirectFollowed: () => { events.push("followed"); },
+    });
+    try {
+      await pinned.fetch("https://source.example.com/", {
+        headers: {
+          authorization: "Bearer example", cookie: "example=value",
+          "proxy-authorization": "Basic example", host: "source.example.com", "x-example": "retained",
+        },
+      });
+      for (const name of ["authorization", "cookie", "proxy-authorization", "host"]) {
+        expect(requests[1]!.headers.has(name)).toBe(!crossOrigin);
+      }
+      expect(requests[1]!.headers.get("x-example")).toBe("retained");
+      expect(events).toEqual([
+        "source.example.com", "discarded", "followed", ...(crossOrigin ? ["target.example.com"] : []),
+      ]);
+    } finally {
+      await pinned.close();
+    }
+  });
+
+  it.each(["manual", "error"] as const)("honors redirect mode %s", async (redirect) => {
+    let discarded = false;
+    let calls = 0;
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: stubResolver(["93.184.216.34"]),
+      baseFetch: async () => {
+        calls++;
+        return new Response(new ReadableStream({ cancel() { discarded = true; } }), {
+          status: 302, headers: { location: "https://target.example.com/" },
+        });
+      },
+    });
+    try {
+      const pending = pinned.fetch("https://source.example.com/", { redirect });
+      if (redirect === "error") {
+        await expect(pending).rejects.toThrow("redirect mode is set to error");
+        expect(discarded).toBe(true);
+      } else {
+        const response = await pending;
+        expect(response.status).toBe(302);
+        expect(discarded).toBe(false);
+        await response.body!.cancel();
+      }
+      expect(calls).toBe(1);
+    } finally {
+      await pinned.close();
+    }
+  });
+
+  it("stops redirect loops at twenty followed hops and discards every source", async () => {
+    let calls = 0;
+    let discarded = 0;
+    let followed = 0;
+    const pinned = await createPinnedFetch("https://source.example.com/", {
+      resolver: stubResolver(["93.184.216.34"]),
+      baseFetch: async () => {
+        calls++;
+        return new Response(new ReadableStream({ cancel() { discarded++; } }), {
+          status: 302, headers: { location: "/loop" },
+        });
+      },
+      onRedirectFollowed: () => { followed++; },
+    });
+    try {
+      await expect(pinned.fetch("https://source.example.com/")).rejects.toThrow("maximum redirect count");
+      expect(calls).toBe(21);
+      expect(discarded).toBe(21);
+      expect(followed).toBe(20);
+    } finally {
+      await pinned.close();
+    }
+  });
+});
+
 describe("buildPinnedLookup — autoSelectFamily callback form", () => {
   const addrs = [
     { address: "2606:2800:220:1::1", family: 6 },

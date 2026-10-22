@@ -1,7 +1,8 @@
 import { lookup } from "node:dns/promises";
 import { isIPv4, isIPv6, type LookupFunction } from "node:net";
+import { Readable } from "node:stream";
 
-import { Agent } from "undici";
+import { Agent, getGlobalDispatcher, type Dispatcher } from "undici";
 
 /**
  * Why `assertSafeUrl` refused this URL. Carried on `SSRFError` so callers can
@@ -157,31 +158,31 @@ export async function createPinnedFetch(url: string, opts?: SSRFGuardOpts): Prom
     let request = new Request(input, init);
     let redirects = 0;
 
-    for (;;) {
-      const target = await targetFor(request.url);
-      const response = await baseFetch(
-        request,
-        (target.agent
-          ? { redirect: "manual", dispatcher: target.agent }
-          : { redirect: "manual" }) as RequestInit
-      );
+    try {
+      for (;;) {
+        const target = await targetFor(request.url);
+        const response = await fetchPinnedHop(request, target, baseFetch);
 
-      if (!isRedirect(response.status) || request.redirect === "manual") return response;
+        if (!isRedirect(response.status) || request.redirect === "manual") return response;
 
-      const location = response.headers.get("location");
-      if (location === null) return response;
+        const location = response.headers.get("location");
+        if (location === null) return response;
 
-      await discardResponse(response);
-      if (request.redirect === "error") {
-        throw new TypeError("fetch failed: redirect mode is set to error");
+        await discardResponse(response);
+        if (request.redirect === "error") {
+          throw new TypeError("fetch failed: redirect mode is set to error");
+        }
+        if (redirects >= MAX_PINNED_REDIRECTS) {
+          throw new TypeError("fetch failed: maximum redirect count exceeded");
+        }
+
+        request = requestForRedirect(request, new URL(location, request.url), response.status);
+        redirects += 1;
+        opts?.onRedirectFollowed?.();
       }
-      if (redirects >= MAX_PINNED_REDIRECTS) {
-        throw new TypeError("fetch failed: maximum redirect count exceeded");
-      }
-
-      request = requestForRedirect(request, new URL(location, request.url), response.status);
-      redirects += 1;
-      opts?.onRedirectFollowed?.();
+    } catch (error) {
+      await request.body?.cancel(error).catch(() => undefined);
+      throw error;
     }
   };
 
@@ -197,6 +198,74 @@ export async function createPinnedFetch(url: string, opts?: SSRFGuardOpts): Prom
 
 interface PinnedTarget {
   agent?: Agent;
+}
+
+async function fetchPinnedHop(
+  request: Request,
+  target: PinnedTarget,
+  baseFetch: typeof fetch
+): Promise<Response> {
+  if (!request.body) {
+    return baseFetch(request, (target.agent
+      ? { redirect: "manual", dispatcher: target.agent }
+      : { redirect: "manual" }) as RequestInit);
+  }
+
+  const body = request.body;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let stopped = false;
+  let dispatched = false;
+  const upload = Readable.from((async function* () {
+    if (stopped) return;
+    reader = body.getReader();
+    try {
+      while (!stopped) {
+        const next = await reader.read();
+        if (next.done || stopped) return;
+        yield next.value;
+      }
+    } finally {
+      reader.releaseLock();
+      reader = undefined;
+    }
+  })(), { objectMode: false, highWaterMark: 64 * 1024 });
+
+  const stop = async (reason?: unknown): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    await (reader ? reader.cancel(reason) : body.cancel(reason)).catch(() => undefined);
+  };
+  const onAbort = (): void => { void stop(request.signal.reason); };
+  request.signal.addEventListener("abort", onAbort, { once: true });
+
+  // Native fetch tees bodies even in manual redirect mode. Give it an empty
+  // body for response handling and instrumentation, and send the actual body
+  // once through its pinned dispatcher instead of creating an unread replay.
+  const dispatcher: Pick<Dispatcher, "dispatch"> = {
+    dispatch(options, handler) {
+      if (dispatched) throw new TypeError("fetch failed: cannot safely replay a request body");
+      dispatched = true;
+      return (target.agent ?? getGlobalDispatcher()).dispatch({
+        ...options,
+        body: upload,
+      }, handler);
+    },
+  };
+
+  try {
+    return await baseFetch(request, {
+      redirect: "manual",
+      // A stream also prevents native automatic body replay (e.g. on HTTP 421).
+      body: new ReadableStream({ start(controller) { controller.close(); } }),
+      duplex: "half",
+      // Node's keepalive is a no-op, but rejects streaming request envelopes.
+      keepalive: false,
+      dispatcher,
+    } as RequestInit);
+  } finally {
+    request.signal.removeEventListener("abort", onAbort);
+    await stop();
+  }
 }
 
 const MAX_PINNED_REDIRECTS = 20;
