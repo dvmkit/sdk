@@ -332,7 +332,13 @@ export function buildContext(
     },
     sendMessage: (type, content) => {
       if (terminated("sendMessage")) return;
+      if (type === "payment-request" && typeof content.amount_msats === "number") job.pendingPaymentMsats = content.amount_msats;
       providerMessage(job, type, content);
+      if ((type === "prompt" || type === "payment-request") && opts.onYield) {
+        void opts.onYield().catch((err: unknown) => {
+          log.error("Failed to persist event-driven wait", { error: String(err) });
+        });
+      }
     },
 
     prompt: (id, text, promptOpts) => {
@@ -343,32 +349,30 @@ export function buildContext(
       if (terminated("prompt")) {
         return Promise.reject(new JobCancelledError(`Job already ${job.status}`));
       }
-      // Unlike `requestPayment`, `prompt` has no auto-credit short-circuit —
-      // it always re-emits during replay and the emission is suppressed by
-      // `replayProviderSkip`, consuming exactly one skip slot per history
-      // prompt. So prompts stay counted in the reactivation skip seed and the
-      // invariant holds without restructuring the replay history.
       job.status = "awaiting-input";
-      providerMessage(job, "prompt", {
-        id,
-        text,
-        ...(promptOpts?.options && { options: promptOpts.options }),
-        ...(promptOpts?.schema && { schema: promptOpts.schema }),
-      });
-
-      // Replay: if this prompt was already answered, resolve immediately
-      if (job.replayHighSeq !== null) {
+      const original = job.replayHighSeq === null ? undefined : job.messages.find(
+        (m) => m.from === "provider" && m.type === "prompt" && m.content.id === id && m.seq <= job.replayHighSeq!
+      );
+      if (original) {
+        // Each concurrent ask consumes its own history slot. An unanswered
+        // prompt does not end replay for its still-pending siblings.
+        if (job.replayProviderSkip > 0) job.replayProviderSkip--;
         const response = job.messages.find(
-          (m) => m.type === "response" && m.from === "requester" && m.content.prompt_id === id
+          (m) => m.type === "response" && m.from === "requester" && m.content.prompt_id === id && m.seq > original.seq
         );
         if (response) {
           job.status = job.pendingPrompts.size > 0 || job.pendingPayment ? "awaiting-input" : "processing";
           opts.onCallerResume?.();
           return Promise.resolve(response.content as ResponseContent);
         }
-        // No cached response — replay is over, this is a genuine new yield
+      } else {
         job.replayHighSeq = null;
         job.replayProviderSkip = 0;
+        providerMessage(job, "prompt", {
+          id, text,
+          ...(promptOpts?.options && { options: promptOpts.options }),
+          ...(promptOpts?.schema && { schema: promptOpts.schema }),
+        });
       }
 
       // Register resolver synchronously — no await before this, so no race with incoming responses
@@ -834,9 +838,11 @@ export function buildContext(
           creditedToHandlerMicro += pendingFiat?.amountMicro ?? 0;
           return payment.content as PaymentContent;
         }
-        // No cached payment — replay is over, this is a genuine new yield
-        job.replayHighSeq = null;
-        job.replayProviderSkip = 0;
+        // A persisted unpaid ask may have concurrently replaying siblings.
+        if (!originalAsk) {
+          job.replayHighSeq = null;
+          job.replayProviderSkip = 0;
+        }
       }
 
       // the cumulative total that caps this job's draw growth. The

@@ -1,4 +1,4 @@
-import { callerDeadline } from "./job";
+import { callerDeadline, hasCallerDeadline } from "./job";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
@@ -1279,6 +1279,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         this.startIdleTimer(job);
         pending.resolve(rc);
       } else if (cap?.onResponse && ctx) {
+        this.startIdleTimer(job);
         await cap.onResponse(ctx, rc);
       }
     } else if (type === "payment") {
@@ -1300,6 +1301,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           await pp.resolve(pc);
         });
       } else if (cap?.onPayment && ctx) {
+        this.startIdleTimer(job);
         await cap.onPayment(ctx, pc);
       }
     } else if (type === "approval" && cap?.onApproval && ctx) {
@@ -1816,10 +1818,6 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return;
     }
 
-    if (job.status !== "awaiting-input" || (current && current.status !== "awaiting-input")) {
-      this.clearIdleTimer(job.id);
-      return;
-    }
     const waiting = current ?? job;
     if (current && isStreamableJobStore(this.jobStore)) {
       const messages = await this.jobStore.getMessages(job.id, 0);
@@ -1838,7 +1836,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       const claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled");
       if (claimed) await this.finalizeStoredTerminal(job.id);
       await this.adoptDurableTerminal(job);
-      if (!claimed && job.status === "awaiting-input") this.startIdleTimer(job, Date.now() + 1);
+      if (!claimed && !isTerminal(job.status)) this.startIdleTimer(job, Date.now() + 1);
       return;
     }
 
@@ -1943,15 +1941,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       );
       let swept = 0;
       for (const record of stale) {
-        const awaiting = record.status === "awaiting-input";
-        if (awaiting) {
-          const messages = await this.jobStore.getMessages(record.id, 0);
-          const deadline = callerDeadline({ ...record, messages: messages.length ? messages : record.messages });
-          if (deadline !== undefined && now < deadline) continue;
-        }
+        const messages = await this.jobStore.getMessages(record.id, 0);
+        const history = messages.length ? messages : record.messages;
+        const deadline = callerDeadline({ ...record, messages: history });
+        if (deadline !== undefined && now < deadline) continue;
+        const orphanedInput = record.status === "awaiting-input" && deadline === undefined && hasCallerDeadline(history);
+        const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !orphanedInput);
         const terminalStatus = awaiting ? "cancelled" : "failed";
         const reason = awaiting ? "stale_no_terminal_status" : "worker_died_mid_job";
-        const expectedActivityBefore = awaiting ? awaitingThreshold : processingThreshold;
+        // Accepted input is no longer the caller's responsibility. A worker
+        // that never claims it gets the processing grace period before failure.
+        const expectedActivityBefore = awaiting && record.status === "awaiting-input" ? awaitingThreshold : processingThreshold;
+        if (expectedActivityBefore < 0 || record.lastActivityAt > expectedActivityBefore) continue;
         const claimed = await this.jobStore.cancelStaleJob(
           record.id,
           expectedActivityBefore,

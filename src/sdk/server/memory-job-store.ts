@@ -559,12 +559,14 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
     if (!eligible) return Promise.resolve(false);
+    let terminalMessages = record.messages;
     if (expectedActivityBefore !== null) {
-      if ((terminalStatus === "cancelled") !== (record.status === "awaiting-input")) return Promise.resolve(false);
       const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
       const history = messages.length ? messages : record.messages;
+      terminalMessages = history;
       const deadline = callerDeadline({ ...record, messages: history });
-      if (record.status === "awaiting-input" && (deadline === undefined ? hasCallerDeadline(history) : Date.now() < deadline)) return Promise.resolve(false);
+      const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(history));
+      if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve(false);
     }
     const seq = this.allocateSeq(jobId);
     const cancelMsg: Message = {
@@ -578,11 +580,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     // ordering so any subscribeMessages listener still hanging on the
     // snapshot sees the cancel via the live stream before terminal cleanup.
     this.messagesFor(jobId).push({ message: cancelMsg, status: "verified" });
-    record.endedBy = expectedActivityBefore === null || record.status === "awaiting-input" ? "caller" : "provider";
+    record.endedBy = expectedActivityBefore === null || terminalStatus === "cancelled" ? "caller" : "provider";
     applyTiming(record, structuredClone(record), Date.now(), terminalStatus);
     record.status = terminalStatus;
     record.summary = record.summary ?? reason;
-    record.messages = [...record.messages, cancelMsg];
+    record.messages = [...terminalMessages, cancelMsg];
     record.seq = seq;
     record.lastActivityAt = Date.now();
     this.notify(jobId, cancelMsg);

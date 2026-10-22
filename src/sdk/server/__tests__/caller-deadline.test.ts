@@ -4,15 +4,16 @@ import fixture from "../../../../protocol-fixtures/caller-deadline-v1.json";
 import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
 import { MemoryKVStore } from "../../store";
-import type { SDKJobContext } from "../../types";
+import type { DVMConfig, SDKJobContext } from "../../types";
 import { JobManager } from "../job-manager";
+import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
 
 const START = 1700000000000;
 const managers: { shutdown(): void | Promise<void> }[] = [];
-function manager(onJob: (ctx: SDKJobContext<unknown, unknown>) => Promise<void>, idleTimeout = 3, store = new MemoryJobStore()) {
-  const jm = new JobManager(configureDVM({ name: "deadline", capability: "test", idleTimeout, onJob }), {
-    env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true,
+function manager(onJob: (ctx: SDKJobContext<unknown, unknown>) => Promise<void>, idleTimeout = 3, store = new MemoryJobStore(), callbacks: Pick<DVMConfig<unknown>, "onResponse" | "onPayment"> = {}, creditLedger?: MemoryCreditLedger) {
+  const jm = new JobManager(configureDVM({ name: "deadline", capability: "test", idleTimeout, onJob, ...callbacks }), {
+    env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, creditLedger,
     fxFetcher: createFxFetcher(), staleJobTimeoutMs: 1, heartbeatIntervalMs: 0,
     staleJobSweepIntervalMs: 100000, processingWatchdogMs: 1000,
   });
@@ -36,6 +37,102 @@ afterEach(async () => {
 });
 
 describe("caller deadlines", () => {
+  it.each(["prompt", "payment-request"] as const)("expires an event-driven %s at its advertised deadline", async (type) => {
+    const { jm, store } = manager(async (ctx) => {
+      if (type === "prompt") ctx.sendMessage(type, { id: "q1", text: "Continue?" });
+      else ctx.sendMessage(type, { amount_msats: 1000, reason: "Next block" });
+    });
+    const job = await start(jm);
+    expect(job.status).toBe("processing"); // Event-driven recovery dispatches callbacks.
+    expect(job.messages[0].content).toHaveProperty("expires_at_ms", START + 3000);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(job.status).toBe("processing");
+    expect(await jm.sweepStaleJobs()).toEqual({ swept: 0 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(job.status).toBe("cancelled");
+    expect((await store.get(job.id))?.endedBy).toBe("caller");
+  });
+
+  it.each(["response", "payment"] as const)("ends an event-driven wait before running on%s", async (type) => {
+    let callbacks = 0;
+    const onInput = async (ctx: SDKJobContext<unknown, unknown>) => { callbacks++; await delay(4000); ctx.complete("done"); };
+    const { jm } = manager(async (ctx) => {
+      if (type === "response") ctx.sendMessage("prompt", { id: "q1", text: "Continue?" });
+      else ctx.sendMessage("payment-request", { amount_msats: 1000, reason: "Next block" });
+    }, 3, new MemoryJobStore(), { onResponse: onInput, onPayment: onInput });
+    const job = await start(jm);
+    await vi.advanceTimersByTimeAsync(2000);
+    const content = type === "response" ? { prompt_id: "q1", text: "yes" } : { amount_msats: 1000 };
+    const seq = await jm.recordInboundPending(job, type, content);
+    if (type === "payment") expect((await jm.processPayment(job, { type, content }, seq, { lockPubkeys: [] })).error).toBeUndefined();
+    else await jm.markInboundVerified(job.id, seq);
+    const dispatch = jm.dispatchMessage(job, type, content);
+    await vi.advanceTimersByTimeAsync(4000);
+    await dispatch;
+    expect(callbacks).toBe(1);
+    expect(job.status).toBe("completed");
+  });
+
+  it("preserves concurrent prompt deadlines across unrelated-input replay", async () => {
+    const handler = async (ctx: SDKJobContext<unknown, unknown>) => {
+      await Promise.all([ctx.prompt("first", "First?"), ctx.prompt("second", "Second?")]);
+      ctx.complete("done");
+    };
+    const { jm, store } = manager(handler);
+    const job = await start(jm);
+    const original = structuredClone(job.messages);
+    jm.shutdown();
+    await store.shutdownStreaming();
+    await vi.advanceTimersByTimeAsync(2000);
+    const recovered = manager(handler, 3, store).jm;
+    const record = (await store.get(job.id))!;
+    record.messages = await store.getMessages(job.id, 0);
+    const { job: replay, sdkCtx } = recovered.reactivateJob(record);
+    const textSeq = await recovered.recordInboundPending(replay, "text", { text: "thinking" });
+    await recovered.markInboundVerified(job.id, textSeq);
+    await store.claimForProcessing(job.id);
+    replay.replayHighSeq = replay.seq;
+    replay.replayProviderSkip = original.length;
+    recovered.runHandler(replay, sdkCtx);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(replay.messages.filter((m) => m.type === "prompt")).toEqual(original);
+    const content = { prompt_id: "first", text: "yes" };
+    const seq = await recovered.recordInboundPending(replay, "response", content);
+    await recovered.markInboundVerified(job.id, seq);
+    await recovered.dispatchMessage(replay, "response", content);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(replay.status).toBe("awaiting-input");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(replay.status).toBe("cancelled");
+  });
+
+  it("fails an abandoned verified response after the worker grace period", async () => {
+    const handler = async (ctx: SDKJobContext<unknown, unknown>) => { await ctx.prompt("q1", "Continue?"); ctx.complete("done"); };
+    const ledger = new MemoryCreditLedger();
+    const credit = await ledger.fund({ callerPubkey: "requester", currency: "usd", amountMicro: 10000, expiryMs: START + 60000, basis: { rail: "cashu", paidMsats: 1000 } });
+    const { jm, store } = manager(handler, 3, new MemoryJobStore(), {}, ledger);
+    const job = await start(jm);
+    await ledger.draw({ creditId: credit.creditId, drawId: "draw", amountMicro: 1000, jobId: job.id });
+    job.creditId = credit.creditId;
+    job.drawId = "draw";
+    await jm.persistJob(job);
+    const seq = await jm.recordInboundPending(job, "response", { prompt_id: "q1", text: "yes" });
+    await jm.markInboundVerified(job.id, seq);
+    // Model process death before dispatch acquires its processing claim.
+    jm.shutdown();
+    await store.shutdownStreaming();
+    const recovery = manager(handler, 3, store, {}, ledger).jm;
+    await vi.advanceTimersByTimeAsync(2);
+    expect(await recovery.sweepStaleJobs()).toEqual({ swept: 0 });
+    expect((await store.get(job.id))?.status).toBe("awaiting-input");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await recovery.sweepStaleJobs()).toEqual({ swept: 1 });
+    expect((await store.get(job.id))?.status).toBe("failed");
+    expect((await store.get(job.id))?.endedBy).toBe("provider");
+    expect((await store.get(job.id))?.messages.some((m) => m.type === "response")).toBe(true);
+    expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.status).toBe("released");
+  });
+
   it("allows work and progress beyond idleTimeout", async () => {
     const { jm } = manager(async (ctx) => {
       for (let i = 0; i < 6; i++) { await delay(500); ctx.progress(i / 6); }

@@ -50,6 +50,33 @@ describe("idle timeout", () => {
     return shutdown;
   }
 
+  it.each(["prompt", "payment-request"] as const)("expires event-driven %s without replaying onJob", async (type) => {
+    const jobStore = new MemoryJobStore();
+    let calls = 0;
+    const descriptor = configureDVM({ name: "Events", capability: "test", idleTimeout: 3,
+      onJob(ctx) {
+        calls++;
+        if (type === "prompt") ctx.sendMessage(type, { id: "q1", text: "Continue?" });
+        else ctx.sendMessage(type, { amount_msats: 1000, reason: "Next block" });
+      },
+    });
+    const stop = await startApp(descriptor, jobStore);
+    const submitted = await postJson(`${baseUrl}/v1/job`, JSON.stringify({ capability: "test", input: "" }));
+    const { job_id, job_token } = await submitted.json();
+    const messages = await fetch(`${baseUrl}/v1/job/${job_id}/messages`, { headers: tokenHeader(job_token) });
+    const ask = (await messages.json()).messages.find((m: { type: string }) => m.type === type);
+    await stop();
+    await jobStore.shutdownStreaming();
+    await vi.advanceTimersByTimeAsync(1000);
+    await startApp(descriptor, jobStore);
+    await postJson(`${baseUrl}/v1/job/${job_id}/messages`, JSON.stringify({ type: "text", content: { text: "thinking" } }), job_token);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms - Date.now() + 100));
+    const result = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
+    expect((await result.json()).status).toBe("cancelled");
+    expect((await jobStore.get(job_id))?.endedBy).toBe("caller");
+  });
+
   it("completes a working job after three idle windows", async () => {
     await startApp(configureDVM({ name: "Working", capability: "test", idleTimeout: 1,
       async onJob(ctx) {
@@ -81,7 +108,7 @@ describe("idle timeout", () => {
     const res = await postJson(`${baseUrl}/v1/job`, JSON.stringify({ capability: "test", input: "" }));
     const { job_id, job_token } = await res.json();
     await vi.advanceTimersByTimeAsync(2500);
-    const first = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
+    const first = await fetch(`${baseUrl}/v1/job/${job_id}/messages`, { headers: tokenHeader(job_token) });
     const initial = await first.json();
     const ask = initial.messages.find((m: { type: string }) => m.type === type);
     expect(ask.content.expires_at_ms).toBeGreaterThan(Date.now() + 2800);
@@ -91,7 +118,8 @@ describe("idle timeout", () => {
     const recovered = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
     const waiting = await recovered.json();
     expect(waiting.status).toBe("awaiting-input");
-    expect(waiting.messages.filter((m: { type: string }) => m.type === type)).toEqual([ask]);
+    const replayedMessages = await fetch(`${baseUrl}/v1/job/${job_id}/messages`, { headers: tokenHeader(job_token) });
+    expect((await replayedMessages.json()).messages.filter((m: { type: string }) => m.type === type)).toEqual([ask]);
     await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms - Date.now() + 100));
     const final = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
     expect((await final.json()).status).toBe("cancelled");
@@ -114,7 +142,7 @@ describe("idle timeout", () => {
     await jobStore.shutdownStreaming();
     await vi.advanceTimersByTimeAsync(1500);
     await startApp(descriptor, jobStore);
-    const content = type === "response" ? { prompt_id: "q1", text: "yes" } : { amount_msats: 1000 };
+    const content = type === "response" ? { prompt_id: "q1", text: "yes" } : { cashu_token: "fake-token", amount_msats: 1000 };
     const answered = await postJson(`${baseUrl}/v1/job/${job_id}/messages`, JSON.stringify({ type, content }), job_token);
     expect(answered.status).toBe(201);
     const final = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });

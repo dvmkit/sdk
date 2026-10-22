@@ -450,6 +450,7 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
     const job = blankJob(500_000);
     job.status = "awaiting-input";
     job.messages = [
+      { seq: 0, type: "prompt", from: "provider", content: { id: "confirm", text: "Confirm" }, timestamp: 0 },
       {
         seq: 1,
         type: "response",

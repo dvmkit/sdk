@@ -490,7 +490,7 @@ type WaitingJob = Pick<JobRecord, "status" | "messages" | "pendingPaymentMsats" 
 
 /** Recover outstanding asks from verified history; text and unrelated responses never extend a turn. */
 export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): number | undefined {
-  if (job.status !== "awaiting-input") return undefined;
+  if (isTerminal(job.status)) return undefined;
   const prompts = new Map<string, Message & { type: "prompt" }>();
   let payment: (Message & { type: "payment-request" }) | undefined;
   for (const message of job.messages) {
@@ -502,7 +502,7 @@ export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): numbe
   const deadlines = asks.map((ask) => ask.content.expires_at_ms).filter((stamp): stamp is number => Number.isSafeInteger(stamp));
   if (deadlines.length > 0) return Math.min(...deadlines);
   // Legacy snapshots did not carry millisecond emission timestamps.
-  if (legacyTimeoutMs !== undefined && (asks.length > 0 || job.messages.length === 0)) {
+  if (job.status === "awaiting-input" && legacyTimeoutMs !== undefined && (asks.length > 0 || job.messages.length === 0)) {
     return (job.awaitingInputAtMs ?? job.lastActivityAt) + legacyTimeoutMs;
   }
   return undefined;
