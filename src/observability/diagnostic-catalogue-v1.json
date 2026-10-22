@@ -364,6 +364,7 @@
     "spans_retention_failed",
     "stale_job_cancelled",
     "stale_job_failed",
+    "stale_job_local_live_skipped",
     "stale_job_sweep_clock_skew",
     "stale_job_sweep_failed",
     "stripe.create_checkout_session",

@@ -276,9 +276,10 @@ describe("caller deadlines", () => {
     await jm.markInboundVerified(job.id, seq);
     await jm.dispatchMessage(job, "response", content);
     await jm.persistJob(job);
-    // Heartbeats are disabled in this harness to model a dead worker.
+    // Another manager must still reap the worker if its heartbeats stop.
+    const reaper = manager(async () => {}, 3, store).jm;
     await vi.advanceTimersByTimeAsync(1001);
-    expect(await jm.sweepStaleJobs()).toEqual({ swept: 1 });
+    expect(await reaper.sweepStaleJobs()).toEqual({ swept: 1 });
     expect((await store.get(job.id))?.status).toBe("failed");
     expect((await store.get(job.id))?.endedBy).toBe("provider");
   });

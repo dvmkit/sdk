@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { verifyReceipt } from "../../../lib/receipt";
 import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
 import { MemoryKVStore } from "../../store";
+import type { SDKJobContext } from "../../types";
 import { JobManager, type JobManagerOpts } from "../job-manager";
 import type { JobRecord } from "../job-store";
 import { MemoryJobStore } from "../memory-job-store";
+import { ReceiptIssuer } from "../receipt-issuer";
 
 const STALE_AGE_MS = 10 * 60_000;
 
@@ -35,16 +38,15 @@ function buildManager(
   staleJobTimeoutMs: number,
   processingWatchdogMs: number = staleJobTimeoutMs,
   onPaidJobDeath?: JobManagerOpts["onPaidJobDeath"],
-  extra: Partial<JobManagerOpts> = {}
+  extra: Partial<JobManagerOpts> = {},
+  onJob: (ctx: SDKJobContext) => void | Promise<void> = (ctx) => { ctx.complete("ok"); }
 ) {
   const descriptor = configureDVM({
     name: "stale-test",
     capability: "test",
     tag: "test",
     idleTimeout: 120,
-    onJob(ctx) {
-      ctx.complete("ok");
-    }
+    onJob
   });
   return new JobManager(descriptor, {
     env: {},
@@ -303,6 +305,117 @@ describe("JobManager stale-job sweeper", () => {
 });
 
 describe("status-aware watchdog + worker heartbeat", () => {
+  it.each(["processing", "working"] as const)(
+    "refreshes a locally live %s job when the sweep fires before the heartbeat after a pause",
+    async (status) => {
+      vi.useFakeTimers();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const store = new MemoryJobStore();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const jm = buildManager(store, 1_000, 1_000, undefined, {}, async (ctx) => {
+        if (status === "working") ctx.working();
+        await held;
+      });
+
+      try {
+        const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+        const ctx = jm.buildAndAttachContext(job, "");
+        await jm.persistJob(job);
+        jm.runHandler(job, ctx);
+        await job.messageAppenderTail;
+        await jm.persistJob(job);
+        const beforePause = Date.now();
+
+        // Move wall time without firing either timer, then run the sweep first.
+        vi.setSystemTime(beforePause + STALE_AGE_MS);
+        expect(await jm.sweepStaleJobs()).toEqual({ swept: 0 });
+        expect(job.status).toBe(status);
+        expect(ctx.signal.aborted).toBe(false);
+        expect(await store.get(job.id)).toMatchObject({ status, lastActivityAt: Date.now() });
+        expect(warn).toHaveBeenCalledWith(
+          '{"event":"stale_job_local_live_skipped","level":"warn","ageMs":600000}'
+        );
+        warn.mockClear();
+        expect(await jm.sweepStaleJobs()).toEqual({ swept: 0 });
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        release();
+        jm.shutdown();
+        warn.mockRestore();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("still reaps another manager's stale job and issues its failure receipt", async () => {
+    vi.useFakeTimers();
+    const store = new MemoryJobStore();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const owner = buildManager(store, 1_000, 1_000, undefined, {}, () => held);
+    const reaper = buildManager(store, 1_000, 1_000, undefined, {
+      receiptIssuer: new ReceiptIssuer({ secret: "11".repeat(32), dvm: "test", dvmId: "test-dvm" })
+    });
+
+    try {
+      const job = owner.createJob({ input: "" }, "test", { paidMsats: 19_000, receivedProofs: [] }, undefined, "test");
+      const ctx = owner.buildAndAttachContext(job, "");
+      await owner.persistJob(job);
+      owner.runHandler(job, ctx);
+      vi.setSystemTime(Date.now() + STALE_AGE_MS);
+
+      expect(await reaper.sweepStaleJobs()).toEqual({ swept: 1 });
+      const record = await store.get(job.id);
+      expect(record?.status).toBe("failed");
+      expect(record?.receipt).toMatchObject({ outcome: "failed", reason: "worker_died_mid_job" });
+      expect(verifyReceipt(record!.receipt!)).toBe(true);
+    } finally {
+      release();
+      owner.shutdown();
+      reaper.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not protect a job after a reactivation claim supersedes the local handler", async () => {
+    vi.useFakeTimers();
+    const store = new MemoryJobStore();
+    const resumed = vi.fn();
+    const jm = buildManager(store, 1_000, 1_000, undefined, {}, async (ctx) => {
+      await ctx.requestPayment(1_000, "Continue");
+      resumed();
+    });
+
+    try {
+      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const ctx = jm.buildAndAttachContext(job, "");
+      await jm.persistJob(job);
+      jm.runHandler(job, ctx);
+      await vi.advanceTimersByTimeAsync(0);
+      expect((await store.get(job.id))?.status).toBe("awaiting-input");
+
+      // A replay wins the claim before the original handler hears about payment.
+      expect(await store.claimForProcessing(job.id)).toBe(true);
+      const seq = await store.recordInbound(job.id, {
+        from: "requester", type: "payment", timestamp: Date.now(), content: { amount_msats: 1_000 }
+      });
+      await store.verifyAndCredit(job.id, seq, { paidMsatsDelta: 1_000, clearPending: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.signal.aborted).toBe(true);
+      expect(jm.activeJobs.has(job.id)).toBe(false);
+      expect(resumed).not.toHaveBeenCalled();
+
+      vi.setSystemTime(Date.now() + STALE_AGE_MS);
+      expect(await jm.sweepStaleJobs()).toEqual({ swept: 1 });
+      expect((await store.get(job.id))?.status).toBe("failed");
+      expect((await store.get(job.id))?.summary).toBe("worker_died_mid_job");
+    } finally {
+      jm.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
   it("applies a tight processing watchdog but the long idle timeout to awaiting-input", async () => {
     const now = Date.now();
     const store = new MemoryJobStore();
