@@ -548,8 +548,14 @@ export interface JobStatus {
 
 /**
  * What a provider's `201` to a job message carries, when the transport
- * surfaces it. `seq` names the durable inbound message; `drawFundingReceipt`
- * is the signed fact a mid-job rail payment funded the job's own draw.
+ * surfaces it. The successful standard message response's `seq` is the latest
+ * message position observed after dispatch, so it can equal or exceed the
+ * accepted payment's sequence. `drawFundingReceipt` is the signed fact a mid-job
+ * rail payment funded the job's own draw: its optional `payment_seq` fixes the
+ * accepted inbound payment sequence, while `ledger_seq` names the credit draw's
+ * ledger position. Cursor equality is not a funding-validity requirement;
+ * signature verification and all funding bindings still apply. Separately,
+ * `503 job_snapshot_unavailable.seq` identifies the recorded inbound payment.
  */
 export interface SendMessageResult {
   seq: number;
