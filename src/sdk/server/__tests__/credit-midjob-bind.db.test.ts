@@ -13,7 +13,7 @@ import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
 import { CreditLedger } from "../credit-ledger";
 import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
-import type { ServerJob } from "../job";
+import { fromJobRecord, toJobRecord, type ServerJob } from "../job";
 import { CREDIT_INBOUND_ATTEMPTS, CREDIT_INBOUND_READ_ATTEMPTS, JobManager } from "../job-manager";
 import type { JobRecord } from "../job-store";
 import { PostgresJobStore } from "../postgres-job-store";
@@ -262,18 +262,7 @@ describe.skipIf(!RUN)("the mid-job Tx C seam", () => {
       lastActivityAt: Date.now(),
     };
     await jobStore.save(record);
-    return {
-      id: jobId,
-      requesterId: "requester-1",
-      requesterPubkey: CALLER,
-      status: "awaiting-input",
-      messages: [],
-      seq: 0,
-      paidMsats: 0,
-      pendingPaymentMsats: ASK_MSATS,
-      pendingPaymentFiatMicro: ASK_MICRO,
-      pendingPaymentFiatCurrency: "usd",
-    } as unknown as ServerJob;
+    return fromJobRecord(record);
   }
 
   // Arm after inbound recording so only job binding, not admission, encounters the COMMIT fault.
@@ -568,7 +557,7 @@ describe.skipIf(!RUN)("the mid-job Tx C seam", () => {
     const jmB = manager();
     const jobA = await seedJob(jobId);
 
-    const jobB = { ...jobA, messages: [] } as ServerJob;
+    const jobB = fromJobRecord(toJobRecord(jobA));
 
     // Two machines, two rail payments, one job — neither sees the other's
     // credit in its snapshot, so each opens its own implicit one.
