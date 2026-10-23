@@ -303,7 +303,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     }
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
     if (seq > record.seq) record.seq = seq;
-    this.notify(jobId, fullMessage);
+    this.notify(jobId);
     return Promise.resolve(seq);
   }
 
@@ -379,7 +379,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
       }
     }
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
-    this.notify(jobId, stored.message);
+    this.notify(jobId);
     return Promise.resolve({
       counters: snapshotCounters(record),
       alreadyVerified: false,
@@ -402,6 +402,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     const stored = this.messagesFor(jobId).find((m) => m.message.seq === seq);
     if (stored?.status === "pending-verification") {
       stored.status = "failed-verify";
+      this.notify(jobId);
     }
     return Promise.resolve();
   }
@@ -524,12 +525,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
   }
 
   getMessages(jobId: string, afterSeq: number): Promise<Message[]> {
-    const stored = this.messagesFor(jobId);
-    return Promise.resolve(
-      stored
-        .filter((m) => m.status === "verified" && m.message.seq > afterSeq)
-        .map((m) => m.message)
-    );
+    return Promise.resolve(this.visibleMessages(jobId, afterSeq));
   }
 
   initStreaming(): Promise<void> {
@@ -590,7 +586,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     record.messages = [...terminalMessages, cancelMsg];
     record.seq = seq;
     record.lastActivityAt = Date.now();
-    this.notify(jobId, cancelMsg);
+    this.notify(jobId);
     this.messages.delete(jobId);
     return Promise.resolve(true);
   }
@@ -610,11 +606,26 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     return list;
   }
 
-  private notify(jobId: string, message: Message): void {
+  private visibleMessages(jobId: string, afterSeq: number): Message[] {
+    const stored = this.messagesFor(jobId);
+    const status = this.data.get(jobId)?.status;
+    let boundary = Infinity;
+    if (!status || !isTerminal(status)) {
+      for (const entry of stored) {
+        if (entry.status === "pending-verification" && entry.message.type === "payment") {
+          boundary = Math.min(boundary, entry.message.seq);
+        }
+      }
+    }
+    return stored.filter(entry => entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary)
+      .map(entry => entry.message);
+  }
+
+  private notify(jobId: string): void {
     const subs = this.messageSubscribers.get(jobId);
     if (subs) {
       for (const sub of subs) {
-        if (message.seq > sub.afterSeq) {
+        for (const message of this.visibleMessages(jobId, sub.afterSeq)) {
           sub.afterSeq = message.seq;
           sub.cb(message);
         }

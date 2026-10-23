@@ -252,9 +252,9 @@ describe("`dev_auto` is the explicit dev-console hatch", () => {
         null,
         { lockPubkeys: LOCK_PUBKEYS }
       );
-      // No rail matched, so nothing is verified and nothing is credited — the
-      // flag buys a non-dev caller exactly nothing.
-      expect(res).toEqual({});
+      // A development flag without a configured rail must explicitly refuse
+      // production payment acceptance while leaving the outstanding ask intact.
+      expect(res).toMatchObject({ error: { status: 402, body: { error: "payment_invalid" } } });
     } finally {
       jm.shutdown();
     }

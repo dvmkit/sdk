@@ -442,19 +442,59 @@ export function providerMessage(
   job.messageAppender?.(msg, type === "prompt" ? { awaitingInput: job.status === "awaiting-input" } : undefined);
 }
 
+const historyHolds = new WeakMap<ServerJob, Set<number>>();
+const heldNotifications = new WeakMap<ServerJob, Message[]>();
+
+export function holdJobHistory(job: ServerJob, seq: number): void {
+  let holds = historyHolds.get(job);
+  if (!holds) {
+    holds = new Set();
+    historyHolds.set(job, holds);
+  }
+  holds.add(seq);
+}
+
+/** A cursor must never advance beyond a payment that may still become visible. */
+export function visibleJobMessages(job: ServerJob): Message[] {
+  const holds = historyHolds.get(job);
+  if (!holds?.size) return job.messages;
+  const boundary = Math.min(...holds);
+  return job.messages.filter(message => message.seq < boundary);
+}
+
+export function releaseJobHistory(job: ServerJob, seq: number, accepted?: Message): void {
+  const holds = historyHolds.get(job);
+  const wasPending = holds?.delete(seq);
+  if (accepted && wasPending) {
+    const next = job.messages.findIndex(existing => existing.seq > accepted.seq);
+    job.messages.splice(next < 0 ? job.messages.length : next, 0, accepted);
+    const queued = heldNotifications.get(job) ?? [];
+    queued.push(accepted);
+    heldNotifications.set(job, queued);
+  }
+  flushJobHistory(job);
+}
+
+function flushJobHistory(job: ServerJob): void {
+  const holds = historyHolds.get(job);
+  const boundary = holds?.size ? Math.min(...holds) : Infinity;
+  const queued = heldNotifications.get(job) ?? [];
+  queued.sort((a, b) => a.seq - b.seq);
+  heldNotifications.set(job, queued.filter(message => message.seq >= boundary));
+  for (const message of queued) {
+    if (message.seq < boundary) {
+      for (const listener of job.listeners) listener(message);
+    }
+  }
+}
+
 /**
  * Push a message into the in-memory log and fan it out to this machine's SSE
- * listeners **without** appending it to the store — the store write for these
- * messages happens elsewhere.
- *
- * Two callers, both on the cancel path. The DELETE route records the caller's
- * `cancel` here and lets the following `persistJob` carry it to the store; the
- * machine adopting a cancel another machine committed materialises
- * the terminal `cancel` that is already durable — and whose `job_messages` rows
- * may already have been swept, so re-appending it would orphan a duplicate.
- *
- * The fan-out is the load-bearing half: `cancel` is a yield message, so it is
- * the event that closes an SSE stream this machine is already serving.
+ * listeners without appending it to the store — store writes happen elsewhere.
+ * The DELETE route lets the following persistJob carry its cancel to the store;
+ * an adopted remote cancel is already durable and must not be appended again.
+ * Fan-out closes open SSE streams. Cancellation also releases buffered output
+ * and prevents an in-flight payment appearing behind the terminal cursor later.
  */
 export function localMessage(
   job: ServerJob,
@@ -462,6 +502,10 @@ export function localMessage(
   type: MessageType,
   content: Record<string, unknown> | object
 ): Message {
+  if (type === "cancel") {
+    historyHolds.get(job)?.clear();
+    flushJobHistory(job);
+  }
   job.seq++;
   const msg = {
     seq: job.seq,
@@ -471,8 +515,13 @@ export function localMessage(
     content,
   } as Message;
   job.messages.push(msg);
-  for (const listener of job.listeners) {
-    listener(msg);
+  const holds = historyHolds.get(job);
+  if (holds?.size && msg.seq >= Math.min(...holds)) {
+    const queued = heldNotifications.get(job) ?? [];
+    queued.push(msg);
+    heldNotifications.set(job, queued);
+  } else {
+    for (const listener of job.listeners) listener(msg);
   }
   return msg;
 }

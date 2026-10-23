@@ -3038,7 +3038,9 @@ async function verifyIncomingPaymentInScope(
     }
   }
 
-  return {};
+  return { error: { status: 402, body: paymentErrorBody("payment_invalid", {
+    message: "Payment method is not configured",
+  }) } };
 }
 
 /**

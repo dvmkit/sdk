@@ -52,10 +52,12 @@ import type { ServerJob } from "./job";
 import {
   abortJob,
   fromJobRecord,
+  holdJobHistory,
   isTerminal,
   JobCancelledError,
   localMessage,
   providerMessage,
+  releaseJobHistory,
   toJobRecord,
 } from "./job";
 import type {
@@ -2770,6 +2772,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         this.pendingPaymentMessages.set(job, pending);
       }
       pending.set(txSeq ?? msgContent, message);
+      holdJobHistory(job, message.seq);
     } else {
       job.messages.push(message);
     }
@@ -2901,17 +2904,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const pending = this.pendingPaymentMessages.get(job);
     const key = inboundSeq ?? body.content;
     const message = pending?.get(key);
+    let accepted: Message | undefined;
     try {
       const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, extra);
       if (!outcome.error && message && pending?.get(key) === message) {
-        // A provider message can arrive during verification. Preserve the
-        // reserved local sequence without exposing the payment before acceptance.
-        const next = job.messages.findIndex(existing => existing.seq > message.seq);
-        job.messages.splice(next < 0 ? job.messages.length : next, 0, message);
+        accepted = message;
       }
       return outcome;
     } finally {
       pending?.delete(key);
+      if (message) releaseJobHistory(job, message.seq, accepted);
     }
   }
 
@@ -3035,7 +3037,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     }
 
     const info = verifyResult.verified;
-    if (!info) return {};
+    if (!info) return { error: { status: 402, body: { error: "payment_invalid", message: "Payment was not accepted" } } };
     // Issued before Tx C: the funding row committed with the rail leg, so the
     // artifact exists whether or not the job row write below succeeds, and a
     // `payment_unapplied` answer can still carry it. Never fatal — an issuance

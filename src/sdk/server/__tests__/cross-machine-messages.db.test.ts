@@ -1,5 +1,5 @@
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { Message, MessageType } from "../../../lib/messages/types";
 import { configureDVM } from "../../configure";
@@ -166,6 +166,27 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     const msgs = await store.getMessages("job-2", seq2 - 1);
     expect(msgs.length).toBeGreaterThanOrEqual(2);
     expect(msgs.every((m) => m.seq >= seq2)).toBe(true);
+  });
+
+  it.each([true, false])("preserves cursors across pending payment verification, accepted=%s", async (accepted) => {
+    const jobId = `pending-payment-${accepted}`;
+    await ensureJob(jobId);
+    const received: string[] = [];
+    const unsubscribe = await store.subscribeMessages(jobId, 0, message => received.push(message.type));
+    try {
+      const seq = await store.recordInbound(jobId, {
+        from: "requester", type: "payment", timestamp: 1, content: { x402_payment: "proof" },
+      });
+      await store.appendOutgoing(jobId, outgoing("text", { text: "During verification" }));
+      expect(await store.getMessages(jobId, 0)).toEqual([]);
+      if (accepted) await store.verifyAndCredit(jobId, seq, null);
+      else await store.markInboundFailed(jobId, seq, "payment_invalid");
+      const expected = accepted ? ["payment", "text"] : ["text"];
+      expect((await store.getMessages(jobId, 0)).map(message => message.type)).toEqual(expected);
+      await vi.waitFor(() => expect(received).toEqual(expected));
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("subscribeMessages delivers initial messages then NOTIFY-driven ones", async () => {

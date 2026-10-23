@@ -116,7 +116,7 @@ import { HostedSettlementReportObligations } from "./hosting-settlement-report-o
 import type { BuilderIdentity, OwnerDisplay } from "./host";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import type { ServerJob } from "./job";
-import { isTerminal, isYieldMessage, localMessage } from "./job";
+import { isTerminal, isYieldMessage, localMessage, visibleJobMessages } from "./job";
 import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
@@ -4186,7 +4186,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       if (isStreamableJobStore(store) && !isTerminal(record.status)) {
         const msgs = await store.getMessages(id, after);
-        if (msgs.length > 0) return c.json(await this.messageFields(record, msgs));
+        return c.json(await this.messageFields(record, msgs));
       }
       return c.json(await this.messageFields(record, filtered));
     }
@@ -4197,7 +4197,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       const fields = await this.contentFields(job);
       return streamSSE(c, async (stream) => {
         if (fields.content_available === false) return;
-        const existing = job.messages.filter((m) => m.seq > after);
+        const existing = visibleJobMessages(job).filter((m) => m.seq > after);
         let yielded = false;
         for (const msg of existing) {
           await stream.writeSSE({ data: JSON.stringify(msg), event: "message" });
@@ -4230,7 +4230,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       });
     }
 
-    return c.json(await this.messageFields(job, job.messages.filter((m) => m.seq > after)));
+    return c.json(await this.messageFields(job, visibleJobMessages(job).filter((m) => m.seq > after)));
   }
 
   private jobNotActiveResponse(c: Context<AppEnv>): Response {
