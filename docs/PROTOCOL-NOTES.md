@@ -1,5 +1,15 @@
 # Protocol notes
 
+## Payment message history
+
+Requester `payment` messages in `GET /v1/job/:id/messages` (JSON or SSE) and saved job history are published only after the server accepts the payment through its verification and accounting flow. Pending and rejected attempts are omitted, including attempts that fail signature verification. A rejected attempt does not satisfy the outstanding payment request; a later valid payment can still be accepted. Explicit development-mode acceptance follows the same history rule even when verification is bypassed.
+
+An unsupported payment method is rejected with HTTP 402 `payment_invalid`, rather than acknowledged without verification. While a payment is pending, message reads and streams hold later output behind it so an `after` cursor cannot skip a payment that is accepted later. Every host, including the active worker, uses the shared store's message sequences and delivery cutoff. Rejection releases that output without publishing the rejected attempt; completion, failure and cancellation release final output immediately. Payment sequence bindings remain unchanged.
+
+Terminal snapshots retain every verified message, including accepted payments beyond an unresolved earlier attempt. `StreamableJobStore.getMessages` accepts an optional third argument `{ includeHeld: true }` for this complete verified read; custom stores that implement the delivery cutoff must honor this option when building terminal snapshots. Incremental reads retain the cutoff by default, and terminal history remains readable after incremental rows are cleaned up.
+
+Message sequences can have gaps where attempts were rejected. A history entry records acceptance, not final job settlement, and does not by itself prove that all funding was applied to the job: retain any credit explanation and signed funding or settlement evidence returned by the server. An absent entry alone does not authorize another spend after an unknown outcome; use the payment method's recovery evidence. Older servers and snapshots created before this fix may contain rejected payment attempts without a rejection marker; those entries cannot establish acceptance under this contract. No wire fields or storage migrations are added, and old snapshots are not rewritten.
+
 ## Accepted upfront payments
 
 Successful submit (`POST /v1/job`), request-resume and request-result responses, and authenticated job reads, may carry `upfront_payment`. It records the original accepted payment before the handler runs. `amount_msats` is an integer millisatoshi value from the accepted payment or committed credit allocation, not a new quote or conversion at the current exchange rate. When a draw exists, `amount_micro` and `currency` preserve its exact credit denomination in integer millionths; `native_amount` and `native_asset`, when present, describe its allocated rail-native atomic units. A funding deposit may exceed all of these job amounts.

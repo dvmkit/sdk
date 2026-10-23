@@ -52,10 +52,12 @@ import type { ServerJob } from "./job";
 import {
   abortJob,
   fromJobRecord,
+  holdJobHistory,
   isTerminal,
   JobCancelledError,
   localMessage,
   providerMessage,
+  releaseJobHistory,
   toJobRecord,
 } from "./job";
 import type {
@@ -627,6 +629,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   // Bind live resolvers and recovery scaffolds to the store-allocated ask identity.
   private readonly paymentAskSeqs = new WeakMap<object, number>();
   private readonly reactivationAskSeqs = new WeakMap<ServerJob, number>();
+  private readonly pendingPaymentMessages = new WeakMap<ServerJob, Map<number | object, Message>>();
 
   // Every local input resume holds this queue through its durable wait update.
   // A prompt response and a payment NOTIFY must not mistake each other for a
@@ -1385,12 +1388,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       //
       // Guard: if the durable read returns FEWER messages than the in-memory
       // array — a rolled-back `appendOutgoing` (DB outage, already logged as
-      // `job_message_append_failed`) or an unverified/rejected inbound this
-      // machine still holds in memory — keep the in-memory snapshot rather than
-      // wipe durably-absent messages. `getMessages` filters `status='verified'`,
+      // `job_message_append_failed`) — keep the in-memory snapshot rather than
+      // wipe durably-absent messages. The snapshot read filters `status='verified'`
+      // independently of any pending-payment delivery cutoff,
       // so accepted cross-machine caller messages are included and rejected ones
       // stay out.
-      const durable = await this.jobStore.getMessages(job.id, 0);
+      const durable = await this.jobStore.getMessages(job.id, 0, { includeHeld: true });
       if (durable.length >= record.messages.length) {
         record.messages = durable;
         const highSeq = durable.length ? durable[durable.length - 1].seq : record.seq;
@@ -2731,8 +2734,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * Record an inbound client message durably via Tx B and append
-   * it to the in-memory `job.messages` array. Returns the DB-allocated seq
+   * Record an inbound client message durably via Tx B. Payments stay outside
+   * visible history until processPayment accepts them; other messages append
+   * to `job.messages` immediately. Returns the DB-allocated seq
    * (`null` when the store isn't streamable — non-Postgres test fallback).
    *
    * Status starts as `pending-verification`; a follow-up Tx C call
@@ -2755,13 +2759,24 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       });
     }
     job.seq++;
-    job.messages.push({
+    const message = {
       seq: job.seq,
       from: "requester",
       timestamp,
       type: msgType,
       content: msgContent,
-    } as Message);
+    } as Message;
+    if (msgType === "payment") {
+      let pending = this.pendingPaymentMessages.get(job);
+      if (!pending) {
+        pending = new Map();
+        this.pendingPaymentMessages.set(job, pending);
+      }
+      pending.set(txSeq ?? msgContent, message);
+      holdJobHistory(job, message.seq);
+    } else {
+      job.messages.push(message);
+    }
     job.lastActivityAt = Date.now();
     return txSeq;
   }
@@ -2887,6 +2902,31 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       mintHealthTracker?: MintHealthTracker;
     }
   ): Promise<ProcessPaymentOutcome> {
+    const pending = this.pendingPaymentMessages.get(job);
+    const key = inboundSeq ?? body.content;
+    const message = pending?.get(key);
+    let accepted: Message | undefined;
+    try {
+      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, extra);
+      if (!outcome.error && message && pending?.get(key) === message) {
+        accepted = message;
+      }
+      return outcome;
+    } finally {
+      pending?.delete(key);
+      if (message) releaseJobHistory(job, message.seq, accepted);
+    }
+  }
+
+  private async processPaymentAndCredit(
+    job: ServerJob,
+    body: { type: MessageType; content: Record<string, unknown> },
+    inboundSeq: number | null,
+    extra?: {
+      lockPubkeys?: LockPubkey[];
+      mintHealthTracker?: MintHealthTracker;
+    }
+  ): Promise<ProcessPaymentOutcome> {
     if (body.type !== "payment") return {};
 
     const devAuto =
@@ -2998,7 +3038,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     }
 
     const info = verifyResult.verified;
-    if (!info) return {};
+    if (!info) return { error: { status: 402, body: { error: "payment_invalid", message: "Payment was not accepted" } } };
     // Issued before Tx C: the funding row committed with the rail leg, so the
     // artifact exists whether or not the job row write below succeeds, and a
     // `payment_unapplied` answer can still carry it. Never fatal — an issuance

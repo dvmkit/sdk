@@ -703,6 +703,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       record.status === "failed" ||
       record.status === "cancelled"
     ) {
+      await this.pool.query("SELECT pg_notify('job_messages', $1)", [record.id]).catch(() => undefined);
       await this.deleteResolvedMessages(record.id).catch(() => undefined);
     }
   }
@@ -1238,7 +1239,11 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
 
   async markInboundFailed(jobId: string, seq: number, _reason: string): Promise<void> {
     await this.pool.query(
-      "UPDATE job_messages SET status='failed-verify' WHERE job_id = $1 AND seq = $2 AND status = 'pending-verification'",
+      `WITH failed AS (
+         UPDATE job_messages SET status='failed-verify'
+         WHERE job_id = $1 AND seq = $2 AND status = 'pending-verification'
+         RETURNING job_id
+       ) SELECT pg_notify('job_messages', job_id) FROM failed`,
       [jobId, seq]
     );
   }
@@ -1398,10 +1403,24 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     });
   }
 
-  async getMessages(jobId: string, afterSeq: number): Promise<Message[]> {
+  async getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]> {
     const { rows } = await this.pool.query<{ data: Message | string }>(
-      "SELECT data FROM job_messages WHERE job_id = $1 AND seq > $2 AND status = 'verified' ORDER BY seq",
-      [jobId, afterSeq]
+      `WITH terminal AS (
+         SELECT messages FROM jobs WHERE id = $1 AND status IN ('completed', 'failed', 'cancelled')
+       ), history AS (
+         SELECT seq, data, 0 AS origin FROM job_messages
+         WHERE job_id = $1 AND seq > $2 AND status = 'verified'
+           AND ($3::boolean OR EXISTS (SELECT 1 FROM terminal)
+             OR EXISTS (SELECT 1 FROM job_messages WHERE job_id = $1 AND status = 'verified'
+               AND data->>'from' = 'provider' AND data->>'type' IN ('complete', 'cancel'))
+             OR seq < COALESCE((SELECT MIN(seq) FROM job_messages
+               WHERE job_id = $1 AND status = 'pending-verification' AND data->>'type' = 'payment'), 9223372036854775807))
+         UNION ALL
+         SELECT (message->>'seq')::bigint, message, 1 AS origin
+         FROM terminal CROSS JOIN LATERAL jsonb_array_elements(terminal.messages) AS snapshot(message)
+         WHERE (message->>'seq')::bigint > $2
+       ) SELECT DISTINCT ON (seq) data FROM history ORDER BY seq, origin`,
+      [jobId, afterSeq, options?.includeHeld ?? false]
     );
     return rows.map((r) => (typeof r.data === "string" ? JSON.parse(r.data) : r.data) as Message);
   }

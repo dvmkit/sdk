@@ -1,5 +1,5 @@
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { Message, MessageType } from "../../../lib/messages/types";
 import { configureDVM } from "../../configure";
@@ -166,6 +166,62 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     const msgs = await store.getMessages("job-2", seq2 - 1);
     expect(msgs.length).toBeGreaterThanOrEqual(2);
     expect(msgs.every((m) => m.seq >= seq2)).toBe(true);
+  });
+
+  it("keeps terminal snapshots and subscriptions complete beyond pending payment cutoffs", async () => {
+    const jm = new JobManager(configureDVM({ name: "terminal-history", capability: "test", onJob: async () => undefined }), {
+      env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, fxFetcher: stubFx,
+    });
+    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const received: string[] = [];
+    let unsubscribe: (() => void) | undefined;
+    try {
+      await jm.persistJob(job);
+      providerMessage(job, "text", { text: "Before payment" });
+      await jm.persistJob(job);
+      unsubscribe = await store.subscribeMessages(job.id, 1, message => received.push(message.type));
+      await store.recordInbound(job.id, { from: "requester", type: "payment", content: { x402_payment: "pending" }, timestamp: 1 });
+      const acceptedSeq = await store.recordInbound(job.id, { from: "requester", type: "payment", content: { x402_payment: "accepted" }, timestamp: 2 });
+      await store.verifyAndCredit(job.id, acceptedSeq, null);
+      providerMessage(job, "text", { text: "Final output" });
+      await job.messageAppenderTail;
+      expect((await store.getMessages(job.id, 0)).map(message => message.type)).toEqual(["text"]);
+      expect((await store.getMessages(job.id, 0, { includeHeld: true })).map(message => message.type))
+        .toEqual(["text", "payment", "text"]);
+      job.status = "completed";
+      providerMessage(job, "complete", { summary: "done" });
+      await jm.persistJob(job);
+      const snapshot = (await store.get(job.id))!;
+      expect(snapshot.messages.map(message => message.type)).toEqual(["text", "payment", "text", "complete"]);
+      expect(snapshot.messages.find(message => message.type === "payment"))
+        .toMatchObject({ seq: acceptedSeq, content: { x402_payment: "accepted" } });
+      expect((await store.getMessages(job.id, 1)).map(message => message.type)).toEqual(["payment", "text", "complete"]);
+      await vi.waitFor(() => expect(received).toEqual(["payment", "text", "complete"]));
+    } finally {
+      unsubscribe?.();
+      jm.shutdown();
+    }
+  });
+
+  it.each([true, false])("preserves cursors across pending payment verification, accepted=%s", async (accepted) => {
+    const jobId = `pending-payment-${accepted}`;
+    await ensureJob(jobId);
+    const received: string[] = [];
+    const unsubscribe = await store.subscribeMessages(jobId, 0, message => received.push(message.type));
+    try {
+      const seq = await store.recordInbound(jobId, {
+        from: "requester", type: "payment", timestamp: 1, content: { x402_payment: "proof" },
+      });
+      await store.appendOutgoing(jobId, outgoing("text", { text: "During verification" }));
+      expect(await store.getMessages(jobId, 0)).toEqual([]);
+      if (accepted) await store.verifyAndCredit(jobId, seq, null);
+      else await store.markInboundFailed(jobId, seq, "payment_invalid");
+      const expected = accepted ? ["payment", "text"] : ["text"];
+      expect((await store.getMessages(jobId, 0)).map(message => message.type)).toEqual(expected);
+      await vi.waitFor(() => expect(received).toEqual(expected));
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("subscribeMessages delivers initial messages then NOTIFY-driven ones", async () => {

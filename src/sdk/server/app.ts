@@ -116,7 +116,7 @@ import { HostedSettlementReportObligations } from "./hosting-settlement-report-o
 import type { BuilderIdentity, OwnerDisplay } from "./host";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import type { ServerJob } from "./job";
-import { isTerminal, isYieldMessage, localMessage } from "./job";
+import { isTerminal, isYieldMessage, localMessage, visibleJobMessages } from "./job";
 import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
@@ -4090,18 +4090,24 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const job = this.jobManager.activeJobs.get(id);
     const after = Number(c.req.query("after") ?? "0");
     const accept = c.req.header("Accept") ?? "";
+    const store = this.jobManager.store;
+    if (job && !isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
 
-    if (!job) {
-      const store = this.jobManager.store;
+    if (!job || isStreamableJobStore(store)) {
+      if (job) await job.messageAppenderTail;
       const record = await store.get(id);
       if (!record) return c.json({ error: "Job not found" }, 404);
       if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
-      const filtered = record.messages.filter((m) => m.seq > after);
+      const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+      let filtered = record.messages.filter((m) => m.seq > after);
+      if (isStreamableJobStore(store)) {
+        const durable = await store.getMessages(id, after, { includeHeld: terminal });
+        if (durable.length > 0 || !terminal) filtered = durable;
+      }
 
       if (accept.includes("text/event-stream")) {
-        // Cross-machine live stream: subscribe via NOTIFY when the job is
-        // still in-flight on another machine and the store supports it.
-        if (isStreamableJobStore(store) && !isTerminal(record.status)) {
+        // Every host uses store-allocated cursors, including the active worker.
+        if (isStreamableJobStore(store) && !terminal) {
           return streamSSE(c, async (stream) => {
             let unsubFn: (() => void) | undefined;
 
@@ -4184,10 +4190,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         });
       }
 
-      if (isStreamableJobStore(store) && !isTerminal(record.status)) {
-        const msgs = await store.getMessages(id, after);
-        if (msgs.length > 0) return c.json(await this.messageFields(record, msgs));
-      }
       return c.json(await this.messageFields(record, filtered));
     }
 
@@ -4197,7 +4199,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       const fields = await this.contentFields(job);
       return streamSSE(c, async (stream) => {
         if (fields.content_available === false) return;
-        const existing = job.messages.filter((m) => m.seq > after);
+        const existing = visibleJobMessages(job).filter((m) => m.seq > after);
         let yielded = false;
         for (const msg of existing) {
           await stream.writeSSE({ data: JSON.stringify(msg), event: "message" });
@@ -4230,7 +4232,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       });
     }
 
-    return c.json(await this.messageFields(job, job.messages.filter((m) => m.seq > after)));
+    return c.json(await this.messageFields(job, visibleJobMessages(job).filter((m) => m.seq > after)));
   }
 
   private jobNotActiveResponse(c: Context<AppEnv>): Response {

@@ -327,31 +327,31 @@ describe("Pattern A reactivation — payment credit", () => {
       jobStore,
       devMode: true,
     });
-    const baseUrl = await servers.serve(app);
-
-    const res = await postJson(
-      `${baseUrl}/v1/job`,
-      JSON.stringify({ capability: "test", input: "" })
-    );
+    const res = await app.request("/v1/job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ capability: "test", input: "" }),
+    });
     const { job_id, job_token } = await res.json();
     await tick();
 
     jobManager.activeJobs.delete(job_id);
 
-    // Simulate the regression: `processPayment` returns success but never
-    // credits the job. The defensive assertion in `requestPayment`'s replay
-    // branch (context.ts) must catch this and fail the job with the
-    // `[internal_error]` reason — not run unpaid work for 120s.
-    const processPaymentSpy = vi.spyOn(jobManager, "processPayment").mockResolvedValue({});
+    // Accept the message without applying its credit, leaving the real payment
+    // path to publish it. Replay must reject that inconsistent accounting state.
+    const verifyAndCredit = jobStore.verifyAndCredit.bind(jobStore);
+    const creditSpy = vi.spyOn(jobStore, "verifyAndCredit").mockImplementation(
+      (jobId, seq) => verifyAndCredit(jobId, seq, null)
+    );
 
-    const msgRes = await postJson(
-      `${baseUrl}/v1/job/${job_id}/messages`,
-      JSON.stringify({
+    const msgRes = await app.request(`/v1/job/${job_id}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Job-Token": job_token },
+      body: JSON.stringify({
         type: "payment",
         content: { cashu_token: "fake-token", amount_msats: 1_000 },
       }),
-      job_token
-    );
+    });
     expect(msgRes.status).toBe(201);
     await tick();
 
@@ -366,7 +366,8 @@ describe("Pattern A reactivation — payment credit", () => {
     expect((cancelMsg?.content as { reason?: string } | undefined)?.reason).toContain(
       "[internal_error] payment replay reached without credit"
     );
-    processPaymentSpy.mockRestore();
+    creditSpy.mockRestore();
+    jobManager.shutdown();
   });
 
   // When two machines race the cross-machine reactivation, the

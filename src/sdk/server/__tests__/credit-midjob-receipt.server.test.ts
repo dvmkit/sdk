@@ -213,6 +213,34 @@ beforeEach(() => {
 });
 
 describe("a mid-job top-up reaches the receipt and the books", () => {
+  it("excludes a failed verification from GET history and accepts a later valid payment", async () => {
+    const h = await startServer();
+    await fundCredit(h.ledger);
+    const job = await submit(h.url);
+    const headers: Record<string, string> = job.job_token ? { "X-Job-Token": job.job_token } : {};
+    async function history() {
+      const response = await fetch(`${h.url}/v1/job/${job.job_id}/messages`, { headers });
+      expect(response.status).toBe(200);
+      return await response.json() as { messages: { from: string; type: string }[] };
+    }
+    vi.mocked(verifyX402Payment).mockResolvedValueOnce({ verified: false, amountMsats: 0 });
+    const rejected = await payMidJob(h.url, job);
+    expect(rejected.status).toBe(402);
+    expect(await rejected.json()).toMatchObject({ error: "payment_invalid" });
+    expect((await history()).messages.filter(message => message.type === "payment")).toEqual([]);
+    expect(await h.ledger.getDraw({ creditId: "c1", drawId: "d1" })).toMatchObject({
+      amountMicro: PRICE_MICRO, status: "pending",
+    });
+
+    expect((await payMidJob(h.url, job)).status).toBe(201);
+    await awaitReceipt(h.url, job);
+    expect((await history()).messages.filter(message => message.type === "payment"))
+      .toEqual([expect.objectContaining({ from: "requester" })]);
+    expect(await h.ledger.getDraw({ creditId: "c1", drawId: "d1" })).toMatchObject({
+      amountMicro: PRICE_MICRO + TOPUP_MICRO, status: "settled",
+    });
+  });
+
   it("countersigns the full amount: upfront draw plus mid-job top-up", async () => {
     const h = await startServer();
     await fundCredit(h.ledger);

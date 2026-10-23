@@ -153,6 +153,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     const cur = this.nextSeq.get(record.id) ?? 1;
     this.nextSeq.set(record.id, Math.max(cur, record.seq + 1));
     if (isTerminal(record.status)) {
+      this.notify(record.id);
       this.messages.delete(record.id);
     }
     return Promise.resolve();
@@ -303,7 +304,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     }
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
     if (seq > record.seq) record.seq = seq;
-    this.notify(jobId, fullMessage);
+    this.notify(jobId);
     return Promise.resolve(seq);
   }
 
@@ -379,7 +380,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
       }
     }
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
-    this.notify(jobId, stored.message);
+    this.notify(jobId);
     return Promise.resolve({
       counters: snapshotCounters(record),
       alreadyVerified: false,
@@ -402,6 +403,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     const stored = this.messagesFor(jobId).find((m) => m.message.seq === seq);
     if (stored?.status === "pending-verification") {
       stored.status = "failed-verify";
+      this.notify(jobId);
     }
     return Promise.resolve();
   }
@@ -523,13 +525,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     });
   }
 
-  getMessages(jobId: string, afterSeq: number): Promise<Message[]> {
-    const stored = this.messagesFor(jobId);
-    return Promise.resolve(
-      stored
-        .filter((m) => m.status === "verified" && m.message.seq > afterSeq)
-        .map((m) => m.message)
-    );
+  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]> {
+    return Promise.resolve(this.visibleMessages(jobId, afterSeq, options?.includeHeld));
   }
 
   initStreaming(): Promise<void> {
@@ -590,7 +587,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     record.messages = [...terminalMessages, cancelMsg];
     record.seq = seq;
     record.lastActivityAt = Date.now();
-    this.notify(jobId, cancelMsg);
+    this.notify(jobId);
     this.messages.delete(jobId);
     return Promise.resolve(true);
   }
@@ -610,11 +607,37 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     return list;
   }
 
-  private notify(jobId: string, message: Message): void {
+  private visibleMessages(jobId: string, afterSeq: number, includeHeld = false): Message[] {
+    const stored = this.messagesFor(jobId);
+    const record = this.data.get(jobId);
+    const terminal = record && isTerminal(record.status);
+    const terminalMessage = stored.some(entry => entry.status === "verified" && entry.message.from === "provider" &&
+      (entry.message.type === "complete" || entry.message.type === "cancel"));
+    let boundary = Infinity;
+    if (!includeHeld && !terminal && !terminalMessage) {
+      for (const entry of stored) {
+        if (entry.status === "pending-verification" && entry.message.type === "payment") {
+          boundary = Math.min(boundary, entry.message.seq);
+        }
+      }
+    }
+    const messages = new Map<number, Message>();
+    if (terminal) {
+      for (const message of record.messages) if (message.seq > afterSeq) messages.set(message.seq, message);
+    }
+    for (const entry of stored) {
+      if (entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary) {
+        messages.set(entry.message.seq, entry.message);
+      }
+    }
+    return [...messages.values()].sort((a, b) => a.seq - b.seq);
+  }
+
+  private notify(jobId: string): void {
     const subs = this.messageSubscribers.get(jobId);
     if (subs) {
       for (const sub of subs) {
-        if (message.seq > sub.afterSeq) {
+        for (const message of this.visibleMessages(jobId, sub.afterSeq)) {
           sub.afterSeq = message.seq;
           sub.cb(message);
         }
