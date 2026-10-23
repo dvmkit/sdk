@@ -627,6 +627,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   // Bind live resolvers and recovery scaffolds to the store-allocated ask identity.
   private readonly paymentAskSeqs = new WeakMap<object, number>();
   private readonly reactivationAskSeqs = new WeakMap<ServerJob, number>();
+  private readonly pendingPaymentMessages = new WeakMap<ServerJob, Map<number | object, Message>>();
 
   // Every local input resume holds this queue through its durable wait update.
   // A prompt response and a payment NOTIFY must not mistake each other for a
@@ -1385,8 +1386,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       //
       // Guard: if the durable read returns FEWER messages than the in-memory
       // array — a rolled-back `appendOutgoing` (DB outage, already logged as
-      // `job_message_append_failed`) or an unverified/rejected inbound this
-      // machine still holds in memory — keep the in-memory snapshot rather than
+      // `job_message_append_failed`) — keep the in-memory snapshot rather than
       // wipe durably-absent messages. `getMessages` filters `status='verified'`,
       // so accepted cross-machine caller messages are included and rejected ones
       // stay out.
@@ -2731,8 +2731,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * Record an inbound client message durably via Tx B and append
-   * it to the in-memory `job.messages` array. Returns the DB-allocated seq
+   * Record an inbound client message durably via Tx B. Payments stay outside
+   * visible history until processPayment accepts them; other messages append
+   * to `job.messages` immediately. Returns the DB-allocated seq
    * (`null` when the store isn't streamable — non-Postgres test fallback).
    *
    * Status starts as `pending-verification`; a follow-up Tx C call
@@ -2755,13 +2756,23 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       });
     }
     job.seq++;
-    job.messages.push({
+    const message = {
       seq: job.seq,
       from: "requester",
       timestamp,
       type: msgType,
       content: msgContent,
-    } as Message);
+    } as Message;
+    if (msgType === "payment") {
+      let pending = this.pendingPaymentMessages.get(job);
+      if (!pending) {
+        pending = new Map();
+        this.pendingPaymentMessages.set(job, pending);
+      }
+      pending.set(txSeq ?? msgContent, message);
+    } else {
+      job.messages.push(message);
+    }
     job.lastActivityAt = Date.now();
     return txSeq;
   }
@@ -2879,6 +2890,32 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * 500. See `creditInbound`.
    */
   async processPayment(
+    job: ServerJob,
+    body: { type: MessageType; content: Record<string, unknown> },
+    inboundSeq: number | null,
+    extra?: {
+      lockPubkeys?: LockPubkey[];
+      mintHealthTracker?: MintHealthTracker;
+    }
+  ): Promise<ProcessPaymentOutcome> {
+    const pending = this.pendingPaymentMessages.get(job);
+    const key = inboundSeq ?? body.content;
+    const message = pending?.get(key);
+    try {
+      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, extra);
+      if (!outcome.error && message && pending?.get(key) === message) {
+        // A provider message can arrive during verification. Preserve the
+        // reserved local sequence without exposing the payment before acceptance.
+        const next = job.messages.findIndex(existing => existing.seq > message.seq);
+        job.messages.splice(next < 0 ? job.messages.length : next, 0, message);
+      }
+      return outcome;
+    } finally {
+      pending?.delete(key);
+    }
+  }
+
+  private async processPaymentAndCredit(
     job: ServerJob,
     body: { type: MessageType; content: Record<string, unknown> },
     inboundSeq: number | null,
