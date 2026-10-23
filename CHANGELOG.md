@@ -32,6 +32,79 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.12.0](https://github.com/dvmkit/sdk/compare/v0.15.0...v0.12.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* Default prepaid and implicit credit lifetimes increase from 30 to 90 days. Set credit.ttl to 2592000 seconds to retain 30 days.
+* Custom CreditLedgerLike stores must implement transactional refundDraw accounting and report enqueueing.
+
+### Features
+
+* add admin routes for hosted Tempo close reports ([#16](https://github.com/dvmkit/sdk/issues/16)) ([a86a85d](https://github.com/dvmkit/sdk/commit/a86a85d6e2ac2d4474629d021bd05d6b88e750de))
+* add operator decisions for held Tempo drains ([c0e1841](https://github.com/dvmkit/sdk/commit/c0e18418df914c13633a485c8abe01621c15a3b8))
+* expose accepted upfront payments on job responses ([5eee6e4](https://github.com/dvmkit/sdk/commit/5eee6e4d47cad4ea0d56a15e9033580ef117dc82))
+* extend default prepaid credit lifetime to 90 days ([312e7ae](https://github.com/dvmkit/sdk/commit/312e7ae2df30351bd5e7666f88b2b95a30afcb9a))
+* pay mid-job requests from prepaid balance ([768178f](https://github.com/dvmkit/sdk/commit/768178f13297e5145b730f3d4f3fcf3fc3e4fb88))
+* sign mid-job funding evidence and reconcile funded draws ([d1aed67](https://github.com/dvmkit/sdk/commit/d1aed6734f0956197f5221c5ed0437a4f8a2221b))
+* summarize pending implicit credit draws ([4edeae0](https://github.com/dvmkit/sdk/commit/4edeae05bacd047d0cf624882cef6db112d0ef90))
+* support completed credit draw refunds ([ffd3334](https://github.com/dvmkit/sdk/commit/ffd3334101a1b9f9792a87b0b29b251906f987bd))
+* terminalize hosted Tempo close obligations ([#9](https://github.com/dvmkit/sdk/issues/9)) ([3f306d4](https://github.com/dvmkit/sdk/commit/3f306d46f7a9adb378c577f6efb911de96dcc386))
+
+
+### Bug Fixes
+
+* bound streamed upload memory in pinned fetch ([7a2a213](https://github.com/dvmkit/sdk/commit/7a2a2135d451624e9b5a1d23eb92fead46159a1b))
+* bring every hosted Tempo close obligation to a terminal state ([#7](https://github.com/dvmkit/sdk/issues/7)) ([8fc12f9](https://github.com/dvmkit/sdk/commit/8fc12f9f8d10621eaeaab68a29aabc416a52d16b))
+* classify finalized Tempo backing loss from close evidence ([c5b17f3](https://github.com/dvmkit/sdk/commit/c5b17f3fb2ba27dc6ab62ee9b050f8082482460d))
+* ignore older receipt replay under the credit lock ([755d35a](https://github.com/dvmkit/sdk/commit/755d35a3ae7de8bd6734f47c5087f8671b790352))
+* keep pending prompts awaiting input after duplicate rail payments ([f632c62](https://github.com/dvmkit/sdk/commit/f632c62f254ddfa9baaf0307100df8362223ee8f))
+* keep pre-1.0 releases on the development line ([aa0d33d](https://github.com/dvmkit/sdk/commit/aa0d33df14a3fdbcf70b8516a168df0e2dd2eb85))
+* limit idle timeouts to caller response windows ([2474705](https://github.com/dvmkit/sdk/commit/2474705f48215dd5eef9e61d0656e49b81965924))
+* make concurrent job snapshots safe ([92a17a1](https://github.com/dvmkit/sdk/commit/92a17a1ce25fa801aa315beb90c41acd0e69c0d2))
+* persist completed steps before returning to handlers ([8ae1591](https://github.com/dvmkit/sdk/commit/8ae1591c3c54906df522322b62e5e2a2f2eee288))
+* preserve locally running jobs during stale sweeps ([297aa66](https://github.com/dvmkit/sdk/commit/297aa66b0f42e71ebcb43d2dcecfdbedd0671197))
+* preserve pending prompts during development payments ([35cd6ad](https://github.com/dvmkit/sdk/commit/35cd6ad537bfc830f8878728faa06863b75d8a51))
+* prevent duplicate Tempo settlements from stale reads ([12bbbe1](https://github.com/dvmkit/sdk/commit/12bbbe191306139d3b8534560973fed89a8b0995))
+* publish payment history only after acceptance ([d818fb8](https://github.com/dvmkit/sdk/commit/d818fb8de06f82d610fd632e19e78c7809f8c28d))
+* recommend latest caller release in credential hint ([a3d3b0a](https://github.com/dvmkit/sdk/commit/a3d3b0a6fa9f3498236e1ed56c9ed55a35d3490d))
+* require Tempo drain proof and share close searches ([#18](https://github.com/dvmkit/sdk/issues/18)) ([cb8df3e](https://github.com/dvmkit/sdk/commit/cb8df3e9eabb50d68c99419867ecc6bc86a7c5e5))
+* **tempo:** honour proven charges when replay marking fails ([02292e5](https://github.com/dvmkit/sdk/commit/02292e5df9d26467f17685a7d726f8a47ba64804))
+
+
+### Documentation
+
+* clarify message acknowledgement cursor semantics ([d4a1241](https://github.com/dvmkit/sdk/commit/d4a124157b9fb51b139248fdf35513ad4dee43b4))
+* document stable release graduation ([1a9460b](https://github.com/dvmkit/sdk/commit/1a9460be9dd700f09b5f46b6ee48156136725827))
+
+
+### Continuous Integration
+
+* upgrade artifact downloads to Node 24 ([#49](https://github.com/dvmkit/sdk/issues/49)) ([518e2c7](https://github.com/dvmkit/sdk/commit/518e2c7b1d7d81eb0f1c4a0b3a71c7c8dbb27732))
+* upgrade artifact uploads to Node 24 ([#46](https://github.com/dvmkit/sdk/issues/46)) ([92c0f88](https://github.com/dvmkit/sdk/commit/92c0f88551988440cf8396eed681e21f2f3f578f))
+* validate workflows on Ubuntu 26.04 ([#19](https://github.com/dvmkit/sdk/issues/19)) ([d29a8db](https://github.com/dvmkit/sdk/commit/d29a8db95d125bebbd129e1f9ff3f5cc5039ad0d))
+
+
+### Miscellaneous Chores
+
+* **claude:** block Claude attribution in commits and PRs ([#22](https://github.com/dvmkit/sdk/issues/22)) ([cd58d28](https://github.com/dvmkit/sdk/commit/cd58d2813a96c7d176af05a538f23c7a80df6001))
+* configure the first stable release ([#5](https://github.com/dvmkit/sdk/issues/5)) ([b795a23](https://github.com/dvmkit/sdk/commit/b795a23775c4134124fd6da88c2f2e36bdcacd6c))
+* **master:** release 0.10.0 ([#17](https://github.com/dvmkit/sdk/issues/17)) ([c59b219](https://github.com/dvmkit/sdk/commit/c59b2193b613a00bee98ca1a9ab7850cf9aaaec6))
+* **master:** release 0.10.1 ([#20](https://github.com/dvmkit/sdk/issues/20)) ([c965bee](https://github.com/dvmkit/sdk/commit/c965bee126a0c46c91cc99fdccb3bac009a9e248))
+* **master:** release 0.11.0-rc.1 ([eff1b83](https://github.com/dvmkit/sdk/commit/eff1b8396757f0818e98b8f39803124d1f404775))
+* **master:** release 0.12.0-rc.1 ([eebb93b](https://github.com/dvmkit/sdk/commit/eebb93bbe9faffbddbbd89e7f41bc060a623decf))
+* **master:** release 0.13.0 ([#37](https://github.com/dvmkit/sdk/issues/37)) ([462ae04](https://github.com/dvmkit/sdk/commit/462ae04c7fce88fc0ff22a415651c70674419803))
+* **master:** release 0.14.0 ([#40](https://github.com/dvmkit/sdk/issues/40)) ([a6e67fb](https://github.com/dvmkit/sdk/commit/a6e67fbf7cfefd6db0d13595b854ed81337592a1))
+* **master:** release 0.14.1 ([#44](https://github.com/dvmkit/sdk/issues/44)) ([c2cb672](https://github.com/dvmkit/sdk/commit/c2cb6726d0aaaab2c88d4834dd866cccc82be4dd))
+* **master:** release 0.14.2 ([#48](https://github.com/dvmkit/sdk/issues/48)) ([0e2adf4](https://github.com/dvmkit/sdk/commit/0e2adf4e52665150f4df9f8bc6e344974af84a62))
+* **master:** release 0.15.0 ([3f97038](https://github.com/dvmkit/sdk/commit/3f97038cb73bebf331fcd5c50aa98ccc36928cfb))
+* **master:** release 0.8.0 ([#6](https://github.com/dvmkit/sdk/issues/6)) ([33d7b34](https://github.com/dvmkit/sdk/commit/33d7b3401f139263e6e545a925ddf1fd5481365f))
+* **master:** release 0.8.1 ([#8](https://github.com/dvmkit/sdk/issues/8)) ([51995ca](https://github.com/dvmkit/sdk/commit/51995cadbd194200defc731a8ab7c9aee0b2dccd))
+* **master:** release 0.9.0 ([#10](https://github.com/dvmkit/sdk/issues/10)) ([bf8a89c](https://github.com/dvmkit/sdk/commit/bf8a89c057806c77e62a7adc5a4c50cff8b6af34))
+* **master:** release 1.0.0-rc.1 ([1b62f1e](https://github.com/dvmkit/sdk/commit/1b62f1e5b4438eebf7fea87e5f88d3fa69cd6349))
+* release 0.12.0 ([a6aafb1](https://github.com/dvmkit/sdk/commit/a6aafb1ec0d73cfd0f74c7092ba95475a947ed80))
+
 ## [0.15.0](https://github.com/dvmkit/sdk/compare/v0.14.2...v0.15.0) (2026-10-23)
 
 
