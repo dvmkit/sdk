@@ -623,8 +623,12 @@ export interface StreamableJobStore extends JobStore {
    */
   subscribeNotifications(jobId: string, onNotify: () => void): Promise<() => void>;
 
-  /** Read messages from the `job_messages` table for a job. */
-  getMessages(jobId: string, afterSeq: number): Promise<Message[]>;
+  /**
+   * Read verified history without advancing past a pending payment. Terminal
+   * output releases the cutoff. Snapshot reconstruction uses includeHeld to
+   * retain every verified message, independently of incremental delivery.
+   */
+  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]>;
 
   /**
    * Find stale non-terminal jobs. Two status-aware

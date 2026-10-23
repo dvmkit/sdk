@@ -4090,18 +4090,24 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const job = this.jobManager.activeJobs.get(id);
     const after = Number(c.req.query("after") ?? "0");
     const accept = c.req.header("Accept") ?? "";
+    const store = this.jobManager.store;
+    if (job && !isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
 
-    if (!job) {
-      const store = this.jobManager.store;
+    if (!job || isStreamableJobStore(store)) {
+      if (job) await job.messageAppenderTail;
       const record = await store.get(id);
       if (!record) return c.json({ error: "Job not found" }, 404);
       if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
-      const filtered = record.messages.filter((m) => m.seq > after);
+      const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+      let filtered = record.messages.filter((m) => m.seq > after);
+      if (isStreamableJobStore(store)) {
+        const durable = await store.getMessages(id, after, { includeHeld: terminal });
+        if (durable.length > 0 || !terminal) filtered = durable;
+      }
 
       if (accept.includes("text/event-stream")) {
-        // Cross-machine live stream: subscribe via NOTIFY when the job is
-        // still in-flight on another machine and the store supports it.
-        if (isStreamableJobStore(store) && !isTerminal(record.status)) {
+        // Every host uses store-allocated cursors, including the active worker.
+        if (isStreamableJobStore(store) && !terminal) {
           return streamSSE(c, async (stream) => {
             let unsubFn: (() => void) | undefined;
 
@@ -4184,10 +4190,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         });
       }
 
-      if (isStreamableJobStore(store) && !isTerminal(record.status)) {
-        const msgs = await store.getMessages(id, after);
-        return c.json(await this.messageFields(record, msgs));
-      }
       return c.json(await this.messageFields(record, filtered));
     }
 

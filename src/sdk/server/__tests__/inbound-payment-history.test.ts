@@ -48,14 +48,14 @@ describe("inbound payment history", () => {
     }
   });
 
-  it.each([false, true])("keeps a late accepted payment reachable with anotherHost=%s", async (anotherHost) => {
+  it.each(["same-host", "remote-reader", "remote-submitter"])("keeps a late accepted payment reachable with %s", async (routing) => {
     const descriptor = configureDVM({
       name: "payment-cursor", capability: "test", onJob: async () => undefined,
     });
     const backing = new MemoryJobStore();
     const options = { env: {}, store: new MemoryKVStore(), jobStore: backing, devMode: true, mints: ["https://mint.example.com"] };
     const { app, jobManager } = await createDVMServer(descriptor, options);
-    const reader = anotherHost ? await createDVMServer(descriptor, options) : undefined;
+    const other = routing !== "same-host" ? await createDVMServer(descriptor, options) : undefined;
     try {
       const submitted = await app.request("/v1/job", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -67,27 +67,103 @@ describe("inbound payment history", () => {
       providerMessage(job, "text", { text: "Before payment" });
       await jobManager.persistJob(job);
       job.pendingPaymentMsats = 1000;
+      await jobManager.persistJob(job);
       const payment = { type: "payment" as const, content: { dev_auto: true } };
-      const seq = await jobManager.recordInboundPending(job, payment.type, payment.content);
+      const submitter = routing === "remote-submitter" ? other!.jobManager : jobManager;
+      const target = routing === "remote-submitter"
+        ? submitter.reactivateJob((await backing.get(job_id))!).job : job;
+      const seq = await submitter.recordInboundPending(target, payment.type, payment.content);
       const live: string[] = [];
       job.listeners.add(message => live.push(message.type));
       providerMessage(job, "text", { text: "During verification" });
       await jobManager.persistJob(job);
       async function read(after = 0) {
-        const response = await (reader?.app ?? app).request(`/v1/job/${job_id}/messages?after=${after}`, { headers });
+        const response = await (routing === "remote-reader" ? other!.app : app).request(`/v1/job/${job_id}/messages?after=${after}`, { headers });
         expect(response.status).toBe(200);
         return (await response.json() as { messages: { seq: number; type: string }[] }).messages;
       }
       const during = await read();
       const cursor = Math.max(0, ...during.map(message => message.seq));
       expect(await read(cursor)).toEqual([]);
-      expect(live).toEqual([]);
-      expect((await jobManager.processPayment(job, payment, seq)).error).toBeUndefined();
+      if (routing !== "remote-submitter") expect(live).toEqual([]);
+      expect((await submitter.processPayment(target, payment, seq)).error).toBeUndefined();
       expect((await read(cursor)).map(message => message.type)).toEqual(["payment", "text"]);
-      expect(live).toEqual(["payment", "text"]);
+      if (routing !== "remote-submitter") expect(live).toEqual(["payment", "text"]);
     } finally {
       jobManager.shutdown();
-      reader?.jobManager.shutdown();
+      other?.jobManager.shutdown();
+    }
+  });
+
+  it("publishes completion while an earlier payment remains unresolved", async () => {
+    const { app, jobManager } = await createDVMServer(configureDVM({
+      name: "complete-payment-history", capability: "test", onJob: async () => undefined,
+    }), { env: {}, store: new MemoryKVStore(), devMode: true });
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let streamed: Promise<string> | undefined;
+    try {
+      const submitted = await app.request("/v1/job", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capability: "test", input: "" }),
+      });
+      const { job_id, job_token } = await submitted.json() as { job_id: string; job_token: string };
+      const job = jobManager.activeJobs.get(job_id)!;
+      const response = await app.request(`/v1/job/${job_id}/messages`, {
+        headers: { "X-Job-Token": job_token, Accept: "text/event-stream" },
+      });
+      reader = response.body!.getReader();
+      streamed = (async () => {
+        let text = "";
+        const decoder = new TextDecoder();
+        for (;;) {
+          const chunk = await reader!.read();
+          if (chunk.done) return text;
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      })();
+      await jobManager.recordInboundPending(job, "payment", { dev_auto: true });
+      const seen: string[] = [];
+      job.listeners.add(message => seen.push(message.type));
+      providerMessage(job, "text", { text: "Final output" });
+      job.sdkCtx!.complete("done");
+      expect(seen).toEqual(["text", "complete"]);
+      const history = await app.request(`/v1/job/${job_id}/messages`, { headers: { "X-Job-Token": job_token } });
+      expect((await history.json() as { messages: { type: string }[] }).messages.map(message => message.type))
+        .toEqual(["text", "complete"]);
+      expect((await streamed).split("\n").filter(line => line.startsWith("data:"))
+        .map(line => (JSON.parse(line.slice(5).trim()) as { type: string }).type)).toEqual(["text", "complete"]);
+      await job.terminalWork;
+    } finally {
+      await reader?.cancel();
+      await streamed?.catch(() => undefined);
+      jobManager.shutdown();
+    }
+  });
+
+  it.each([true, false])("retains verified remote payments in the terminal snapshot with terminalMessage=%s", async (terminalMessage) => {
+    const store = new MemoryJobStore();
+    const jm = new JobManager(configureDVM({ name: "terminal-payment-history", capability: "test", onJob: async () => undefined }), {
+      env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, fxFetcher: createFxFetcher(),
+    });
+    try {
+      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      await jm.persistJob(job);
+      providerMessage(job, "text", { text: "Before payment" });
+      await jm.persistJob(job);
+      await store.recordInbound(job.id, { from: "requester", type: "payment", content: { x402_payment: "pending" }, timestamp: 1 });
+      const acceptedSeq = await store.recordInbound(job.id, { from: "requester", type: "payment", content: { x402_payment: "accepted" }, timestamp: 2 });
+      await store.verifyAndCredit(job.id, acceptedSeq, null);
+      providerMessage(job, "text", { text: "Final output" });
+      job.status = "completed";
+      if (terminalMessage) providerMessage(job, "complete", { summary: "done" });
+      await jm.persistJob(job);
+      const messages = (await store.get(job.id))!.messages;
+      expect(messages.map(message => message.type)).toEqual(terminalMessage
+        ? ["text", "payment", "text", "complete"] : ["text", "payment", "text"]);
+      expect(messages.find(message => message.type === "payment"))
+        .toMatchObject({ seq: acceptedSeq, from: "requester", content: { x402_payment: "accepted" } });
+    } finally {
+      jm.shutdown();
     }
   });
 

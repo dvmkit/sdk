@@ -1389,10 +1389,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Guard: if the durable read returns FEWER messages than the in-memory
       // array — a rolled-back `appendOutgoing` (DB outage, already logged as
       // `job_message_append_failed`) — keep the in-memory snapshot rather than
-      // wipe durably-absent messages. `getMessages` filters `status='verified'`,
+      // wipe durably-absent messages. The snapshot read filters `status='verified'`
+      // independently of any pending-payment delivery cutoff,
       // so accepted cross-machine caller messages are included and rejected ones
       // stay out.
-      const durable = await this.jobStore.getMessages(job.id, 0);
+      const durable = await this.jobStore.getMessages(job.id, 0, { includeHeld: true });
       if (durable.length >= record.messages.length) {
         record.messages = durable;
         const highSeq = durable.length ? durable[durable.length - 1].seq : record.seq;

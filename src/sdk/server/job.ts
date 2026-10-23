@@ -493,7 +493,7 @@ function flushJobHistory(job: ServerJob): void {
  * listeners without appending it to the store — store writes happen elsewhere.
  * The DELETE route lets the following persistJob carry its cancel to the store;
  * an adopted remote cancel is already durable and must not be appended again.
- * Fan-out closes open SSE streams. Cancellation also releases buffered output
+ * Fan-out closes open SSE streams. Terminal output also releases buffered output
  * and prevents an in-flight payment appearing behind the terminal cursor later.
  */
 export function localMessage(
@@ -502,7 +502,7 @@ export function localMessage(
   type: MessageType,
   content: Record<string, unknown> | object
 ): Message {
-  if (type === "cancel") {
+  if (type === "cancel" || type === "complete") {
     historyHolds.get(job)?.clear();
     flushJobHistory(job);
   }

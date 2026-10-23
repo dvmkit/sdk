@@ -153,6 +153,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     const cur = this.nextSeq.get(record.id) ?? 1;
     this.nextSeq.set(record.id, Math.max(cur, record.seq + 1));
     if (isTerminal(record.status)) {
+      this.notify(record.id);
       this.messages.delete(record.id);
     }
     return Promise.resolve();
@@ -524,8 +525,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     });
   }
 
-  getMessages(jobId: string, afterSeq: number): Promise<Message[]> {
-    return Promise.resolve(this.visibleMessages(jobId, afterSeq));
+  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]> {
+    return Promise.resolve(this.visibleMessages(jobId, afterSeq, options?.includeHeld));
   }
 
   initStreaming(): Promise<void> {
@@ -606,19 +607,30 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     return list;
   }
 
-  private visibleMessages(jobId: string, afterSeq: number): Message[] {
+  private visibleMessages(jobId: string, afterSeq: number, includeHeld = false): Message[] {
     const stored = this.messagesFor(jobId);
-    const status = this.data.get(jobId)?.status;
+    const record = this.data.get(jobId);
+    const terminal = record && isTerminal(record.status);
+    const terminalMessage = stored.some(entry => entry.status === "verified" && entry.message.from === "provider" &&
+      (entry.message.type === "complete" || entry.message.type === "cancel"));
     let boundary = Infinity;
-    if (!status || !isTerminal(status)) {
+    if (!includeHeld && !terminal && !terminalMessage) {
       for (const entry of stored) {
         if (entry.status === "pending-verification" && entry.message.type === "payment") {
           boundary = Math.min(boundary, entry.message.seq);
         }
       }
     }
-    return stored.filter(entry => entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary)
-      .map(entry => entry.message);
+    const messages = new Map<number, Message>();
+    if (terminal) {
+      for (const message of record.messages) if (message.seq > afterSeq) messages.set(message.seq, message);
+    }
+    for (const entry of stored) {
+      if (entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary) {
+        messages.set(entry.message.seq, entry.message);
+      }
+    }
+    return [...messages.values()].sort((a, b) => a.seq - b.seq);
   }
 
   private notify(jobId: string): void {

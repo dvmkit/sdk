@@ -1,6 +1,12 @@
 {
   "package": "@dvmkit/sdk",
   "version": "0.14.2",
+  "storeContracts": {
+    "StreamableJobStore.getMessages": {
+      "options": "optional { includeHeld?: boolean }",
+      "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff"
+    }
+  },
   "wireContracts": {
     "callerDeadline": {
       "fixture": "protocol-fixtures/caller-deadline-v1.json",
