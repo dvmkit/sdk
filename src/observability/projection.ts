@@ -490,6 +490,7 @@ function projectHost(value: unknown): string | null {
 
 function validateIdentity(key: string, value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
+  if (key === "dvm_resolution") return value === "none" ? value : undefined;
   if (key === "dvm_slug") return SLUG_RE.test(value) ? value : undefined;
   return value.length <= 36 && UUID_RE.test(value) ? value : undefined;
 }
@@ -498,7 +499,10 @@ function projectIdentity(
   key: string,
   authority: DiagnosticIdentityAuthority | undefined,
 ): string | undefined {
-  return authority && AUTHORITY_IDENTITIES.get(authority)?.[key];
+  const identities = authority && AUTHORITY_IDENTITIES.get(authority);
+  // A resolved DVM takes precedence even when the input row omits its ID.
+  if (key === "dvm_resolution" && identities?.dvm_id) return undefined;
+  return identities?.[key];
 }
 
 function projectCapability(
