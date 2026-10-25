@@ -5,8 +5,13 @@ import {
   bindDiagnosticCapabilityAuthority,
   bindDiagnosticIdentityAuthority,
   createDiagnosticCapabilityAuthority,
+  DbTransport,
   extendDiagnosticIdentityAuthority,
+  initLoggers,
   insertSpanBatch,
+  pinDimension,
+  SpanWriter,
+  withTraceContext,
 } from "@dvmkit/sdk/internal";
 import pg from "pg";
 
@@ -166,6 +171,62 @@ try {
     },
   ]);
   assert.equal(JSON.stringify(result.rows).includes("SENTINEL"), false);
+
+  const writer = new SpanWriter(new DbTransport(target));
+  const loggers = initLoggers(writer, "router");
+  await withTraceContext({
+    traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    spanId: null,
+    dimensions: {},
+    service: "router",
+  }, () => loggers.platform.span("router.proxy", { dvm_resolution: "spoof" }, () => {
+    pinDimension("dvm_resolution", "none");
+  }));
+  await writer.shutdown();
+  const pinned = await target.query(
+    "SELECT dimensions, attributes FROM observability.spans WHERE trace_id = $1",
+    ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  );
+  assert.deepEqual(pinned.rows, [{
+    dimensions: { dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  }]);
+
+  const unboundMark = span("6666666666666666", {
+    dimensions: { dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  });
+  const marked = bindDiagnosticIdentityAuthority(span("7777777777777777", {
+    dimensions: { dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  }), extendDiagnosticIdentityAuthority(undefined, "dvm_resolution", "none"));
+  const serializedMark = JSON.parse(JSON.stringify(marked));
+  const unrelatedMark = bindDiagnosticIdentityAuthority(span("8888888888888888", {
+    dimensions: { dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  }), identityAuthority);
+  const conflictingMark = bindDiagnosticIdentityAuthority(span("9999999999999999", {
+    dimensions: { dvm_id: spoofDvmId, dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  }), extendDiagnosticIdentityAuthority(identityAuthority, "dvm_resolution", "none"));
+  const forgedMark = bindDiagnosticIdentityAuthority(span("aaaaaaaaaaaaaaaa", {
+    dimensions: { dvm_resolution: "none" },
+    attributes: { dvm_resolution: "none" },
+  }), forgedAuthority);
+
+  await insertSpanBatch(target, [unboundMark, serializedMark, unrelatedMark, conflictingMark, forgedMark]);
+  const marks = await target.query(
+    `SELECT span_id, dimensions, attributes FROM observability.spans
+      WHERE span_id = ANY($1::text[]) ORDER BY span_id`,
+    [["6666666666666666", "7777777777777777", "8888888888888888", "9999999999999999", "aaaaaaaaaaaaaaaa"]],
+  );
+  assert.deepEqual(marks.rows, [
+    { span_id: "6666666666666666", dimensions: {}, attributes: {} },
+    { span_id: "7777777777777777", dimensions: {}, attributes: {} },
+    { span_id: "8888888888888888", dimensions: {}, attributes: {} },
+    { span_id: "9999999999999999", dimensions: { dvm_id: trustedDvmId }, attributes: {} },
+    { span_id: "aaaaaaaaaaaaaaaa", dimensions: {}, attributes: {} },
+  ]);
 } finally {
   if (target) await target.end();
   try {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { pinDimension, setDimension, withTraceContext } from "../context";
 import { createDiagnosticCapabilityAuthority } from "../projection";
-import { SpanWriter } from "../span-writer";
+import { HttpTransport, SpanWriter } from "../span-writer";
 import type { SpanRow } from "../types";
 import { setEmitter, withSpan } from "../with-span";
 
@@ -330,6 +330,70 @@ describe("withSpan", () => {
       dvm_slug: "approved-child",
       capability: "transcribe",
     });
+  });
+
+  it.each([false, true])("carries a late no-DVM mark through stdout and buffered HTTP transport (throws: %s)", async (throws) => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const writer = new SpanWriter(new HttpTransport("https://example.com", "test-token"));
+    setEmitter((row) => writer.enqueue(row));
+    const failure = new Error("resolver failed");
+
+    const operation = withTraceContext({
+      traceId: "33333333333333333333333333333333",
+      spanId: null,
+      dimensions: {},
+      service: "router",
+    }, () => withSpan({
+      dataset: "platform",
+      name: "router.proxy",
+      attrs: { dvm_resolution: "spoof" },
+    }, async () => {
+      pinDimension("dvm_resolution", "none");
+      setDimension("dvm_resolution", "spoof");
+      await withSpan({ dataset: "platform", name: "message" }, () => undefined);
+      if (throws) throw failure;
+    }));
+    if (throws) await expect(operation).rejects.toBe(failure);
+    else await operation;
+
+    // Flush after leaving the trace scope to exercise the detached authority binding.
+    await writer.flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const rows = JSON.parse(String(fetch.mock.calls[0][1]?.body)).spans as SpanRow[];
+    expect(rows).toHaveLength(2);
+    const outer = rows.find((row) => row.name === "router.proxy");
+    const inner = rows.find((row) => row.name === "message");
+    expect(outer?.dimensions).toEqual({ dvm_resolution: "none" });
+    expect(outer?.attributes).toEqual({ dvm_resolution: "none" });
+    expect(outer?.status).toBe(throws ? "error" : "ok");
+    expect(inner?.dimensions).toEqual({ dvm_resolution: "none" });
+    const lines = vi.mocked(process.stdout.write).mock.calls.map(([line]) => String(line));
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line).toContain("dvm_resolution=none");
+      expect(line).not.toContain("spoof");
+    }
+  });
+
+  it.each([true, false])("keeps only the DVM identity when the no-DVM mark is pinned first: %s", async (markFirst) => {
+    await withTraceContext({
+      traceId: "33333333333333333333333333333333",
+      spanId: null,
+      dimensions: {},
+      service: "router",
+    }, () => withSpan({
+      dataset: "platform",
+      name: "router.proxy",
+      attrs: { dvm_resolution: "none", dvm_id: "spoof" },
+    }, () => {
+      const pinDvm = () => pinDimension("dvm_id", "123e4567-e89b-12d3-a456-426614174000");
+      if (markFirst) pinDimension("dvm_resolution", "none");
+      pinDvm();
+      if (!markFirst) pinDimension("dvm_resolution", "none");
+    }));
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].dimensions).toEqual({ dvm_id: "123e4567-e89b-12d3-a456-426614174000" });
+    expect(emitted[0].attributes).toEqual({ dvm_id: "123e4567-e89b-12d3-a456-426614174000" });
   });
 
   it.each([

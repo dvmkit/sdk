@@ -1020,7 +1020,8 @@
   "identityFields": [
     "dvm_id",
     "dvm_slug",
-    "builder_id"
+    "builder_id",
+    "dvm_resolution"
   ],
   "capabilityFields": [
     "capability"

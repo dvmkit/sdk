@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   bindDiagnosticCapabilityAuthority,
+  bindDiagnosticIdentityAuthority,
   createDiagnosticCapabilityAuthority,
   DIAGNOSTIC_CATALOGUE_VERSION,
+  extendDiagnosticIdentityAuthority,
   projectDiagnosticFields,
   projectSpanRow,
 } from "../projection";
@@ -32,6 +34,94 @@ function makeSpan(overrides: Partial<SpanRow> = {}): SpanRow {
     ...overrides,
   };
 }
+
+describe("trusted DVM resolution", () => {
+  const dvmId = "123e4567-e89b-12d3-a456-426614174000";
+
+  it("projects the authority's mark instead of the input value", () => {
+    const authority = extendDiagnosticIdentityAuthority(undefined, "dvm_resolution", "none");
+    const fields = { dvm_resolution: "untrusted", dvm_id: dvmId };
+    expect(projectDiagnosticFields(fields, undefined, undefined, authority)).toEqual({
+      dvm_resolution: "none",
+    });
+
+    const input = bindDiagnosticIdentityAuthority(
+      makeSpan({ dimensions: fields, attributes: fields }),
+      authority,
+    );
+    expect(projectSpanRow(input)).toEqual({
+      ok: true,
+      row: expect.objectContaining({
+        dimensions: { dvm_resolution: "none" },
+        attributes: { dvm_resolution: "none" },
+      }),
+    });
+    expect(projectDiagnosticFields(bindDiagnosticIdentityAuthority(fields, authority))).toEqual({
+      dvm_resolution: "none",
+    });
+    expect(projectSpanRow(JSON.parse(JSON.stringify(input)))).toEqual({
+      ok: true,
+      row: expect.objectContaining({ dimensions: {}, attributes: {} }),
+    });
+  });
+
+  it.each(["unbound", "unrelated", "forged"])("drops a mark with %s authority", (kind) => {
+    const authority = kind === "unrelated"
+      ? extendDiagnosticIdentityAuthority(undefined, "dvm_slug", "example-app")
+      : kind === "forged"
+        ? {} as NonNullable<ReturnType<typeof extendDiagnosticIdentityAuthority>>
+        : undefined;
+    const fields = { dvm_resolution: "none" };
+    expect(projectDiagnosticFields(fields, undefined, undefined, authority)).toEqual({});
+    expect(projectSpanRow(bindDiagnosticIdentityAuthority(
+      makeSpan({ dimensions: fields, attributes: fields }),
+      authority,
+    ))).toEqual({
+      ok: true,
+      row: expect.objectContaining({ dimensions: {}, attributes: {} }),
+    });
+  });
+
+  it.each([
+    "", "NONE", "none ", "resolved", dvmId, null, undefined, false, 0,
+    ["none"], { toString: () => "none" },
+  ])("refuses invalid authority value %j", (value) => {
+    expect(extendDiagnosticIdentityAuthority(undefined, "dvm_resolution", value)).toBeUndefined();
+    const existing = extendDiagnosticIdentityAuthority(undefined, "dvm_slug", "example-app");
+    const authority = extendDiagnosticIdentityAuthority(existing, "dvm_resolution", value);
+    expect(projectDiagnosticFields(
+      { dvm_slug: "spoof", dvm_resolution: "none" }, undefined, undefined, authority,
+    )).toEqual({ dvm_slug: "example-app" });
+    const marked = extendDiagnosticIdentityAuthority(existing, "dvm_resolution", "none");
+    expect(projectDiagnosticFields(
+      { dvm_resolution: value }, undefined, undefined,
+      extendDiagnosticIdentityAuthority(marked, "dvm_resolution", value),
+    )).toEqual({ dvm_resolution: "none" });
+  });
+
+  it.each([true, false])("gives DVM identity precedence when the mark is pinned first: %s", (markFirst) => {
+    const entries = markFirst
+      ? [["dvm_resolution", "none"], ["dvm_id", dvmId]]
+      : [["dvm_id", dvmId], ["dvm_resolution", "none"]];
+    let authority;
+    for (const [key, value] of entries) {
+      authority = extendDiagnosticIdentityAuthority(authority, key, value);
+    }
+    expect(projectDiagnosticFields(
+      { dvm_id: "spoof", dvm_resolution: "none" }, undefined, undefined, authority,
+    )).toEqual({ dvm_id: dvmId });
+    expect(projectDiagnosticFields(
+      { dvm_resolution: "none" }, undefined, undefined, authority,
+    )).toEqual({});
+    expect(projectSpanRow(bindDiagnosticIdentityAuthority(makeSpan({
+      dimensions: { dvm_id: "spoof", dvm_resolution: "none" },
+      attributes: { dvm_resolution: "none" },
+    }), authority))).toEqual({
+      ok: true,
+      row: expect.objectContaining({ dimensions: { dvm_id: dvmId }, attributes: {} }),
+    });
+  });
+});
 
 describe("projectSpanRow", () => {
   it("implements diagnostic catalogue version 1", () => {

@@ -37,3 +37,11 @@ A Tempo adapter exception may instead emit:
 ```
 
 Diagnostics are best-effort and cannot change the payment outcome. Existing sanitized origin fields retain their established privacy rules; payment failure fields never retain URLs or arbitrary text.
+
+## Trusted DVM resolution
+
+Catalogue version 1 includes the additive identity field `dvm_resolution`, whose only accepted value is the primitive string `"none"`. It positively records that a request resolved no DVM; an absent DVM identity alone makes no such statement.
+
+Trusted instrumentation sets the mark with `pinDimension("dvm_resolution", "none")` inside a trace context, or extends and binds a process-local `DiagnosticIdentityAuthority` with `extendDiagnosticIdentityAuthority`. Ordinary dimensions and attributes cannot grant this authority. Projection ignores input values and retains only the bound authority's value; it drops the field when authority is missing, forged, or does not carry the mark. Authority bindings survive in-process projection and buffering, but do not serialize: receiving a JSON row with the mark grants no authority to retain it.
+
+When an authority carries both `dvm_id` and `dvm_resolution`, projection retains the DVM identity and omits `dvm_resolution` from dimensions and attributes, regardless of pinning order or whether the input includes `dvm_id`. All diagnostic sinks apply this rule, including stdout, HTTP serialization, and direct PostgreSQL insertion. Invalid mark values do not extend or replace the existing authority.

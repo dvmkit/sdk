@@ -80,7 +80,7 @@ function ownDataValue(input: unknown, key: string): unknown {
 
 function ownIdentityKeys(input: unknown): string[] {
   try {
-    return ["dvm_id", "dvm_slug", "builder_id"].filter((key) => {
+    return ["dvm_id", "dvm_slug", "builder_id", "dvm_resolution"].filter((key) => {
       const descriptor =
         ((typeof input === "object" && input !== null) ||
           typeof input === "function") &&
