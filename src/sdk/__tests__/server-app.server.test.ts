@@ -432,7 +432,7 @@ describe("SDK server app", () => {
     expect(messages.map((message: { type: string }) => message.type)).toEqual(["text", "artifact", "complete"]);
   });
 
-  it("ignores query text after a fragment when reading authenticated job messages over HTTP", async () => {
+  it("uses the first decoded cursor and ignores fragments in authenticated job message queries over HTTP", async () => {
     const finished = gate();
     await startApp(
       configureDVM({
@@ -456,6 +456,8 @@ describe("SDK server app", () => {
 
     for (const [suffix, expectedTypes] of [
       ["?after=1", ["complete"]],
+      ["?%61fter=1&after=2", ["complete"]],
+      ["?after=2&%61fter=1", []],
       ["#ignored?after=99", ["text", "complete"]],
       ["?after=1#ignored&after=99", ["complete"]],
     ] as const) {

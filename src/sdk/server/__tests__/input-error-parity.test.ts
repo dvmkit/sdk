@@ -78,6 +78,53 @@ async function bothEndpoints(app: TestApp, data: unknown): Promise<[Answer, Answ
 }
 
 describe("a schema-invalid input gets one answer from /v1/quote and /v1/job", () => {
+  it("counts an astral character as one code point for minimum length on quote and submit", async () => {
+    const app = await startDVM({
+      schema: z.object({ text: z.string().min(2) }),
+      auth: false,
+      free: true,
+    });
+    const [quote, job] = await bothEndpoints(app, { text: "😀" });
+
+    for (const answer of [quote, job]) {
+      expect(answer.status).toBe(400);
+      expect(answer.body.error).toBe("invalid_input");
+      expect(answer.body.message).toBe("text: too short (min 2 chars)");
+    }
+    expect(quote.body).toEqual(job.body);
+  });
+
+  it("accepts an astral character within a one-code-point maximum on quote and submit", async () => {
+    const app = await startDVM({
+      schema: z.object({ text: z.string().max(1) }),
+      auth: false,
+      free: true,
+    });
+    const [quote, job] = await bothEndpoints(app, { text: "😀" });
+
+    expect(quote.status).toBe(200);
+    expect(job.status).toBe(200);
+  });
+
+  it("reports only the collection bound before parsing oversized malformed items on quote and submit", async () => {
+    const app = await startDVM({
+      schema: z.object({ items: z.array(z.number()).max(1) }),
+      auth: false,
+      free: true,
+    });
+    const [quote, job] = await bothEndpoints(app, { items: ["a", "b"] });
+
+    for (const answer of [quote, job]) {
+      expect(answer.status).toBe(400);
+      expect(answer.body.error).toBe("invalid_input");
+      expect(answer.body.message).toBe("items: too many items (max 1)");
+      expect(answer.body.display).toBe(
+        "Request input doesn't satisfy the published schema — items: too many items (max 1)"
+      );
+    }
+    expect(quote.body).toEqual(job.body);
+  });
+
   it("answers a correctly-signed, wrongly-named field identically on both", async () => {
     const app = await startDVM({ schema: optionalEnvelopeSchema, auth: true });
     const [quote, job] = await bothEndpoints(
