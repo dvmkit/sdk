@@ -1989,6 +1989,7 @@ export async function verifyTempoSessionManagementCredential(args: {
 export type PaymentErrorCode =
   | "payment_invalid"
   | "x402_not_offered"
+  | "payment_method_requires_signature"
   | "x402_settlement_ambiguous"
   | "cashu_unavailable"
   | "cashu_not_p2pk_locked"
@@ -2046,6 +2047,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     display:
       "The payment couldn't be verified, so the request wasn't accepted. Nothing was charged.",
     hint: "Request a fresh quote and pay again — the previous payment can't be reused.",
+    retryable: false,
+  },
+  payment_method_requires_signature: {
+    display:
+      "This service accepts unsigned requests only when they are paid with Cashu, so this payment was not applied to the job.",
+    hint: "Pay with Cashu to call without signing, or sign the request (secp256k1 Schnorr) to use another payment method.",
     retryable: false,
   },
   x402_not_offered: {

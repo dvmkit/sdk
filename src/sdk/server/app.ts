@@ -2929,6 +2929,34 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
+   * Refuse an x402 or Tempo mid-job payment on an unsigned paid job before it
+   * is recorded or verified: those rails settle into credit owned by a caller
+   * pubkey, which the job lacks. Signed jobs always store their pubkey.
+   */
+  private unsignedJobRailRefusal(
+    job: { requesterPubkey?: string },
+    body: { type: string; content: Record<string, unknown> }
+  ): Response | undefined {
+    if (!this.descriptor.auth?.allowUnsignedPaid || job.requesterPubkey !== undefined) return undefined;
+    if (body.type !== "payment" || (!body.content.x402_payment && !body.content.tempo_credential)) {
+      return undefined;
+    }
+    return buildPaymentErrorResponse(
+      paymentErrorBody("payment_method_requires_signature", {
+        message: "Unsigned jobs may be paid only with Cashu; an x402 or Tempo payment was sent.",
+      }),
+      undefined,
+      undefined,
+      402
+    );
+  }
+
+  /** Whether this DVM takes Cashu, the only rail an unsigned payer may use. */
+  private unsignedCashuOffered(): boolean {
+    return (this.opts.mints?.length ?? 0) > 0 && this.resolvePaymentMethods().includes("cashu");
+  }
+
+  /**
    * The error the signed path raises for this envelope-free body, so a refused
    * unsigned request reads exactly as it does on a DVM without the option.
    */
@@ -3171,17 +3199,33 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       throw err;
     }
 
-    // A capability with no price at all, or a development host that skips
-    // payment, can never require one: refuse it before hosting admission and
-    // pricing, as a signed-only DVM would. Zero dynamic prices are refused below.
+    // A capability with no price at all, a development host that skips
+    // payment, or a DVM without Cashu (the only unsigned rail) leaves an
+    // unsigned caller nothing to pay with: refuse it before hosting admission
+    // and pricing, as a signed-only DVM would. Zero dynamic prices are refused below.
     if (
       unsignedPaid &&
-      ((cap.price === undefined && !cap.onQuote) || devModeSkipsPaymentVerification(this.opts))
+      ((cap.price === undefined && !cap.onQuote) ||
+        devModeSkipsPaymentVerification(this.opts) ||
+        !this.unsignedCashuOffered())
     ) {
       return buildAuthErrorResponse(
         c,
         this.unsignedRequestRefusal(c, cap.input, body, capabilityName),
         this.publicOrigin
+      );
+    }
+    // x402 and Tempo settle into prepaid credit owned by a caller pubkey, which
+    // an unsigned payer lacks, so a failed job would strand their money. Refuse
+    // those artifacts before admission, pricing or any rail call.
+    if (unsignedPaid && (await carriesNonCashuPayment(c))) {
+      return buildPaymentErrorResponse(
+        paymentErrorBody("payment_method_requires_signature", {
+          message: "Unsigned requests may pay only with Cashu; an x402 or Tempo payment was attached.",
+        }),
+        undefined,
+        undefined,
+        402
       );
     }
 
@@ -3461,7 +3505,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
       }
       if (!skipPayment && !resumedAcceptedPayment) {
-        const railOpts = await this.railVerifyOpts(c);
+        const railOpts = unsignedPaid
+          ? cashuOnlyRailOpts(await this.railVerifyOpts(c))
+          : await this.railVerifyOpts(c);
         hostingPaymentMayHaveLanded = Boolean(
           creditEnvelope || railOpts.cashuToken || railOpts.x402Payment || railOpts.mppCredential
         );
@@ -3545,11 +3591,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             }
             if (!resumedAcceptedPayment) {
               // Attach the prepaid menu in this request's ledger denomination, including
-              // free requests that have no priceFiat.
-              attachCreditMenu(
-                err.detail.body,
-                await this.creditMenu(this.creditCurrency(), authPubkey)
-              );
+              // free requests that have no priceFiat. An unsigned payer cannot
+              // hold credit, so its challenge carries no menu.
+              if (!unsignedPaid) {
+                attachCreditMenu(
+                  err.detail.body,
+                  await this.creditMenu(this.creditCurrency(), authPubkey)
+                );
+              }
               // Return the same price_micro and required_msats used for this request's
               // funding ratio; a second quote may use a different FX snapshot.
               if (priceFiat) {
@@ -4413,6 +4462,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         this.opts.devMode === true
       );
       if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
+      const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
+      if (railRefusal) return railRefusal;
 
       const inboundSeq = await jm.recordInboundPending(activeJob, body.type, body.content);
 
@@ -4496,6 +4547,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     const contentErr = validateMessageContent(body.type, body.content, this.opts.devMode === true);
     if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
+    const railRefusal = this.unsignedJobRailRefusal(record, body);
+    if (railRefusal) return railRefusal;
 
     if (isStreamableJobStore(jm.store)) {
       record.messages = await jm.store.getMessages(id, 0);
@@ -5007,6 +5060,32 @@ function removeUnavailableContent(fields: Record<string, unknown>): void {
  * signing can precede the terminal snapshot save, so an in-flight row must not
  * expose a terminal receipt yet.
  */
+/** Whether the submit carries an x402 or MPP (Tempo) payment artifact. */
+async function carriesNonCashuPayment(c: Context<AppEnv>): Promise<boolean> {
+  if (c.req.header("PAYMENT-SIGNATURE") || c.req.header("X-PAYMENT")) return true;
+  const authorization = c.req.header("Authorization");
+  if (!authorization) return false;
+  return Boolean((await import("mppx")).Credential.extractPaymentScheme(authorization));
+}
+
+/**
+ * Rail options for an unsigned submit: Cashu only. Without the x402 and MPP
+ * handles the verifier neither accepts nor advertises those rails, so the
+ * unsigned 402 lists Cashu alone.
+ */
+function cashuOnlyRailOpts(opts: UpfrontPaymentOpts): UpfrontPaymentOpts {
+  return {
+    ...opts,
+    x402Payment: undefined,
+    x402Config: undefined,
+    x402ExactSettlement: undefined,
+    x402ExactVersions: undefined,
+    x402BatchSettlement: undefined,
+    mppCredential: undefined,
+    mpp: undefined,
+  };
+}
+
 function terminalResponseFields(job: TerminalFieldSource): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
   if (job.upfrontPayment !== undefined) fields.upfront_payment = job.upfrontPayment;

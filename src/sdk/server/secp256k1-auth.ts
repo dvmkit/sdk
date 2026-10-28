@@ -72,9 +72,17 @@ export interface Secp256k1AuthOpts {
   now?: () => number;
   /**
    * Accept an unsigned `POST /v1/job` (no `pubkey`, `signature`, `timestamp`,
-   * `nonce` or `auth_statement`) when the job requires a per-call payment, and
-   * advertise `["secp256k1-schnorr-v2", "none"]` on `/v1/info#auth`. A body
+   * `nonce` or `auth_statement`) when the job requires a per-call Cashu
+   * payment, and advertise `["secp256k1-schnorr-v2", "none"]` on `/v1/info#auth`. A body
    * carrying any envelope field is verified as before and never falls back.
+   * Unsigned calls take Cashu only: their 402 and mid-job asks offer Cashu
+   * alone, with no credit menu, and an attached x402 or Tempo payment (upfront
+   * or mid-job) is refused with `payment_method_requires_signature` before any
+   * settlement. A Cashu token is the payment, so a failed job keeping it is
+   * ordinary Cashu behaviour; this SDK settles x402 before the job runs, so an
+   * anonymous x402 payer would lose money a standard x402 server would not
+   * take, and Tempo is held back until checked. A DVM without Cashu serves no
+   * unsigned calls. Signed callers keep every rail.
    * Unsigned jobs run as the anonymous requester: the handler sees no
    * `ctx.auth`, the input omits the envelope fields, prepaid credit and
    * `request_id` recovery are refused, a payer whose response is lost cannot
