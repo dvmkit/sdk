@@ -228,6 +228,24 @@ export async function insertAccumulatorRows(
 }
 
 /**
+ * Whether any of these proof secrets is already banked for `dvmId`, i.e.
+ * whether {@link insertAccumulatorRows} would collide on
+ * `UNIQUE(dvm_id, proof_secret_hash)`.
+ */
+export async function hasAccumulatedProof(
+  db: AccumulatorQuerier,
+  dvmId: string,
+  secrets: string[]
+): Promise<boolean> {
+  if (secrets.length === 0) return false;
+  const { rows } = await db.query(
+    `SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1 AND proof_secret_hash = ANY($2::text[]) LIMIT 1`,
+    [dvmId, secrets.map(hashProofSecret)]
+  );
+  return rows.length > 0;
+}
+
+/**
  * Group of accumulator rows for a single `(lock_pubkey, mint_url,
  * melt_quote_id)` batch. `oldestReceivedAt` and `totalSats` summarize the
  * batch's age and face value for monitoring and administrative callers.

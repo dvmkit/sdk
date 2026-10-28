@@ -1,5 +1,5 @@
 /*
- * Cashu verification is mocked; accumulator inserts and credit accounting use real Postgres
+ * Token decoding and DLEQ checks are mocked; lock judgement parses the real secrets; accumulator inserts and credit accounting use real Postgres
  * on one transaction. A throw between those writes must roll back both.
  */
 import * as cashuTs from "@cashu/cashu-ts";
@@ -18,7 +18,6 @@ vi.mock("@cashu/cashu-ts", async (importOriginal) => {
   const actual = await importOriginal<typeof cashuTs>();
   return {
     ...actual,
-    getP2PKExpectedWitnessPubkeys: vi.fn(),
     verifyDleqIfPresent: vi.fn(),
   };
 });
@@ -28,7 +27,6 @@ const { initWalletAccumulatorTable } = await import("../wallet-accumulator-store
 const { CreditLedger } = await import("../credit-ledger");
 
 const mockVerify = vi.mocked(cashuVerify.verifyCashuToken);
-const mockExpectedPubkeys = vi.mocked(cashuTs.getP2PKExpectedWitnessPubkeys);
 const mockVerifyDleq = vi.mocked(cashuTs.verifyDleqIfPresent);
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -41,11 +39,12 @@ const CALLER = "ef".repeat(32);
 const FUTURE_MS = Date.now() + 24 * 60 * 60 * 1000;
 
 let secretCounter = 0;
-function makeProof(amount = 10): Proof {
+function makeProof(amount = 10, tags: string[][] = []): Proof {
+  const nonce = `dvm-funding-secret-${++secretCounter}-${Date.now()}`;
   return {
     id: "keyset-1",
     amount: amount as unknown as Proof["amount"],
-    secret: `dvm-funding-secret-${++secretCounter}-${Date.now()}`,
+    secret: JSON.stringify(["P2PK", { nonce, data: LOCK_PUBKEY, tags }]),
     C: "C-deadbeef",
     dleq: { e: "01", s: "02", r: "03" },
   };
@@ -75,7 +74,6 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockExpectedPubkeys.mockReturnValue([LOCK_PUBKEY]);
     mockVerifyDleq.mockReturnValue(true);
   });
 
@@ -211,5 +209,60 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
     expect(replay.kind === "rejected" && replay.code).toBe("replay_rejected");
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000);
     expect((await ledger.get(creditId))?.lastLedgerSeq).toBe(1);
+  });
+  it("a non-exclusive lock writes no accumulator row and no credit", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const payer = "02" + CALLER;
+    const shapes: [string, string[][]][] = [
+      ["past", [["locktime", `${nowSec - 60}`], ["refund", payer]]],
+      ["soon", [["locktime", `${nowSec + 60}`], ["refund", payer]]],
+      ["bare", [["locktime", `${nowSec + 60}`]]],
+      ["oneofn", [["pubkeys", payer]]],
+      ["multisig", [["pubkeys", payer], ["n_sigs", "2"]]],
+    ];
+    for (const [label, tags] of shapes) {
+      const requestId = `atom-lock-${label}`;
+      const withCommitTx = vi.fn();
+      const result = await accept({ proofs: [makeProof(10, tags)], requestId, withCommitTx });
+      expect(result, label).toMatchObject({ kind: "rejected", code: "lock_not_exclusive" });
+      expect(withCommitTx, label).not.toHaveBeenCalled();
+      expect(await ledger.get(`imp:cashu:${requestId}`), label).toBeUndefined();
+    }
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
+    expect(rows.rowCount).toBe(0);
+  });
+
+  it("a retry after the lock floor has passed still resolves as the original payment's replay", async () => {
+    const requestId = "atom-aged-replay";
+    const creditId = `imp:cashu:${requestId}`;
+    const t0 = Date.now();
+    const proofs = [makeProof(10, [["locktime", `${Math.floor(t0 / 1000) + 7 * 86_400}`], ["refund", "02" + CALLER]])];
+    const commit: NonNullable<Parameters<typeof acceptAccumulatorPayment>[0]["withCommitTx"]> = async (tx, accepted) => {
+      await fundCredit(ledger, {
+        creditId,
+        callerPubkey: CALLER,
+        currency: "usd",
+        amountMicro: accepted.paidMsats,
+        expiryMs: FUTURE_MS + 7 * 24 * 60 * 60 * 1000,
+        tx,
+      });
+      await ledger.draw({ creditId, drawId: requestId, amountMicro: accepted.paidMsats, tx });
+    };
+    expect((await accept({ proofs, requestId, withCommitTx: commit })).kind).toBe("accumulated");
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(t0 + 36 * 60 * 60 * 1000);
+      const retry = await accept({ proofs, requestId, withCommitTx: commit });
+      expect(retry.kind === "rejected" && retry.code).toBe("replay_rejected");
+      // The same shape from a payment never banked is refused at this clock.
+      const fresh = await accept({ proofs: [makeProof(10, [["locktime", `${Math.floor(t0 / 1000) + 7 * 86_400}`]])], requestId: "atom-aged-fresh" });
+      expect(fresh.kind === "rejected" && fresh.code).toBe("lock_not_exclusive");
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await ledger.get(creditId))?.lastLedgerSeq).toBe(1);
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
+    expect(rows.rowCount).toBe(1);
   });
 });

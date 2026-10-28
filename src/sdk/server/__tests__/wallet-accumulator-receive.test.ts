@@ -13,16 +13,15 @@ vi.mock("@cashu/cashu-ts", async (importOriginal) => {
   const actual = await importOriginal<typeof cashuTs>();
   return {
     ...actual,
-    getP2PKExpectedWitnessPubkeys: vi.fn(),
     verifyDleqIfPresent: vi.fn(),
   };
 });
 
 const { acceptAccumulatorPayment, valueCashuFunding } =
   await import("../wallet-accumulator-receive");
+const { createDisposableCashuStore } = await import("../disposable-cashu-store");
 
 const mockVerify = vi.mocked(cashuVerify.verifyCashuToken);
-const mockExpectedPubkeys = vi.mocked(cashuTs.getP2PKExpectedWitnessPubkeys);
 const mockVerifyDleq = vi.mocked(cashuTs.verifyDleqIfPresent);
 
 const RECOVERY_PUBKEY = toLockPubkey("02" + "ab".repeat(32));
@@ -55,7 +54,12 @@ function makeMockPool(mockOpts: MockPoolOpts = {}) {
   return { pool, client, clientQuery };
 }
 
-function makeProof(secret = "secret-1", amount = 5, id = "keyset-1"): Proof {
+/** A real NUT-11 secret; `label` doubles as the nonce so each proof is distinct. */
+function p2pkSecret(label: string, data: string = RECOVERY_PUBKEY, tags: string[][] = []): string {
+  return JSON.stringify(["P2PK", { nonce: label, data, tags }]);
+}
+
+function makeProof(label = "secret-1", amount = 5, id = "keyset-1", secret = p2pkSecret(label)): Proof {
   return {
     id,
     amount: amount as unknown as Proof["amount"],
@@ -194,9 +198,8 @@ describe("acceptAccumulatorPayment", () => {
   });
 
   it("rejects when proof is not P2PK-locked to recovery pubkey", async () => {
-    const proofs = [makeProof()];
+    const proofs = [makeProof("wrong", 5, "keyset-1", p2pkSecret("wrong", "02" + "11".repeat(32)))];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue(["02" + "11".repeat(32)]); // wrong pubkey
 
     const { pool } = makeMockPool();
 
@@ -217,7 +220,6 @@ describe("acceptAccumulatorPayment", () => {
   it("rejects with proof_not_unspent when NUT-7 reports SPENT", async () => {
     const proofs = [makeProof()];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y", state: CheckStateEnum.SPENT, witness: null },
     ]);
@@ -245,7 +247,6 @@ describe("acceptAccumulatorPayment", () => {
     // agent retry rather than mark the token permanently rejected.
     const proofs = [makeProof("s1"), makeProof("s2")];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y1", state: CheckStateEnum.UNSPENT, witness: null },
     ]);
@@ -275,7 +276,6 @@ describe("acceptAccumulatorPayment", () => {
     // permanent "already spent" failure.
     const proofs = [makeProof()];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y", state: CheckStateEnum.PENDING, witness: null },
     ]);
@@ -300,7 +300,6 @@ describe("acceptAccumulatorPayment", () => {
     const proofs = [makeProof("s1"), makeProof("s2")];
     proofs[0].dleq = { e: "dleq-e", s: "dleq-s", r: "blind-r" };
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y1", state: CheckStateEnum.UNSPENT, witness: null },
       { Y: "y2", state: CheckStateEnum.UNSPENT, witness: null },
@@ -345,7 +344,6 @@ describe("acceptAccumulatorPayment", () => {
       makeProof("f4", 1),
     ];
     const { wallet } = setupHappyDecode(proofs, 401, 1);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue(
       proofs.map((_, index) => ({
         Y: `y${index}`,
@@ -384,7 +382,6 @@ describe("acceptAccumulatorPayment", () => {
   it("runs value validation before opening the accumulator transaction", async () => {
     const proofs = [makeProof("precommit", 10)];
     const { wallet } = setupHappyDecode(proofs, 10, 1);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y", state: CheckStateEnum.UNSPENT, witness: null },
     ]);
@@ -408,22 +405,14 @@ describe("acceptAccumulatorPayment", () => {
   });
 
   it("parses the NUT-11 locktime tag and persists t_expire (ms) on the row", async () => {
-    // First proof carries a valid NUT-10 P2PK secret with a locktime tag
-    // (unix seconds). Second proof's secret is a plain string with no tag.
+    // First proof carries a locktime tag (unix seconds); the second has none.
     // The store's INSERT must bind the parsed locktime in ms for the first
     // row and null for the second.
-    const locktimeSec = 1_800_000_000;
-    const nut10Secret = JSON.stringify([
-      "P2PK",
-      {
-        nonce: "n1",
-        data: RECOVERY_PUBKEY,
-        tags: [["locktime", `${locktimeSec}`]],
-      },
-    ]);
-    const proofs = [makeProof(nut10Secret), makeProof("plain-secret-no-tag")];
+    const locktimeSec = Math.floor(Date.now() / 1000) + 7 * 86_400;
+    const nut10Secret = p2pkSecret("n1", RECOVERY_PUBKEY, [["locktime", `${locktimeSec}`]]);
+    const noTagSecret = p2pkSecret("no-tag");
+    const proofs = [makeProof("n1", 5, "keyset-1", nut10Secret), makeProof("no-tag", 5, "keyset-1", noTagSecret)];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y1", state: CheckStateEnum.UNSPENT, witness: null },
       { Y: "y2", state: CheckStateEnum.UNSPENT, witness: null },
@@ -452,7 +441,7 @@ describe("acceptAccumulatorPayment", () => {
       tExpireBySecret.set(params[5] as string, params[13]);
     }
     expect(tExpireBySecret.get(nut10Secret)).toBe(locktimeSec * 1000);
-    expect(tExpireBySecret.get("plain-secret-no-tag")).toBeNull();
+    expect(tExpireBySecret.get(noTagSecret)).toBeNull();
   });
 
   it("returns replay_rejected on UNIQUE constraint violation", async () => {
@@ -462,7 +451,6 @@ describe("acceptAccumulatorPayment", () => {
     // wallet-accumulator-store db test.
     const proofs = [makeProof("s-replay")];
     const { wallet } = setupHappyDecode(proofs, 10);
-    mockExpectedPubkeys.mockReturnValue([RECOVERY_PUBKEY]);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y", state: CheckStateEnum.UNSPENT, witness: null },
     ]);
@@ -485,10 +473,9 @@ describe("acceptAccumulatorPayment", () => {
 
   it("accepts a proof locked to a retired-but-in-grace pubkey", async () => {
     const RETIRED_PUBKEY = toLockPubkey("03" + "cd".repeat(32));
-    const proofs = [makeProof()];
-    const { wallet } = setupHappyDecode(proofs, 10);
     // Proof was minted with outputs locked to the now-retired pubkey.
-    mockExpectedPubkeys.mockReturnValue([RETIRED_PUBKEY]);
+    const proofs = [makeProof("retired", 5, "keyset-1", p2pkSecret("retired", RETIRED_PUBKEY))];
+    const { wallet } = setupHappyDecode(proofs, 10);
     wallet.checkProofsStates.mockResolvedValue([
       { Y: "y", state: CheckStateEnum.UNSPENT, witness: null },
     ]);
@@ -515,4 +502,96 @@ describe("acceptAccumulatorPayment", () => {
     expect(insertParams[2]).toBe(RETIRED_PUBKEY); // lock_pubkey column
   });
 
+  it("refuses a non-exclusive lock before the mint round-trip, valuation hooks or any write", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const proofs = [
+      makeProof("ok"),
+      makeProof("soon", 5, "keyset-1", p2pkSecret("soon", RECOVERY_PUBKEY, [
+        ["locktime", `${nowSec + 3600}`],
+        ["refund", "02" + "ef".repeat(32)],
+      ])),
+    ];
+    const { wallet } = setupHappyDecode(proofs, 10);
+    const { pool } = makeMockPool();
+    const beforeCommit = vi.fn();
+    const withCommitTx = vi.fn();
+
+    const result = await acceptAccumulatorPayment({
+      cashuToken: "cashuB...",
+      requestId: "req-not-exclusive",
+      mints: [MINT],
+      db: pool as never,
+      dvmId: DVM_ID,
+      lockPubkeys: [RECOVERY_PUBKEY],
+      walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
+      beforeCommit,
+      withCommitTx,
+    });
+
+    expect(result).toMatchObject({ kind: "rejected", code: "lock_not_exclusive" });
+    expect(wallet.checkProofsStates).not.toHaveBeenCalled();
+    expect(beforeCommit).not.toHaveBeenCalled();
+    expect(withCommitTx).not.toHaveBeenCalled();
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("answers a below-floor retry of already-banked proofs as replay_rejected", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const proofs = [makeProof("aged", 5, "keyset-1", p2pkSecret("aged", RECOVERY_PUBKEY, [
+      ["locktime", `${nowSec + 5 * 86_400}`],
+    ]))];
+    const { wallet } = setupHappyDecode(proofs, 5);
+    const { pool } = makeMockPool();
+    vi.mocked(pool.query).mockResolvedValueOnce({ rows: [{ "?column?": 1 }], rowCount: 1 } as never);
+
+    const result = await acceptAccumulatorPayment({
+      cashuToken: "cashuB...",
+      requestId: "req-aged",
+      mints: [MINT],
+      db: pool as never,
+      dvmId: DVM_ID,
+      lockPubkeys: [RECOVERY_PUBKEY],
+      walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
+    });
+
+    expect(result).toMatchObject({ kind: "rejected", code: "replay_rejected" });
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("keeps a disposable-store retry a replay after the clock passes the floor", async () => {
+    const LOOPBACK_MINT = "http://localhost:3338";
+    const store = createDisposableCashuStore();
+    const t0 = Date.now();
+    const lockedFor = (label: string) =>
+      makeProof(label, 5, "keyset-1", p2pkSecret(label, RECOVERY_PUBKEY, [
+        ["locktime", `${Math.floor(t0 / 1000) + 7 * 86_400}`],
+        ["refund", "02" + "ef".repeat(32)],
+      ]));
+    const accept = (proof: Proof, requestId: string) => {
+      const { wallet } = setupHappyDecode([proof], 5);
+      mockVerify.mockReturnValue({ mint: LOOPBACK_MINT, totalMsats: 5000, unit: "sat" });
+      wallet.checkProofsStates.mockResolvedValue([{ Y: "y", state: CheckStateEnum.UNSPENT, witness: null }]);
+      return acceptAccumulatorPayment({
+        cashuToken: "cashuB...",
+        requestId,
+        mints: [LOOPBACK_MINT],
+        disposable: store.accumulator,
+        withDisposableLedger: async () => {},
+        dvmId: DVM_ID,
+        lockPubkeys: [RECOVERY_PUBKEY],
+        walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
+      });
+    };
+    const banked = lockedFor("banked");
+    expect(await accept(banked, "req-banked")).toMatchObject({ kind: "accumulated" });
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(t0 + 36 * 3_600_000);
+      expect(await accept(banked, "req-banked")).toMatchObject({ code: "replay_rejected" });
+      expect(await accept(lockedFor("fresh"), "req-fresh")).toMatchObject({ code: "lock_not_exclusive" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

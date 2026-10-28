@@ -3,13 +3,17 @@ import {
   Amount,
   CheckStateEnum,
   getP2PKExpectedWitnessPubkeys,
+  getSecretData,
+  getSecretKind,
   getTagInt,
+  getTags,
+  parseP2PKSecret,
   type Proof,
   type Wallet,
   verifyDleqIfPresent,
 } from "@cashu/cashu-ts";
 
-import { type LockPubkey, toLockPubkey } from "../../lib/cashu/lock-pubkey";
+import type { LockPubkey } from "../../lib/cashu/lock-pubkey";
 import { verifyCashuToken } from "../../lib/cashu/verify";
 import type { CreditLedgerLike } from "./credit-ledger";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
@@ -18,6 +22,7 @@ import {
   type AccumulatorPool,
   type AccumulatorQuerier,
   AccumulatorReplayError,
+  hasAccumulatedProof,
   insertAccumulatorRows,
 } from "./wallet-accumulator-store";
 
@@ -31,6 +36,7 @@ export type AccumulatorRejectionCode =
   | "missing_lock_pubkey"
   | "not_p2pk_locked"
   | "wrong_lock_pubkey"
+  | "lock_not_exclusive"
   | "proof_not_unspent"
   | "proof_pending"
   | "replay_rejected"
@@ -138,6 +144,151 @@ export function valueCashuFunding(
   };
 }
 
+/**
+ * Shortest NUT-11 refund `locktime`, in seconds from now, that `/v1/info`
+ * advertises as `cashu.min_locktime`. Banked proofs wait for the batch melt,
+ * so a refund path must stay closed for at least this long.
+ */
+export const CASHU_MIN_LOCKTIME_SECONDS = 604_800;
+
+/**
+ * Slack subtracted from {@link CASHU_MIN_LOCKTIME_SECONDS} when enforcing it.
+ * The reference caller locks to `now + max(48h, min_locktime)` and re-sends an
+ * unacknowledged payment for at most 24 hours, so an honest resume still clears
+ * the enforced floor.
+ */
+export const CASHU_LOCKTIME_RESUME_MARGIN_SECONDS = 86_400;
+
+/** The NUT-11 tags a banked proof may carry; any other tag is refused. */
+const P2PK_TAG_KEYS = new Set(["locktime", "refund", "pubkeys", "n_sigs", "sigflag", "n_sigs_refund"]);
+const SINGLE_VALUE_TAG_KEYS = new Set(["locktime", "n_sigs", "sigflag", "n_sigs_refund"]);
+
+/** Outcome of judging one proof secret's NUT-11 spending conditions. */
+export type CashuLockAssessment =
+  | {
+      kind: "exclusive";
+      /** The DVM lock key named by the secret's `data` field. */
+      lockPubkey: LockPubkey;
+    }
+  | {
+      kind: "rejected";
+      code: "not_p2pk_locked" | "wrong_lock_pubkey" | "lock_not_exclusive";
+      message: string;
+      /**
+       * True when the only defect is a refund `locktime` below the floor. That
+       * verdict depends on the clock, so a proof accepted earlier can reach it
+       * on a later retry.
+       */
+      locktimeBelowFloor?: boolean;
+    };
+
+/**
+ * Judge from the secret's structure, independent of the current lock state,
+ * whether only one of `lockPubkeys` can spend the proof until at least
+ * `CASHU_MIN_LOCKTIME_SECONDS - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS` after
+ * `nowSec`, and whether the DVM's melter can sign it and the mint redeem it.
+ * Every key must be a 33-byte compressed hex key: the mint cannot parse an
+ * x-only key and the cashu-ts signer refuses padded or duplicate ones. `data`
+ * matches a DVM key by x coordinate, which is what a BIP-340 signature binds,
+ * so either 02/03 prefix of a DVM key is accepted.
+ */
+export function assessCashuLock(
+  secret: string,
+  lockPubkeys: readonly LockPubkey[],
+  nowSec: number
+): CashuLockAssessment {
+  try {
+    parseP2PKSecret(secret);
+    if (getSecretKind(secret) !== "P2PK") throw new Error("not P2PK");
+  } catch {
+    return { kind: "rejected", code: "not_p2pk_locked", message: "Proof secret is not a NUT-11 P2PK secret." };
+  }
+
+  const dvmKeyFor = (x: string | undefined): LockPubkey | undefined =>
+    x === undefined ? undefined : lockPubkeys.find((pk) => compressedX(pk) === x);
+  const data = getSecretData(secret).data;
+  const dataX = typeof data === "string" ? compressedX(data) : undefined;
+  const lockPubkey = dvmKeyFor(dataX);
+  if (!dataX || !lockPubkey) {
+    return {
+      kind: "rejected",
+      code: "wrong_lock_pubkey",
+      message: "Proof is not locked to one of this DVM's active lock pubkeys, spelled as a 33-byte compressed hex key.",
+    };
+  }
+
+  const notExclusive = (message: string, locktimeBelowFloor?: true): CashuLockAssessment => ({
+    kind: "rejected",
+    code: "lock_not_exclusive",
+    message,
+    ...(locktimeBelowFloor && { locktimeBelowFloor }),
+  });
+  try {
+    // The melter signs through cashu-ts, which parses every key list (refund
+    // keys included) before signing; a secret it cannot parse is unmeltable.
+    // Only its throw is used here: its key list depends on the clock.
+    getP2PKExpectedWitnessPubkeys(secret);
+  } catch (err) {
+    return notExclusive(`Proof carries an unreadable spending condition: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Tags are checked against the canonical shape rather than read leniently:
+  // cashu-ts reads a valueless or malformed tag as absent while the mint can
+  // fail on it, so anything outside this allowlist is refused.
+  const tags = new Map<string, string[]>();
+  for (const tag of getTags(secret) as unknown[]) {
+    if (!Array.isArray(tag) || !tag.every((item) => typeof item === "string")) {
+      return notExclusive("Proof carries a malformed tag.");
+    }
+    const [key, ...values] = tag as string[];
+    if (key === undefined || !P2PK_TAG_KEYS.has(key)) return notExclusive(`Proof carries the unsupported tag ${JSON.stringify(key)}.`);
+    if (tags.has(key)) return notExclusive(`Proof repeats the ${key} tag.`);
+    if (values.length === 0) return notExclusive(`Proof carries a ${key} tag without a value.`);
+    if (SINGLE_VALUE_TAG_KEYS.has(key) && values.length !== 1) return notExclusive(`Proof's ${key} tag must carry exactly one value.`);
+    tags.set(key, values);
+  }
+
+  const sigflag = tags.get("sigflag")?.[0];
+  if (sigflag !== undefined && sigflag !== "SIG_INPUTS") {
+    return notExclusive(`Proof requires sigflag ${sigflag}; this DVM accepts SIG_INPUTS only.`);
+  }
+  const nSigs = tags.get("n_sigs")?.[0];
+  if (nSigs !== undefined && nSigs !== "1") {
+    return notExclusive(`Proof requires n_sigs=${nSigs}; this DVM accepts a single-signature lock only.`);
+  }
+  const mainX = [dataX];
+  for (const key of tags.get("pubkeys") ?? []) {
+    const x = compressedX(key);
+    if (!x || !dvmKeyFor(x)) return notExclusive("Proof's pubkeys tag names a key other than this DVM's lock pubkeys.");
+    if (mainX.includes(x)) return notExclusive("Proof repeats a key across data and pubkeys.");
+    mainX.push(x);
+  }
+  const refundX: string[] = [];
+  for (const key of tags.get("refund") ?? []) {
+    const x = compressedX(key);
+    if (!x) return notExclusive("Proof's refund tag names a key that is not a 33-byte compressed hex key.");
+    if (refundX.includes(x)) return notExclusive("Proof repeats a key in its refund tag.");
+    refundX.push(x);
+  }
+  const nSigsRefund = tags.get("n_sigs_refund")?.[0];
+  if (nSigsRefund !== undefined && !(/^[1-9][0-9]*$/.test(nSigsRefund) && Number(nSigsRefund) <= refundX.length)) {
+    return notExclusive(`Proof's n_sigs_refund ${nSigsRefund} is not a count between 1 and its number of refund keys.`);
+  }
+  const locktimeValue = tags.get("locktime")?.[0];
+  if (locktimeValue !== undefined) {
+    const locktime = /^(0|[1-9][0-9]*)$/.test(locktimeValue) ? Number(locktimeValue) : NaN;
+    if (!Number.isSafeInteger(locktime)) return notExclusive(`Proof's locktime ${locktimeValue} is not a unix-seconds integer.`);
+    const floor = nowSec + CASHU_MIN_LOCKTIME_SECONDS - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS;
+    if (locktime < floor) {
+      return notExclusive(
+        `Proof locktime ${locktime} is earlier than the accepted floor ${floor} (unix seconds).`,
+        true
+      );
+    }
+  }
+  return { kind: "exclusive", lockPubkey };
+}
+
 export async function acceptAccumulatorPayment(
   opts: AccumulatorReceiveOpts
 ): Promise<AccumulatorReceiveResult> {
@@ -194,49 +345,35 @@ export async function acceptAccumulatorPayment(
     paidMsats: valuation.netMsats,
   };
 
-  // Verify every proof has a NUT-11 P2PK authority matching one of the DVM's
-  // active lock pubkeys. `getP2PKExpectedWitnessPubkeys` is
-  // time-sensitive: a plain secret throws, while an unlocked or expired lock
-  // without a refund path yields no expected witness; all three map to
-  // `not_p2pk_locked`. An expired lock with a refund path still yields refund
-  // witnesses and follows the same active-key check as a live lock; no
-  // current or retired-in-grace DVM key maps to `wrong_lock_pubkey`. The same
-  // loop extracts each NUT-11 `locktime` (ms since epoch) for oldest-first
-  // ordering and the expiring-soon monitor.
+  // Judge every proof's lock from its secret's structure before any mint
+  // round-trip or write. The same loop extracts each NUT-11 `locktime` (ms
+  // since epoch) for oldest-first ordering and the expiring-soon monitor.
+  const nowSec = Math.floor(Date.now() / 1000);
   const tExpireMsByIndex: (number | null)[] = [];
   const matchedLockPubkeyByIndex: LockPubkey[] = [];
+  let belowFloorMessage: string | undefined;
   for (const p of proofs) {
-    let allowed: string[];
-    try {
-      allowed = getP2PKExpectedWitnessPubkeys(p.secret);
-    } catch {
-      return {
-        kind: "rejected",
-        code: "not_p2pk_locked",
-        message: "Proof secret is not a NUT-11 P2PK secret.",
-      };
+    const lock = assessCashuLock(p.secret, accepted, nowSec);
+    if (lock.kind === "rejected") {
+      if (!lock.locktimeBelowFloor) return { kind: "rejected", code: lock.code, message: lock.message };
+      belowFloorMessage ??= lock.message;
+      continue;
     }
-    if (allowed.length === 0) {
-      return {
-        kind: "rejected",
-        code: "not_p2pk_locked",
-        message: "Proof is unlocked or the P2PK lock has expired.",
-      };
-    }
-    const allowedNormalised = allowed.map(toLockPubkey);
-    if (opts.disposable && (allowedNormalised.length !== 1 || (getTagInt(p.secret, "n_sigs") ?? 1) !== 1)) {
-      return { kind: "rejected", code: "not_p2pk_locked", message: "Disposable Cashu requires an exclusive single-signature P2PK lock." };
-    }
-    const match = accepted.find((pk) => allowedNormalised.includes(pk));
-    if (!match) {
-      return {
-        kind: "rejected",
-        code: "wrong_lock_pubkey",
-        message: "Proof is not locked to one of this DVM's active lock pubkeys.",
-      };
-    }
-    matchedLockPubkeyByIndex.push(match);
+    matchedLockPubkeyByIndex.push(lock.lockPubkey);
     tExpireMsByIndex.push(parseNut11LocktimeMs(p.secret));
+  }
+  if (belowFloorMessage) {
+    // The floor moves with the clock, so a retry of a payment banked earlier
+    // can fall below it. Answer that retry as the replay it is, letting the
+    // route recover the original job, instead of as a fresh refusal.
+    const secrets = proofs.map((p) => p.secret);
+    const banked = opts.disposable
+      ? await opts.disposable.hasAccepted(secrets)
+      : opts.db
+        ? await hasAccumulatedProof(opts.db, opts.dvmId, secrets)
+        : false;
+    if (banked) return replayRejected();
+    return { kind: "rejected", code: "lock_not_exclusive", message: belowFloorMessage };
   }
 
   // NUT-7 checkstate as unconditional observability + PENDING-aware fast-fail.
@@ -328,13 +465,7 @@ export async function acceptAccumulatorPayment(
       await insertAccumulatorRows(opts.db, insertArgs);
     }
   } catch (err) {
-    if (err instanceof AccumulatorReplayError) {
-      return {
-        kind: "rejected",
-        code: "replay_rejected",
-        message: "Proofs or request id already accepted at this DVM.",
-      };
-    }
+    if (err instanceof AccumulatorReplayError) return replayRejected();
     throw err;
   }
 
@@ -348,6 +479,14 @@ export async function acceptAccumulatorPayment(
   };
 }
 
+function replayRejected(): AccumulatorReceiveResult {
+  return {
+    kind: "rejected",
+    code: "replay_rejected",
+    message: "Proofs or request id already accepted at this DVM.",
+  };
+}
+
 // Locktime extraction follows NUT-11 validation; absent or unreadable tags return null.
 function parseNut11LocktimeMs(secret: string): number | null {
   try {
@@ -356,4 +495,10 @@ function parseNut11LocktimeMs(secret: string): number | null {
   } catch {
     return null;
   }
+}
+
+// The x coordinate of an exactly 66-hex compressed (02/03-prefixed) key;
+// undefined for any other spelling, including x-only and padded keys.
+function compressedX(raw: string): string | undefined {
+  return /^0[23][0-9a-fA-F]{64}$/.test(raw) ? raw.slice(2).toLowerCase() : undefined;
 }
