@@ -52,10 +52,14 @@ const signedSchema = z.object({
 const PRIVKEY = new Uint8Array(32).fill(7);
 const OTHER_PRIVKEY = new Uint8Array(32).fill(9);
 
-/** First accept succeeds; every later accept collides on the UNIQUE constraint. */
+/**
+ * First accept succeeds; every later accept collides on the UNIQUE constraint
+ * and reports the proofs bound to the first accept's request id.
+ */
 function acceptOnceThenReplay(): void {
   mockAccept.mockImplementation(() => {
     const call = mockAccept.mock.calls.length;
+    const firstRequestId = mockAccept.mock.calls[0]?.[0].requestId;
     return Promise.resolve(
       call === 1
         ? {
@@ -70,6 +74,7 @@ function acceptOnceThenReplay(): void {
             kind: "rejected" as const,
             code: "replay_rejected" as const,
             message: "Proofs or request id already accepted at this DVM.",
+            acceptedRequestId: firstRequestId,
           }
     );
   });
@@ -228,6 +233,28 @@ describe("replayed paid submit returns the original job", () => {
     expect(body.job_id).toBeUndefined();
     expectNoJobIdentity(replay);
     expect(body.job_token).toBeUndefined();
+  });
+
+  it("refuses a replay whose proofs were accepted under a different request id than the header names", async () => {
+    const started = await startServer({ signed: false });
+    const body = { capability: "do", data: { action: "publish" } };
+    const first = await submit(started.url, body);
+    expect(first.status).toBe(200);
+    mockAccept.mockReset();
+    mockAccept.mockResolvedValue({
+      kind: "rejected",
+      code: "replay_rejected",
+      message: "Proofs or request id already accepted at this DVM.",
+      acceptedRequestId: "req-other-uuid",
+    });
+
+    // The header and body name the paid job, but the proofs are bound elsewhere.
+    const replay = await submit(started.url, body);
+    const refused = (await replay.json()) as SubmitBody;
+    expect(replay.status).toBe(409);
+    expect(refused.error).toBe("replay_rejected");
+    expect(refused.job_token).toBeUndefined();
+    expectNoJobIdentity(replay);
   });
 
   it("keeps the 409 when the request id paid for no job here", async () => {

@@ -85,9 +85,11 @@ export interface Secp256k1AuthOpts {
    * unsigned calls. Signed callers keep every rail.
    * Unsigned jobs run as the anonymous requester: the handler sees no
    * `ctx.auth`, the input omits the envelope fields, prepaid credit and
-   * `request_id` recovery are refused, a payer whose response is lost cannot
-   * recover the job by retrying (the retry is refused), and money released by a failed job lands on
-   * the shared anonymous requester. A dynamic-priced capability's `onQuote`
+   * `request_id` recovery are refused, a payer whose response is lost recovers
+   * the job only by retrying with the same Cashu proofs, `X-Cashu-Request-Id`
+   * and body (a request id belongs to the first proofs banked under it, and a
+   * signed caller's job never recovers unsigned), and money released by a failed job
+   * lands on the shared anonymous requester. A dynamic-priced capability's `onQuote`
    * handler runs for these anonymous callers with no `callerPubkey`, so an
    * unauthenticated request can now trigger it, including any upstream calls
    * it makes. The capability input must be a plain

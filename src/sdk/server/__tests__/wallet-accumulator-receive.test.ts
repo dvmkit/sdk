@@ -20,6 +20,7 @@ vi.mock("@cashu/cashu-ts", async (importOriginal) => {
 const { acceptAccumulatorPayment, valueCashuFunding } =
   await import("../wallet-accumulator-receive");
 const { createDisposableCashuStore } = await import("../disposable-cashu-store");
+const { hashProofSecret } = await import("../wallet-accumulator-store");
 
 const mockVerify = vi.mocked(cashuVerify.verifyCashuToken);
 const mockVerifyDleq = vi.mocked(cashuTs.verifyDleqIfPresent);
@@ -456,6 +457,11 @@ describe("acceptAccumulatorPayment", () => {
     ]);
 
     const { pool } = makeMockPool({ insertReplay: true });
+    // The post-rollback lookup finds the proof banked under this request id.
+    vi.mocked(pool.query).mockResolvedValueOnce({
+      rows: [{ proof_secret_hash: hashProofSecret(proofs[0]!.secret), request_id: "req-replay" }],
+      rowCount: 1,
+    } as never);
 
     const result = await acceptAccumulatorPayment({
       cashuToken: "cashuB...",
@@ -542,7 +548,10 @@ describe("acceptAccumulatorPayment", () => {
     ]))];
     const { wallet } = setupHappyDecode(proofs, 5);
     const { pool } = makeMockPool();
-    vi.mocked(pool.query).mockResolvedValueOnce({ rows: [{ "?column?": 1 }], rowCount: 1 } as never);
+    vi.mocked(pool.query).mockResolvedValueOnce({
+      rows: [{ proof_secret_hash: hashProofSecret(proofs[0]!.secret), request_id: "req-aged" }],
+      rowCount: 1,
+    } as never);
 
     const result = await acceptAccumulatorPayment({
       cashuToken: "cashuB...",
@@ -554,8 +563,39 @@ describe("acceptAccumulatorPayment", () => {
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
-    expect(result).toMatchObject({ kind: "rejected", code: "replay_rejected" });
+    expect(result).toMatchObject({ kind: "rejected", code: "replay_rejected", acceptedRequestId: "req-aged" });
     expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("refuses a token carrying the same proof twice as invalid_token on either store, before any write", async () => {
+    const LOOPBACK_MINT = "http://localhost:3338";
+    const proof = makeProof("twice", 5);
+    const { wallet } = setupHappyDecode([proof, { ...proof }], 10);
+    mockVerify.mockReturnValue({ mint: LOOPBACK_MINT, totalMsats: 10_000, unit: "sat" });
+    const { pool } = makeMockPool();
+    const store = createDisposableCashuStore();
+    const common = {
+      cashuToken: "cashuB...",
+      requestId: "req-twice",
+      mints: [LOOPBACK_MINT],
+      dvmId: DVM_ID,
+      lockPubkeys: [RECOVERY_PUBKEY],
+      walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
+    };
+
+    const onPostgres = await acceptAccumulatorPayment({ ...common, db: pool as never });
+    const withLedger = vi.fn();
+    const inMemory = await acceptAccumulatorPayment({ ...common, disposable: store.accumulator, withDisposableLedger: withLedger });
+
+    for (const result of [onPostgres, inMemory]) {
+      expect(result).toMatchObject({ kind: "rejected", code: "invalid_token" });
+    }
+    expect(pool.connect).not.toHaveBeenCalled();
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(withLedger).not.toHaveBeenCalled();
+    expect(wallet.checkProofsStates).not.toHaveBeenCalled();
+    // Nothing was claimed: the same request id still takes a well-formed payment.
+    expect(await store.accumulator.acceptedRequestIds([proof.secret])).toEqual([undefined]);
   });
 
   it("keeps a disposable-store retry a replay after the clock passes the floor", async () => {
@@ -588,7 +628,7 @@ describe("acceptAccumulatorPayment", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(t0 + 36 * 3_600_000);
-      expect(await accept(banked, "req-banked")).toMatchObject({ code: "replay_rejected" });
+      expect(await accept(banked, "req-banked")).toMatchObject({ code: "replay_rejected", acceptedRequestId: "req-banked" });
       expect(await accept(lockedFor("fresh"), "req-fresh")).toMatchObject({ code: "lock_not_exclusive" });
     } finally {
       vi.useRealTimers();

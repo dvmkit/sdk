@@ -228,21 +228,48 @@ export async function insertAccumulatorRows(
 }
 
 /**
- * Whether any of these proof secrets is already banked for `dvmId`, i.e.
- * whether {@link insertAccumulatorRows} would collide on
+ * Claim `requestId` at `dvmId` for the proof set about to be inserted on `tx`.
+ * A request id belongs to the first proof set banked under it, so this throws
+ * {@link AccumulatorReplayError} when any row already carries it. The
+ * transaction-scoped advisory lock serialises concurrent first claims, so two
+ * different proof sets cannot both bank under one request id. Run it inside
+ * the insert's transaction, before the insert.
+ */
+export async function claimAccumulatorRequestId(
+  tx: AccumulatorQuerier,
+  dvmId: string,
+  requestId: string
+): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    JSON.stringify(["wallet_accumulator_request", dvmId, requestId]),
+  ]);
+  const { rows } = await tx.query(
+    `SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1 AND request_id = $2 LIMIT 1`,
+    [dvmId, requestId]
+  );
+  if (rows.length > 0) throw new AccumulatorReplayError(dvmId, requestId);
+}
+
+/**
+ * The request id each of these proof secrets was accepted under at `dvmId`,
+ * index-aligned with `secrets`; `undefined` where a secret is not banked, i.e.
+ * where {@link insertAccumulatorRows} would not collide on
  * `UNIQUE(dvm_id, proof_secret_hash)`.
  */
-export async function hasAccumulatedProof(
+export async function acceptedRequestIds(
   db: AccumulatorQuerier,
   dvmId: string,
   secrets: string[]
-): Promise<boolean> {
-  if (secrets.length === 0) return false;
-  const { rows } = await db.query(
-    `SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1 AND proof_secret_hash = ANY($2::text[]) LIMIT 1`,
-    [dvmId, secrets.map(hashProofSecret)]
+): Promise<(string | undefined)[]> {
+  if (secrets.length === 0) return [];
+  const hashes = secrets.map(hashProofSecret);
+  const { rows } = await db.query<{ proof_secret_hash: string; request_id: string }>(
+    `SELECT proof_secret_hash, request_id FROM wallet_accumulator
+      WHERE dvm_id = $1 AND proof_secret_hash = ANY($2::text[])`,
+    [dvmId, hashes]
   );
-  return rows.length > 0;
+  const byHash = new Map(rows.map((row) => [row.proof_secret_hash, row.request_id]));
+  return hashes.map((hash) => byHash.get(hash));
 }
 
 /**

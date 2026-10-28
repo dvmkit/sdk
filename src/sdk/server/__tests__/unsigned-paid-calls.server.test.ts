@@ -174,11 +174,11 @@ describe.skipIf(!live)("secp256k1Auth({ allowUnsignedPaid: true }) on a real Cas
     expect(job.job_token).toMatch(/^[0-9a-f]{64}$/);
     expect(job.summary).toBe("anonymous:hello");
 
-    // A retry cannot recover an unsigned job: recovery is keyed on the
-    // caller-chosen request id, which does not prove who paid.
+    // A retry with the same proofs, request id and body recovers the job;
+    // the same payment under a different body does not.
     const retry = await submit(host, unsigned, token, requestId);
-    expect(retry.status).toBe(409);
-    expect(JSON.stringify(await retry.json())).not.toContain(job.job_token);
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token });
     const other = await submit(host, { capability: "paid", data: { text: "other" } }, token, requestId);
     expect(other.status).toBe(409);
 
@@ -186,25 +186,6 @@ describe.skipIf(!live)("secp256k1Auth({ allowUnsignedPaid: true }) on a real Cas
       headers: { "X-Job-Token": job.job_token },
     });
     expect(status.status).toBe(200);
-  }, 30_000);
-
-  it("does not hand a victim's job to a caller replaying their own spent proof with the victim's request id and body", async () => {
-    const host = await startHost(true);
-    const [victimToken, attackerToken] = await lockedTokens(host, 16, 2);
-    const victimBody = { capability: "paid", data: { text: "victim" } };
-    const victimRequestId = randomUUID();
-    const victim = await submit(host, victimBody, victimToken, victimRequestId);
-    expect(victim.status).toBe(200);
-    const victimJob = (await victim.json()) as { job_id: string; job_token: string };
-
-    const own = await submit(host, { capability: "paid", data: { text: "attacker" } }, attackerToken);
-    expect(own.status).toBe(200);
-
-    const hijack = await submit(host, victimBody, attackerToken, victimRequestId);
-    expect(hijack.status).toBe(409);
-    const text = await hijack.text();
-    expect(text).not.toContain(victimJob.job_token);
-    expect(text).not.toContain(victimJob.job_id);
   }, 30_000);
 
   it("refuses an unsigned free request exactly as a signed-only DVM does", async () => {

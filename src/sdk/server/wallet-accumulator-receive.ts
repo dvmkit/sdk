@@ -22,7 +22,8 @@ import {
   type AccumulatorPool,
   type AccumulatorQuerier,
   AccumulatorReplayError,
-  hasAccumulatedProof,
+  acceptedRequestIds,
+  claimAccumulatorRequestId,
   insertAccumulatorRows,
 } from "./wallet-accumulator-store";
 
@@ -40,6 +41,7 @@ export type AccumulatorRejectionCode =
   | "proof_not_unspent"
   | "proof_pending"
   | "replay_rejected"
+  | "request_id_reused"
   | "mint_unreachable"
   | "invalid_token";
 
@@ -78,6 +80,12 @@ export type AccumulatorReceiveResult =
       kind: "rejected";
       code: AccumulatorRejectionCode;
       message: string;
+      /**
+       * On `replay_rejected`: the one request id every presented proof was
+       * already accepted under. Absent when only some proofs were accepted or
+       * they were accepted under different request ids.
+       */
+      acceptedRequestId?: string;
     };
 
 export interface AccumulatorReceiveOpts {
@@ -323,6 +331,9 @@ export async function acceptAccumulatorPayment(
     if (meta.unit !== "sat" || proofs.length === 0) {
       throw new Error("Cashu payment requires nonempty sat proofs.");
     }
+    if (new Set(proofs.map((proof) => proof.secret)).size !== proofs.length) {
+      throw new Error("Cashu payment carries the same proof more than once.");
+    }
     for (const proof of proofs) {
       if (!proof.dleq || !verifyDleqIfPresent(proof, wallet.getKeyset(proof.id))) {
         throw new Error(
@@ -366,13 +377,8 @@ export async function acceptAccumulatorPayment(
     // The floor moves with the clock, so a retry of a payment banked earlier
     // can fall below it. Answer that retry as the replay it is, letting the
     // route recover the original job, instead of as a fresh refusal.
-    const secrets = proofs.map((p) => p.secret);
-    const banked = opts.disposable
-      ? await opts.disposable.hasAccepted(secrets)
-      : opts.db
-        ? await hasAccumulatedProof(opts.db, opts.dvmId, secrets)
-        : false;
-    if (banked) return replayRejected();
+    const banked = await acceptedUnder(opts, proofs);
+    if (banked.some((id) => id !== undefined)) return replayRejected(banked);
     return { kind: "rejected", code: "lock_not_exclusive", message: belowFloorMessage };
   }
 
@@ -422,9 +428,10 @@ export async function acceptAccumulatorPayment(
 
   await opts.beforeCommit?.(acceptedValue);
 
-  // Persist. UNIQUE(dvm_id, request_id, proof_secret) catches same-call replay;
+  // Persist. A request id belongs to the first proof set banked under it, so
+  // any other proofs under a used request id are refused before the insert;
   // UNIQUE(dvm_id, proof_secret_hash) catches same-proof under a fresh
-  // request_id. Either collision surfaces as AccumulatorReplayError.
+  // request_id. Each surfaces as AccumulatorReplayError, and nothing is kept.
   //
   // With `withCommitTx`, the insert and the callback share one
   // caller-visible transaction: proofs commit iff the ledger credit commits.
@@ -443,13 +450,15 @@ export async function acceptAccumulatorPayment(
       await opts.disposable.commit(opts.requestId, proofs, (ledger) => account(ledger, acceptedValue));
     } else if (!opts.db) {
       throw new Error("Cashu accumulator requires a storage backend.");
-    } else if (opts.withCommitTx) {
-      const withCommitTx = opts.withCommitTx;
+    } else {
       const client = await opts.db.connect();
       try {
         await client.query("BEGIN");
+        // Under a REPEATABLE READ pool default the claim's read would miss a concurrent claim's commit.
+        await client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        await claimAccumulatorRequestId(client, opts.dvmId, opts.requestId);
         await insertAccumulatorRows(opts.db, { ...insertArgs, tx: client });
-        await withCommitTx(client, acceptedValue);
+        await opts.withCommitTx?.(client, acceptedValue);
         await client.query("COMMIT");
       } catch (err) {
         try {
@@ -461,11 +470,15 @@ export async function acceptAccumulatorPayment(
       } finally {
         client.release();
       }
-    } else {
-      await insertAccumulatorRows(opts.db, insertArgs);
     }
   } catch (err) {
-    if (err instanceof AccumulatorReplayError) return replayRejected();
+    if (err instanceof AccumulatorReplayError) {
+      const banked = await acceptedUnder(opts, proofs);
+      // None of these proofs is banked, so the collision is the request id
+      // alone: another proof set already holds it and nothing was kept.
+      if (banked.every((id) => id === undefined)) return requestIdReused();
+      return replayRejected(banked);
+    }
     throw err;
   }
 
@@ -479,11 +492,32 @@ export async function acceptAccumulatorPayment(
   };
 }
 
-function replayRejected(): AccumulatorReceiveResult {
+async function acceptedUnder(
+  opts: AccumulatorReceiveOpts,
+  proofs: Proof[]
+): Promise<(string | undefined)[]> {
+  const secrets = proofs.map((p) => p.secret);
+  if (opts.disposable) return await opts.disposable.acceptedRequestIds(secrets);
+  if (opts.db) return await acceptedRequestIds(opts.db, opts.dvmId, secrets);
+  return secrets.map(() => undefined);
+}
+
+function requestIdReused(): AccumulatorReceiveResult {
+  return {
+    kind: "rejected",
+    code: "request_id_reused",
+    message: "This request id already carries a different payment at this DVM; these proofs were not accepted.",
+  };
+}
+
+function replayRejected(accepted: (string | undefined)[]): AccumulatorReceiveResult {
+  const [first] = accepted;
+  const bound = first !== undefined && accepted.every((id) => id === first);
   return {
     kind: "rejected",
     code: "replay_rejected",
     message: "Proofs or request id already accepted at this DVM.",
+    ...(bound && { acceptedRequestId: first }),
   };
 }
 

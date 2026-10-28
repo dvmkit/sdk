@@ -254,7 +254,7 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
     try {
       vi.setSystemTime(t0 + 36 * 60 * 60 * 1000);
       const retry = await accept({ proofs, requestId, withCommitTx: commit });
-      expect(retry.kind === "rejected" && retry.code).toBe("replay_rejected");
+      expect(retry).toMatchObject({ kind: "rejected", code: "replay_rejected", acceptedRequestId: requestId });
       // The same shape from a payment never banked is refused at this clock.
       const fresh = await accept({ proofs: [makeProof(10, [["locktime", `${Math.floor(t0 / 1000) + 7 * 86_400}`]])], requestId: "atom-aged-fresh" });
       expect(fresh.kind === "rejected" && fresh.code).toBe("lock_not_exclusive");
@@ -264,5 +264,91 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
     expect((await ledger.get(creditId))?.lastLedgerSeq).toBe(1);
     const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
     expect(rows.rowCount).toBe(1);
+  });
+
+  it("names the replay's request id only when every presented proof was accepted under it", async () => {
+    const [a, b] = [makeProof(10), makeProof(10)];
+    expect((await accept({ proofs: [a], requestId: "atom-bind-a" })).kind).toBe("accumulated");
+    expect((await accept({ proofs: [b], requestId: "atom-bind-b" })).kind).toBe("accumulated");
+
+    const own = await accept({ proofs: [a], requestId: "atom-bind-b" });
+    expect(own).toMatchObject({ code: "replay_rejected", acceptedRequestId: "atom-bind-a" });
+    const mixed = await accept({ proofs: [a, b], requestId: "atom-bind-a" });
+    expect(mixed).toMatchObject({ code: "replay_rejected" });
+    expect(mixed).not.toHaveProperty("acceptedRequestId");
+    const partial = await accept({ proofs: [a, makeProof(10)], requestId: "atom-bind-a" });
+    expect(partial).toMatchObject({ code: "replay_rejected" });
+    expect(partial).not.toHaveProperty("acceptedRequestId");
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
+    expect(rows.rowCount).toBe(2);
+  });
+
+  it("refuses other proofs under a request id another proof set already holds, keeping nothing", async () => {
+    const requestId = "atom-claim";
+    const creditId = `imp:cashu:${requestId}`;
+    const commit: NonNullable<Parameters<typeof acceptAccumulatorPayment>[0]["withCommitTx"]> = async (tx, accepted) => {
+      await fundCredit(ledger, { creditId, callerPubkey: CALLER, currency: "usd", amountMicro: accepted.paidMsats, expiryMs: FUTURE_MS, tx });
+      await ledger.draw({ creditId, drawId: requestId, amountMicro: accepted.paidMsats, tx });
+    };
+    expect((await accept({ proofs: [makeProof(10)], requestId, withCommitTx: commit })).kind).toBe("accumulated");
+
+    const withLedger = vi.fn();
+    const fresh = await accept({ proofs: [makeProof(10)], requestId, withCommitTx: withLedger });
+    expect(fresh).toMatchObject({ kind: "rejected", code: "request_id_reused" });
+    expect(withLedger).not.toHaveBeenCalled();
+    const bare = await accept({ proofs: [makeProof(10)], requestId });
+    expect(bare).toMatchObject({ kind: "rejected", code: "request_id_reused" });
+
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
+    expect(rows.rowCount).toBe(1);
+    expect((await ledger.get(creditId))?.lastLedgerSeq).toBe(1);
+  });
+
+  it("lets only one of two concurrent proof sets claim a new request id", async () => {
+    const requestId = "atom-claim-race";
+    const results = await Promise.all([
+      accept({ proofs: [makeProof(10)], requestId }),
+      accept({ proofs: [makeProof(10)], requestId }),
+    ]);
+    expect(results.map((result) => result.kind).sort()).toEqual(["accumulated", "rejected"]);
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1 AND request_id = $2", [DVM_ID, requestId]);
+    expect(rows.rowCount).toBe(1);
+  });
+
+  it("refuses a token carrying the same proof twice as invalid_token and keeps nothing", async () => {
+    const proof = makeProof(10);
+    const result = await accept({ proofs: [proof, { ...proof }], requestId: "atom-twice" });
+    expect(result).toMatchObject({ kind: "rejected", code: "invalid_token" });
+    const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1", [DVM_ID]);
+    expect(rows.rowCount).toBe(0);
+    expect((await accept({ proofs: [proof], requestId: "atom-twice" })).kind).toBe("accumulated");
+  });
+
+  it("keeps the request id claim exclusive on a pool that defaults to REPEATABLE READ", async () => {
+    const repeatable = new pg.Pool({
+      connectionString: DATABASE_URL,
+      options: "-c default_transaction_isolation=repeatable\\ read",
+    });
+    try {
+      const requestId = "atom-claim-rr";
+      const acceptOn = (proofs: Proof[]) => {
+        mockVerify.mockReturnValue({ mint: MINT, totalMsats: 10_000, unit: "sat" });
+        return acceptAccumulatorPayment({
+          cashuToken: "cashuAtomicity",
+          requestId,
+          mints: [MINT],
+          db: repeatable,
+          dvmId: DVM_ID,
+          lockPubkeys: [LOCK_PUBKEY],
+          walletProvider: (() => Promise.resolve(walletFor(proofs))) as never,
+        });
+      };
+      const results = await Promise.all([acceptOn([makeProof(10)]), acceptOn([makeProof(10)])]);
+      expect(results.map((result) => result.kind).sort()).toEqual(["accumulated", "rejected"]);
+      const rows = await pool.query("SELECT 1 FROM wallet_accumulator WHERE dvm_id = $1 AND request_id = $2", [DVM_ID, requestId]);
+      expect(rows.rowCount).toBe(1);
+    } finally {
+      await repeatable.end();
+    }
   });
 });
