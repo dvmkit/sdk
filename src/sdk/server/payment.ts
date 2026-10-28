@@ -2324,6 +2324,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     hint: "Re-fetch this service's current lock key from /v1/info and lock a fresh token to it.",
     retryable: false,
   },
+  lock_not_exclusive: {
+    display:
+      "The payment token's lock would let a key other than this service's spend it, so it wasn't accepted. Nothing was charged.",
+    hint: "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key. Use only the locktime, refund, pubkeys, n_sigs, sigflag and n_sigs_refund tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys, and any locktime at least cashu.min_locktime minus 24 hours in the future.",
+    retryable: false,
+  },
   proof_not_unspent: {
     display: "The payment token has already been spent. Nothing was charged.",
     hint: "Those funds are gone; pay with a fresh token.",

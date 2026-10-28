@@ -11,6 +11,8 @@ export interface DisposableCashuCommit {
     proofs: Proof[],
     account: (ledger: CreditLedgerLike) => Promise<void>
   ): Promise<void>;
+  /** Whether any of these proof secrets has already been committed. */
+  hasAccepted(secrets: string[]): Promise<boolean>;
 }
 
 /** A process-local, test-funds-only store. Never substitutes for durable production storage. */
@@ -58,6 +60,9 @@ export function createDisposableCashuStore(): {
           requests.add(requestId);
           for (const secret of incoming) secrets.add(secret);
         });
+      },
+      hasAccepted(incoming) {
+        return exclusive(() => Promise.resolve(incoming.some((secret) => secrets.has(secret))));
       },
     },
   };

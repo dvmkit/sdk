@@ -8,6 +8,7 @@ import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
+import { CASHU_MIN_LOCKTIME_SECONDS } from "./wallet-accumulator-receive";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import type { Context } from "hono";
@@ -2491,7 +2492,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         mints,
         lock_pubkeys: activePubkeySet(active),
         lock_pubkey_grace_seconds: this.graceSeconds(),
-        min_locktime: 604800,
+        min_locktime: CASHU_MIN_LOCKTIME_SECONDS,
         canonical_id: this.opts.canonicalDvmId ?? this.opts.dvmId ?? null,
       };
     }

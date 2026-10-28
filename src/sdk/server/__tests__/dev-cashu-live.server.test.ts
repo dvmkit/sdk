@@ -64,4 +64,41 @@ describe.skipIf(!live)("real disposable Cashu host", () => {
       expect(restarted.status).toBe(402);
     } finally { await running.close(); }
   }, 30000);
+  it("refuses a lock whose refund path opens too soon, on the wire with its copy", async () => {
+    const descriptor = configureDVM({ name: "dev-lock", capability: "test", tag: "test",
+      price: "$0.016", onJob(ctx) { ctx.complete("paid"); } });
+    const running = await serve(descriptor, { devMode: true, port: 0, env: {}, mints: [LOCAL_MINT_URL],
+      fx: { fetch: async () => ({ rates: { usd: 100000 }, as_of: new Date().toISOString() }), supportedCurrencies: () => ["usd"] } });
+    try {
+      const info = await (await fetch(`${running.url}/v1/info`)).json() as { cashu: { lock_pubkeys: string[]; min_locktime: number } };
+      expect(info.cashu.min_locktime).toBe(604800);
+      const wallet = new Wallet(LOCAL_MINT_URL);
+      await wallet.loadMint();
+      const quote = await wallet.createMintQuoteBolt11(32);
+      let paid = await wallet.checkMintQuoteBolt11(quote.quote);
+      for (let n = 0; paid.state !== "PAID" && n < 100; n++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        paid = await wallet.checkMintQuoteBolt11(quote.quote);
+      }
+      const minted = await wallet.mintProofsBolt11(32, paid);
+      const preview = await wallet.ops.send(16, minted).asP2PK({
+        pubkey: info.cashu.lock_pubkeys[0]!,
+        locktime: Math.floor(Date.now() / 1000) + 3600,
+        refundKeys: ["02" + "ef".repeat(32)],
+      }).includeFees(true).prepare();
+      const swapped = await wallet.completeSwap(preview);
+      const response = await fetch(`${running.url}/v1/job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Cashu": getEncodedToken({ mint: LOCAL_MINT_URL, proofs: swapped.send }), "X-Cashu-Request-Id": randomUUID() },
+        body: JSON.stringify({ capability: "test" }),
+      });
+      expect(response.status).toBe(402);
+      const body = await response.json() as { error: string; display: string; hint: string; retryable: boolean };
+      expect(body).toMatchObject({ error: "lock_not_exclusive", retryable: false });
+      // The payer must learn which lock is accepted: the first advertised key, refund no sooner than the floor.
+      expect(body.display).toContain("Nothing was charged");
+      expect(body.hint).toContain("cashu.lock_pubkeys[0]");
+      expect(body.hint).toContain("cashu.min_locktime minus 24 hours");
+    } finally { await running.close(); }
+  }, 30000);
 });

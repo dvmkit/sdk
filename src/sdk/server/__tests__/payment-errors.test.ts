@@ -60,6 +60,7 @@ const EXPECTED_RETRYABLE: Record<PaymentErrorCode, boolean> = {
   invalid_token: false,
   not_p2pk_locked: false,
   wrong_lock_pubkey: false,
+  lock_not_exclusive: false,
   proof_not_unspent: false,
   mint_unreachable: true,
   proof_pending: true,
