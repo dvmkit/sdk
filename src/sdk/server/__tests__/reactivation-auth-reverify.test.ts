@@ -30,7 +30,7 @@ const AUTH_DOMAIN = {
   capability: "do"
 } as const;
 
-function buildManager(schema: typeof sampleSchema = sampleSchema): {
+function buildManager(schema: typeof sampleSchema = sampleSchema, allowUnsignedPaid = false): {
   jm: JobManager<Record<string, unknown>, typeof sampleSchema>;
   signer: ReturnType<typeof createSignedRequestVerifier<z.infer<typeof sampleSchema>>>;
 } {
@@ -44,7 +44,7 @@ function buildManager(schema: typeof sampleSchema = sampleSchema): {
     onJob(ctx) {
       ctx.complete(`ok:${ctx.auth?.pubkey ?? "missing"}`);
     },
-    auth: secp256k1Auth()
+    auth: secp256k1Auth({ allowUnsignedPaid })
   });
   const jm = new JobManager(descriptor, {
     env: {},
@@ -345,6 +345,56 @@ describe("JobManager.reactivateJob re-verifies persisted auth envelope", () => {
     try {
       const record = seedRecord(""); // empty input string
       expect(() => jm.reactivateJob(record)).toThrow(ReactivationAuthSchemaError);
+    } finally {
+      jm.shutdown();
+    }
+  });
+
+  it("reactivates an unsigned paid job without a signature when the scheme allows it", () => {
+    // A suspended unsigned job resumed by a mid-job payment persists no
+    // envelope; demanding one would fail every such resume.
+    const { jm } = buildManager(sampleSchema, true);
+    try {
+      const record = seedRecord(JSON.stringify({ action: "publish" }), { authRequestPath: undefined });
+      const { sdkCtx } = jm.reactivateJob(record);
+      expect(sdkCtx.auth).toBeUndefined();
+      expect(sdkCtx.input).toEqual({ action: "publish" });
+    } finally {
+      jm.shutdown();
+    }
+  });
+
+  it("refuses a signed row whose envelope was stripped and payload rewritten, with the option on", () => {
+    // The row still records the signer's pubkey and route, so it was written as
+    // a signed job; dropping the envelope must not turn it into an unsigned one.
+    const { jm, signer } = buildManager(sampleSchema, true);
+    try {
+      const signed = signer.signRequest(PRIVKEY, { action: "publish" });
+      const record = seedRecord(JSON.stringify({ action: "delete-everything" }), {
+        requesterPubkey: signed.pubkey,
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() => jm.reactivateJob(record)).toThrow();
+      } finally {
+        warn.mockRestore();
+      }
+    } finally {
+      jm.shutdown();
+    }
+  });
+
+  it("still re-verifies a persisted envelope when the scheme allows unsigned paid jobs", () => {
+    const { jm, signer } = buildManager(sampleSchema, true);
+    try {
+      const signed = signer.signRequest(PRIVKEY, { action: "publish" });
+      const record = seedRecord(JSON.stringify({ ...signed, pubkey: "f".repeat(64) }));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() => jm.reactivateJob(record)).toThrow(SignedRequestError);
+      } finally {
+        warn.mockRestore();
+      }
     } finally {
       jm.shutdown();
     }

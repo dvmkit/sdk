@@ -187,6 +187,7 @@ import type {
 } from "./revenue-reporter";
 import type { CanonicalEnvelope } from "./signed-request";
 import { SignedRequestError, signedRequestInput } from "./signed-request";
+import { carriesCreditFields, unsignedInputSchema } from "./unsigned-request";
 import {
   handleTempoCloseEvent,
   parseTempoCloseEventLocator,
@@ -2393,7 +2394,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       name: this.descriptor.name,
       description: this.descriptor.description || undefined,
       tags: this.descriptor.tags,
-      auth: this.descriptor.auth ? [this.descriptor.auth.id] : ["none"],
+      auth: !this.descriptor.auth
+        ? ["none"]
+        : this.descriptor.auth.allowUnsignedPaid
+          ? [this.descriptor.auth.id, "none"]
+          : [this.descriptor.auth.id],
       ...(this.authAudience ? { auth_audience: this.authAudience } : {}),
       protocol_version: 1,
       sdk_sha: this.opts.env.GIT_SHA ?? "unknown",
@@ -2924,6 +2929,31 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
+   * The error the signed path raises for this envelope-free body, so a refused
+   * unsigned request reads exactly as it does on a DVM without the option.
+   */
+  private unsignedRequestRefusal(
+    c: Context<AppEnv>,
+    schema: unknown,
+    body: { input?: string; data?: unknown },
+    capabilityName: string
+  ): SignedRequestError {
+    try {
+      if (this.descriptor.auth && isZodSchema(schema)) {
+        this.descriptor.auth.checkAuth(
+          schema,
+          signedRequestInput(body),
+          this.signedRequestDomain(c, capabilityName)
+        );
+      }
+    } catch (err) {
+      if (err instanceof SignedRequestError) return err;
+      throw err;
+    }
+    return new SignedRequestError("signed request required", "signature_invalid");
+  }
+
+  /**
    * On authenticated DVMs, envelope-only parse failures defer to auth
    * (401 signature_invalid). Builder input issues remain 400 invalid_input.
    * Auth reparses the same schema/raw input; a backstop refuses disagreement.
@@ -3068,6 +3098,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const capabilityResult = this.requireCapabilityFromBody(c, body.capability);
     if ("error" in capabilityResult) return capabilityResult.error;
     const capabilityName = capabilityResult.name;
+    // No envelope field on a DVM that allows it: authenticate nothing, require
+    // a per-call payment below, and run as the anonymous requester.
+    const unsignedPaid = this.jobManager.unsignedPaidInput(body, capabilityName);
+    if (unsignedPaid && publicRequestId) {
+      return c.json(
+        {
+          error: "request_recovery_unsupported",
+          message: "Public request ids require a signed request.",
+          hint: "Sign the request to use request_id recovery, or omit request_id.",
+        },
+        400
+      );
+    }
     // The dispatcher is the authority on what this request will run. Pin its
     // answer while the entry span is still open so both the `dvm.request` row
     // and every downstream span carry the same capability. Missing/unknown
@@ -3086,11 +3129,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       parsedInput = await loggers.isolate.span(
         "dvm.input.validate",
         { capability: capabilityName, stage: "input" },
-        () => this.jobManager.parseInput(body, capabilityName),
+        () => this.jobManager.parseInput(body, capabilityName, unsignedPaid),
         { onError: () => ({ "error.code": "invalid_input" }) }
       );
     } catch (err) {
-      if (!this.deferToAuthGate(err)) return this.invalidInputResponse(c, err);
+      if (unsignedPaid || !this.deferToAuthGate(err)) return this.invalidInputResponse(c, err);
       deferredInputError = err;
     }
 
@@ -3100,6 +3143,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // structurally broken shapes before auth or payment run. A malformed
     // envelope is stripped like a well-formed one, so it lands here as
     // `invalid_credit_fields` rather than as a schema error blaming the input.
+    // Prepaid credit is owned by a verified pubkey; an unsigned body has none.
+    if (unsignedPaid && carriesCreditFields(signedRequestInput(body))) {
+      return c.json(
+        {
+          error: "invalid_credit_fields",
+          message: "credit_id, draw_id and fund require a signed request.",
+          hint: "Sign the request to draw on or fund prepaid credit, or remove the credit fields and pay per call.",
+        },
+        400
+      );
+    }
     let creditEnvelope: CreditEnvelope | undefined;
     try {
       creditEnvelope = extractCreditEnvelope(body.data);
@@ -3117,11 +3171,25 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       throw err;
     }
 
+    // A capability with no price at all, or a development host that skips
+    // payment, can never require one: refuse it before hosting admission and
+    // pricing, as a signed-only DVM would. Zero dynamic prices are refused below.
+    if (
+      unsignedPaid &&
+      ((cap.price === undefined && !cap.onQuote) || devModeSkipsPaymentVerification(this.opts))
+    ) {
+      return buildAuthErrorResponse(
+        c,
+        this.unsignedRequestRefusal(c, cap.input, body, capabilityName),
+        this.publicOrigin
+      );
+    }
+
     // Authenticate before pricing/payment. Replay is committed later, only after
     // payment verifies and immediately before job creation.
     let authEnvelope: CanonicalEnvelope | undefined;
     let authPubkey: string | undefined;
-    if (this.descriptor.auth) {
+    if (this.descriptor.auth && !unsignedPaid) {
       const auth = this.descriptor.auth;
       // verify over the RAW wire body — never `parsedInput`. The
       // caller signed what they put on the wire, and Zod's parse rewrites it
@@ -3194,7 +3262,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       { capability: capabilityName, input: body.input, params: body.params, data: body.data },
       { stripAuthEnvelope: this.descriptor.auth !== undefined }
     );
-    const authFingerprint = this.descriptor.auth
+    const authFingerprint = authEnvelope
       ? requestFingerprint(
           { capability: capabilityName, input: body.input, params: body.params, data: body.data },
           { stripAuthEnvelope: false }
@@ -3335,7 +3403,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           parsedInput,
           normalisedBody,
           authPubkey,
-          skipPayment
+          skipPayment,
+          unsignedPaid
         );
         if (dyn.error) return c.json(dyn.error.body, dyn.error.status);
         priceMsats = dyn.priceMsats;
@@ -3352,6 +3421,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             priceMsats,
             dynamicUpfront,
           });
+
+      // Unsigned admission is for per-call payment only: a request that needs
+      // no payment (free, or a development host that skips verification) gets
+      // the refusal a signed-only DVM gives it, so free capabilities stay signed.
+      if (unsignedPaid && !priceMsats) {
+        return buildAuthErrorResponse(
+          c,
+          this.unsignedRequestRefusal(c, cap.input, body, capabilityName),
+          this.publicOrigin
+        );
+      }
 
       // this submit is the caller's "next request", so it is what
       // drives pull-based Lightning crediting — a top-up they paid a moment ago
@@ -3617,7 +3697,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           requestFingerprint: fingerprint,
           requesterPubkey: authPubkey,
           requestId: publicRequestId,
-          authRequestPath: this.descriptor.auth ? canonicalRequestPath(c.req.url) : undefined,
+          authRequestPath: authEnvelope ? canonicalRequestPath(c.req.url) : undefined,
           jobId,
         }
       );
@@ -3751,6 +3831,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // it. Everywhere else `requesterId` is what the read paths gate on
     // (`isJobOwner`) — pin it too, so a DVM that ever grows identified callers
     // can't hand caller B the job caller A's body happens to fingerprint to.
+    // An unsigned prior on an auth DVM is never recovered here: the lookup key
+    // is the caller-chosen request id, not the presented proofs, so the body
+    // and requester checks alone would hand its token to anyone holding any
+    // spent proof plus the id and body.
     const pubkeyMatches =
       this.descriptor.auth === undefined ||
       (prior.requesterPubkey !== undefined && prior.requesterPubkey === opts.callerPubkey);
@@ -3930,7 +4014,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     parsedInput: unknown,
     body: { input: string; params?: Record<string, string> },
     callerPubkey?: string,
-    skipRateConversion = false
+    skipRateConversion = false,
+    unsigned = false
   ): Promise<{
     priceMsats?: number;
     upfront?: { amount: number; currency: string };
@@ -3938,14 +4023,21 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }> {
     let data: unknown = parsedInput;
     if (isZodSchema(onQuote.schema)) {
-      const parsed = onQuote.schema.safeParse(parsedInput);
+      // An unsigned input was parsed without the envelope, so a quote schema
+      // that reuses the capability schema is narrowed the same way. One that
+      // cannot be narrowed fails closed below.
+      const schema = unsigned
+        ? (unsignedInputSchema(onQuote.schema) ?? onQuote.schema)
+        : onQuote.schema;
+      const parsed = schema.safeParse(parsedInput);
       if (!parsed.success) {
         return {
           error: {
             body: {
               error: "quote_unavailable",
-              message:
-                "DVM uses dynamic pricing but the job input does not satisfy onQuote.schema. Submit the same payload to /v1/quote to confirm pricing.",
+              message: unsigned
+                ? "DVM uses dynamic pricing but the unsigned job input does not satisfy onQuote.schema. Sign the request, or send input that matches the published schema."
+                : "DVM uses dynamic pricing but the job input does not satisfy onQuote.schema. Submit the same payload to /v1/quote to confirm pricing.",
             },
             status: 400,
           },
