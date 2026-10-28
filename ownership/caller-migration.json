@@ -22965,6 +22965,9 @@
         },
         {
           "module": "src/lib/job-identity-header.ts"
+        },
+        {
+          "module": "src/sdk/server/unsigned-request.ts"
         }
       ]
     },
@@ -27117,6 +27120,9 @@
         },
         {
           "module": "src/sdk/server/x402-facilitator-support.ts"
+        },
+        {
+          "module": "src/sdk/server/unsigned-request.ts"
         }
       ]
     },
@@ -32265,6 +32271,63 @@
       "dependencies": [
         {
           "module": "src/observability/diagnostic-console.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/unsigned-request.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "carriesCreditFields",
+            "takesUnsignedPath",
+            "unsignedInputSchema"
+          ],
+          "consumerEvidence": [
+            "acceptance:./internal#createDVMServer",
+            "acceptance:./server#CREDIT_REQUEST_SCHEMA",
+            "acceptance:./server#createDVMHost",
+            "acceptance:./server#serve",
+            "builder:./server#DVMHostOpts",
+            "builder:./server#DVMServeResult",
+            "builder:./server#serve",
+            "service:./server#DVMHost",
+            "service:./server#DVMHostOpts",
+            "service:./server#createDVMHost",
+            "service:./server#serve",
+            "supported:./server#BuilderIdentity",
+            "supported:./server#CREDIT_REQUEST_SCHEMA",
+            "supported:./server#CreditRequest",
+            "supported:./server#CreditRouteDeps",
+            "supported:./server#DVMHost",
+            "supported:./server#DVMHostOpts",
+            "supported:./server#DVMServeResult",
+            "supported:./server#JobManager",
+            "supported:./server#JobManagerOpts",
+            "supported:./server#MountOpts",
+            "supported:./server#OwnerDisplay",
+            "supported:./server#PlatformReporterOpts",
+            "supported:./server#createDVMHost",
+            "supported:./server#handleCreditRequest",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/credit-envelope.ts"
+        },
+        {
+          "module": "src/sdk/server/secp256k1-auth.ts"
+        },
+        {
+          "module": "src/sdk/server/signed-request.ts"
+        },
+        {
+          "module": "src/sdk/types.ts"
         }
       ]
     },

@@ -100,6 +100,7 @@ import type {
   RevenueSkippedNoRailPayload,
 } from "./revenue-reporter";
 import { type CanonicalEnvelope, SignedRequestError, signedRequestInput } from "./signed-request";
+import { takesUnsignedPath, unsignedInputSchema } from "./unsigned-request";
 import {
   type AccumulatorMonitorHandle,
   startAccumulatorMonitor,
@@ -966,12 +967,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * explicit draw as an unknown key, before the envelope was even extracted.
    * The persisted `record.input` the reactivation path re-reads is the
    * pre-Zod wire form, so it comes through the second branch carrying them too.
+   *
+   * `unsigned` validates against the schema without its envelope fields; pass
+   * it only when {@link unsignedPaidInput} accepted the same body.
    */
-  parseInput(body: { input?: string; data?: unknown }, capability: string): unknown {
+  parseInput(
+    body: { input?: string; data?: unknown },
+    capability: string,
+    unsigned = false
+  ): unknown {
     const cap = this.requireCapability(capability);
     const rawSchema: unknown = cap.input;
     if (!rawSchema || !isZodSchema(rawSchema)) return body.input ?? "";
-    const schema = rawSchema;
+    const schema = unsigned ? unsignedInputSchema(rawSchema) : rawSchema;
+    if (!schema) throw new Error(`capability "${capability}" cannot validate unsigned input`);
     if (body.data !== undefined) {
       return schema.parse(stripProtocolEnvelope(schema, body.data));
     }
@@ -980,6 +989,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return schema.parse(stripProtocolEnvelope(schema, json));
     }
     throw new MissingStructuredInputError();
+  }
+
+  /**
+   * Whether this body takes the unsigned paid path: the auth scheme allows it,
+   * the raw input carries no envelope field, and the capability schema can be
+   * narrowed to exclude the envelope. Otherwise the signed path applies.
+   */
+  unsignedPaidInput(body: { input?: string; data?: unknown }, capability: string): boolean {
+    if (!takesUnsignedPath(this.descriptor.auth, body)) return false;
+    const rawSchema: unknown = this.requireCapability(capability).input;
+    return isZodSchema(rawSchema) && unsignedInputSchema(rawSchema) !== undefined;
   }
 
   /**
@@ -2825,9 +2845,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job: ServerJob;
     sdkCtx: SDKJobContext<unknown, unknown>;
   } {
-    const parsedInput = this.parseInput({ input: record.input }, record.capability);
+    // An unsigned paid job persists no envelope, so there is no signature to
+    // re-verify. Submit leaves `authRequestPath` and `requesterPubkey` unset
+    // only for unsigned jobs, so a signed row whose envelope was stripped from
+    // `input` still takes the signed branch and is refused. A writer who can
+    // also clear both columns can still downgrade a row to an anonymous job:
+    // rows carry no integrity marker that would detect that.
+    const unsigned =
+      record.authRequestPath === undefined &&
+      record.requesterPubkey === undefined &&
+      this.unsignedPaidInput({ input: record.input }, record.capability);
+    const parsedInput = this.parseInput({ input: record.input }, record.capability, unsigned);
 
-    if (this.descriptor.auth) {
+    if (this.descriptor.auth && !unsigned) {
       const cap = this.requireCapability(record.capability);
       if (!cap.input || !isZodSchema(cap.input)) {
         throw new ReactivationAuthSchemaError(record.id, record.capability);

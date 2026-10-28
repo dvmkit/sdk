@@ -13,6 +13,7 @@ Builders can pass `onPaidJobCompleted` to observe settled customer charges after
 
 - Use Postgres through `DATABASE_URL`; production boot refuses an in-memory job store unless you deliberately supply another durable implementation.
 - Add `auth: secp256k1Auth()` for caller-owned state. The host automatically uses a Postgres replay store when one is available; a per-process replay window is unsafe across replicas.
+- `secp256k1Auth({ allowUnsignedPaid: true })` also serves unsigned callers when they pay per call, such as standard HTTP payment wallets. Those jobs run anonymously: no `ctx.auth`, no prepaid credit, and a failed job's released money cannot be reclaimed. See [Unsigned paid calls](PROTOCOL-NOTES.md#unsigned-paid-calls).
 - Configure only the rails you operate: Cashu, x402, and Tempo are job payment methods. Lightning is a receive-only prepaid-credit funding leg. Keep every private key, wallet connection, and platform token in your secret store rather than source.
 - A `credit` block opts into reusable prepaid balances and their reclaim obligations. Reusable channels return undrawn collateral through their channel lifecycle; one-payment stablecoin funding is disabled unless `allowOneShotStablecoin: true` because it creates manual refunds. Run and monitor the documented reclaim/payout worker.
 - Honour `ctx.signal`, use `ctx.fetch` for abortable provider calls, and declare provider cost with `ctx.cost` only after the durable step that incurred it.

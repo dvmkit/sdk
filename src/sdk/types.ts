@@ -150,7 +150,8 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
   /**
    * Verified caller identity from the descriptor's `auth` scheme.
    * Present when the DVM declares `auth: secp256k1Auth(...)`; undefined for
-   * DVMs without descriptor-level auth. The envelope is the same `T &
+   * DVMs without descriptor-level auth and for unsigned paid jobs admitted by
+   * `secp256k1Auth({ allowUnsignedPaid: true })`. The envelope is the same `T &
    * CanonicalEnvelope` the auth scheme produced — handlers can read
    * `ctx.auth.envelope.<field>` instead of re-parsing the input.
    */
@@ -318,7 +319,10 @@ export interface QuoteContext<QuoteData = Record<string, unknown>> {
    * the descriptor declares an auth scheme and the
    * envelope verified — `/v1/quote` runs `checkAuth` before the handler, so by
    * the time this is set the signature is good. Undefined on unauthenticated
-   * DVMs; quote handlers that price per-caller must handle that.
+   * DVMs and for unsigned paid requests on a
+   * `secp256k1Auth({ allowUnsignedPaid: true })` DVM, where any anonymous
+   * caller can make the handler run while pricing `POST /v1/job`; quote
+   * handlers that price per-caller or call paid upstreams must handle that.
    */
   callerPubkey?: string;
   /**
@@ -812,7 +816,8 @@ export interface DVMConfig<
    *
    * When set, the active capability's `input` schema is reused for
    * verification; one scheme covers every capability under the DVM.
-   * Advertised on `/v1/info#auth` as `[scheme.id]`.
+   * Advertised on `/v1/info#auth` as `[scheme.id]`, or `[scheme.id, "none"]`
+   * when the scheme also admits unsigned paid jobs.
    */
   auth?: DVMAuthScheme;
 

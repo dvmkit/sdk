@@ -29,6 +29,12 @@ export type ReplayStoreBackend = "postgres" | "memory" | "user-supplied" | "disa
 export interface DVMAuthScheme {
   /** Wire-level identifier surfaced on `/v1/info#auth`. */
   readonly id: typeof SIGNED_REQUEST_AUTH_ID;
+  /**
+   * Also serve `POST /v1/job` bodies carrying no envelope field when the job
+   * is paid per call. Such jobs run as the anonymous requester with no
+   * `ctx.auth`, credit fields or recovery id; free capabilities stay signed-only.
+   */
+  readonly allowUnsignedPaid?: boolean;
   /** Schema + drift + signature check at request entry. No replay-store touch. */
   checkAuth<T>(
     schema: ZodLike<T>,
@@ -64,6 +70,23 @@ export interface Secp256k1AuthOpts {
   driftSeconds?: number;
   /** Current Unix-seconds source. Defaults to `() => Math.floor(Date.now() / 1000)`. */
   now?: () => number;
+  /**
+   * Accept an unsigned `POST /v1/job` (no `pubkey`, `signature`, `timestamp`,
+   * `nonce` or `auth_statement`) when the job requires a per-call payment, and
+   * advertise `["secp256k1-schnorr-v2", "none"]` on `/v1/info#auth`. A body
+   * carrying any envelope field is verified as before and never falls back.
+   * Unsigned jobs run as the anonymous requester: the handler sees no
+   * `ctx.auth`, the input omits the envelope fields, prepaid credit and
+   * `request_id` recovery are refused, a payer whose response is lost cannot
+   * recover the job by retrying (the retry is refused), and money released by a failed job lands on
+   * the shared anonymous requester. A dynamic-priced capability's `onQuote`
+   * handler runs for these anonymous callers with no `callerPubkey`, so an
+   * unauthenticated request can now trigger it, including any upstream calls
+   * it makes. The capability input must be a plain
+   * `z.object` schema so its envelope fields can be removed; any other schema
+   * keeps that capability signed-only. Defaults to false.
+   */
+  allowUnsignedPaid?: boolean;
 }
 
 /**
@@ -104,6 +127,7 @@ export function secp256k1Auth(opts: Secp256k1AuthOpts = {}): DVMAuthScheme {
 
   return {
     id: SIGNED_REQUEST_AUTH_ID,
+    allowUnsignedPaid: opts.allowUnsignedPaid === true,
     checkAuth<T>(schema: ZodLike<T>, input: unknown, domain?: SignedRequestDomain) {
       const envelope = getVerifier(schema).checkAuth(input, domain);
       return { pubkey: envelope.pubkey, envelope };

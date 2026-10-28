@@ -623,7 +623,10 @@ export interface V1InfoResponse {
   /** Provider description (omitted when empty). */
   description?: string;
   tags: string[];
-  /** Auth schemes supported (e.g. `["none"]`, `["secp256k1-schnorr-v2"]`). */
+  /**
+   * Auth schemes supported (e.g. `["none"]`, `["secp256k1-schnorr-v2"]`), or
+   * `["secp256k1-schnorr-v2", "none"]` when unsigned paid calls are also served.
+   */
   auth: string[];
   /** Audience bound into v2 signed caller statements. */
   auth_audience?: SignedRequestAudience;
@@ -719,7 +722,10 @@ export interface ProviderInfo {
   /** Provider description (wire `description`; kept as `about` for the `dvm describe` output contract) */
   about?: string;
   tags?: string[];
-  /** Auth schemes supported (e.g. ["none"], ["secp256k1-schnorr-v2"]) */
+  /**
+   * Auth schemes supported (e.g. ["none"], ["secp256k1-schnorr-v2"]), or
+   * ["secp256k1-schnorr-v2", "none"] when unsigned paid calls are also served.
+   */
   auth?: string[];
   /** Audience advertised for v2 signed caller statements. */
   authAudience?: SignedRequestAudience;
