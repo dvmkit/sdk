@@ -18,12 +18,13 @@ import {
 } from "../../lib/x402/spec";
 import type { X402Config, X402ExactVersionSupport, X402Receipt } from "../../lib/x402/types";
 import type { ProcessedPaymentQuerier } from "./processed-payment-store";
-import type {
-  X402ExactAuthorizationFacts,
-  X402ExactSettlementAttempt,
-  X402ExactSettlementEffect,
-  X402ExactSettlementIntent,
-  X402ExactSettlementStore,
+import {
+  X402ExactIntentConflictError,
+  type X402ExactAuthorizationFacts,
+  type X402ExactSettlementAttempt,
+  type X402ExactSettlementEffect,
+  type X402ExactSettlementIntent,
+  type X402ExactSettlementStore,
 } from "./x402-exact-settlement-store";
 
 /** Chain evidence recovered for one exact x402 authorization. */
@@ -176,13 +177,24 @@ export class X402ExactSettlementServer {
     if (!verified.isValid) {
       return { outcome: "rejected", intentId, reason: verified.invalidReason ?? "verify_failed" };
     }
-    await this.opts.store.prepare({
-      id: intentId,
-      dvmId: args.dvmId,
-      resource: args.resource,
-      ...facts,
-      effect: args.effect,
-    });
+    // The `get` above is only a cheap early exit: presentations that overlap
+    // during `/verify` all pass it. The insert is the claim, and only the
+    // presentation that created the row may run the work.
+    // Each presentation carries its own job id, so the loser of the race also
+    // trips the store's binding check against the winner's row.
+    const claimed = await this.opts.store
+      .claim({
+        id: intentId,
+        dvmId: args.dvmId,
+        resource: args.resource,
+        ...facts,
+        effect: args.effect,
+      })
+      .catch((err: unknown) => {
+        if (err instanceof X402ExactIntentConflictError) return undefined;
+        throw err;
+      });
+    if (!claimed?.inserted) return { outcome: "replayed", intentId };
     return { outcome: "prepared", intentId, payload, requirements, validBeforeMs };
   }
 

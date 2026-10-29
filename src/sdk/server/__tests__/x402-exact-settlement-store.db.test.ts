@@ -200,6 +200,16 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
       "intent-submitted",
     ]);
   });
+
+  it("lets exactly one of several concurrent claims of the same intent insert it", async () => {
+    const claims = await Promise.all(
+      Array.from({ length: 5 }, () => store.claim(exactIntent("intent-claimed")))
+    );
+
+    expect(claims.filter((claim) => claim.inserted)).toHaveLength(1);
+    expect(new Set(claims.map((claim) => claim.intent.id))).toEqual(new Set(["intent-claimed"]));
+    expect((await store.claim(exactIntent("intent-claimed"))).inserted).toBe(false);
+  });
 });
 
 async function settledIntent(

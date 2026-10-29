@@ -61,22 +61,21 @@ interface Rig {
   facilitatorCalls: (suffix: "/verify" | "/settle") => number;
 }
 
-function rig(): Rig {
+function rig(verifyGate?: Promise<void>): Rig {
   const ledger = new MemoryCreditLedger();
   const processedPayments = new MemoryProcessedPaymentStore();
   const store = new MemoryX402ExactSettlementStore();
   const settlement = new X402ExactSettlementServer({ store });
-  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input);
+    if (url.endsWith("/verify")) await verifyGate;
     const body = url.endsWith("/verify")
       ? { isValid: true }
       : url.endsWith("/settle")
         ? { success: true, transaction: TX, network: X402.network }
         : undefined;
     if (!body) throw new Error(`unexpected request to ${url}`);
-    return Promise.resolve(
-      new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } })
-    );
+    return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
   });
   const settler = new InProcessDeferredX402Settler({
     settlement,
@@ -116,7 +115,12 @@ function admit(r: Rig, header: string | undefined, jobId: string): Promise<Payme
   }) as never;
 }
 
-function manager(r: Rig, onJob: Parameters<typeof configureDVM>[0]["onJob"], maxRuntimeSeconds = RUNTIME_SECONDS) {
+function manager(
+  r: Rig,
+  onJob: Parameters<typeof configureDVM>[0]["onJob"],
+  maxRuntimeSeconds = RUNTIME_SECONDS,
+  settler: InProcessDeferredX402Settler = r.settler
+) {
   const completed = vi.fn();
   const descriptor = configureDVM({
     name: "deferred-test",
@@ -133,7 +137,7 @@ function manager(r: Rig, onJob: Parameters<typeof configureDVM>[0]["onJob"], max
     devMode: true,
     dvmId: DVM_ID,
     fxFetcher: createFxFetcher(),
-    deferredX402: r.settler,
+    deferredX402: settler,
     onJobCompleted: completed,
     orphanDrawSweepIntervalMs: 0,
     staleJobTimeoutMs: 0,
@@ -251,8 +255,7 @@ describe("unsigned x402 settled after the job", () => {
       dvmId: DVM_ID,
       commit: () => Promise.reject(new Error("must not commit")),
     });
-    const { jobs } = manager(r, (ctx) => ctx.complete("done"));
-    (jobs as unknown as { opts: { deferredX402: unknown } }).opts.deferredX402 = restarted;
+    const { jobs } = manager(r, (ctx) => ctx.complete("done"), RUNTIME_SECONDS, restarted);
 
     const job = await run(jobs, payment, "job-restart");
 
@@ -303,6 +306,26 @@ describe("unsigned x402 settled after the job", () => {
     expect(whileRunning.error?.status).toBe(409);
     expect(afterSettled.error?.status).toBe(409);
     expect(r.facilitatorCalls("/verify")).toBe(1);
+    expect(r.facilitatorCalls("/settle")).toBe(1);
+    jobs.shutdown();
+  });
+
+  it("admits only one of several presentations that overlap during facilitator verification", async () => {
+    let openVerify!: () => void;
+    const r = rig(new Promise<void>((resolve) => (openVerify = resolve)));
+    const header = authorization(60);
+
+    const attempts = ["a", "b", "c"].map((id) => admit(r, header, `job-race-${id}`));
+    // Every presentation is parked inside /verify before any can record its claim.
+    await vi.waitFor(() => expect(r.facilitatorCalls("/verify")).toBe(3));
+    openVerify();
+    const results = await Promise.all(attempts);
+
+    expect(results.filter((p) => p.error === undefined)).toHaveLength(1);
+    expect(results.filter((p) => p.error?.status === 409)).toHaveLength(2);
+    const { jobs } = manager(r, (ctx) => ctx.complete("done"));
+    const winner = results.findIndex((p) => p.error === undefined);
+    await run(jobs, results[winner]!, `job-race-${["a", "b", "c"][winner]}`);
     expect(r.facilitatorCalls("/settle")).toBe(1);
     jobs.shutdown();
   });

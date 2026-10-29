@@ -90,6 +90,14 @@ export interface X402ExactSettlementStore {
   prepare(
     intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
   ): Promise<X402ExactSettlementIntent>;
+  /**
+   * Same binding checks as {@link prepare}, but reports whether this call
+   * created the row. Concurrent callers presenting one authorization race to
+   * insert it, so exactly one sees `inserted: true`.
+   */
+  claim(
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+  ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }>;
   get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined>;
   markSubmitting(args: {
     dvmId: string;
@@ -190,12 +198,18 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
   async prepare(
     intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
   ): Promise<X402ExactSettlementIntent> {
+    return (await this.claim(intent)).intent;
+  }
+
+  async claim(
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+  ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }> {
     const now = Date.now();
     const existing = await this.get(intent.dvmId, intent.id);
     if (existing && !sameIntentBinding(existing, intent)) {
       throw new X402ExactIntentConflictError(intent.id);
     }
-    const write = async (q: Pick<Pool, "query">): Promise<void> => {
+    const write = async (q: Pick<Pool, "query">): Promise<boolean> => {
       const authFingerprint = intent.effect?.jobAdmission?.authFingerprint;
       if (authFingerprint) {
       await q.query(
@@ -210,8 +224,8 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
       );
       if (rows[0]?.intent_id !== intent.id) throw new X402ExactIntentConflictError(intent.id);
       }
-      if (existing) return;
-      await q.query(
+      if (existing) return false;
+      const { rowCount } = await q.query(
       `INSERT INTO x402_exact_settlement_intents
          (dvm_id, intent_id, resource, network, asset, authorizer, recipient, value,
           valid_after, valid_before, nonce, fingerprint, status, effect, submission_block,
@@ -239,10 +253,12 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
         now,
       ]
       );
+      return rowCount === 1;
     };
+    let inserted: boolean;
     if (this.hostingCleanupFence && !existing) {
       const effect = intent.effect;
-      await this.hostingCleanupFence.withNewIntent({
+      inserted = await this.hostingCleanupFence.withNewIntent({
         admissionId: effect?.hostingAdmissionId,
         jobId: effect?.jobId,
         paymentSeq: effect?.hostingPaymentSeq,
@@ -251,15 +267,15 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
         callerPubkey: effect?.jobId ? undefined : effect?.callerId,
       }, write);
     } else {
-      await write(this.pool);
+      inserted = await write(this.pool);
     }
-    if (existing) return existing;
+    if (existing) return { intent: existing, inserted: false };
     const stored = await this.get(intent.dvmId, intent.id);
     if (!stored) throw new Error(`x402 exact intent ${intent.id} was not persisted`);
     if (!sameIntentBinding(stored, intent)) {
       throw new X402ExactIntentConflictError(intent.id);
     }
-    return stored;
+    return { intent: stored, inserted };
   }
 
   async get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined> {
@@ -497,9 +513,15 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
   private readonly authBindings = new Map<string, string>();
   private readonly locks = new Map<string, Promise<void>>();
 
-  prepare(
+  async prepare(
     intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
   ): Promise<X402ExactSettlementIntent> {
+    return (await this.claim(intent)).intent;
+  }
+
+  async claim(
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+  ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }> {
     const key = intentKey(intent.dvmId, intent.id);
     const existing = this.intents.get(key);
     if (existing && !sameIntentBinding(existing, intent)) {
@@ -514,7 +536,7 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
       }
       this.authBindings.set(bindingKey, intent.id);
     }
-    if (existing) return Promise.resolve(existing);
+    if (existing) return { intent: existing, inserted: false };
     const now = Date.now();
     const stored: X402ExactSettlementIntent = {
       ...intent,
@@ -523,7 +545,7 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
       updatedAt: now,
     };
     this.intents.set(key, stored);
-    return Promise.resolve(stored);
+    return { intent: stored, inserted: true };
   }
 
   get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined> {
