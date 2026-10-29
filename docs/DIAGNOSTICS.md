@@ -1,5 +1,11 @@
 # Payment diagnostics
 
+## Cashu advertisement
+
+When mints are configured but Cashu is absent from the resolved payment methods, the server emits one `cashu_not_advertised` warning at boot. Boolean fields identify the cause: `cashu_explicitly_excluded` means the override omits Cashu; `cashu_mode_missing` means `p2pk-accumulator` mode is absent; `cashu_lock_pubkey_missing` means no lock public key is wired; `cashu_store_missing` means neither Postgres nor the explicit development Cashu store is wired. Multiple prerequisites can be missing together. The diagnostic contains no key values, mint addresses, or connection strings, and info requests do not repeat it.
+
+## Payment failures
+
 Payment diagnostics retain fixed SDK categories so operators can distinguish a skipped credit leg from a credential, persistence, or accounting failure. Categories identify what the SDK observed; they do not establish that a service is down or that money moved.
 
 Every diagnostic sink uses the same catalogue projection: console loggers, span stdout, emitters, buffering, HTTP transport, and database insertion. Category fields retain only primitive strings in these closed enums; `source_status` retains only integer HTTP statuses from 100 through 599. Unknown strings, nested objects, arrays, accessors, and coercible values are omitted; unclassified exceptions produce `unknown`. Exception names, messages, stacks, causes, provider response bodies, headers, credentials, proofs, and payment identifiers are excluded from these fields.

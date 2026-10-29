@@ -1,5 +1,11 @@
 # Protocol notes
 
+## Payment method discovery
+
+An explicit `paymentMethods` list bounds `payment.methods` on `/v1/info` and `/v1/quote`, the top-level `x402` and `tempo` info blocks, and credit funding rails and terms on info, quotes, and unpaid job responses. Excluded x402 and Tempo blocks are omitted rather than emitted empty. Lightning remains an independent receive-only credit funding leg. The [portable example](../protocol-fixtures/payment-method-discovery-v1.json) describes an x402/Tempo-wired DVM restricted to Cashu.
+
+Omitting the override preserves derived defaults, including independent x402 batch credit funding when hosted exact payment is unavailable. Availability, currency support, and stablecoin-credit opt-in still filter the allowed methods. This corrects discovery on older servers that could expose excluded rails; it adds no wire fields or storage migration.
+
 ## Payment message history
 
 Requester `payment` messages in `GET /v1/job/:id/messages` (JSON or SSE) and saved job history are published only after the server accepts the payment through its verification and accounting flow. Pending and rejected attempts are omitted, including attempts that fail signature verification. A rejected attempt does not satisfy the outstanding payment request; a later valid payment can still be accepted. Explicit development-mode acceptance follows the same history rule even when verification is bypassed.

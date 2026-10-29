@@ -18,6 +18,10 @@ Builders can pass `onPaidJobCompleted` to observe settled customer charges after
 - A `credit` block opts into reusable prepaid balances and their reclaim obligations. Reusable channels return undrawn collateral through their channel lifecycle; one-payment stablecoin funding is disabled unless `allowOneShotStablecoin: true` because it creates manual refunds. Run and monitor the documented reclaim/payout worker.
 - Honour `ctx.signal`, use `ctx.fetch` for abortable provider calls, and declare provider cost with `ctx.cost` only after the durable step that incurred it.
 
+An explicit `paymentMethods` list restricts the advertised job methods, x402/Tempo metadata, and credit funding terms, even when another rail is wired through host configuration. For example, `paymentMethods: ["cashu"]` suppresses x402 and Tempo discovery and funding; an empty list advertises no job payment methods. Lightning credit funding still follows its receive wallet independently.
+
+When `paymentMethods` is omitted, methods are derived from ready configuration. Cashu requires accepted mints, `p2pk-accumulator` mode, a lock public key, and either Postgres or the explicit development Cashu store. Configuring mints alone does not advertise Cashu. The boot event `cashu_not_advertised` identifies missing prerequisites or an explicit exclusion; see [diagnostics](DIAGNOSTICS.md#cashu-advertisement).
+
 Reusable x402 channels default to a 24-hour payer withdrawal grace (86400 seconds) on every network. For Base Sepolia (`eip155:84532`) acceptance tests, set `x402.batchSettlement.withdrawDelay: 900` or `DVMKIT_X402_WITHDRAW_DELAY_SECONDS=900` with `DVMKIT_X402_BATCH_SETTLEMENT=true`. Explicit delays must be integer seconds and at least 900 on Base Sepolia; Base mainnet retains the 86400 minimum even in development mode and still requires self-relay. The grace is bound into each channel's immutable configuration: changing the server setting affects new channels, not existing deposits. A shorter testnet run exercises early-withdrawal refusal and post-deadline recovery; retain a separate 24-hour run to cover next-day recovery.
 
 ## Prepaid credit lifetime

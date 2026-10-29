@@ -1184,6 +1184,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     this.app = new Hono<AppEnv>();
     try {
       this.registerRoutes();
+      if (opts.mints?.length && !this.resolvePaymentMethods().includes("cashu")) {
+        diagnosticConsole.warn({
+          event: "cashu_not_advertised",
+          cashu_explicitly_excluded: opts.paymentMethods !== undefined && !opts.paymentMethods.includes("cashu"),
+          cashu_mode_missing: opts.cashuMode !== "p2pk-accumulator",
+          cashu_lock_pubkey_missing: !opts.lockPubkey,
+          cashu_store_missing: !opts.db && !opts.disposableCashu,
+        });
+      }
       if (opts.hostingControlInstance) {
         this.hostingSweepTimer = setInterval(() => {
           void this.sweepHostingDeadline().catch((error: unknown) => {
@@ -1943,12 +1952,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // `resolvePaymentMethods`. A healthy batch server is an independent credit
     // funding leg, though: mainnet self-relay must remain usable when hosted
     // exact is unavailable or stale. Which flavour to use rides
-    // {@link creditX402Schemes}, so this list names the rail when either is live.
+    // {@link creditX402Schemes}, so this list names the rail when either is live
+    // and the builder has not explicitly excluded it.
     const creditMpp = this.creditMppMethods().length > 0;
     const methods: FundingMethod[] = this.resolvePaymentMethods().filter(
       (method) => method !== "tempo" || creditMpp
     );
     if (
+      (this.opts.paymentMethods === undefined || this.opts.paymentMethods.includes("x402")) &&
       this.x402CurrencySupported() &&
       this.x402BatchAvailable() &&
       !methods.includes("x402")
@@ -1980,7 +1991,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     offered: { method: string; intent: "charge" | "session" }[];
     withheld: { method: string; intent: "charge" | "session"; reason: string }[];
   } {
-    if (!this.opts.mpp) return { offered: [], withheld: [] };
+    if (!this.opts.mpp || !this.resolvePaymentMethods().includes("tempo")) {
+      return { offered: [], withheld: [] };
+    }
     const configured = advertisedMethods(this.opts.mpp)
       .filter(
         (method): method is { method: string; intent: "charge" | "session" } =>
@@ -2440,7 +2453,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (this.opts.mints) info.mints = this.advertisedMints();
     info.capabilities = this.renderCapabilities();
     info.payment = { methods: this.resolvePaymentMethods() };
-    if (this.x402CurrencySupported() && this.opts.x402 && this.x402Support()?.available) {
+    if (info.payment.methods.includes("x402") && this.opts.x402 && this.x402Support()?.available) {
       info.x402 = {
         pay_to: this.opts.x402.payTo,
         network: this.opts.x402.network,
@@ -2450,7 +2463,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         dual_serve: this.opts.x402.dualServe ?? true,
       };
     }
-    if (this.opts.mpp) {
+    if (info.payment.methods.includes("tempo") && this.opts.mpp) {
       const configured = advertisedMethods(this.opts.mpp);
       const withheld = configured.flatMap((method) => {
         const reason = this.tempoSessionWithheldReason(method);
