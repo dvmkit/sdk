@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import pg, { type Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { PostgresJobStore } from "../../sdk/server/postgres-job-store";
 import {
   applyRetryToPool,
   formatPostgresApplicationName,
@@ -131,8 +132,15 @@ describe("applyRetryToPool", () => {
     expect(warnSpy).toHaveBeenCalledOnce();
   });
 
-  it.each([3, 10])("replaces %i stale idle clients on the first ordinary query", async (size) => {
+  it.each([
+    ["query", 3],
+    ["query", 10],
+    ["claim", 3],
+    ["claim", 10],
+    ["callback", 3],
+  ] as const)("recovers the first %s through %i stale idle clients", async (boundary, size) => {
     const clients: TransportClient[] = [];
+    const statements: string[] = [];
     // Only the transport is simulated: pg owns checkout, eviction, release and replacement.
     class TransportClient extends EventEmitter {
       _queryable = true;
@@ -148,11 +156,27 @@ describe("applyRetryToPool", () => {
         queueMicrotask(() => callback());
       }
 
-      query(_text: unknown, _values: unknown, callback: (error?: Error, result?: unknown) => void): void {
-        queueMicrotask(() => callback(
-          this.stale ? new Error("Connection terminated unexpectedly") : undefined,
-          this.stale ? undefined : { rows: [{ n: 1 }] }
-        ));
+      query(config: string | { text: string }, _values?: unknown, callback?: (error?: unknown, result?: unknown) => void): Promise<unknown> | void {
+        const execute = () => {
+          if (this.stale) throw new Error("Connection terminated unexpectedly");
+          const text = typeof config === "string" ? config : config.text;
+          statements.push(text);
+          if (text.includes("pg_try_advisory_lock")) return { rows: [{ acquired: true }] };
+          if (text.includes("pg_advisory_unlock")) return { rows: [{ unlocked: true }] };
+          if (text.includes("INSERT INTO request_id_claims")) {
+            return { rows: [{ job_id: "job-recovery" }], rowCount: 1 };
+          }
+          return { rows: [{ n: 1 }] };
+        };
+        if (!callback) return Promise.resolve().then(execute);
+        const done = callback;
+        queueMicrotask(() => {
+          try {
+            done(undefined, execute());
+          } catch (error) {
+            done(error);
+          }
+        });
       }
 
       end(callback?: () => void): void {
@@ -176,7 +200,39 @@ describe("applyRetryToPool", () => {
       for (const client of checkedOut) client.release();
       expect(pool.idleCount).toBe(size);
 
-      await expect(pool.query("SELECT 1 AS n")).resolves.toMatchObject({ rows: [{ n: 1 }] });
+      if (boundary === "claim") {
+        const store = new PostgresJobStore(pool);
+        const claim = {
+          requestId: "request-recovery",
+          requesterPubkey: "11".repeat(32),
+          requesterId: "caller-recovery",
+          requestFingerprint: "22".repeat(32),
+          jobId: "job-recovery",
+          claimToken: "claim-recovery",
+        };
+        try {
+          await expect(store.claimRequestId(claim)).resolves.toEqual({
+            jobId: "job-recovery", replayed: false,
+          });
+          expect(statements.filter((text) => text.includes("INSERT INTO request_id_claims"))).toHaveLength(1);
+        } finally {
+          await store.releaseRequestIdClaim(claim);
+        }
+      } else if (boundary === "callback") {
+        const client = await new Promise<pg.PoolClient>((resolve, reject) => {
+          pool.connect((error, checkedOut) => {
+            if (error) reject(error);
+            else resolve(checkedOut!);
+          });
+        });
+        try {
+          await expect(client.query("SELECT 1 AS n")).resolves.toMatchObject({ rows: [{ n: 1 }] });
+        } finally {
+          client.release();
+        }
+      } else {
+        await expect(pool.query("SELECT 1 AS n")).resolves.toMatchObject({ rows: [{ n: 1 }] });
+      }
 
       expect(clients).toHaveLength(size + 1);
       expect(clients.slice(0, size).every((client) => client._ending)).toBe(true);
@@ -184,6 +240,69 @@ describe("applyRetryToPool", () => {
       expect(pool.idleCount).toBe(1);
     } finally {
       await pool.end();
+    }
+  });
+
+  it("times out a stalled checkout probe through the pg driver", async () => {
+    // A disconnected pg client queues the probe without ever answering it.
+    const client = new pg.Client({ host: "db.example.com", user: "test", database: "test" });
+    const release = vi.fn(() => { void client.end(); });
+    const pool = makePool(async () => ({ rows: [] }), async () => Object.assign(client, { release }));
+    pool.options.connectionTimeoutMillis = 20;
+    applyRetryToPool(pool, "test");
+
+    await expect(pool.connect()).rejects.toThrow("Query read timeout");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release.mock.calls[0]).toEqual([expect.any(Error)]);
+  });
+
+  it("does not replay business queries after a client has been exposed", async () => {
+    const error = new Error("Connection terminated unexpectedly");
+    const query = vi.fn(async (config: unknown) => {
+      if (typeof config === "string") throw error;
+      return { rows: [] };
+    });
+    const client = { query, release: vi.fn() };
+    const connect = vi.fn(async () => client);
+    const pool = makePool(async () => ({ rows: [] }), connect);
+    applyRetryToPool(pool, "test");
+
+    const checkedOut = await pool.connect();
+    try {
+      await expect(checkedOut.query("INSERT INTO example VALUES (1)")).rejects.toBe(error);
+      expect(query.mock.calls.filter(([config]) => typeof config === "string"))
+        .toEqual([["INSERT INTO example VALUES (1)"]]);
+      expect(connect).toHaveBeenCalledOnce();
+    } finally {
+      checkedOut.release();
+    }
+  });
+
+  it.each(["promise", "callback"])("bounds failed checkout probes using %s checkout", async (mode) => {
+    let now = 1_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const error = new Error("Connection terminated unexpectedly");
+    const release = vi.fn();
+    const connect = vi.fn(async () => ({
+      query: async () => {
+        now += 60;
+        throw error;
+      },
+      release,
+    }));
+    const pool = makePool(async () => ({ rows: [] }), connect);
+    pool.options.connectionTimeoutMillis = 100;
+    applyRetryToPool(pool, "test");
+    try {
+      const checkout = mode === "promise" ? pool.connect() : new Promise((resolve, reject) => {
+        pool.connect((failure, client) => failure ? reject(failure) : resolve(client));
+      });
+      await expect(checkout).rejects.toBe(error);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(release.mock.calls).toEqual([[error], [error]]);
+      expect(now - 1_000).toBeLessThanOrEqual(200);
+    } finally {
+      clock.mockRestore();
     }
   });
 
