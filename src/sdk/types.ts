@@ -571,6 +571,43 @@ export interface ResolvedCreditConfig {
   allowOneShotStablecoin: boolean;
 }
 
+/**
+ * Refund-locktime floors for Cashu payments. A payer may lock proofs with a
+ * NUT-11 refund path back to itself; the DVM refuses a refund `locktime` that
+ * opens before the proofs can be melted. Shortening a floor below its default
+ * is safe only when the builder melts more often than the floor: once a
+ * proof's locktime passes, the payer's refund key can spend it if it is still
+ * unmelted.
+ */
+export interface CashuConfig {
+  /**
+   * Shortest refund `locktime`, in seconds from now, a signed caller must
+   * use. Advertised as `cashu.min_locktime` on `/v1/info`; the DVM enforces it
+   * less 24 hours so a caller resuming an unacknowledged payment still
+   * clears it. Default 604800 (7 days). A whole number of at least 90000
+   * (25 hours), so the enforced floor is always at least an hour away.
+   */
+  minLocktimeSeconds?: number;
+  /**
+   * Shortest refund `locktime`, in seconds from receipt, for an unsigned
+   * `POST /v1/job` payment sent without `X-Cashu-Request-Id` (a NUT-24
+   * wallet) to a DVM without auth or one built with
+   * `secp256k1Auth({ allowUnsignedPaid: true })`. Such a wallet cannot be
+   * told this floor and locks to its own default, so it is enforced exactly,
+   * with no resume margin, and advertised as `cashu.unsigned_min_locktime`.
+   * A payment carrying `X-Cashu-Request-Id` takes the signed floor. Default
+   * `minLocktimeSeconds` less 24 hours (518400 when that is unset). A whole
+   * number of at least 3600.
+   */
+  unsignedMinLocktimeSeconds?: number;
+}
+
+/** A {@link CashuConfig} with both floors filled from their defaults. */
+export interface ResolvedCashuConfig {
+  minLocktimeSeconds: number;
+  unsignedMinLocktimeSeconds: number;
+}
+
 /** Platform default for {@link CreditConfig.min} — a dust floor below which rail fees dominate. */
 export const DEFAULT_CREDIT_MIN: PriceValue = "$0.10";
 
@@ -874,6 +911,8 @@ export interface DVMConfig<
    * omitting it leaves callers on per-call payment. See {@link CreditConfig}.
    */
   credit?: CreditConfig;
+  /** Cashu refund-locktime floors. See {@link CashuConfig}. */
+  cashu?: CashuConfig;
   /**
    * Register DVM-scoped non-protocol routes on the descriptor's Hono sub-app
    * Invoked once per `host.mount(dvm)` against the sub-app that
@@ -972,6 +1011,8 @@ export interface DVMDescriptor<
    * `credit` block — the presence check IS the opt-in gate.
    */
   readonly credit?: ResolvedCreditConfig;
+  /** Cashu refund-locktime floors, present iff `configureDVM` was given a `cashu` block. */
+  readonly cashu?: ResolvedCashuConfig;
   /**
    * Descriptor-level auth scheme. Set when `configureDVM` was
    * called with `auth: secp256k1Auth(...)` — the SDK fires this on

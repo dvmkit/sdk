@@ -27,6 +27,17 @@ export const DEFAULT_TICK_INTERVAL_MS = 30_000;
  */
 export const EXPIRING_SOON_THRESHOLD_MS = 36 * 60 * 60 * 1000;
 
+/**
+ * The expiring-soon threshold for a DVM whose shortest enforced lock window
+ * is `shortestLockWindowSeconds`: 36h, or half that window when it is
+ * shorter. Half keeps an honest payment at the floor silent on arrival while
+ * still warning with half its window left before the earliest deadline. The
+ * default windows (518400s) leave the threshold at 36h.
+ */
+export function expiringSoonThresholdMs(shortestLockWindowSeconds: number): number {
+  return Math.min(EXPIRING_SOON_THRESHOLD_MS, Math.max(0, shortestLockWindowSeconds) * 500);
+}
+
 export interface AccumulatorMonitorOpts {
   /** Pool that exposes both `query` and `connect` (used for advisory locks). */
   pool: Pool;
@@ -47,6 +58,8 @@ export interface AccumulatorMonitorOpts {
    * drives the prune sweep. Defaults to 24h.
    */
   lockPubkeyGraceSeconds?: number;
+  /** When a batch counts as expiring soon. Defaults to {@link EXPIRING_SOON_THRESHOLD_MS}. */
+  expiringSoonThresholdMs?: number;
   /** Test seam — defaults to `Date.now`. */
   now?: () => number;
 }
@@ -85,6 +98,7 @@ export function startAccumulatorMonitor(opts: AccumulatorMonitorOpts): Accumulat
           now,
           lockKey,
           graceSeconds: opts.lockPubkeyGraceSeconds ?? DEFAULT_LOCK_PUBKEY_GRACE_SECONDS,
+          expiringSoonThresholdMs: opts.expiringSoonThresholdMs ?? EXPIRING_SOON_THRESHOLD_MS,
         });
       } catch (_err) {
         diagnosticConsole.error(
@@ -123,6 +137,7 @@ interface ResolvedTickOpts {
   lockKey: bigint;
   getLockPubkeyState?: LockPubkeyStateLoader;
   graceSeconds: number;
+  expiringSoonThresholdMs: number;
 }
 
 async function runTick(opts: ResolvedTickOpts): Promise<void> {
@@ -199,7 +214,7 @@ async function emitExpiryEvents(
     const delta = batch.oldestTExpire - now;
     if (delta < 0) {
       emitExpired(opts.dvmId, batch, -delta);
-    } else if (delta < EXPIRING_SOON_THRESHOLD_MS) {
+    } else if (delta < opts.expiringSoonThresholdMs) {
       emitExpiringSoon(opts.dvmId, batch, delta);
     }
   }

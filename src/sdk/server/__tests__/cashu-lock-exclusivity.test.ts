@@ -62,6 +62,14 @@ describe("assessCashuLock", () => {
     );
   });
 
+  it("enforces a caller-supplied floor instead of the default one", () => {
+    const floorSec = NOW + DAY;
+    const at = (locktime: number) =>
+      assessCashuLock(secret(DVM_KEY, [["locktime", `${locktime}`], ["refund", PAYER_KEY]]), ACTIVE, NOW, floorSec);
+    expect(at(floorSec)).toEqual({ kind: "exclusive", lockPubkey: DVM_KEY });
+    expect(at(floorSec - 1)).toMatchObject({ code: "lock_not_exclusive", locktimeBelowFloor: true });
+  });
+
   it.each(acceptedLockShapes({ current: DVM_KEY, retired: RETIRED_KEY, payer: PAYER_KEY, nowSec: NOW }))(
     "accepts $label",
     ({ data, tags, matches }) => {

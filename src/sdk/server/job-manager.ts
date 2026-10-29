@@ -103,8 +103,10 @@ import { type CanonicalEnvelope, SignedRequestError, signedRequestInput } from "
 import { takesUnsignedPath, unsignedInputSchema } from "./unsigned-request";
 import {
   type AccumulatorMonitorHandle,
+  expiringSoonThresholdMs,
   startAccumulatorMonitor,
 } from "./wallet-accumulator-monitor";
+import { shortestCashuLockWindowSeconds, signedCashuLockWindowSeconds } from "../cashu-locktime";
 import type { X402ExactSettlementServer } from "./x402-exact-settlement";
 import type { X402FacilitatorHealthLike } from "./x402-facilitator-support";
 
@@ -729,9 +731,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // runs builder-local via `dvmctl melt-pending`.
     if (opts.cashuMode === "p2pk-accumulator" && opts.db && opts.dvmId) {
       try {
+        const shortestWindow = shortestCashuLockWindowSeconds(
+          descriptor.cashu,
+          !descriptor.auth || descriptor.auth.allowUnsignedPaid === true
+        );
         this.accumulatorMonitor = startAccumulatorMonitor({
           pool: opts.db,
           dvmId: opts.dvmId,
+          expiringSoonThresholdMs: expiringSoonThresholdMs(shortestWindow),
         });
       } catch (_err) {
         diagnosticConsole.error(
@@ -3014,6 +3021,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       disposableCashu: this.opts.disposableCashu,
         dvmId: this.opts.dvmId,
         lockPubkeys: extra?.lockPubkeys,
+        cashuLockWindowSeconds: signedCashuLockWindowSeconds(this.descriptor.cashu),
         mintHealthTracker: extra?.mintHealthTracker,
         fxFetcher: this.opts.fxFetcher,
         // the ledger leg — a mid-job payment is a top-up that funds

@@ -311,6 +311,10 @@ export interface UpfrontPaymentOpts {
   lockPubkeys?: LockPubkey[];
   /** UUIDv4 from `X-Cashu-Request-Id` header. */
   requestId?: string;
+  /** Enforced refund-locktime window; see {@link AccumulatorReceiveOpts.lockWindowSeconds}. */
+  cashuLockWindowSeconds?: number;
+  /** Replaces the `lock_not_exclusive` hint when the floor that applied is not the signed one. */
+  cashuLockRefusalHint?: string;
   /**
    * Per-call Cashu the NUT-24 way, for a `POST /v1/job` the payer could pay
    * without signing. The unpaid 402 then carries the `X-Cashu` payment request
@@ -2041,6 +2045,12 @@ export type PaymentErrorCode =
   | "lightning_unavailable"
   | AccumulatorRejectionCode;
 
+const LOCK_SHAPE_HINT =
+  "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key. Use only the locktime, refund, pubkeys, n_sigs, sigflag and n_sigs_refund tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys";
+
+/** `lock_not_exclusive` hint for an unsigned payment judged against `cashu.unsigned_min_locktime`. */
+export const UNSIGNED_LOCK_REFUSAL_HINT = `${LOCK_SHAPE_HINT}, and any locktime at least cashu.unsigned_min_locktime seconds in the future.`;
+
 /**
  * Agent-facing copy for one payment-error code. `display` is relayed to a human
  * verbatim (no rail names the caller didn't choose, no jargon); `hint` is the
@@ -2357,7 +2367,7 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
   lock_not_exclusive: {
     display:
       "The payment token's lock would let a key other than this service's spend it, so it wasn't accepted. Nothing was charged.",
-    hint: "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key. Use only the locktime, refund, pubkeys, n_sigs, sigflag and n_sigs_refund tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys, and any locktime at least cashu.min_locktime minus 24 hours in the future.",
+    hint: `${LOCK_SHAPE_HINT}, and any locktime at least cashu.min_locktime minus 24 hours in the future.`,
     retryable: false,
   },
   proof_not_unspent: {
@@ -2543,6 +2553,8 @@ export interface IncomingPaymentOpts {
   dvmId?: string;
   /** Active NUT-11 P2PK lock pubkeys (current + retired-in-grace). */
   lockPubkeys?: LockPubkey[];
+  /** Enforced refund-locktime window. Mirrors {@link UpfrontPaymentOpts.cashuLockWindowSeconds}. */
+  cashuLockWindowSeconds?: number;
   /** Runtime mint-health tracker. */
   mintHealthTracker?: MintHealthTracker;
   /**
@@ -2743,6 +2755,7 @@ async function verifyIncomingPaymentInScope(
           lockPubkeys: opts.lockPubkeys,
           requestId,
           mintHealthTracker: opts.mintHealthTracker,
+          cashuLockWindowSeconds: opts.cashuLockWindowSeconds,
         },
         mints,
         snapshot.pendingPaymentMsats,
@@ -3368,6 +3381,7 @@ async function processIncomingPaymentInScope(
           lockPubkeys: opts.lockPubkeys,
           requestId,
           mintHealthTracker: opts.mintHealthTracker,
+          cashuLockWindowSeconds: opts.cashuLockWindowSeconds,
         },
         mints,
         job.pendingPaymentMsats
@@ -3593,6 +3607,8 @@ interface AccumulatorReceiveCommonOpts {
   requestId?: string;
   mintHealthTracker?: MintHealthTracker;
   nut24?: UpfrontPaymentOpts["nut24"];
+  cashuLockWindowSeconds?: number;
+  cashuLockRefusalHint?: string;
 }
 
 /** Whether a presented Cashu token takes the P2PK accumulator path. */
@@ -3780,6 +3796,7 @@ async function verifyAccumulatorReceipt(
       } : undefined,
       dvmId,
       lockPubkeys,
+      lockWindowSeconds: opts.cashuLockWindowSeconds,
       beforeCommit,
       withCommitTx,
     });
@@ -3818,6 +3835,8 @@ async function verifyAccumulatorReceipt(
             result.code === "replay_rejected" && {
               hint: "These proofs already paid for an earlier request. Resend them with that request's exact body to fetch its job; a new request needs new proofs.",
             }),
+          ...(result.code === "lock_not_exclusive" &&
+            opts.cashuLockRefusalHint !== undefined && { hint: opts.cashuLockRefusalHint }),
           extra: { mints },
         }),
         status,

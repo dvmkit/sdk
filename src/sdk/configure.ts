@@ -1,4 +1,5 @@
 import { CAPABILITY_NAME_RE } from "../lib/wire-schema";
+import { resolveCashuConfig } from "./cashu-locktime";
 import { type Currency, InvalidCurrencyError, validateCurrency } from "./pricing/currency";
 import { parseUsdPrice } from "./pricing/usd";
 import {
@@ -64,6 +65,7 @@ export function configureDVM<
     x402: config.x402,
     mpp: config.mpp,
     credit: resolveCreditConfig(config.credit),
+    cashu: resolveCashuConfig(config.cashu),
     auth: config.auth,
   };
 

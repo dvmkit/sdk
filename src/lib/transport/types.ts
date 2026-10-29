@@ -703,6 +703,8 @@ export interface V1InfoResponse {
     lock_pubkeys: string[];
     lock_pubkey_grace_seconds: number;
     min_locktime: number;
+    /** Refund-locktime floor, in seconds, for an unsigned paid call; present only when the DVM configures one. */
+    unsigned_min_locktime?: number;
     canonical_id: string | null;
   };
 }
@@ -771,6 +773,7 @@ export interface ProviderInfo {
     mints: string[];
     lock_pubkeys: string[];
     min_locktime: number;
+    unsigned_min_locktime?: number;
     canonical_id: string | null;
   };
   /** Git SHA the deployed image was built from. `"unknown"` when baked-in SHA is absent. */
