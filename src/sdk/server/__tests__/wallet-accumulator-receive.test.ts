@@ -198,6 +198,20 @@ describe("acceptAccumulatorPayment", () => {
     if (result.kind === "rejected") expect(result.code).toBe("missing_request_id");
   });
 
+  it("refuses a supplied request id in the derived-id namespace before touching the store", async () => {
+    const { pool } = makeMockPool();
+    const result = await acceptAccumulatorPayment({
+      cashuToken: "cashuB...",
+      mints: [MINT],
+      db: pool as never,
+      dvmId: DVM_ID,
+      lockPubkeys: [RECOVERY_PUBKEY],
+      requestId: `nut24-${"0".repeat(64)}`,
+    });
+    expect(result).toMatchObject({ kind: "rejected", code: "reserved_request_id" });
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
   it("rejects when proof is not P2PK-locked to recovery pubkey", async () => {
     const proofs = [makeProof("wrong", 5, "keyset-1", p2pkSecret("wrong", "02" + "11".repeat(32)))];
     const { wallet } = setupHappyDecode(proofs, 10);
@@ -374,6 +388,7 @@ describe("acceptAccumulatorPayment", () => {
       mintUrl: MINT,
       netMsats: 400_000,
       paidMsats: 400_000,
+      requestId: "req-fee",
     };
     expect(result).toEqual({ kind: "accumulated", ...accepted });
     expect(beforeCommit).toHaveBeenCalledWith(accepted);

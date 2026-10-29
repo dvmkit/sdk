@@ -50,12 +50,13 @@ import {
 } from "../../observability/projection";
 import type { TraceContext } from "../../observability/types";
 import { withSpan } from "../../observability/with-span";
-import type { FxFetcher } from "../pricing/index";
+import type { FxFetcher, FxRateSnapshot } from "../pricing/index";
 import {
   createFxFetcher,
   fiatToSatsCeil,
   fxRateFor,
   InvalidCurrencyError,
+  parseUsdPrice,
   resolveFxSourceFromEnv,
   UnsupportedCurrencyError,
   validateCurrency,
@@ -145,6 +146,11 @@ import {
   type LockPubkeyState,
   toLockPubkey,
 } from "./lock-pubkey-store";
+import {
+  DERIVED_REQUEST_ID_PREFIX,
+  type FxFetcherWithHistory,
+  withFxHistory,
+} from "./cashu-payment-request";
 import { MemoryCreditLedger } from "./memory-credit-ledger";
 import { MintHealthTracker } from "./mint-health-tracker";
 import { advertisedMethods, installHostedTempoChargeGuard,
@@ -1013,7 +1019,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   private readonly consumedCredentialStore: ConsumedCredentialStore;
   private readonly adminCashuNonceStore: ConsumedCredentialStore;
   private readonly ownsMintHealthTracker: boolean;
-  private readonly fxFetcher: FxFetcher;
+  private readonly fxFetcher: FxFetcherWithHistory;
   /**
    * The currency this DVM prices in and denominates its credit ledger in,
    * resolved once at construction.
@@ -1067,7 +1073,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // an authenticated `PlatformFxSource` rather than being passed verbatim as a
     // URL string — `createFxFetcher({ source: "platform" })` would `fetch("platform")`
     // and throw `Failed to parse URL from platform`, surfacing as `fx_rate_unavailable`.
-    this.fxFetcher = opts.fxFetcher ?? createFxFetcher({ source: resolveFxSourceFromEnv(fxEnv) });
+    this.fxFetcher = withFxHistory(
+      opts.fxFetcher ?? createFxFetcher({ source: resolveFxSourceFromEnv(fxEnv) })
+    );
     // Validate the declared denomination against the fetcher's supported currencies
     // at boot; a valid code can still be unsupported by this rate source.
     const fxCurrencies = this.fxFetcher.supportedCurrencies();
@@ -1431,7 +1439,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       })
     );
     if (this.opts.devMode) {
-      this.app.use("*", cors());
+      // A browser NUT-24 wallet reads the payment request off the 402's header.
+      this.app.use("*", cors({ exposeHeaders: ["X-Cashu"] }));
       this.app.get("/_dev", (c) => c.html(devPageHtml(this.descriptor.name)));
       this.app.all("/_proxy/*", (c) => this.handleProxy(c));
     }
@@ -3012,6 +3021,31 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return all.filter((m) => !tracker.isNutIncompatible(m));
   }
 
+  /**
+   * This request's price at the rates `pricedAt` replaced, or `undefined` when
+   * there are none or they were replaced longer ago than the hold window.
+   * Computed the way the current price is, so the figure matches the one an
+   * earlier 402 quoted.
+   */
+  private previousPriceMsats(
+    cap: CapabilityDescriptor,
+    dynamicUpfront: { amount: number; currency: string } | undefined,
+    pricedAt: FxRateSnapshot | undefined
+  ): number | undefined {
+    const previous = pricedAt && this.fxFetcher.previousFor(pricedAt);
+    if (!previous) return undefined;
+    try {
+      if (dynamicUpfront) {
+        return fiatToSatsCeil(dynamicUpfront.amount, fxRateFor(previous, dynamicUpfront.currency)) * 1000;
+      }
+      if (cap.price === undefined) return undefined;
+      return fiatToSatsCeil(parseUsdPrice(cap.price, "price"), fxRateFor(previous, "usd")) * 1000;
+    } catch {
+      // A rate the previous snapshot lacks just means no hold for this price.
+      return undefined;
+    }
+  }
+
   /** Authenticated, read-only recovery of a previously accepted public request id. */
   private async handleRequestResult(c: Context<AppEnv>): Promise<Response> {
     const requestId = c.req.param("requestId");
@@ -3101,6 +3135,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           error: "invalid_request_id",
           message: "request_id must be 1–128 URL-safe characters.",
         },
+        400
+      );
+    }
+    // The receive path refuses this id too; refusing it here as well tells a
+    // caller before it pays, rather than answering 402 for a payment it could
+    // not make under this id, and before the permanent public request-id binding.
+    if (c.req.header("X-Cashu-Request-Id")?.startsWith(DERIVED_REQUEST_ID_PREFIX)) {
+      return c.json(
+        paymentErrorBody("reserved_request_id", {
+          message: `X-Cashu-Request-Id may not start with "${DERIVED_REQUEST_ID_PREFIX}".`,
+        }),
         400
       );
     }
@@ -3430,9 +3475,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       const skipPayment = devModeSkipsPaymentVerification(this.opts);
       let priceMsats = resumeOnly ? payment.paidMsats || undefined : undefined;
+      // The rates this request is priced at; the NUT-24 price hold is keyed to them.
+      let pricedAt: FxRateSnapshot | undefined;
       if (!resumeOnly && !skipPayment) {
         try {
-          priceMsats = await this.jobManager.currentPriceMsats(capabilityName);
+          if (cap.price !== undefined) pricedAt = await this.fxFetcher.fetch();
+          priceMsats = await this.jobManager.currentPriceMsats(capabilityName, pricedAt);
         } catch (err) {
           const fxErr = pickFxRateUnavailable(err);
           if (fxErr) return c.json({ error: fxErr }, 503);
@@ -3453,6 +3501,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         if (dyn.error) return c.json(dyn.error.body, dyn.error.status);
         priceMsats = dyn.priceMsats;
         dynamicUpfront = dyn.upfront;
+        pricedAt = dyn.pricedAt;
       }
 
       // pin the price's fiat denomination from the same quote surface
@@ -3508,6 +3557,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         const railOpts = unsignedPaid
           ? cashuOnlyRailOpts(await this.railVerifyOpts(c))
           : await this.railVerifyOpts(c);
+        // A NUT-24 wallet neither signs nor sends X-Cashu-Request-Id, so that
+        // form is offered and accepted only where the request needs no signature.
+        if (!this.descriptor.auth || unsignedPaid) {
+          railOpts.nut24 = {
+            mints: this.advertisedMints(),
+            previousRequiredMsats: this.previousPriceMsats(cap, dynamicUpfront, pricedAt),
+          };
+        }
         hostingPaymentMayHaveLanded = Boolean(
           creditEnvelope || railOpts.cashuToken || railOpts.x402Payment || railOpts.mppCredential
         );
@@ -3608,7 +3665,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 err.detail.body.price_micro = priceFiat.amountMicro;
                 err.detail.body.price_currency = priceFiat.currency;
               }
-              return buildPaymentErrorResponse(
+              const response = buildPaymentErrorResponse(
                 err.detail.body,
                 err.detail.mppChallenges,
                 err.detail.x402Requirements,
@@ -3618,6 +3675,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 this.x402Support()?.exact,
                 err.detail.x402ErrorCode
               );
+              if (err.detail.cashuPaymentRequest) {
+                response.headers.set("X-Cashu", err.detail.cashuPaymentRequest);
+                response.headers.set("Cache-Control", "no-store");
+              }
+              return response;
             }
           }
           throw err;
@@ -4071,6 +4133,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   ): Promise<{
     priceMsats?: number;
     upfront?: { amount: number; currency: string };
+    pricedAt?: FxRateSnapshot;
     error?: { body: Record<string, unknown>; status: 400 | 500 | 503 };
   }> {
     let data: unknown = parsedInput;
@@ -4122,6 +4185,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return {
         priceMsats,
         upfront: { amount: validated.upfront.amount, currency: upfrontCurrency },
+        pricedAt: fx,
       };
     } catch (err) {
       if (err instanceof InvalidCurrencyError || err instanceof UnsupportedCurrencyError) {

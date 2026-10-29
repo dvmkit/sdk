@@ -69,6 +69,7 @@ function shortUpfrontPay(h: Harness) {
       mintUrl: MINT,
       netMsats: SHORT_MSATS,
       paidMsats: SHORT_MSATS,
+      requestId: opts.requestId ?? "",
     };
     await opts.withCommitTx?.({} as never, accepted);
     return { kind: "accumulated" as const, ...accepted };
@@ -102,6 +103,7 @@ function explicitShortUpfrontPay(h: Harness) {
       mintUrl: MINT,
       netMsats: SHORT_MSATS,
       paidMsats: SHORT_MSATS,
+      requestId: opts.requestId ?? "",
     };
     await opts.beforeCommit?.(accepted);
     await opts.withCommitTx?.({} as never, accepted);

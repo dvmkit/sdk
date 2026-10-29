@@ -57,6 +57,7 @@ const EXPECTED_RETRYABLE: Record<PaymentErrorCode, boolean> = {
   lightning_invoice_expired: false,
   lightning_unavailable: true,
   missing_request_id: false,
+  reserved_request_id: false,
   missing_lock_pubkey: false,
   invalid_token: false,
   not_p2pk_locked: false,

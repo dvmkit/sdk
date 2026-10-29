@@ -91,6 +91,7 @@ function acceptFullPayment(): void {
       mintUrl: MINT,
       netMsats: ASK_MSATS,
       paidMsats: ASK_MSATS,
+      requestId: opts.requestId ?? "",
     };
     await opts.withCommitTx?.({} as never, accepted);
     return { kind: "accumulated" as const, ...accepted };

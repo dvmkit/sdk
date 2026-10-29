@@ -179,6 +179,27 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
     expect(await retry.json()).toMatchObject({ job_id: first.job_id, job_token: first.job_token });
   }, 30_000);
 
+  it("banks a payment sent without a request id under its proof set's id, and recovers it on retry", async () => {
+    const host = await startHost(false);
+    const [proofs] = await lockedProofs(1);
+    const body = { capability: "paid", data: { text: "first" } };
+    const first = await post(`${host.url}/v1/job`, body, { "X-Cashu": token(proofs!) });
+    expect(first.status).toBe(200);
+    const job = (await first.json()) as { job_id: string; job_token: string };
+    const { rows } = await pool.query<{ request_id: string }>(
+      "SELECT DISTINCT request_id FROM wallet_accumulator WHERE dvm_id = $1",
+      [host.dvmId]
+    );
+    expect(rows).toEqual([{ request_id: expect.stringMatching(/^nut24-[0-9a-f]{64}$/) }]);
+    const banked = await rowsUnder(host.dvmId, rows[0]!.request_id);
+    expect(banked).toBe(proofs!.length);
+
+    const retry = await post(`${host.url}/v1/job`, body, { "X-Cashu": token(proofs!) });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token });
+    expect(await rowsUnder(host.dvmId, rows[0]!.request_id)).toBe(banked);
+  }, 30_000);
+
   it("refuses POST /v1/credit funding with other proofs under a used request id", async () => {
     const host = await startHost(true);
     const [firstProofs, otherProofs] = await lockedProofs(2);

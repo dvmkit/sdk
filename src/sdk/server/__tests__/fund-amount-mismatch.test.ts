@@ -153,6 +153,7 @@ beforeEach(() => {
       mintUrl: MINT,
       netMsats: PAID_MSATS,
       paidMsats: PAID_MSATS,
+      requestId: opts.requestId ?? "",
     };
     await opts.beforeCommit?.(accepted);
     await opts.withCommitTx?.({} as never, accepted);

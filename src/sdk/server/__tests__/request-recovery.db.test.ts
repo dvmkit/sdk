@@ -828,6 +828,7 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
           inputFeeMsats: 0,
           netMsats: PRICE_MSATS,
           mintUrl: CASHU_MINT,
+          requestId: cashuRequestId,
         });
         await client.query("COMMIT");
         accumulatorMutations += 1;
@@ -844,6 +845,7 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
         inputFeeMsats: 0,
         netMsats: PRICE_MSATS,
         mintUrl: CASHU_MINT,
+        requestId: cashuRequestId,
       };
     });
 
