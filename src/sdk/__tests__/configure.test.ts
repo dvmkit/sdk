@@ -105,6 +105,9 @@ describe("configureDVM", () => {
         unsignedMinLocktimeSeconds: 86_400,
       });
       expect(resolve({ minLocktimeSeconds: 90_000 })?.unsignedMinLocktimeSeconds).toBe(3_600);
+      expect(resolve({ minLocktimeSeconds: 172_800, unsignedMinLocktimeSeconds: 86_400 })?.unsignedMinLocktimeSeconds).toBe(
+        86_400
+      );
       expect(resolve({ unsignedMinLocktimeSeconds: 43_200 })).toEqual({
         minLocktimeSeconds: 604_800,
         unsignedMinLocktimeSeconds: 43_200,
@@ -126,6 +129,28 @@ describe("configureDVM", () => {
       expect(() =>
         configureDVM({ name: "X", capability: "test", cashu: { [field]: value as number }, onJob: noop })
       ).toThrow(new RegExp(`cashu\\.${field} must be a whole number of seconds, at least ${minimum};`));
+    });
+
+    // An unsigned payer can send X-Cashu-Request-Id to take the signed floor,
+    // so an unsigned floor longer than the enforced signed one protects nothing.
+    it("rejects an unsigned floor longer than the enforced signed floor", () => {
+      expect(() =>
+        configureDVM({
+          name: "X",
+          capability: "test",
+          cashu: { minLocktimeSeconds: 172_800, unsignedMinLocktimeSeconds: 86_401 },
+          onJob: noop,
+        })
+      ).toThrow(/cashu\.unsignedMinLocktimeSeconds \(86401\) must not exceed cashu\.minLocktimeSeconds less 86400 \(86400\)/);
+      expect(() =>
+        configureDVM({ name: "X", capability: "test", cashu: { unsignedMinLocktimeSeconds: 518_401 }, onJob: noop })
+      ).toThrow(/must not exceed/);
+    });
+
+    it.each([null, 5, "7d", []])("rejects a cashu block of %j at configuration", (cashu) => {
+      expect(() =>
+        configureDVM({ name: "X", capability: "test", cashu: cashu as never, onJob: noop })
+      ).toThrow(/configureDVM: cashu must be an object of refund-locktime floors/);
     });
 
     it("accepts each floor at its minimum", () => {

@@ -573,11 +573,11 @@ export interface ResolvedCreditConfig {
 
 /**
  * Refund-locktime floors for Cashu payments. A payer may lock proofs with a
- * NUT-11 refund path back to itself; the DVM refuses a refund `locktime` that
- * opens before the proofs can be melted. Shortening a floor below its default
- * is safe only when the builder melts more often than the floor: once a
- * proof's locktime passes, the payer's refund key can spend it if it is still
- * unmelted.
+ * NUT-11 `locktime`; the DVM refuses one that passes before the proofs can be
+ * melted. Shortening a floor below its default is safe only when the builder
+ * melts more often than the floor: once a proof's locktime passes, the payer
+ * can take it back if it is still unmelted, through its refund key, or, when
+ * the proof names no refund key, by anyone holding the proof.
  */
 export interface CashuConfig {
   /**
@@ -597,7 +597,9 @@ export interface CashuConfig {
    * with no resume margin, and advertised as `cashu.unsigned_min_locktime`.
    * A payment carrying `X-Cashu-Request-Id` takes the signed floor. Default
    * `minLocktimeSeconds` less 24 hours (518400 when that is unset). A whole
-   * number of at least 3600.
+   * number of at least 3600, and no more than `minLocktimeSeconds` less 24
+   * hours: an unsigned payer can send `X-Cashu-Request-Id` to take the signed
+   * floor instead, so a longer unsigned floor would protect nothing.
    */
   unsignedMinLocktimeSeconds?: number;
 }

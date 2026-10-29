@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { toLockPubkey } from "../../../lib/cashu/lock-pubkey";
+import { DEFAULT_CASHU_LOCK_WINDOW_SECONDS } from "../../cashu-locktime";
 import * as cashuVerify from "../../../lib/cashu/verify";
 
 vi.mock("../../../lib/cashu/verify", () => ({
@@ -167,6 +168,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
     };
     const missingResult = await acceptAccumulatorPayment({
       ...base,
@@ -193,6 +195,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
     });
     expect(result.kind).toBe("rejected");
     if (result.kind === "rejected") expect(result.code).toBe("missing_request_id");
@@ -206,6 +209,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       requestId: `nut24-${"0".repeat(64)}`,
     });
     expect(result).toMatchObject({ kind: "rejected", code: "reserved_request_id" });
@@ -225,6 +229,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -248,6 +253,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -275,6 +281,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -304,6 +311,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -329,6 +337,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -377,6 +386,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
       beforeCommit,
       withCommitTx,
@@ -411,6 +421,7 @@ describe("acceptAccumulatorPayment", () => {
         db: pool as never,
         dvmId: DVM_ID,
         lockPubkeys: [RECOVERY_PUBKEY],
+        lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
         walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
         beforeCommit: () => {
           throw new Error("valuation mismatch");
@@ -442,6 +453,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
     expect(result.kind).toBe("accumulated");
@@ -485,6 +497,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -509,6 +522,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY, RETIRED_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -544,6 +558,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
       beforeCommit,
       withCommitTx,
@@ -575,6 +590,7 @@ describe("acceptAccumulatorPayment", () => {
       db: pool as never,
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     });
 
@@ -595,6 +611,7 @@ describe("acceptAccumulatorPayment", () => {
       mints: [LOOPBACK_MINT],
       dvmId: DVM_ID,
       lockPubkeys: [RECOVERY_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
     };
 
@@ -634,6 +651,7 @@ describe("acceptAccumulatorPayment", () => {
         withDisposableLedger: async () => {},
         dvmId: DVM_ID,
         lockPubkeys: [RECOVERY_PUBKEY],
+        lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
         walletProvider: vi.fn(() => Promise.resolve(wallet as never)),
       });
     };

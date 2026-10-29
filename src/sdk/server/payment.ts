@@ -78,6 +78,7 @@ import { cashuPaymentRequest } from "./cashu-payment-request";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { ProcessedPaymentReplayError } from "./processed-payment-store";
 import type { CreditDepositEnqueue, CreditDepositPayload } from "./revenue-reporter";
+import { DEFAULT_CASHU_LOCK_WINDOW_SECONDS } from "../cashu-locktime";
 import {
   acceptAccumulatorPayment,
   type AccumulatorRejectionCode,
@@ -311,7 +312,11 @@ export interface UpfrontPaymentOpts {
   lockPubkeys?: LockPubkey[];
   /** UUIDv4 from `X-Cashu-Request-Id` header. */
   requestId?: string;
-  /** Enforced refund-locktime window; see {@link AccumulatorReceiveOpts.lockWindowSeconds}. */
+  /**
+   * Enforced refund-locktime window; see
+   * {@link AccumulatorReceiveOpts.lockWindowSeconds}. The SDK host always
+   * sets it; a direct caller that omits it gets the default window.
+   */
   cashuLockWindowSeconds?: number;
   /** Replaces the `lock_not_exclusive` hint when the floor that applied is not the signed one. */
   cashuLockRefusalHint?: string;
@@ -912,7 +917,12 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     // verifies the lock, and either accumulates (sub-threshold) or swaps
     // on-receive (above-threshold).
     if (cashuAccumulatorReady(opts)) {
-      return verifyAccumulatorReceipt(opts, mints, requiredMsats, ledgerCtx);
+      return verifyAccumulatorReceipt(
+        { ...opts, cashuLockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds) },
+        mints,
+        requiredMsats,
+        ledgerCtx
+      );
     }
 
     // Unlocked Cashu proofs are no longer accepted. Only P2PK-locked
@@ -2755,7 +2765,7 @@ async function verifyIncomingPaymentInScope(
           lockPubkeys: opts.lockPubkeys,
           requestId,
           mintHealthTracker: opts.mintHealthTracker,
-          cashuLockWindowSeconds: opts.cashuLockWindowSeconds,
+          cashuLockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds),
         },
         mints,
         snapshot.pendingPaymentMsats,
@@ -3381,7 +3391,7 @@ async function processIncomingPaymentInScope(
           lockPubkeys: opts.lockPubkeys,
           requestId,
           mintHealthTracker: opts.mintHealthTracker,
-          cashuLockWindowSeconds: opts.cashuLockWindowSeconds,
+          cashuLockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds),
         },
         mints,
         job.pendingPaymentMsats
@@ -3607,8 +3617,13 @@ interface AccumulatorReceiveCommonOpts {
   requestId?: string;
   mintHealthTracker?: MintHealthTracker;
   nut24?: UpfrontPaymentOpts["nut24"];
-  cashuLockWindowSeconds?: number;
+  cashuLockWindowSeconds: number;
   cashuLockRefusalHint?: string;
+}
+
+/** The entry points' one fallback for a direct caller that names no window. */
+function lockWindowOrDefault(seconds: number | undefined): number {
+  return seconds ?? DEFAULT_CASHU_LOCK_WINDOW_SECONDS;
 }
 
 /** Whether a presented Cashu token takes the P2PK accumulator path. */

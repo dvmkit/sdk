@@ -128,10 +128,10 @@ export interface AccumulatorReceiveOpts {
    */
   lockPubkeys: LockPubkey[];
   /**
-   * Seconds after receipt that a refund `locktime` must not precede. Defaults
-   * to {@link DEFAULT_CASHU_LOCK_WINDOW_SECONDS}.
+   * Seconds after receipt that a refund `locktime` must not precede. Required
+   * so no path can fall back to a floor other than the one its DVM configured.
    */
-  lockWindowSeconds?: number;
+  lockWindowSeconds: number;
   /** Test seam — defaults to the cashu-ts wallet wrapper. */
   walletProvider?: typeof getWallet;
   /**
@@ -380,7 +380,7 @@ export async function acceptAccumulatorPayment(
   // round-trip or write. The same loop extracts each NUT-11 `locktime` (ms
   // since epoch) for oldest-first ordering and the expiring-soon monitor.
   const nowSec = Math.floor(Date.now() / 1000);
-  const floorSec = nowSec + (opts.lockWindowSeconds ?? DEFAULT_CASHU_LOCK_WINDOW_SECONDS);
+  const floorSec = nowSec + opts.lockWindowSeconds;
   const tExpireMsByIndex: (number | null)[] = [];
   const matchedLockPubkeyByIndex: LockPubkey[] = [];
   let belowFloorMessage: string | undefined;

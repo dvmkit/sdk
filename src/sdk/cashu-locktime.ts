@@ -65,12 +65,23 @@ export function shortestCashuLockWindowSeconds(
  */
 export function resolveCashuConfig(cashu: CashuConfig | undefined): ResolvedCashuConfig | undefined {
   if (cashu === undefined) return undefined;
+  if (typeof cashu !== "object" || cashu === null || Array.isArray(cashu)) {
+    throw new Error(`configureDVM: cashu must be an object of refund-locktime floors; received ${JSON.stringify(cashu)}`);
+  }
   const minLocktimeSeconds =
     validFloor(cashu.minLocktimeSeconds, "minLocktimeSeconds", CASHU_SIGNED_LOCKTIME_FLOOR_MINIMUM_SECONDS) ??
     CASHU_MIN_LOCKTIME_SECONDS;
   const unsignedMinLocktimeSeconds =
     validFloor(cashu.unsignedMinLocktimeSeconds, "unsignedMinLocktimeSeconds", CASHU_LOCKTIME_FLOOR_MINIMUM_SECONDS) ??
     minLocktimeSeconds - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS;
+  // An unsigned payer picks its floor by sending X-Cashu-Request-Id or not,
+  // so it always gets the shorter one: a longer unsigned floor protects nothing.
+  const signedWindow = minLocktimeSeconds - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS;
+  if (unsignedMinLocktimeSeconds > signedWindow) {
+    throw new Error(
+      `configureDVM: cashu.unsignedMinLocktimeSeconds (${unsignedMinLocktimeSeconds}) must not exceed cashu.minLocktimeSeconds less 86400 (${signedWindow}); a payer without a signature can take the signed floor instead by sending X-Cashu-Request-Id`
+    );
+  }
   return { minLocktimeSeconds, unsignedMinLocktimeSeconds };
 }
 

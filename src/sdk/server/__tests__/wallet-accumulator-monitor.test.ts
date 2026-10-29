@@ -472,13 +472,13 @@ describe("expiring-soon threshold under configured lock floors", () => {
 
   it("keeps 36 hours for the default floors, signed and unsigned", () => {
     expect(expiringSoonThresholdMs(shortestCashuLockWindowSeconds(undefined, true))).toBe(36 * HOUR_MS);
-    expect(EXPIRING_SOON_THRESHOLD_MS).toBe(36 * HOUR_MS);
   });
 
   it("stays silent when a payment arrives at a 12-hour unsigned floor and warns before its deadline", async () => {
     const cashu = { minLocktimeSeconds: 604_800, unsignedMinLocktimeSeconds: 43_200 };
     const thresholdMs = expiringSoonThresholdMs(shortestCashuLockWindowSeconds(cashu, true));
-    expect(await expiringSoonLogged(thresholdMs, 12 * HOUR_MS)).toBe(false);
+    // A tick after receipt: a threshold of the whole window would already fire.
+    expect(await expiringSoonLogged(thresholdMs, 12 * HOUR_MS - 60_000)).toBe(false);
     expect(await expiringSoonLogged(thresholdMs, 5 * HOUR_MS)).toBe(true);
   });
 

@@ -230,9 +230,9 @@ Which floor applies depends on how the payment arrives, not on the kind of DVM:
 | Any `POST /v1/job` carrying `X-Cashu-Request-Id`, signed or not, on any DVM | signed: `cashu.min_locktime` minus 24 hours |
 | A signed `POST /v1/job`, a mid-job `payment` message, `POST /v1/credit` | signed |
 
-A payer that sends `X-Cashu-Request-Id` reads `cashu.min_locktime` before locking and may re-send the same payment after a lost response, so it keeps the 24-hour margin even on a DVM without auth. A `lock_not_exclusive` refusal's `hint` names `cashu.unsigned_min_locktime` only on the unsigned path of a DVM that advertises it.
+A payer that sends `X-Cashu-Request-Id` reads `cashu.min_locktime` before locking and may re-send the same payment after a lost response, so it keeps the 24-hour margin even on a DVM without auth. Because the header picks the floor, an unsigned payer always gets the shorter of the two, so `configureDVM` refuses an `unsignedMinLocktimeSeconds` longer than `minLocktimeSeconds` less 24 hours. A `lock_not_exclusive` refusal's `hint` names `cashu.unsigned_min_locktime` only on the unsigned path of a DVM that advertises it.
 
-A floor shorter than the default is safe only if the builder melts banked proofs more often than the floor. Banked proofs wait unswapped for the batch melt, and once a proof's `locktime` passes, the payer's refund key can spend it if it is still unmelted. The accumulator monitor's `wallet_accumulator_batch_expiring_soon` event fires 36 hours before a batch's earliest locktime, or at half the shortest enforced floor when that is shorter, so a payment at the floor does not raise it on arrival.
+A floor shorter than the default is safe only if the builder melts banked proofs more often than the floor. Banked proofs wait unswapped for the batch melt, and once a proof's `locktime` passes and it is still unmelted, NUT-11 lets the payer take it back through its `refund` key, or, when the proof names no `refund` key, lets anyone holding the proof spend it. The accumulator monitor's `wallet_accumulator_batch_expiring_soon` event fires 36 hours before a batch's earliest locktime, or at half the shortest enforced floor when that is shorter, so a payment at the floor does not raise it on arrival.
 
 
 ## Job identity field
