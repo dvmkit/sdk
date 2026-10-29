@@ -3711,17 +3711,22 @@ async function verifyAccumulatorReceipt(
   // the current one is valued against the price it covers, decided here,
   // before the short-payment branch could forfeit it.
   const previousRequired = headerless ? opts.nut24?.previousRequiredMsats : undefined;
-  const requiredFor = (paidMsats: number): number | undefined =>
+  const heldAt = (paidMsats: number): number | undefined =>
     requiredMsats !== undefined &&
     paidMsats < requiredMsats &&
     previousRequired !== undefined &&
     paidMsats >= previousRequired
       ? previousRequired
-      : requiredMsats;
-  const held = (ctx: LedgerContext, paidMsats: number): LedgerContext => ({
-    ...ctx,
-    requiredMsats: requiredFor(paidMsats) ?? ctx.requiredMsats,
-  });
+      : undefined;
+  const requiredFor = (paidMsats: number): number | undefined =>
+    heldAt(paidMsats) ?? requiredMsats;
+  // Only a held payment re-prices the ledger leg. Otherwise the context keeps
+  // its own reference price: once a job's ask is paid the outer requirement is
+  // 0, while the context values the payment against a no-ask reference rate.
+  const held = (ctx: LedgerContext, paidMsats: number): LedgerContext => {
+    const previous = heldAt(paidMsats);
+    return previous === undefined ? ctx : { ...ctx, requiredMsats: previous };
+  };
   const signedFund = ledgerCtx?.creditEnvelope?.fund;
   const beforeCommit =
     ledgerCtx && signedFund

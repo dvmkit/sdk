@@ -246,6 +246,11 @@ export function fundedMicroFor(
   paidMsats: number,
   requiredMsats: number
 ): number {
+  // A missing reference price is a caller bug; dividing by it would surface
+  // as the payer's `payment_invalid` instead of a server fault.
+  if (!Number.isFinite(requiredMsats) || requiredMsats <= 0) {
+    throw new Error(`fundedMicroFor needs a positive reference price in msats (got ${requiredMsats})`);
+  }
   if (paidMsats === requiredMsats) return priceFiat.amountMicro;
   return Math.round((priceFiat.amountMicro * paidMsats) / requiredMsats);
 }

@@ -347,6 +347,43 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       });
     });
 
+    it("books a Cashu payment after the ask is paid as balance, not a refusal", async () => {
+      const h = harness();
+      await upfrontDraw(h, { rail: "cashu" });
+      vi.mocked(acceptAccumulatorPayment).mockImplementation(async (opts) => {
+        const accepted = {
+          grossMsats: TOPUP_MSATS,
+          inputFeeMsats: 0,
+          mintUrl: "https://mint.example",
+          netMsats: TOPUP_MSATS,
+          paidMsats: TOPUP_MSATS,
+          requestId: opts.requestId ?? "",
+        };
+        await opts.withCommitTx?.({} as never, accepted);
+        return { kind: "accumulated" as const, ...accepted };
+      });
+
+      const { verified, error } = await verifyIncomingPayment(
+        { type: "payment", content: { cashu_token: "cashuTok", cashu_request_id: "req-late" } },
+        {
+          cashuMode: "p2pk-accumulator",
+          accumulatorDb: {} as never,
+          lockPubkeys: ["02" + "ab".repeat(32)] as never,
+          mints: ["https://mint.example"],
+          dvmId: DVM_ID,
+          jobId: JOB_ID,
+          fxFetcher: warmFetcher(),
+          creditLedger: h.ledger,
+          processedPayments: h.processedPayments
+        },
+        explicitJob({ paymentRail: "cashu", pendingPaymentMsats: 0, pendingPaymentFiatMicro: undefined })
+      );
+      expect(error).toBeUndefined();
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect((await h.ledger.getDraw({ creditId: "c1", drawId: "d1" }))?.amountMicro).toBe(UPFRONT_MICRO);
+      expect((await h.ledger.get("c1"))?.balanceMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
+    });
+
     it("leaves exactly one row behind a replayed payment and names the payment it collided on", async () => {
       const h = harness();
       await upfrontDraw(h);
