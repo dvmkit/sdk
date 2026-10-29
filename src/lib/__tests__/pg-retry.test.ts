@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 
-import type { Pool } from "pg";
+import pg, { type Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -129,6 +129,98 @@ describe("applyRetryToPool", () => {
     applyRetryToPool(pool, "test");
     await expect(pool.query("SELECT 1")).rejects.toBe(err);
     expect(warnSpy).toHaveBeenCalledOnce();
+  });
+
+  it.each([3, 10])("replaces %i stale idle clients on the first ordinary query", async (size) => {
+    const clients: TransportClient[] = [];
+    // Only the transport is simulated: pg owns checkout, eviction, release and replacement.
+    class TransportClient extends EventEmitter {
+      _queryable = true;
+      _ending = false;
+      stale = false;
+
+      constructor() {
+        super();
+        clients.push(this);
+      }
+
+      connect(callback: (error?: Error) => void): void {
+        queueMicrotask(() => callback());
+      }
+
+      query(_text: unknown, _values: unknown, callback: (error?: Error, result?: unknown) => void): void {
+        queueMicrotask(() => callback(
+          this.stale ? new Error("Connection terminated unexpectedly") : undefined,
+          this.stale ? undefined : { rows: [{ n: 1 }] }
+        ));
+      }
+
+      end(callback?: () => void): void {
+        this._ending = true;
+        queueMicrotask(() => {
+          this.emit("end");
+          callback?.();
+        });
+      }
+    }
+
+    const pool = new pg.Pool({
+      max: size,
+      idleTimeoutMillis: 0,
+      Client: TransportClient as unknown as typeof pg.Client,
+    });
+    applyRetryToPool(pool, "test");
+    try {
+      const checkedOut = await Promise.all(Array.from({ length: size }, () => pool.connect()));
+      for (const client of clients) client.stale = true;
+      for (const client of checkedOut) client.release();
+      expect(pool.idleCount).toBe(size);
+
+      await expect(pool.query("SELECT 1 AS n")).resolves.toMatchObject({ rows: [{ n: 1 }] });
+
+      expect(clients).toHaveLength(size + 1);
+      expect(clients.slice(0, size).every((client) => client._ending)).toBe(true);
+      expect(pool.totalCount).toBe(1);
+      expect(pool.idleCount).toBe(1);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it.each([undefined, 100])("stops slow connection retries within the timeout envelope (%s)", async (timeout) => {
+    let now = 1_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const error = new Error("Connection terminated due to connection timeout");
+    let calls = 0;
+    const pool = makePool(async () => {
+      calls += 1;
+      now += timeout === undefined ? 6_000 : 60;
+      throw error;
+    });
+    pool.options.max = 10;
+    pool.options.connectionTimeoutMillis = timeout;
+    applyRetryToPool(pool, "test");
+    try {
+      await expect(pool.query("SELECT 1")).rejects.toBe(error);
+      expect(calls).toBe(2);
+      expect(now - 1_000).toBeLessThanOrEqual(2 * (timeout ?? 10_000));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("caps immediate persistent transport failures at one pool replacement", async () => {
+    let calls = 0;
+    const error = new Error("Connection terminated unexpectedly");
+    const pool = makePool(async () => {
+      calls += 1;
+      throw error;
+    });
+    pool.options.max = 3;
+    applyRetryToPool(pool, "test");
+
+    await expect(pool.query("SELECT 1")).rejects.toBe(error);
+    expect(calls).toBe(4);
   });
 
   it("drains a full stale pool inside the Tempo close recovery budget", async () => {

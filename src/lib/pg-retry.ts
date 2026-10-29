@@ -77,8 +77,9 @@ const guardedClients = new WeakSet<object>();
 
 /** Patches pool.query and pool.connect in-place to retry transport errors.
  * Idempotent — safe to call multiple times on the same pool instance.
- * Ordinary work retries once; a bounded recovery context may replace every
- * socket in the configured pool during a money-protection request.
+ * Recovery may replace every socket in the configured pool. The connection
+ * timeout bounds how long ordinary work starts retries; a request context can
+ * supply its own deadline.
  * Registers pool.on("error") to prevent idle-client eviction errors from crashing the process,
  * and attaches an 'error' guard to every checked-out client for the same reason (see
  * {@link guardCheckedOutClient}). */
@@ -153,8 +154,16 @@ async function withTransportRecovery<value>(
   callback: () => Promise<value>
 ): Promise<value> {
   const context = postgresRecovery.getStore();
-  const maxAttempts = context?.drainPool ? hostPoolSize(pool) + 1 : 2;
+  const maxAttempts = context?.drainPool === false ? 2 : hostPoolSize(pool) + 1;
   const startedAt = Date.now();
+  const configuredTimeout = pool.options.connectionTimeoutMillis;
+  const retryWindowMs = typeof configuredTimeout === "number" && Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : 10_000;
+  // Stop launching retries within one connect-timeout window. An in-flight
+  // attempt still uses pg's timeout, so recovery cannot multiply that wait by
+  // pool size. Do not race database writes against an uncancellable timer.
+  const deadlineMs = context?.deadlineMs ?? startedAt + retryWindowMs;
   let firstError: Error | undefined;
 
   for (let attempt = 1; ; attempt += 1) {
@@ -176,7 +185,7 @@ async function withTransportRecovery<value>(
       if (!isTransportError(error)) throw error;
       firstError ??= asError(error);
       const elapsedMs = Date.now() - startedAt;
-      if (attempt >= maxAttempts || (context !== undefined && Date.now() >= context.deadlineMs)) {
+      if (attempt >= maxAttempts || Date.now() >= deadlineMs) {
         logTransportRecovery({
           context,
           label,

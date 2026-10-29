@@ -2,6 +2,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildAdminAuthHeader } from "../../../lib/cashu/admin-auth";
+import { applyRetryToPool } from "../../../lib/pg-retry";
 import { configureDVM } from "../../configure";
 import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
@@ -21,9 +22,12 @@ describe("admin lock-state outage", () => {
 
   it("keeps info fallback read-only and accepts the same admin nonce after recovery", async () => {
     let unavailable = true;
+    let staleClients = 0;
     const query = vi.fn((text: string) => {
       if (text.includes("FROM dvm_lock_pubkeys")) {
-        if (unavailable) return Promise.reject(new Error("connection terminated unexpectedly"));
+        if (unavailable || staleClients-- > 0) {
+          return Promise.reject(new Error("Connection terminated unexpectedly"));
+        }
         return Promise.resolve({
           rows: [{ pubkey: LOCK_PUBKEY, retired_at_ms: null }],
           rowCount: 1,
@@ -39,6 +43,9 @@ describe("admin lock-state outage", () => {
       mark: vi.fn(() => Promise.resolve()),
     };
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const pool = { query, connect: vi.fn(), on: vi.fn(), options: { max: 3 } };
+    applyRetryToPool(pool as never, "test");
     const dvm = configureDVM({
       name: "admin-lock-state-outage",
       capability: "test",
@@ -54,7 +61,7 @@ describe("admin lock-state outage", () => {
       cashuMode: "p2pk-accumulator",
       lockPubkey: LOCK_PUBKEY,
       dvmId: DVM_ID,
-      db: { query } as never,
+      db: pool as never,
       adminCashuNonceStore: nonceStore,
     });
     shutdown = built.shutdown;
@@ -78,6 +85,7 @@ describe("admin lock-state outage", () => {
     expect(nonceStore.mark).not.toHaveBeenCalled();
 
     unavailable = false;
+    staleClients = 3;
     const recovered = await built.app.request(path, { headers: { Authorization: header } });
     expect(recovered.status).toBe(200);
     expect(nonceStore.has).toHaveBeenCalledOnce();
