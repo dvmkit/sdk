@@ -54,6 +54,7 @@ describe("processIncomingPayment — cashu_p2pk mid-job", () => {
       inputFeeMsats: 0,
       netMsats: 7_000,
       mintUrl: MINT,
+      requestId: "req-mid-uuid",
     });
 
     const job = makeJob();

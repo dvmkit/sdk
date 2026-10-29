@@ -467,7 +467,8 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
           inputFeeMsats: 1_000,
           mintUrl: MINT,
           netMsats: SHORT_MSATS,
-          paidMsats: SHORT_MSATS
+          paidMsats: SHORT_MSATS,
+          requestId: opts.requestId ?? "",
         };
         await opts.withCommitTx?.({} as never, accepted);
         return { kind: "accumulated" as const, ...accepted };
@@ -614,7 +615,8 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
             inputFeeMsats: 1_000,
             mintUrl: MINT,
             netMsats: SHORT_MSATS,
-            paidMsats: SHORT_MSATS
+            paidMsats: SHORT_MSATS,
+            requestId: opts.requestId ?? "",
           };
           await opts.withCommitTx?.({} as never, accepted);
           return { kind: "accumulated" as const, ...accepted };
@@ -758,7 +760,8 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
           inputFeeMsats: 0,
           mintUrl: MINT,
           netMsats: TOPUP_MSATS,
-          paidMsats: TOPUP_MSATS
+          paidMsats: TOPUP_MSATS,
+          requestId: opts.requestId ?? "",
         };
         await opts.withCommitTx?.({} as never, accepted);
         return { kind: "accumulated" as const, ...accepted };

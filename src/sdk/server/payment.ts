@@ -74,6 +74,7 @@ import {
   methodNativeAsset,
   msatsToMethodAmount,
 } from "./mpp-units";
+import { cashuPaymentRequest } from "./cashu-payment-request";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { ProcessedPaymentReplayError } from "./processed-payment-store";
 import type { CreditDepositEnqueue, CreditDepositPayload } from "./revenue-reporter";
@@ -311,6 +312,16 @@ export interface UpfrontPaymentOpts {
   /** UUIDv4 from `X-Cashu-Request-Id` header. */
   requestId?: string;
   /**
+   * Per-call Cashu the NUT-24 way, for a `POST /v1/job` the payer could pay
+   * without signing. The unpaid 402 then carries the `X-Cashu` payment request
+   * for `mints` (the health-filtered list `/v1/info` advertises), and a token
+   * sent without {@link requestId} is accepted under the id derived from its
+   * proofs. Such a payment's payer-fixable refusals answer 400, and it may
+   * cover `previousRequiredMsats`, the same price at the rate snapshot before
+   * the current one, so a 402 priced just before a rate refresh stays payable.
+   */
+  nut24?: { mints: string[]; previousRequiredMsats?: number };
+  /**
    * Runtime mint-health tracker. Receive path short-circuits with
    * `cashu_mint_sick` when the token's mint is currently flagged sick, so
    * agents retry against a healthy alternative without waiting for the
@@ -432,6 +443,12 @@ export interface PaymentErrorDetail {
    * decide whether a 402 is correctable.
    */
   x402ErrorCode?: string;
+  /**
+   * NUT-18 payment request for the `X-Cashu` response header. Set only on the
+   * unpaid `payment_required` 402 of a NUT-24 request, never on a refusal, so
+   * a wallet that pays every `X-Cashu` 402 automatically never pays twice.
+   */
+  cashuPaymentRequest?: string;
   /**
    * On a `replay_rejected` from the x402/mpp processed-payment marker
    * the payment id the original funding committed under. The
@@ -890,13 +907,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     // Agent-wallet: the SDK accepts P2PK-locked proofs from agents,
     // verifies the lock, and either accumulates (sub-threshold) or swaps
     // on-receive (above-threshold).
-    if (
-      opts.cashuMode === "p2pk-accumulator" &&
-      (opts.accumulatorDb || opts.disposableCashu) &&
-      opts.dvmId &&
-      opts.lockPubkeys &&
-      opts.lockPubkeys.length > 0
-    ) {
+    if (cashuAccumulatorReady(opts)) {
       return verifyAccumulatorReceipt(opts, mints, requiredMsats, ledgerCtx);
     }
 
@@ -1718,6 +1729,11 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
             opts.priceFiat
           )
         : undefined;
+    const lockPubkey = opts.lockPubkeys?.[0];
+    const cashuRequest =
+      opts.nut24 && opts.nut24.mints.length > 0 && !opts.fundOnly && cashuAccumulatorReady(opts) && lockPubkey
+        ? cashuPaymentRequest({ requiredMsats, mints: opts.nut24.mints, lockPubkey })
+        : undefined;
     return {
       paidMsats: 0,
       receivedProofs: [],
@@ -1728,6 +1744,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           ...(mints && { mints }),
         },
         status: 402,
+        ...(cashuRequest && { cashuPaymentRequest: cashuRequest }),
         ...(mppChallenges && { mppChallenges }),
         ...(x402Requirements && { x402Requirements }),
         ...(x402BatchRequirements && { x402V2Requirements: x402BatchRequirements }),
@@ -2308,6 +2325,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     display:
       "The payment was missing a required identifier and couldn't be processed. Nothing was charged.",
     hint: "Include the X-Cashu-Request-Id header and pay again.",
+    retryable: false,
+  },
+  reserved_request_id: {
+    display:
+      "The payment's request identifier isn't allowed, so the payment wasn't processed. Nothing was charged.",
+    hint: 'Send a fresh UUIDv4 as X-Cashu-Request-Id. Ids starting with "nut24-" are reserved for payments sent without one.',
     retryable: false,
   },
   missing_lock_pubkey: {
@@ -3569,7 +3592,30 @@ interface AccumulatorReceiveCommonOpts {
   lockPubkeys?: LockPubkey[];
   requestId?: string;
   mintHealthTracker?: MintHealthTracker;
+  nut24?: UpfrontPaymentOpts["nut24"];
 }
+
+/** Whether a presented Cashu token takes the P2PK accumulator path. */
+function cashuAccumulatorReady(opts: UpfrontPaymentOpts): boolean {
+  return (
+    opts.cashuMode === "p2pk-accumulator" &&
+    Boolean(opts.accumulatorDb || opts.disposableCashu) &&
+    Boolean(opts.dvmId) &&
+    (opts.lockPubkeys?.length ?? 0) > 0
+  );
+}
+
+/**
+ * Refusals a payer can fix by sending a different token. NUT-24 answers these
+ * 400 when the payment came without `X-Cashu-Request-Id`.
+ */
+const NUT24_PAYER_FIXABLE = new Set<PaymentErrorCode>([
+  "invalid_token",
+  "not_p2pk_locked",
+  "wrong_lock_pubkey",
+  "lock_not_exclusive",
+  "payment_insufficient",
+]);
 
 /**
  * Accumulator-path receive. Routes through
@@ -3657,10 +3703,25 @@ async function verifyAccumulatorReceipt(
   // Ledger leg (spec condition 3): fund + draw run inside the SAME
   // transaction as the accumulator insert, via the receive path's
   // `withCommitTx` hook — the money commits iff the ledger credit commits.
-  // Only wired when a request id exists (its absence is rejected below with
-  // `missing_request_id` before the hook would run).
+  // The hooks run only once the receive path holds a request id, supplied or
+  // derived from the proofs of a NUT-24 payment that came without one.
   let credited: CommittedFunding | undefined;
-  const requestId = opts.requestId;
+  const headerless = !opts.requestId && opts.nut24 !== undefined;
+  // A header-less payment covering the previous rate snapshot's price but not
+  // the current one is valued against the price it covers, decided here,
+  // before the short-payment branch could forfeit it.
+  const previousRequired = headerless ? opts.nut24?.previousRequiredMsats : undefined;
+  const requiredFor = (paidMsats: number): number | undefined =>
+    requiredMsats !== undefined &&
+    paidMsats < requiredMsats &&
+    previousRequired !== undefined &&
+    paidMsats >= previousRequired
+      ? previousRequired
+      : requiredMsats;
+  const held = (ctx: LedgerContext, paidMsats: number): LedgerContext => ({
+    ...ctx,
+    requiredMsats: requiredFor(paidMsats) ?? ctx.requiredMsats,
+  });
   const signedFund = ledgerCtx?.creditEnvelope?.fund;
   const beforeCommit =
     ledgerCtx && signedFund
@@ -3676,16 +3737,16 @@ async function verifyAccumulatorReceipt(
         }
       : undefined;
   const withCommitTx =
-    ledgerCtx && requestId
+    ledgerCtx
       ? async (
           tx: AccumulatorQuerier,
-          accepted: { paidMsats: number; grossMsats: number; inputFeeMsats: number }
+          accepted: { paidMsats: number; grossMsats: number; inputFeeMsats: number; requestId: string }
         ) => {
           credited = await fundAndDraw(
-            ledgerCtx,
+            held(ledgerCtx, accepted.paidMsats),
             {
               rail: "cashu",
-              paymentId: requestId,
+              paymentId: accepted.requestId,
               paidMsats: accepted.paidMsats,
               grossPaidMsats: accepted.grossMsats,
               cashuInputFeeMsats: accepted.inputFeeMsats,
@@ -3701,12 +3762,13 @@ async function verifyAccumulatorReceipt(
     result = await acceptAccumulatorPayment({
       cashuToken,
       requestId: opts.requestId,
+      deriveRequestId: headerless,
       mints,
       db: accumulatorDb,
       disposable: opts.disposableCashu,
-      withDisposableLedger: ledgerCtx && requestId ? async (ledger, accepted) => {
-        credited = await fundAndDraw({ ...ledgerCtx, ledger }, {
-          rail: "cashu", paymentId: requestId, paidMsats: accepted.paidMsats,
+      withDisposableLedger: ledgerCtx ? async (ledger, accepted) => {
+        credited = await fundAndDraw({ ...held(ledgerCtx, accepted.paidMsats), ledger }, {
+          rail: "cashu", paymentId: accepted.requestId, paidMsats: accepted.paidMsats,
           grossPaidMsats: accepted.grossMsats, cashuInputFeeMsats: accepted.inputFeeMsats,
           mint: tokenMint,
         });
@@ -3731,12 +3793,28 @@ async function verifyAccumulatorReceipt(
   }
 
   if (result.kind === "rejected") {
-    const status = result.code === "replay_rejected" || result.code === "request_id_reused" ? 409 : 402;
+    const status =
+      result.code === "replay_rejected" || result.code === "request_id_reused"
+        ? 409
+        : result.code === "reserved_request_id" ||
+            (headerless && NUT24_PAYER_FIXABLE.has(result.code))
+          ? 400
+          : 402;
+    const requestId = result.requestId;
     return {
       paidMsats: 0,
       receivedProofs: [],
       error: {
-        body: paymentErrorBody(result.code, { message: result.message, extra: { mints } }),
+        body: paymentErrorBody(result.code, {
+          message: result.message,
+          // Without a request id the proof set is the payment's identity, so
+          // only these exact proofs with the original body recover its job.
+          ...(headerless &&
+            result.code === "replay_rejected" && {
+              hint: "These proofs already paid for an earlier request. Resend them with that request's exact body to fetch its job; a new request needs new proofs.",
+            }),
+          extra: { mints },
+        }),
         status,
         // The request id is also the funding id a mid-job top-up committed
         // under and the job's payment reference, so the route can return the
@@ -3762,9 +3840,10 @@ async function verifyAccumulatorReceipt(
   // and the ledger decides whether the full-price draw is covered. A short
   // explicit token is therefore a smaller deposit, never a failed per-call
   // payment whose balance-funded draw may be forfeited.
+  const heldRequired = requiredFor(result.paidMsats);
   if (
-    requiredMsats &&
-    result.paidMsats < requiredMsats &&
+    heldRequired &&
+    result.paidMsats < heldRequired &&
     !ledgerCtx?.fundOnly &&
     !ledgerCtx?.creditEnvelope
   ) {
@@ -3826,6 +3905,10 @@ async function verifyAccumulatorReceipt(
             // site where that is the caller's next action.
             hint: `The ${result.paidMsats} msats already sent are held on credit ${held.creditId} and do not reduce what is owed — retry with a single payment of required_msats, or reclaim the held balance with op "drain" at POST /v1/credit.`,
           }),
+          ...(!held &&
+            headerless && {
+              hint: "The proofs already sent are kept and do not count toward this request. Pay again with new proofs worth required_msats after the mint's input fee.",
+            }),
           extra: {
             required_msats: requiredMsats,
             received_msats: result.paidMsats,
@@ -3837,7 +3920,7 @@ async function verifyAccumulatorReceipt(
             }),
           },
         }),
-        status: 402,
+        status: headerless ? 400 : 402,
         forfeit,
         // Report the deposit on the failure path too, or the platform never
         // learns about a liability it is carrying. Mutually exclusive with
@@ -3854,13 +3937,11 @@ async function verifyAccumulatorReceipt(
       paymentMint: result.mintUrl,
       paymentRail: "cashu",
       receivedProofs: [],
-      // requestId is non-null here because acceptAccumulatorPayment returns
-      // kind:"rejected" with code "missing_request_id" when unset (handled by
-      // the rejected branch above). Thread it as the per-call settlement
-      // reference for revenue_events.tx_hash. Unique per
-      // (dvm_id, request_id) by the wallet_accumulator UNIQUE constraint, so
-      // it serves as a stable id even though it isn't an on-chain hash.
-      paymentTxHash: opts.requestId,
+      // The request id the proofs were banked under, supplied or derived, is
+      // the per-call settlement reference for revenue_events.tx_hash. Unique
+      // per (dvm_id, request_id) by the wallet_accumulator UNIQUE constraint,
+      // so it serves as a stable id even though it isn't an on-chain hash.
+      paymentTxHash: result.requestId,
       cashuFlow: "p2pk_accumulator",
     },
     ledgerCtx,

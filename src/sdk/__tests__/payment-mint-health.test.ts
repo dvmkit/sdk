@@ -138,6 +138,7 @@ describe("verifyUpfrontPayment — runtime mint-health gate", () => {
       inputFeeMsats: 0,
       netMsats: 1_000_000,
       mintUrl: HEALTHY_MINT,
+      requestId: "req-uuid-2",
     });
 
     const result = await verifyUpfrontPayment({

@@ -42,6 +42,7 @@ describe("Cashu receiver-fee funding valuation", () => {
         mintUrl: MINT,
         netMsats: NET_MSATS,
         paidMsats: NET_MSATS,
+        requestId: opts.requestId ?? "",
       };
       await opts.beforeCommit?.(accepted);
       await opts.withCommitTx?.({} as never, accepted);

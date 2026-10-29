@@ -15,6 +15,7 @@ import {
 
 import type { LockPubkey } from "../../lib/cashu/lock-pubkey";
 import { verifyCashuToken } from "../../lib/cashu/verify";
+import { DERIVED_REQUEST_ID_PREFIX, proofSetRequestId } from "./cashu-payment-request";
 import type { CreditLedgerLike } from "./credit-ledger";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
 import { getWallet } from "../../lib/cashu/wallet";
@@ -34,6 +35,7 @@ import {
  */
 export type AccumulatorRejectionCode =
   | "missing_request_id"
+  | "reserved_request_id"
   | "missing_lock_pubkey"
   | "not_p2pk_locked"
   | "wrong_lock_pubkey"
@@ -58,6 +60,8 @@ export interface CashuFundingValuation {
 /** Cashu value accepted by the accumulator and passed to its commit hooks. */
 export interface AcceptedAccumulatorValue extends CashuFundingValuation {
   mintUrl: string;
+  /** The request id the proofs are banked under, supplied or derived. */
+  requestId: string;
   /** Net fundable value; retained as the common payment-rail field. */
   paidMsats: number;
 }
@@ -75,6 +79,8 @@ export type AccumulatorReceiveResult =
       /** Caller principal after subtracting the receiver input fee. */
       netMsats: number;
       mintUrl: string;
+      /** The request id the proofs were banked under, supplied or derived. */
+      requestId: string;
     }
   | {
       kind: "rejected";
@@ -86,6 +92,11 @@ export type AccumulatorReceiveResult =
        * they were accepted under different request ids.
        */
       acceptedRequestId?: string;
+      /**
+       * The request id this attempt ran under, supplied or derived. Absent
+       * when it was refused before its proofs were read.
+       */
+      requestId?: string;
     };
 
 export interface AccumulatorReceiveOpts {
@@ -93,6 +104,12 @@ export interface AccumulatorReceiveOpts {
   cashuToken: string;
   /** UUIDv4 from `X-Cashu-Request-Id` — required for replay protection. */
   requestId?: string;
+  /**
+   * With no {@link requestId}, bind the payment to the id derived from its
+   * proof set instead of refusing it, so a NUT-24 payer that sends only the
+   * token gets the same replay and recovery binding.
+   */
+  deriveRequestId?: boolean;
   mints: string[];
   db?: AccumulatorPool;
   /** Explicit test-only in-memory commit backend. */
@@ -303,11 +320,20 @@ export async function acceptAccumulatorPayment(
   if (opts.disposable && !opts.mints.every(isTestMintUrl)) {
     throw new Error("Disposable Cashu accepts only known test or loopback mints.");
   }
-  if (!opts.requestId) {
+  if (!opts.requestId && !opts.deriveRequestId) {
     return {
       kind: "rejected",
       code: "missing_request_id",
       message: "X-Cashu-Request-Id header required for the agent-wallet path.",
+    };
+  }
+  // Derived ids are claimed only by the proof set they name. A caller who could
+  // send one would claim it first and turn the honest payer's payment away.
+  if (opts.requestId?.startsWith(DERIVED_REQUEST_ID_PREFIX)) {
+    return {
+      kind: "rejected",
+      code: "reserved_request_id",
+      message: `A Cashu request id may not start with "${DERIVED_REQUEST_ID_PREFIX}".`,
     };
   }
   if (opts.lockPubkeys.length === 0) {
@@ -350,10 +376,12 @@ export async function acceptAccumulatorPayment(
     };
   }
 
+  const requestId = opts.requestId || proofSetRequestId(proofs.map((proof) => proof.secret));
   const acceptedValue: AcceptedAccumulatorValue = {
     ...valuation,
     mintUrl,
     paidMsats: valuation.netMsats,
+    requestId,
   };
 
   // Judge every proof's lock from its secret's structure before any mint
@@ -378,7 +406,7 @@ export async function acceptAccumulatorPayment(
     // can fall below it. Answer that retry as the replay it is, letting the
     // route recover the original job, instead of as a fresh refusal.
     const banked = await acceptedUnder(opts, proofs);
-    if (banked.some((id) => id !== undefined)) return replayRejected(banked);
+    if (banked.some((id) => id !== undefined)) return replayRejected(banked, requestId);
     return { kind: "rejected", code: "lock_not_exclusive", message: belowFloorMessage };
   }
 
@@ -440,14 +468,14 @@ export async function acceptAccumulatorPayment(
     lockPubkeyByIndex: matchedLockPubkeyByIndex,
     mintUrl,
     proofs,
-    requestId: opts.requestId,
+    requestId,
     tExpireMsByIndex,
   };
   try {
     if (opts.disposable) {
       const account = opts.withDisposableLedger;
       if (!account) throw new Error("Disposable Cashu requires atomic credit accounting.");
-      await opts.disposable.commit(opts.requestId, proofs, (ledger) => account(ledger, acceptedValue));
+      await opts.disposable.commit(requestId, proofs, (ledger) => account(ledger, acceptedValue));
     } else if (!opts.db) {
       throw new Error("Cashu accumulator requires a storage backend.");
     } else {
@@ -456,7 +484,7 @@ export async function acceptAccumulatorPayment(
         await client.query("BEGIN");
         // Under a REPEATABLE READ pool default the claim's read would miss a concurrent claim's commit.
         await client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-        await claimAccumulatorRequestId(client, opts.dvmId, opts.requestId);
+        await claimAccumulatorRequestId(client, opts.dvmId, requestId);
         await insertAccumulatorRows(opts.db, { ...insertArgs, tx: client });
         await opts.withCommitTx?.(client, acceptedValue);
         await client.query("COMMIT");
@@ -476,8 +504,8 @@ export async function acceptAccumulatorPayment(
       const banked = await acceptedUnder(opts, proofs);
       // None of these proofs is banked, so the collision is the request id
       // alone: another proof set already holds it and nothing was kept.
-      if (banked.every((id) => id === undefined)) return requestIdReused();
-      return replayRejected(banked);
+      if (banked.every((id) => id === undefined)) return requestIdReused(requestId);
+      return replayRejected(banked, requestId);
     }
     throw err;
   }
@@ -489,6 +517,7 @@ export async function acceptAccumulatorPayment(
     inputFeeMsats: valuation.inputFeeMsats,
     netMsats: valuation.netMsats,
     mintUrl,
+    requestId,
   };
 }
 
@@ -502,21 +531,23 @@ async function acceptedUnder(
   return secrets.map(() => undefined);
 }
 
-function requestIdReused(): AccumulatorReceiveResult {
+function requestIdReused(requestId: string): AccumulatorReceiveResult {
   return {
     kind: "rejected",
     code: "request_id_reused",
+    requestId,
     message: "This request id already carries a different payment at this DVM; these proofs were not accepted.",
   };
 }
 
-function replayRejected(accepted: (string | undefined)[]): AccumulatorReceiveResult {
+function replayRejected(accepted: (string | undefined)[], requestId: string): AccumulatorReceiveResult {
   const [first] = accepted;
   const bound = first !== undefined && accepted.every((id) => id === first);
   return {
     kind: "rejected",
     code: "replay_rejected",
     message: "Proofs or request id already accepted at this DVM.",
+    requestId,
     ...(bound && { acceptedRequestId: first }),
   };
 }

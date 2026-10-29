@@ -59,7 +59,8 @@ const OTHER_PRIVKEY = new Uint8Array(32).fill(9);
 function acceptOnceThenReplay(): void {
   mockAccept.mockImplementation(() => {
     const call = mockAccept.mock.calls.length;
-    const firstRequestId = mockAccept.mock.calls[0]?.[0].requestId;
+    const firstRequestId = mockAccept.mock.calls[0]?.[0].requestId ?? "";
+    const requestId = mockAccept.mock.calls[call - 1]?.[0].requestId;
     return Promise.resolve(
       call === 1
         ? {
@@ -69,12 +70,14 @@ function acceptOnceThenReplay(): void {
             mintUrl: MINT,
             netMsats: 1_000_000,
             paidMsats: 1_000_000,
+            requestId: firstRequestId,
           }
         : {
             kind: "rejected" as const,
             code: "replay_rejected" as const,
             message: "Proofs or request id already accepted at this DVM.",
             acceptedRequestId: firstRequestId,
+            requestId,
           }
     );
   });

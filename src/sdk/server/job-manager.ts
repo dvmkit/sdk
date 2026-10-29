@@ -23,7 +23,7 @@ import type {
 } from "../../lib/signed-request-statement";
 import type { X402Config } from "../../lib/x402/types";
 import { loggers } from "../../observability/loggers";
-import type { FxFetcher } from "../pricing/index";
+import type { FxFetcher, FxRateSnapshot } from "../pricing/index";
 import { fiatToSatsCeil, fxRateFor, parseUsdPrice, roundUsd } from "../pricing/index";
 import { StepCache } from "../step-cache";
 import type {
@@ -928,11 +928,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * `"$X.XX"` is parsed as USD and converted via the SDK's shared fx fetcher.
    * Returns `undefined` for dynamic-priced capabilities (those that declare
    * `onQuote`) — the caller falls back to `computeDynamicPrice` in that path.
+   * A caller that already holds the snapshot it prices at passes it as `fx`.
    */
-  async currentPriceMsats(capability: string): Promise<number | undefined> {
+  async currentPriceMsats(capability: string, fx?: FxRateSnapshot): Promise<number | undefined> {
     const cap = this.requireCapability(capability);
     if (cap.price === undefined) return undefined;
-    return resolveStaticPriceMsats(cap.price, this.opts.fxFetcher);
+    return resolveStaticPriceMsats(cap.price, fx ?? (await this.opts.fxFetcher.fetch()));
   }
 
   /**
@@ -4656,9 +4657,8 @@ function unappliedCopy(
  * fetcher so every USD-denominated price on this process shares one cache
  * window, and so the figure matches what `/v1/quote` advertised.
  */
-async function resolveStaticPriceMsats(price: PriceValue, fxFetcher: FxFetcher): Promise<number> {
+function resolveStaticPriceMsats(price: PriceValue, fx: FxRateSnapshot): number {
   const usd = parseUsdPrice(price, "price");
-  const fx = await fxFetcher.fetch();
   return fiatToSatsCeil(usd, fxRateFor(fx, "usd")) * 1000;
 }
 

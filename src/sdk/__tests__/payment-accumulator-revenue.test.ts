@@ -28,6 +28,7 @@ describe("verifyUpfrontPayment — accumulator path threads revenue fields", () 
       inputFeeMsats: 0,
       netMsats: 1_000_000,
       mintUrl: MINT,
+      requestId: "req-accum-uuid",
     });
 
     const result = await verifyUpfrontPayment({
