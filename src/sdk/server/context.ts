@@ -81,6 +81,13 @@ export interface BuildContextOpts {
   /** Persist a remaining prompt wait after accepted payment, without repeating verification. */
   onPaymentResume?: () => Promise<void>;
   paymentMethods?: PaymentMethod[];
+  /**
+   * The job is an unsigned paid call, so its mid-job asks offer Cashu alone.
+   * A push-mode Tempo wallet broadcasts its transfer before the server sees the
+   * credential, so refusing the credential afterwards cannot stop the payment;
+   * the ask must not advertise the rail at all.
+   */
+  cashuOnly?: boolean;
   x402?: X402Config;
   /** Live facilitator capabilities used to suppress unavailable mid-job asks. */
   x402FacilitatorHealth?: X402FacilitatorHealthLike;
@@ -690,7 +697,7 @@ export function buildContext(
         // USDC can state a USD-denominated ask exactly. On any other DVM
         // currency it would require a fresh FX conversion, so x402 is withheld
         // even when the handler supplies an explicit per-ask override.
-        if ((opts.pricingCurrency ?? "usd") === "usd") {
+        if (!opts.cashuOnly && (opts.pricingCurrency ?? "usd") === "usd") {
           if (payOpts?.x402) {
             paymentRequestContent.x402 = payOpts.x402;
           } else if (
@@ -763,7 +770,9 @@ export function buildContext(
         // without this binding a credential lifted from a sibling job that
         // requested the same fields could satisfy this payment-request.
         let mppChallengeIds: string[] | undefined;
-        if (payOpts?.mpp) {
+        if (opts.cashuOnly) {
+          // No Tempo challenge on an unsigned job; see `cashuOnly`.
+        } else if (payOpts?.mpp) {
           // Pre-issued challenges get the same session filter as the issuer
           // below: a builder handing `requestPayment` its own list
           // would otherwise advertise a reusable channel both mid-job verifiers

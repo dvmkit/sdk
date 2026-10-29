@@ -3578,6 +3578,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       store: this.opts.store,
       env: this.opts.env,
       paymentMethods: this.opts.paymentMethods,
+      cashuOnly: Boolean(this.descriptor.auth?.allowUnsignedPaid) && job.requesterPubkey === undefined,
       x402: this.opts.x402,
       x402FacilitatorHealth: this.opts.x402FacilitatorHealth,
       mpp: this.opts.mpp,
