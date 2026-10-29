@@ -15,6 +15,7 @@ export type X402ExactSettlementStatus =
   | "local_committed"
   | "ambiguous"
   | "rejected"
+  | "released"
   | "complete";
 
 /** Serializable local economic effect that follows an exact settlement. */
@@ -109,6 +110,12 @@ export interface X402ExactSettlementStore {
     intentId: string,
     fn: (intent: X402ExactSettlementIntent, tx?: ProcessedPaymentQuerier) => Promise<T>
   ): Promise<{ intent: X402ExactSettlementIntent; value?: T; replayed: boolean }>;
+  /**
+   * Retire a `prepared` intent whose work did not succeed so it is never sent
+   * for settlement. Returns false for any other status, which keeps a
+   * submitted or settled authorization from being disowned.
+   */
+  release(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean>;
   markAdmissionComplete(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent>;
   list(args: {
     dvmId: string;
@@ -414,6 +421,17 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
     }
   }
 
+  async release(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean> {
+    const now = Date.now();
+    const { rowCount } = await this.pool.query(
+      `UPDATE x402_exact_settlement_intents
+          SET status = 'released', last_outcome = $3, resolved_at = $4, updated_at = $4
+        WHERE dvm_id = $1 AND intent_id = $2 AND status = 'prepared'`,
+      [args.dvmId, args.intentId, args.reason, now]
+    );
+    return rowCount === 1;
+  }
+
   async markAdmissionComplete(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent> {
     const now = Date.now();
     const { rows } = await this.pool.query<X402ExactIntentRow>(
@@ -438,7 +456,7 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
   }): Promise<X402ExactSettlementIntent[]> {
     const { rows } = await this.pool.query<X402ExactIntentRow>(
       `SELECT * FROM x402_exact_settlement_intents
-        WHERE dvm_id = $1 ${args.includeResolved ? "" : "AND status <> 'complete' AND status <> 'rejected'"}
+        WHERE dvm_id = $1 ${args.includeResolved ? "" : "AND status NOT IN ('complete', 'rejected', 'released')"}
         ORDER BY updated_at ASC LIMIT $2`,
       [args.dvmId, args.limit]
     );
@@ -598,6 +616,21 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
     });
   }
 
+  release(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean> {
+    const key = intentKey(args.dvmId, args.intentId);
+    const intent = this.intents.get(key);
+    if (intent?.status !== "prepared") return Promise.resolve(false);
+    const now = Date.now();
+    this.intents.set(key, {
+      ...intent,
+      status: "released",
+      lastOutcome: args.reason,
+      resolvedAt: now,
+      updatedAt: now,
+    });
+    return Promise.resolve(true);
+  }
+
   markAdmissionComplete(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent> {
     const key = intentKey(dvmId, intentId);
     const intent = this.intents.get(key);
@@ -628,7 +661,9 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
           (intent) =>
             intent.dvmId === args.dvmId &&
             ((args.includeResolved ?? false) ||
-              (intent.status !== "complete" && intent.status !== "rejected"))
+              (intent.status !== "complete" &&
+                intent.status !== "rejected" &&
+                intent.status !== "released"))
         )
         .sort((a, b) => a.updatedAt - b.updatedAt)
         .slice(0, args.limit)

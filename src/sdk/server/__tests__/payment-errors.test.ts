@@ -8,6 +8,7 @@ const EXPECTED_RETRYABLE: Record<PaymentErrorCode, boolean> = {
   payment_invalid: false,
   x402_not_offered: false,
   payment_method_requires_signature: false,
+  payment_authorization_too_short: true,
   x402_settlement_ambiguous: true,
   cashu_unavailable: false,
   cashu_not_p2pk_locked: false,

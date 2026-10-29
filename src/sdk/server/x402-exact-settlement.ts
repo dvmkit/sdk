@@ -120,7 +120,116 @@ export class X402ExactSettlementServer {
       effect: args.effect,
     });
 
+    return this.advance({ ...args, intentId, payload, requirements });
+  }
+
+  /**
+   * Verify an authorization and record it as `prepared` without settling it.
+   * The caller must run {@link settlePrepared} once the work it pays for has
+   * succeeded, or {@link release} when it has not. A presentation whose
+   * intent already exists is reported as `replayed` and neither verified nor
+   * prepared again, so one authorization admits one piece of work.
+   */
+  async verifyAndPrepare(args: {
+    paymentHeader: string;
+    config: X402Config;
+    requiredUsdcMicro: bigint;
+    resource: string;
+    exactVersions?: X402ExactVersionSupport;
+    dvmId: string;
+    effect: X402ExactSettlementEffect;
+    /** Refuse, before any facilitator call, an authorization that expires sooner than this. */
+    minValidSeconds: number;
+    maxTimeoutSeconds: number;
+    nowMs?: number;
+  }): Promise<
+    | {
+        outcome: "prepared";
+        intentId: string;
+        payload: PaymentPayload;
+        requirements: PaymentRequirementsV1 | PaymentRequirementsV2;
+        validBeforeMs: number;
+      }
+    | { outcome: "replayed"; intentId: string }
+    | { outcome: "authorization_too_short"; intentId: string; validBefore: string }
+    | { outcome: "rejected"; intentId?: string; reason: string }
+  > {
+    const decoded = decodeAndDescribe(args);
+    if ("reason" in decoded) return { outcome: "rejected", reason: decoded.reason };
+    const { payload, requirements, facts, intentId } = decoded;
+    if (await this.opts.store.get(args.dvmId, intentId)) {
+      return { outcome: "replayed", intentId };
+    }
+    const validBeforeMs = Number(facts.validBefore) * 1000;
+    if (
+      !Number.isFinite(validBeforeMs) ||
+      validBeforeMs - (args.nowMs ?? Date.now()) < args.minValidSeconds * 1000
+    ) {
+      return { outcome: "authorization_too_short", intentId, validBefore: facts.validBefore };
+    }
+    const verified = await verifyWithFacilitator(
+      payload,
+      requirements,
+      args.config,
+      createX402FacilitatorAuthHeaders(args.config)
+    );
+    if (!verified.isValid) {
+      return { outcome: "rejected", intentId, reason: verified.invalidReason ?? "verify_failed" };
+    }
+    await this.opts.store.prepare({
+      id: intentId,
+      dvmId: args.dvmId,
+      resource: args.resource,
+      ...facts,
+      effect: args.effect,
+    });
+    return { outcome: "prepared", intentId, payload, requirements, validBeforeMs };
+  }
+
+  /** Settle an authorization recorded by {@link verifyAndPrepare} and commit its local effect. */
+  settlePrepared<T>(args: {
+    dvmId: string;
+    intentId: string;
+    payload: PaymentPayload;
+    requirements: PaymentRequirementsV1 | PaymentRequirementsV2;
+    config: X402Config;
+    btcUsdRate: number;
+    commit: (
+      receipt: X402Receipt,
+      tx?: ProcessedPaymentQuerier,
+      effect?: X402ExactSettlementEffect
+    ) => Promise<T>;
+  }): Promise<X402ExactAcceptance<T>> {
+    return this.advance(args);
+  }
+
+  /**
+   * Abandon a prepared authorization whose work did not succeed. The
+   * authorization is never sent to the facilitator, so it expires unspent.
+   * Returns false when the intent is no longer `prepared`.
+   */
+  release(dvmId: string, intentId: string, reason: string): Promise<boolean> {
+    return this.opts.store.release({ dvmId, intentId, reason });
+  }
+
+  private async advance<T>(args: {
+    dvmId: string;
+    intentId: string;
+    payload: PaymentPayload;
+    requirements: PaymentRequirementsV1 | PaymentRequirementsV2;
+    config: X402Config;
+    btcUsdRate: number;
+    commit: (
+      receipt: X402Receipt,
+      tx?: ProcessedPaymentQuerier,
+      effect?: X402ExactSettlementEffect
+    ) => Promise<T>;
+  }): Promise<X402ExactAcceptance<T>> {
+    const { intentId, payload, requirements } = args;
     let intent = await this.requiredIntent(args.dvmId, intentId);
+    if (intent.status === "released") {
+      return { outcome: "rejected", intentId, reason: intent.lastOutcome ?? "released" };
+    }
     if (intent.status === "complete") {
       return {
         outcome: "accepted",
@@ -283,6 +392,10 @@ export class X402ExactSettlementServer {
     return this.finalize(intent, args.btcUsdRate, args.commit);
   }
 
+  get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined> {
+    return this.opts.store.get(dvmId, intentId);
+  }
+
   list(args: {
     dvmId: string;
     limit: number;
@@ -376,6 +489,18 @@ export class X402ExactSettlementServer {
   }
 }
 
+/** Durable id of the intent a payment header would create, or undefined when it cannot be read. */
+export function exactSettlementIntentId(args: {
+  paymentHeader: string;
+  config: X402Config;
+  requiredUsdcMicro: bigint;
+  resource: string;
+  exactVersions?: X402ExactVersionSupport;
+}): string | undefined {
+  const decoded = decodeAndDescribe(args);
+  return "reason" in decoded ? undefined : decoded.intentId;
+}
+
 /** Raised when operator repair cannot prove the payment on chain. */
 export class X402ExactSettlementEvidenceMissingError extends Error {
   constructor(readonly intentId: string) {
@@ -390,6 +515,7 @@ function decodeAndDescribe(args: {
   requiredUsdcMicro: bigint;
   resource: string;
   exactVersions?: X402ExactVersionSupport;
+  maxTimeoutSeconds?: number;
 }):
   | { reason: string }
   | {
@@ -412,6 +538,7 @@ function decodeAndDescribe(args: {
     x402Config: args.config,
     requiredUsdcMicro: args.requiredUsdcMicro,
     resource: args.resource,
+    maxTimeoutSeconds: args.maxTimeoutSeconds,
   };
   const requirements =
     payload.x402Version === 1
@@ -480,3 +607,95 @@ function safeError(err: unknown): string {
   if (err instanceof Error) return err.name;
   return "settlement_transport_error";
 }
+
+/** A verified authorization kept in memory until its job finishes. */
+export interface HeldX402Authorization {
+  payload: PaymentPayload;
+  requirements: PaymentRequirementsV1 | PaymentRequirementsV2;
+  config: X402Config;
+  btcUsdRate: number;
+  validBeforeMs: number;
+}
+
+/** How a finished job's deferred authorization ended. */
+export type DeferredX402Outcome = "settled" | "unpaid";
+
+export interface DeferredX402Settler {
+  hold(intentId: string, held: HeldX402Authorization): void;
+  /**
+   * Settle the job's authorization. Resolves `settled` once the funding is
+   * committed (also when an earlier call already did) and `unpaid` when the
+   * payment is definitively not collected. Rejects while the outcome is still
+   * unknown, so the caller retries.
+   */
+  settle(intentId: string): Promise<DeferredX402Outcome>;
+  /** Give up the authorization without sending it to the facilitator. */
+  release(intentId: string, reason: string): Promise<void>;
+}
+
+/**
+ * Holds each verified authorization in this process and sends it to the
+ * facilitator only when its job succeeds. The signature is a bearer
+ * credential, so it is never persisted: a process that loses it can only
+ * release the intent, leaving the payer unharmed and the work unpaid.
+ */
+export class InProcessDeferredX402Settler implements DeferredX402Settler {
+  private readonly held = new Map<string, HeldX402Authorization>();
+
+  constructor(
+    private readonly opts: {
+      settlement: X402ExactSettlementServer;
+      dvmId: string;
+      commit: (
+        receipt: X402Receipt,
+        tx?: ProcessedPaymentQuerier,
+        effect?: X402ExactSettlementEffect
+      ) => Promise<unknown>;
+    }
+  ) {}
+
+  hold(intentId: string, held: HeldX402Authorization): void {
+    this.held.set(intentId, held);
+    // An authorization past its own expiry can no longer settle, so keeping it
+    // would only leak memory for a job that never reached a terminal.
+    const timer = setTimeout(
+      () => {
+        if (this.held.get(intentId) === held) this.held.delete(intentId);
+      },
+      Math.max(0, held.validBeforeMs - Date.now()) + 1000
+    );
+    timer.unref();
+  }
+
+  async settle(intentId: string): Promise<DeferredX402Outcome> {
+    const { settlement, dvmId } = this.opts;
+    const intent = await settlement.get(dvmId, intentId);
+    if (intent?.status === "complete") return "settled";
+    if (intent?.status === "released" || intent?.status === "rejected") return "unpaid";
+    const held = this.held.get(intentId);
+    if (!held) {
+      await settlement.release(dvmId, intentId, "authorization_unavailable");
+      return "unpaid";
+    }
+    const result = await settlement.settlePrepared({
+      dvmId,
+      intentId,
+      payload: held.payload,
+      requirements: held.requirements,
+      config: held.config,
+      btcUsdRate: held.btcUsdRate,
+      commit: this.opts.commit,
+    });
+    if (result.outcome === "ambiguous") {
+      throw new Error(`x402 settlement ${intentId} outcome unknown: ${result.reason}`);
+    }
+    this.held.delete(intentId);
+    return result.outcome === "accepted" ? "settled" : "unpaid";
+  }
+
+  async release(intentId: string, reason: string): Promise<void> {
+    this.held.delete(intentId);
+    await this.opts.settlement.release(this.opts.dvmId, intentId, reason);
+  }
+}
+

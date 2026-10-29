@@ -304,6 +304,46 @@ export function implicitCreditId(rail: "cashu" | "x402" | "tempo", paymentId: st
 }
 
 /**
+ * Seconds an authorization must outlive the job's runtime bound: the
+ * facilitator rejects one within 6 seconds of `validBefore`, and `/settle`
+ * itself takes time.
+ */
+export const DEFERRED_X402_SETTLE_MARGIN_SECONDS = 15;
+
+/** Extra validity advertised so ordinary signing and network delay cannot trip the guard. */
+export const DEFERRED_X402_SIGNING_ALLOWANCE_SECONDS = 15;
+
+/** Authorization lifetime a deferred-settlement capability needs and advertises. */
+export function deferredX402Window(maxRuntimeSeconds: number): {
+  minValidSeconds: number;
+  advertisedTimeoutSeconds: number;
+} {
+  const minValidSeconds = maxRuntimeSeconds + DEFERRED_X402_SETTLE_MARGIN_SECONDS;
+  return {
+    minValidSeconds,
+    advertisedTimeoutSeconds: minValidSeconds + DEFERRED_X402_SIGNING_ALLOWANCE_SECONDS,
+  };
+}
+
+const DEFERRED_ID_PREFIX = "x402d:";
+
+/**
+ * Credit and draw id of a job paid by a deferred x402 authorization. The ids
+ * are fixed at admission, before any ledger row exists, and name the intent so
+ * the terminal funnel can settle or release it from the job record alone.
+ */
+export function deferredX402Id(intentId: string): string {
+  return `${DEFERRED_ID_PREFIX}${intentId}`;
+}
+
+/** The intent a deferred-settlement credit id names, or undefined for any other credit. */
+export function deferredX402IntentId(creditId: string | undefined): string | undefined {
+  return creditId?.startsWith(DEFERRED_ID_PREFIX)
+    ? creditId.slice(DEFERRED_ID_PREFIX.length)
+    : undefined;
+}
+
+/**
  * Id prefixes the SERVER derives: `imp:` for an implicit N=1 funding,
  * `fnd:` for a `/v1/credit` top-up that names no credit.
  */

@@ -47,7 +47,7 @@ import {
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
-import { implicitCreditId } from "./funding";
+import { deferredX402IntentId, implicitCreditId } from "./funding";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -107,7 +107,7 @@ import {
   startAccumulatorMonitor,
 } from "./wallet-accumulator-monitor";
 import { shortestCashuLockWindowSeconds, signedCashuLockWindowSeconds } from "../cashu-locktime";
-import type { X402ExactSettlementServer } from "./x402-exact-settlement";
+import type { DeferredX402Settler, X402ExactSettlementServer } from "./x402-exact-settlement";
 import type { X402FacilitatorHealthLike } from "./x402-facilitator-support";
 
 /**
@@ -337,6 +337,11 @@ export interface JobManagerOpts {
   enqueueCreditDeposit?: CreditDepositEnqueue;
   /** Reporter outbox inserted atomically with a terminal draw release. */
   enqueueCreditDrawRelease?: CreditDrawReleaseEnqueue;
+  /**
+   * Settles or releases the x402 authorization behind an unsigned job once the
+   * job is terminal. Absent on a DVM that takes no unsigned x402.
+   */
+  deferredX402?: DeferredX402Settler;
   /** Credit lifetime a top-up mints with, from the DVM's advertised `credit.ttl`. */
   creditTtlMs?: number;
   /**
@@ -1176,6 +1181,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         void job.terminalWork;
       }
       return;
+    }
+    // A deferred x402 authorization stays valid only for the window the guard
+    // checked at admission, so the job must be over before it lapses.
+    const runtimeBound = deferredX402IntentId(job.creditId) ? cap.maxRuntimeSeconds : undefined;
+    if (runtimeBound !== undefined) {
+      setTimeout(() => {
+        if (isTerminal(job.status)) return;
+        job.abort.abort();
+        onError(new Error(`Job exceeded its ${runtimeBound} second runtime limit`));
+      }, runtimeBound * 1000).unref();
     }
     try {
       const result = loggers.isolate.span(
@@ -3882,6 +3897,27 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async resolveCreditDraw(record: JobRecord): Promise<ReceiptCredit | undefined> {
     const ledger = this.opts.creditLedger;
     if (!ledger || !record.creditId || !record.drawId) return undefined;
+    const deferredIntent = deferredX402IntentId(record.creditId);
+    if (deferredIntent) {
+      // The authorization was only verified at admission; no ledger row exists
+      // until it settles. Only a completed job may send it to the facilitator,
+      // and every other terminal abandons it unspent.
+      const deferred = this.opts.deferredX402;
+      if (!deferred) throw new Error(`no settler for deferred x402 intent ${deferredIntent}`);
+      if (!this.settlesDraw(record.status)) {
+        await deferred.release(deferredIntent, record.status);
+        return undefined;
+      }
+      if ((await deferred.settle(deferredIntent)) === "unpaid") {
+        diagnosticConsole.warn({
+          level: "warn",
+          event: "deferred_x402_unpaid",
+          jobId: record.id,
+          intentId: deferredIntent,
+        });
+        return undefined;
+      }
+    }
     const args = this.drawResolutionArgs(record.creditId, record.drawId);
     try {
       const res = this.settlesDraw(record.status)

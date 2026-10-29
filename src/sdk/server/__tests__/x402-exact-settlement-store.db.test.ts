@@ -181,6 +181,25 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
     await store.markAdmissionComplete(DVM_ID, "intent-job-admission");
     expect((await store.get(DVM_ID, "intent-job-admission"))?.status).toBe("complete");
   });
+
+  it("releases only an intent that was never submitted, and stops counting it as unresolved", async () => {
+    await store.prepare(exactIntent("intent-released"));
+    await store.prepare({ ...exactIntent("intent-submitted"), nonce: `0x${"66".repeat(32)}` });
+    await store.markSubmitting({ dvmId: DVM_ID, intentId: "intent-submitted" });
+
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-released", reason: "failed" })).toBe(true);
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-released", reason: "failed" })).toBe(false);
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-submitted", reason: "failed" })).toBe(false);
+
+    expect(await store.get(DVM_ID, "intent-released")).toMatchObject({
+      status: "released",
+      lastOutcome: "failed",
+    });
+    expect((await store.get(DVM_ID, "intent-submitted"))?.status).toBe("submitting");
+    expect((await store.list({ dvmId: DVM_ID, limit: 10 })).map((intent) => intent.id)).toEqual([
+      "intent-submitted",
+    ]);
+  });
 });
 
 async function settledIntent(

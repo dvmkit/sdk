@@ -9,6 +9,9 @@ export const X402_VERSION = 2;
 /** Legacy x402 protocol version retained during the dual-serve window. */
 export const X402_V1_VERSION = 1;
 
+/** Authorization validity, in seconds, requested when a capability sets no runtime bound. */
+export const DEFAULT_MAX_TIMEOUT_SECONDS = 60;
+
 /** x402 protocol versions supported by dvmkit's hand-rolled exact codec. */
 export type X402Version = typeof X402_V1_VERSION | typeof X402_VERSION;
 
@@ -178,6 +181,12 @@ export interface BuildPaymentRequirementsOpts {
   description?: string;
   mimeType?: string;
   version?: X402Version;
+  /**
+   * Validity window, in seconds, a compliant client gives its authorization.
+   * Facilitators do not enforce it; a server that settles after the work must
+   * read the signed `validBefore` instead.
+   */
+  maxTimeoutSeconds?: number;
 }
 
 /**
@@ -196,6 +205,7 @@ export function buildPaymentRequirements(
   opts: BuildPaymentRequirementsOpts
 ): PaymentRequirementsV1 | PaymentRequirementsV2 {
   const { x402Config, requiredUsdcMicro, resource, description, mimeType } = opts;
+  const maxTimeoutSeconds = opts.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS;
   const version = opts.version ?? X402_VERSION;
   const network =
     version === X402_V1_VERSION ? caip2ToX402Network(x402Config.network) : x402Config.network;
@@ -213,7 +223,7 @@ export function buildPaymentRequirements(
       amount: requiredUsdcMicro.toString(),
       payTo: x402Config.payTo,
       asset,
-      maxTimeoutSeconds: 60,
+      maxTimeoutSeconds,
       extra,
     };
   }
@@ -226,7 +236,7 @@ export function buildPaymentRequirements(
     mimeType: mimeType ?? "application/json",
     payTo: x402Config.payTo,
     asset,
-    maxTimeoutSeconds: 60,
+    maxTimeoutSeconds,
     ...(Object.keys(extra).length > 0 ? { extra } : {}),
   };
 }

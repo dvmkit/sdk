@@ -39,7 +39,12 @@ import {
 } from "../../lib/signed-request-statement";
 import { parseTraceparent } from "../../lib/traceparent";
 import type { V1InfoCapability, V1InfoResponse } from "../../lib/transport/types";
-import { X402_BATCH_SETTLEMENT_SCHEME, X402_EXACT_SCHEME } from "../../lib/x402/spec";
+import {
+  encodeSettleResponseHeader,
+  X402_BATCH_SETTLEMENT_SCHEME,
+  X402_EXACT_SCHEME,
+  type SettleResponse,
+} from "../../lib/x402/spec";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
 import type {
   X402Config,
@@ -109,6 +114,7 @@ import { handleCreditRequest } from "./credit-routes";
 import { devPageHtml } from "./dev-page";
 import type { PriceFiat } from "./funding";
 import {
+  deferredX402IntentId,
   derivedFundCreditId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
@@ -213,7 +219,7 @@ import {
   type X402BatchSettlementServer,
 } from "./x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "./x402-channel-store";
-import { X402ExactSettlementServer } from "./x402-exact-settlement";
+import { InProcessDeferredX402Settler, X402ExactSettlementServer } from "./x402-exact-settlement";
 import { PostgresX402ExactSettlementStore } from "./x402-exact-settlement-store";
 import {
   configuredX402FacilitatorSupport,
@@ -1053,6 +1059,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   /** Coalesces concurrent requests that first observe batch support. */
   private x402BatchSettlementInit?: Promise<X402BatchSettlementServer>;
   private readonly x402ExactSettlement?: X402ExactSettlementServer;
+  /** Holds unsigned x402 authorizations until their job finishes; absent without durable exact settlement. */
+  private readonly deferredX402?: InProcessDeferredX402Settler;
   /** Withdraws this mount's Tempo session capability from the poll. */
   private undeclareSessionCapability?: () => void;
   private hostingSweepTimer?: ReturnType<typeof setInterval>;
@@ -1141,7 +1149,26 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return !completed.replayed;
     });
     this.processedPayments = opts.processedPayments ?? new MemoryProcessedPaymentStore();
+    this.deferredX402 =
+      this.x402ExactSettlement && opts.x402
+        ? new InProcessDeferredX402Settler({
+            settlement: this.x402ExactSettlement,
+            dvmId: opts.dvmId ?? "",
+            commit: (receipt, tx, effect) => {
+              if (!receipt.txHash) throw new Error("settled exact x402 intent has no transaction");
+              return repairX402ExactSettlementEffect({
+                effect,
+                paymentId: receipt.txHash,
+                ledger: this.creditLedger,
+                processedPayments: this.processedPayments,
+                enqueueCreditDeposit: opts.enqueueCreditDeposit,
+                tx,
+              });
+            },
+          })
+        : undefined;
     this.jobManager = new JobManager(descriptor, {
+      deferredX402: this.deferredX402,
       receiptIssuer: this.receiptIssuer,
       creditLedger: this.creditLedger,
       env: opts.env,
@@ -2991,9 +3018,51 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return this.descriptor.cashu !== undefined && (!this.descriptor.auth || this.descriptor.auth.allowUnsignedPaid === true);
   }
 
-  /** Whether this DVM takes Cashu, the only rail an unsigned payer may use. */
+  /** Whether this DVM takes Cashu, which an unsigned payer may always use. */
   private unsignedCashuOffered(): boolean {
     return (this.opts.mints?.length ?? 0) > 0 && this.resolvePaymentMethods().includes("cashu");
+  }
+
+  /**
+   * The x402 settlement an unsigned payer gets on this capability: verified
+   * before the job and settled only if it succeeds. Offered only where the
+   * capability bounds its runtime, so the authorization window can be checked,
+   * and where exact settlements are durable.
+   */
+  private unsignedX402(
+    cap: { maxRuntimeSeconds?: number }
+  ): NonNullable<UpfrontPaymentOpts["x402Deferred"]> | undefined {
+    if (!this.deferredX402 || cap.maxRuntimeSeconds === undefined) return undefined;
+    if (!this.x402CurrencySupported() || !this.resolvePaymentMethods().includes("x402")) {
+      return undefined;
+    }
+    return { maxRuntimeSeconds: cap.maxRuntimeSeconds, settler: this.deferredX402 };
+  }
+
+  /**
+   * `PAYMENT-RESPONSE` for a job paid by a deferred authorization, once the
+   * facilitator has settled it. The submit response cannot carry it because
+   * settlement follows the job.
+   */
+  private async deferredSettlementHeader(creditId: string | undefined): Promise<string | undefined> {
+    const intentId = deferredX402IntentId(creditId);
+    if (!intentId || !this.x402ExactSettlement) return undefined;
+    const intent = await this.x402ExactSettlement.get(this.opts.dvmId ?? "", intentId);
+    return intent?.status === "complete" && intent.settleResponse
+      ? encodeSettleResponseHeader(intent.settleResponse as unknown as SettleResponse)
+      : undefined;
+  }
+
+  private async withDeferredSettlement(
+    response: Response,
+    creditId: string | undefined
+  ): Promise<Response> {
+    const header = await this.deferredSettlementHeader(creditId);
+    if (!header) return response;
+    const out = new Response(response.body, response);
+    out.headers.set("PAYMENT-RESPONSE", header);
+    out.headers.set("X-PAYMENT-RESPONSE", header);
+    return out;
   }
 
   /**
@@ -3283,7 +3352,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       unsignedPaid &&
       ((cap.price === undefined && !cap.onQuote) ||
         devModeSkipsPaymentVerification(this.opts) ||
-        !this.unsignedCashuOffered())
+        (!this.unsignedCashuOffered() && !this.unsignedX402(cap)))
     ) {
       return buildAuthErrorResponse(
         c,
@@ -3294,10 +3363,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // x402 and Tempo settle into prepaid credit owned by a caller pubkey, which
     // an unsigned payer lacks, so a failed job would strand their money. Refuse
     // those artifacts before admission, pricing or any rail call.
-    if (unsignedPaid && (await carriesNonCashuPayment(c))) {
+    if (unsignedPaid && (await carriesNonCashuPayment(c, this.unsignedX402(cap) !== undefined))) {
       return buildPaymentErrorResponse(
         paymentErrorBody("payment_method_requires_signature", {
-          message: "Unsigned requests may pay only with Cashu; an x402 or Tempo payment was attached.",
+          message: "Unsigned requests may pay only with Cashu or, where offered, x402; the attached payment method was refused.",
         }),
         undefined,
         undefined,
@@ -3586,11 +3655,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       if (!skipPayment && !resumedAcceptedPayment) {
         const railOpts = unsignedPaid
-          ? cashuOnlyRailOpts(await this.railVerifyOpts(c))
+          ? unsignedRailOpts(await this.railVerifyOpts(c), this.unsignedX402(cap))
           : await this.railVerifyOpts(c);
         // A NUT-24 wallet neither signs nor sends X-Cashu-Request-Id, so that
         // form is offered and accepted only where the request needs no signature.
-        if (!this.descriptor.auth || unsignedPaid) {
+        if (!this.descriptor.auth || (unsignedPaid && this.unsignedCashuOffered())) {
           railOpts.nut24 = {
             mints: this.advertisedMints(),
             previousRequiredMsats: this.previousPriceMsats(cap, dynamicUpfront, pricedAt),
@@ -3902,7 +3971,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         response.headers.set("PAYMENT-RESPONSE", payment.x402SettleResponseHeader);
         response.headers.set("X-PAYMENT-RESPONSE", payment.x402SettleResponseHeader);
       }
-      return response;
+      return await this.withDeferredSettlement(response, payment.creditId);
     } finally {
       if (hostingAdmissionId && !hostingAdmissionAccepted) {
         await this.opts.hostingControlInstance!.finishAdmission(
@@ -4304,7 +4373,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       Object.assign(res, terminalResponseFields(job), await this.contentFields(job));
       Object.assign(res, await this.drawFundingFields(job));
       removeUnavailableContent(res);
-    return c.json(res);
+      return this.withDeferredSettlement(c.json(res), job.creditId);
     }
 
     const record = await this.jobManager.store.get(id);
@@ -4315,7 +4384,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     Object.assign(res, terminalResponseFields(record), await this.contentFields(record));
     Object.assign(res, await this.drawFundingFields(record));
     removeUnavailableContent(res);
-    return c.json(res);
+    return this.withDeferredSettlement(c.json(res), record.creditId);
   }
 
   /**
@@ -5166,9 +5235,12 @@ function removeUnavailableContent(fields: Record<string, unknown>): void {
  * signing can precede the terminal snapshot save, so an in-flight row must not
  * expose a terminal receipt yet.
  */
-/** Whether the submit carries an x402 or MPP (Tempo) payment artifact. */
-async function carriesNonCashuPayment(c: Context<AppEnv>): Promise<boolean> {
-  if (c.req.header("PAYMENT-SIGNATURE") || c.req.header("X-PAYMENT")) return true;
+/**
+ * Whether the submit carries a payment an unsigned caller may not use: an MPP
+ * (Tempo) credential always, an x402 payment unless `x402Allowed`.
+ */
+async function carriesNonCashuPayment(c: Context<AppEnv>, x402Allowed: boolean): Promise<boolean> {
+  if (!x402Allowed && (c.req.header("PAYMENT-SIGNATURE") || c.req.header("X-PAYMENT"))) return true;
   const authorization = c.req.header("Authorization");
   if (!authorization) return false;
   return Boolean((await import("mppx")).Credential.extractPaymentScheme(authorization));
@@ -5189,6 +5261,26 @@ function cashuOnlyRailOpts(opts: UpfrontPaymentOpts): UpfrontPaymentOpts {
     x402BatchSettlement: undefined,
     mppCredential: undefined,
     mpp: undefined,
+  };
+}
+
+/**
+ * Rail options for an unsigned submit: Cashu, plus exact x402 on a capability
+ * that settles it after the job.
+ */
+function unsignedRailOpts(
+  opts: UpfrontPaymentOpts,
+  x402Deferred: UpfrontPaymentOpts["x402Deferred"]
+): UpfrontPaymentOpts {
+  const cashuOnly = cashuOnlyRailOpts(opts);
+  if (!x402Deferred || !opts.x402ExactSettlement) return cashuOnly;
+  return {
+    ...cashuOnly,
+    x402Payment: opts.x402Payment,
+    x402Config: opts.x402Config,
+    x402ExactSettlement: opts.x402ExactSettlement,
+    x402ExactVersions: opts.x402ExactVersions,
+    x402Deferred,
   };
 }
 

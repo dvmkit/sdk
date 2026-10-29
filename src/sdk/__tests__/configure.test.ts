@@ -187,6 +187,31 @@ describe("configureDVM", () => {
     expect(dvm.price).toBe("$0.01");
   });
 
+  describe("maxRuntimeSeconds", () => {
+    const withRuntime = (maxRuntimeSeconds: unknown) => () =>
+      configureDVM({
+        name: "X",
+        capability: "scrape",
+        maxRuntimeSeconds: maxRuntimeSeconds as number,
+        onJob: noop,
+      });
+
+    it("carries a whole-second bound onto the capability, flat or in a block", () => {
+      expect(withRuntime(45)().capabilities.scrape?.maxRuntimeSeconds).toBe(45);
+      const capJob = (_ctx: SDKJobContext<Record<string, unknown>, unknown>): void => {};
+      const dvm = configureDVM({
+        name: "X",
+        capabilities: { scrape: { maxRuntimeSeconds: 30, onJob: capJob }, other: { onJob: capJob } },
+      });
+      expect(dvm.capabilities.scrape?.maxRuntimeSeconds).toBe(30);
+      expect(dvm.capabilities.other?.maxRuntimeSeconds).toBeUndefined();
+    });
+
+    it.each([0, -1, 1.5, 601, Number.NaN, "30"])("rejects %j", (value) => {
+      expect(withRuntime(value)).toThrow(/maxRuntimeSeconds must be a whole number/);
+    });
+  });
+
   describe("price validation", () => {
     const withPrice = (price: unknown) => () =>
       configureDVM({

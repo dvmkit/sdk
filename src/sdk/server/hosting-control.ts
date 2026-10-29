@@ -412,7 +412,7 @@ export class HostingControl {
         reasons.push("historical_settlement_owner_unknown");
       }
       if (await count("payout_x402_batches", "TRUE")) reasons.push("x402_payout_batches_pending");
-      if (await count("x402_exact_settlement_intents", "status NOT IN ('complete','rejected')")) {
+      if (await count("x402_exact_settlement_intents", "status NOT IN ('complete','rejected','released')")) {
         reasons.push("x402_exact_unresolved");
       }
       if (await count("x402_batch_settlements", "status <> 'complete'")) {
