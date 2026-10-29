@@ -65,6 +65,7 @@
     "cashu_mint_recovery_failed",
     "cashu_mint_runtime_recovered",
     "cashu_mint_runtime_sick",
+    "cashu_not_advertised",
     "cashu_opts_env_ignored",
     "cashu_refund_amount_unreported",
     "ci_lane_report",
@@ -957,6 +958,10 @@
     "usdc"
   ],
   "booleanFields": [
+    "cashu_explicitly_excluded",
+    "cashu_lock_pubkey_missing",
+    "cashu_mode_missing",
+    "cashu_store_missing",
     "client.capabilities_valid",
     "client.protocol_version_valid",
     "client.version_valid",

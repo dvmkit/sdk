@@ -14,6 +14,8 @@
 
 ### Bug fixes
 
+- Explicit `paymentMethods` overrides now suppress excluded x402 and Tempo discovery blocks and prepaid-credit funding terms, including x402 batch funding. Omitted overrides retain derived defaults, and Lightning funding stays independent. A `cashu_not_advertised` boot warning identifies why configured mints do not result in a Cashu payment method. No storage migration is required; see `protocol-fixtures/payment-method-discovery-v1.json`.
+
 - `idleTimeout` now limits only outstanding caller prompts and payment requests, starting at emission rather than job creation or the last caller message. Each request carries optional `expires_at_ms` in Unix milliseconds; unrelated messages do not extend it, and recovery preserves the original deadline. Processing uses the existing liveness watchdog. Configuration now rejects timeout values outside integer seconds 1–604800; the default remains 3600. See `protocol-fixtures/caller-deadline-v1.json`.
 
 - Replaying an older job receipt no longer changes a newer stored credit projection. The comparison now happens inside the credit-store lock that applies the receipt, so last price, receipt attribution, flags, and update time stay with the newest settled draw, including when another process settles it mid-recovery.

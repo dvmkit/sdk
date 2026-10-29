@@ -1,0 +1,8 @@
+{
+  "description": "A USD DVM with Cashu, x402 batch settlement and Tempo wired, credit enabled, and paymentMethods explicitly restricted to Cashu. Excluded rails have no top-level metadata or credit terms. The same credit funding restriction applies to info, quote and unpaid job responses.",
+  "cashu_only": {
+    "payment": { "methods": ["cashu"] },
+    "credit": { "funding": ["cashu"] },
+    "absent": ["x402", "tempo"]
+  }
+}
