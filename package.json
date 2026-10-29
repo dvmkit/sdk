@@ -1,6 +1,6 @@
 {
   "name": "@dvmkit/sdk",
-  "version": "0.17.1",
+  "version": "0.18.0",
   "description": "SDK for building Digital Vending Machines: pay-per-use HTTPS services AI agents can find, pay, and call with no account or API key",
   "author": "DVM Technologies Ltd",
   "keywords": [
