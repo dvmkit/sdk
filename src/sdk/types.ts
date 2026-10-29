@@ -575,9 +575,9 @@ export interface ResolvedCreditConfig {
  * Refund-locktime floors for Cashu payments. A payer may lock proofs with a
  * NUT-11 `locktime`; the DVM refuses one that passes before the proofs can be
  * melted. Shortening a floor below its default is safe only when the builder
- * melts more often than the floor: once a proof's locktime passes, the payer
- * can take it back if it is still unmelted, through its refund key, or, when
- * the proof names no refund key, by anyone holding the proof.
+ * melts more often than the floor: once a proof's locktime passes, an
+ * unmelted proof can be spent by the payer's refund key or, when the proof
+ * names no refund key, by anyone holding it.
  */
 export interface CashuConfig {
   /**
