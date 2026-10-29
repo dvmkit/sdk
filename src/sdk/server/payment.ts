@@ -2383,6 +2383,11 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     hint: "Don't re-send this payment — the proofs already landed under this request id. Only a genuinely new charge needs a fresh token and request id.",
     retryable: false,
   },
+  request_id_reused: {
+    display: "This payment was not accepted and nothing was charged.",
+    hint: "Each X-Cashu-Request-Id belongs to the first payment made under it. Send these proofs again under a new request id.",
+    retryable: false,
+  },
 };
 
 /**
@@ -3726,17 +3731,18 @@ async function verifyAccumulatorReceipt(
   }
 
   if (result.kind === "rejected") {
-    const status = result.code === "replay_rejected" ? 409 : 402;
+    const status = result.code === "replay_rejected" || result.code === "request_id_reused" ? 409 : 402;
     return {
       paidMsats: 0,
       receivedProofs: [],
       error: {
         body: paymentErrorBody(result.code, { message: result.message, extra: { mints } }),
         status,
-        // The accumulator keys replay on the request id, which is also the
-        // funding id a mid-job top-up committed under, so the route can hand
-        // back the original draw funding evidence beside the 409.
-        ...(status === 409 && requestId && { replayPaymentId: requestId }),
+        // The request id is also the funding id a mid-job top-up committed
+        // under and the job's payment reference, so the route can return the
+        // original evidence beside the 409. It is passed on only when every
+        // presented proof was accepted under this same request id.
+        ...(requestId && result.acceptedRequestId === requestId && { replayPaymentId: requestId }),
       },
     };
   }

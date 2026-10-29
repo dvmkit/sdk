@@ -3558,11 +3558,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             // `short_pay_forfeit` so it stays out of per-job service revenue.
             this.reportShortPayForfeit(err.detail.forfeit);
             // Replay recovery requires the original request binding, not just spent proofs.
-            // Header-keyed rail markers and explicit draw keys remain separate regimes;
-            // try the draw key when a marker cannot resolve an explicitly funded job.
+            // `replayPaymentId` is the payment reference the rail itself bound
+            // the presented payment to (for Cashu, the request id every proof
+            // was accepted under), never the incoming header alone. Explicit
+            // draw keys remain a separate regime; try the draw key when the
+            // payment reference cannot resolve an explicitly funded job.
             if (err.detail.body.error === "replay_rejected") {
               const recovered = await this.recoverReplayedJob(c, {
-                requestId: err.detail.replayPaymentId ?? c.req.header("X-Cashu-Request-Id"),
+                requestId: err.detail.replayPaymentId,
                 fingerprint,
                 callerPubkey: authPubkey,
               });
@@ -3863,8 +3866,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
   /**
    * Recover a lost paid response only for matching request fingerprint,
-   * authenticated pubkey and requester identity. A spent bearer token alone
-   * is not proof of request ownership.
+   * authenticated pubkey and requester identity. `requestId` must be the
+   * payment reference the rail bound the presented payment to; a spent bearer
+   * token alone is not proof of request ownership.
    */
   private async recoverReplayedJob(
     c: Context<AppEnv>,
@@ -3880,13 +3884,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // it. Everywhere else `requesterId` is what the read paths gate on
     // (`isJobOwner`) — pin it too, so a DVM that ever grows identified callers
     // can't hand caller B the job caller A's body happens to fingerprint to.
-    // An unsigned prior on an auth DVM is never recovered here: the lookup key
-    // is the caller-chosen request id, not the presented proofs, so the body
-    // and requester checks alone would hand its token to anyone holding any
-    // spent proof plus the id and body.
+    // An unsigned prior (`allowUnsignedPaid`) recovers only for an unsigned
+    // retry: the lookup key is already bound to the presented payment, so this
+    // is the same proof-plus-body check a DVM without auth applies. Signed and
+    // unsigned never recover each other's jobs.
     const pubkeyMatches =
-      this.descriptor.auth === undefined ||
-      (prior.requesterPubkey !== undefined && prior.requesterPubkey === opts.callerPubkey);
+      this.descriptor.auth === undefined || prior.requesterPubkey === opts.callerPubkey;
     const requesterMatches = prior.requesterId === c.get("requesterId");
 
     if (!bodyMatches || !pubkeyMatches || !requesterMatches) {

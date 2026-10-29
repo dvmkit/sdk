@@ -66,6 +66,7 @@ const EXPECTED_RETRYABLE: Record<PaymentErrorCode, boolean> = {
   mint_unreachable: true,
   proof_pending: true,
   replay_rejected: false,
+  request_id_reused: false,
 };
 
 const ALL_CODES = Object.keys(EXPECTED_RETRYABLE) as PaymentErrorCode[];

@@ -11,8 +11,8 @@ export interface DisposableCashuCommit {
     proofs: Proof[],
     account: (ledger: CreditLedgerLike) => Promise<void>
   ): Promise<void>;
-  /** Whether any of these proof secrets has already been committed. */
-  hasAccepted(secrets: string[]): Promise<boolean>;
+  /** The request id each secret was committed under, index-aligned; `undefined` where not committed. */
+  acceptedRequestIds(secrets: string[]): Promise<(string | undefined)[]>;
 }
 
 /** A process-local, test-funds-only store. Never substitutes for durable production storage. */
@@ -23,7 +23,7 @@ export function createDisposableCashuStore(): {
   let current = new MemoryCreditLedger();
   let tail = Promise.resolve();
   const requests = new Set<string>();
-  const secrets = new Set<string>();
+  const secrets = new Map<string, string>();
   function exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const result = tail.then(operation);
     tail = result.then(() => undefined, () => undefined);
@@ -58,11 +58,11 @@ export function createDisposableCashuStore(): {
           // No awaits between these writes: publication is atomic in this process.
           current = staged;
           requests.add(requestId);
-          for (const secret of incoming) secrets.add(secret);
+          for (const secret of incoming) secrets.set(secret, requestId);
         });
       },
-      hasAccepted(incoming) {
-        return exclusive(() => Promise.resolve(incoming.some((secret) => secrets.has(secret))));
+      acceptedRequestIds(incoming) {
+        return exclusive(() => Promise.resolve(incoming.map((secret) => secrets.get(secret))));
       },
     },
   };
