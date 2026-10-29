@@ -12,6 +12,7 @@ export interface PostgresRecoveryContext {
 }
 
 const postgresRecovery = new AsyncLocalStorage<PostgresRecoveryContext>();
+const queryingPool = new AsyncLocalStorage<Pool>();
 
 /** Run database work under a bounded request-specific transport-recovery budget. */
 export function withPostgresRecoveryContext<value>(
@@ -77,8 +78,9 @@ const guardedClients = new WeakSet<object>();
 
 /** Patches pool.query and pool.connect in-place to retry transport errors.
  * Idempotent — safe to call multiple times on the same pool instance.
- * Ordinary work retries once; a bounded recovery context may replace every
- * socket in the configured pool during a money-protection request.
+ * Recovery may replace every socket in the configured pool. The connection
+ * timeout bounds how long ordinary work starts retries; a request context can
+ * supply its own deadline.
  * Registers pool.on("error") to prevent idle-client eviction errors from crashing the process,
  * and attaches an 'error' guard to every checked-out client for the same reason (see
  * {@link guardCheckedOutClient}). */
@@ -100,16 +102,40 @@ export function applyRetryToPool(pool: Pool, label = "pg-pool"): void {
 
   const origQuery = p.query.bind(pool);
   p.query = (...args: unknown[]) =>
-    withTransportRecovery(pool, label, "pool.query", () => origQuery(...args));
-
-  const origConnect = p.connect.bind(pool);
-  p.connect = async (...args: unknown[]) => {
-    const client = await withTransportRecovery(pool, label, "pool.connect", () =>
-      origConnect(...args)
+    withTransportRecovery(pool, label, "pool.query", () =>
+      queryingPool.run(pool, () => origQuery(...args))
     );
-    guardCheckedOutClient(client, label);
-    return client;
-  };
+
+  const origConnect = pool.connect.bind(pool);
+  type ConnectCallback = Parameters<Pool["connect"]>[0];
+  pool.connect = ((callback?: ConnectCallback) => {
+    // pool.query already retries its own statement. Only direct checkouts need
+    // a probe, before callers can acquire locks or start money-moving work.
+    if (queryingPool.getStore() === pool) {
+      return queryingPool.exit(() => callback ? origConnect(callback) : origConnect());
+    }
+    const pending = withTransportRecovery(pool, label, "pool.connect", async () => {
+      const client = await origConnect();
+      guardCheckedOutClient(client, label);
+      const remainingMs = (postgresRecovery.getStore()?.deadlineMs ?? Infinity) - Date.now();
+      const probe = {
+        text: "SELECT 1",
+        query_timeout: Math.max(1, Math.min(connectionTimeoutMs(pool), remainingMs)),
+      };
+      try {
+        await client.query(probe);
+        return client;
+      } catch (error) {
+        client.release(asError(error));
+        throw error;
+      }
+    });
+    if (!callback) return pending;
+    void pending.then(
+      (client) => callback(undefined, client, client.release),
+      (error: unknown) => callback(asError(error), undefined, () => undefined)
+    );
+  }) as Pool["connect"];
 }
 
 /**
@@ -153,8 +179,12 @@ async function withTransportRecovery<value>(
   callback: () => Promise<value>
 ): Promise<value> {
   const context = postgresRecovery.getStore();
-  const maxAttempts = context?.drainPool ? hostPoolSize(pool) + 1 : 2;
+  const maxAttempts = context?.drainPool === false ? 2 : hostPoolSize(pool) + 1;
   const startedAt = Date.now();
+  // Stop launching retries within one connect-timeout window. An in-flight
+  // attempt still uses pg's timeout, so recovery cannot multiply that wait by
+  // pool size. Do not race database writes against an uncancellable timer.
+  const deadlineMs = context?.deadlineMs ?? startedAt + connectionTimeoutMs(pool);
   let firstError: Error | undefined;
 
   for (let attempt = 1; ; attempt += 1) {
@@ -176,7 +206,7 @@ async function withTransportRecovery<value>(
       if (!isTransportError(error)) throw error;
       firstError ??= asError(error);
       const elapsedMs = Date.now() - startedAt;
-      if (attempt >= maxAttempts || (context !== undefined && Date.now() >= context.deadlineMs)) {
+      if (attempt >= maxAttempts || Date.now() >= deadlineMs) {
         logTransportRecovery({
           context,
           label,
@@ -190,6 +220,13 @@ async function withTransportRecovery<value>(
       }
     }
   }
+}
+
+function connectionTimeoutMs(pool: Pool): number {
+  const configured = pool.options.connectionTimeoutMillis;
+  return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+    ? configured
+    : 10_000;
 }
 
 function hostPoolSize(pool: Pool): number {

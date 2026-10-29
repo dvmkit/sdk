@@ -54,6 +54,7 @@ describe("Tempo session store invariants", () => {
       release: () => undefined,
     };
     const store = new PostgresTempoSessionStore({
+      options: {},
       connect: () => Promise.resolve(client),
     } as never);
     const update = store.update;
