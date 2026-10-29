@@ -8,7 +8,11 @@ import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
-import { CASHU_MIN_LOCKTIME_SECONDS } from "./wallet-accumulator-receive";
+import {
+  CASHU_MIN_LOCKTIME_SECONDS,
+  signedCashuLockWindowSeconds,
+  unsignedCashuLockWindowSeconds,
+} from "../cashu-locktime";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import type { Context } from "hono";
@@ -169,6 +173,7 @@ import {
   PAYMENT_PROOF_KEYS,
   paymentErrorBody,
   repairX402ExactSettlementEffect,
+  UNSIGNED_LOCK_REFUSAL_HINT,
   verifyUpfrontPayment,
 } from "./payment";
 import type { PayoutReporter } from "./payout-reporter";
@@ -2209,6 +2214,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       disposableCashu: this.opts.disposableCashu,
       dvmId: this.opts.dvmId,
       lockPubkeys,
+      cashuLockWindowSeconds: signedCashuLockWindowSeconds(this.descriptor.cashu),
       requestId: c.req.header("X-Cashu-Request-Id"),
       mintHealthTracker: this.mintHealthTracker,
       fxFetcher: this.fxFetcher,
@@ -2519,7 +2525,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         mints,
         lock_pubkeys: activePubkeySet(active),
         lock_pubkey_grace_seconds: this.graceSeconds(),
-        min_locktime: CASHU_MIN_LOCKTIME_SECONDS,
+        min_locktime: this.descriptor.cashu?.minLocktimeSeconds ?? CASHU_MIN_LOCKTIME_SECONDS,
+        ...(this.unsignedFloorAdvertised() && {
+          unsigned_min_locktime: unsignedCashuLockWindowSeconds(this.descriptor.cashu),
+        }),
         canonical_id: this.opts.canonicalDvmId ?? this.opts.dvmId ?? null,
       };
     }
@@ -2971,6 +2980,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       undefined,
       402
     );
+  }
+
+  /**
+   * Whether `/v1/info` names the unsigned refund-locktime floor. Only a DVM
+   * that configures its floors and serves unsigned paid calls does, so a DVM
+   * on the defaults advertises exactly what it did before the option existed.
+   */
+  private unsignedFloorAdvertised(): boolean {
+    return this.descriptor.cashu !== undefined && (!this.descriptor.auth || this.descriptor.auth.allowUnsignedPaid === true);
   }
 
   /** Whether this DVM takes Cashu, the only rail an unsigned payer may use. */
@@ -3577,6 +3595,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             mints: this.advertisedMints(),
             previousRequiredMsats: this.previousPriceMsats(cap, dynamicUpfront, pricedAt),
           };
+          // Only a NUT-24 wallet's payment, which carries no request id, takes
+          // the unsigned floor. A payer sending `X-Cashu-Request-Id` reads
+          // `cashu.min_locktime` and may resume, so it keeps the signed floor
+          // and its margin. By default the two floors coincide.
+          if (!railOpts.requestId) {
+            railOpts.cashuLockWindowSeconds = unsignedCashuLockWindowSeconds(this.descriptor.cashu);
+            if (this.unsignedFloorAdvertised()) railOpts.cashuLockRefusalHint = UNSIGNED_LOCK_REFUSAL_HINT;
+          }
         }
         hostingPaymentMayHaveLanded = Boolean(
           creditEnvelope || railOpts.cashuToken || railOpts.x402Payment || railOpts.mppCredential

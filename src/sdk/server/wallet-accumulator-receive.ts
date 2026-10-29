@@ -13,6 +13,7 @@ import {
   verifyDleqIfPresent,
 } from "@cashu/cashu-ts";
 
+import { DEFAULT_CASHU_LOCK_WINDOW_SECONDS } from "../cashu-locktime";
 import type { LockPubkey } from "../../lib/cashu/lock-pubkey";
 import { verifyCashuToken } from "../../lib/cashu/verify";
 import { DERIVED_REQUEST_ID_PREFIX, proofSetRequestId } from "./cashu-payment-request";
@@ -126,6 +127,11 @@ export interface AccumulatorReceiveOpts {
    * entry is already lowercase, so the receive loop can compare structurally.
    */
   lockPubkeys: LockPubkey[];
+  /**
+   * Seconds after receipt that a refund `locktime` must not precede. Required
+   * so no path can fall back to a floor other than the one its DVM configured.
+   */
+  lockWindowSeconds: number;
   /** Test seam — defaults to the cashu-ts wallet wrapper. */
   walletProvider?: typeof getWallet;
   /**
@@ -169,21 +175,6 @@ export function valueCashuFunding(
   };
 }
 
-/**
- * Shortest NUT-11 refund `locktime`, in seconds from now, that `/v1/info`
- * advertises as `cashu.min_locktime`. Banked proofs wait for the batch melt,
- * so a refund path must stay closed for at least this long.
- */
-export const CASHU_MIN_LOCKTIME_SECONDS = 604_800;
-
-/**
- * Slack subtracted from {@link CASHU_MIN_LOCKTIME_SECONDS} when enforcing it.
- * The reference caller locks to `now + max(48h, min_locktime)` and re-sends an
- * unacknowledged payment for at most 24 hours, so an honest resume still clears
- * the enforced floor.
- */
-export const CASHU_LOCKTIME_RESUME_MARGIN_SECONDS = 86_400;
-
 /** The NUT-11 tags a banked proof may carry; any other tag is refused. */
 const P2PK_TAG_KEYS = new Set(["locktime", "refund", "pubkeys", "n_sigs", "sigflag", "n_sigs_refund"]);
 const SINGLE_VALUE_TAG_KEYS = new Set(["locktime", "n_sigs", "sigflag", "n_sigs_refund"]);
@@ -210,8 +201,9 @@ export type CashuLockAssessment =
 /**
  * Judge from the secret's structure, independent of the current lock state,
  * whether only one of `lockPubkeys` can spend the proof until at least
- * `CASHU_MIN_LOCKTIME_SECONDS - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS` after
- * `nowSec`, and whether the DVM's melter can sign it and the mint redeem it.
+ * `floorSec` (unix seconds; default `nowSec` plus
+ * {@link DEFAULT_CASHU_LOCK_WINDOW_SECONDS}), and whether the DVM's melter
+ * can sign it and the mint redeem it.
  * Every key must be a 33-byte compressed hex key: the mint cannot parse an
  * x-only key and the cashu-ts signer refuses padded or duplicate ones. `data`
  * matches a DVM key by x coordinate, which is what a BIP-340 signature binds,
@@ -220,7 +212,8 @@ export type CashuLockAssessment =
 export function assessCashuLock(
   secret: string,
   lockPubkeys: readonly LockPubkey[],
-  nowSec: number
+  nowSec: number,
+  floorSec: number = nowSec + DEFAULT_CASHU_LOCK_WINDOW_SECONDS
 ): CashuLockAssessment {
   try {
     parseP2PKSecret(secret);
@@ -303,10 +296,9 @@ export function assessCashuLock(
   if (locktimeValue !== undefined) {
     const locktime = /^(0|[1-9][0-9]*)$/.test(locktimeValue) ? Number(locktimeValue) : NaN;
     if (!Number.isSafeInteger(locktime)) return notExclusive(`Proof's locktime ${locktimeValue} is not a unix-seconds integer.`);
-    const floor = nowSec + CASHU_MIN_LOCKTIME_SECONDS - CASHU_LOCKTIME_RESUME_MARGIN_SECONDS;
-    if (locktime < floor) {
+    if (locktime < floorSec) {
       return notExclusive(
-        `Proof locktime ${locktime} is earlier than the accepted floor ${floor} (unix seconds).`,
+        `Proof locktime ${locktime} is earlier than the accepted floor ${floorSec} (unix seconds).`,
         true
       );
     }
@@ -388,11 +380,12 @@ export async function acceptAccumulatorPayment(
   // round-trip or write. The same loop extracts each NUT-11 `locktime` (ms
   // since epoch) for oldest-first ordering and the expiring-soon monitor.
   const nowSec = Math.floor(Date.now() / 1000);
+  const floorSec = nowSec + opts.lockWindowSeconds;
   const tExpireMsByIndex: (number | null)[] = [];
   const matchedLockPubkeyByIndex: LockPubkey[] = [];
   let belowFloorMessage: string | undefined;
   for (const p of proofs) {
-    const lock = assessCashuLock(p.secret, accepted, nowSec);
+    const lock = assessCashuLock(p.secret, accepted, nowSec, floorSec);
     if (lock.kind === "rejected") {
       if (!lock.locktimeBelowFloor) return { kind: "rejected", code: lock.code, message: lock.message };
       belowFloorMessage ??= lock.message;

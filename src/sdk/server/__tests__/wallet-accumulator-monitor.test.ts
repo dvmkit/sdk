@@ -8,8 +8,9 @@ vi.mock("../../../lib/cashu/mint-info", () => ({
 }));
 
 const { getKeysetFinalExpiry } = await import("../../../lib/cashu/mint-info");
-const { startAccumulatorMonitor, EXPIRING_SOON_THRESHOLD_MS } =
+const { startAccumulatorMonitor, EXPIRING_SOON_THRESHOLD_MS, expiringSoonThresholdMs } =
   await import("../wallet-accumulator-monitor");
+const { shortestCashuLockWindowSeconds } = await import("../../cashu-locktime");
 
 const mockKeysetFinalExpiry = vi.mocked(getKeysetFinalExpiry);
 
@@ -445,5 +446,44 @@ describe("startAccumulatorMonitor", () => {
       .find((c) => c.includes("wallet_accumulator_batch_orphan_lock_pubkey"));
     expect(orphanLine).toBeUndefined();
     log.mockRestore();
+  });
+});
+
+describe("expiring-soon threshold under configured lock floors", () => {
+  const HOUR_MS = 3_600_000;
+
+  async function expiringSoonLogged(thresholdMs: number, remainingMs: number): Promise<boolean> {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const fixedNow = 1_700_000_000_000;
+    const builder = buildMockPool();
+    builder.setPendingBatch([makeRow({ t_expire: fixedNow + remainingMs })]);
+    const handle = startAccumulatorMonitor({
+      pool: builder.pool,
+      dvmId: DVM_ID,
+      now: () => fixedNow,
+      expiringSoonThresholdMs: thresholdMs,
+    });
+    await handle.runOnce();
+    handle.stop();
+    const logged = log.mock.calls.flat().map(String).some((c) => c.includes("wallet_accumulator_batch_expiring_soon"));
+    log.mockRestore();
+    return logged;
+  }
+
+  it("keeps 36 hours for the default floors, signed and unsigned", () => {
+    expect(expiringSoonThresholdMs(shortestCashuLockWindowSeconds(undefined, true))).toBe(36 * HOUR_MS);
+  });
+
+  it("stays silent when a payment arrives at a 12-hour unsigned floor and warns before its deadline", async () => {
+    const cashu = { minLocktimeSeconds: 604_800, unsignedMinLocktimeSeconds: 43_200 };
+    const thresholdMs = expiringSoonThresholdMs(shortestCashuLockWindowSeconds(cashu, true));
+    // A tick after receipt: a threshold of the whole window would already fire.
+    expect(await expiringSoonLogged(thresholdMs, 12 * HOUR_MS - 60_000)).toBe(false);
+    expect(await expiringSoonLogged(thresholdMs, 5 * HOUR_MS)).toBe(true);
+  });
+
+  it("ignores the unsigned floor on a DVM that serves no unsigned payer", () => {
+    const cashu = { minLocktimeSeconds: 604_800, unsignedMinLocktimeSeconds: 43_200 };
+    expect(expiringSoonThresholdMs(shortestCashuLockWindowSeconds(cashu, false))).toBe(36 * HOUR_MS);
   });
 });

@@ -135,6 +135,7 @@
       "src/observability/stdout-sink.ts",
       "src/observability/types.ts",
       "src/observability/with-span.ts",
+      "src/sdk/cashu-locktime.ts",
       "src/sdk/configure.ts",
       "src/sdk/env.ts",
       "src/sdk/heartbeat.ts",
@@ -20160,6 +20161,15 @@
       ]
     },
     {
+      "module": "src/sdk/cashu-locktime.ts",
+      "allocations": [],
+      "dependencies": [
+        {
+          "module": "src/sdk/types.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/configure.ts",
       "allocations": [
         {
@@ -20183,6 +20193,9 @@
       "dependencies": [
         {
           "module": "src/lib/wire-schema.ts"
+        },
+        {
+          "module": "src/sdk/cashu-locktime.ts"
         },
         {
           "module": "src/sdk/pricing/currency.ts"

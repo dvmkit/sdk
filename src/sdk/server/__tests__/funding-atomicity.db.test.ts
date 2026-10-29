@@ -8,6 +8,7 @@ import pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { toLockPubkey } from "../../../lib/cashu/lock-pubkey";
+import { DEFAULT_CASHU_LOCK_WINDOW_SECONDS } from "../../cashu-locktime";
 import * as cashuVerify from "../../../lib/cashu/verify";
 import { fundCredit } from "./__helpers__/credit-fixtures";
 
@@ -101,6 +102,7 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
       db: pool,
       dvmId: DVM_ID,
       lockPubkeys: [LOCK_PUBKEY],
+      lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
       walletProvider: (() => Promise.resolve(walletFor(opts.proofs))) as never,
       withCommitTx: opts.withCommitTx,
     });
@@ -340,6 +342,7 @@ describe.skipIf(!RUN)("cashu rail commit + ledger fund/draw atomicity", () => {
           db: repeatable,
           dvmId: DVM_ID,
           lockPubkeys: [LOCK_PUBKEY],
+          lockWindowSeconds: DEFAULT_CASHU_LOCK_WINDOW_SECONDS,
           walletProvider: (() => Promise.resolve(walletFor(proofs))) as never,
         });
       };
