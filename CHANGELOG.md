@@ -34,6 +34,21 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.17.0](https://github.com/dvmkit/sdk/compare/v0.16.2...v0.17.0) (2026-10-29)
+
+
+### Features
+
+* advertise Cashu payment as a NUT-24 payment request and accept NUT-24 payments ([#66](https://github.com/dvmkit/sdk/issues/66)) ([f3a5982](https://github.com/dvmkit/sdk/commit/f3a5982dd4fea16091e9965e851072b62bc81cad))
+* serve unsigned paid per-call jobs behind secp256k1Auth({ allowUnsignedPaid: true }) ([#62](https://github.com/dvmkit/sdk/issues/62)) ([25b0076](https://github.com/dvmkit/sdk/commit/25b0076636e0dcde0ee1c4c89a0ab2ee4841cf4c))
+
+
+### Bug Fixes
+
+* accept unsigned paid calls on Cashu only ([#64](https://github.com/dvmkit/sdk/issues/64)) ([58904ba](https://github.com/dvmkit/sdk/commit/58904bab938e4447d2287fcd9e3ee6041d5b1a0f))
+* honor explicit payment methods in discovery and credit menus ([3cd47c6](https://github.com/dvmkit/sdk/commit/3cd47c66d2dd10718ce530fa1c703af56d2b8f6e))
+* recover a replayed Cashu job only under the request id its proofs were accepted with ([#65](https://github.com/dvmkit/sdk/issues/65)) ([ef7394e](https://github.com/dvmkit/sdk/commit/ef7394e9c80bd9e9def02ac452c40b6a2a4def4a))
+
 ## [0.16.2](https://github.com/dvmkit/sdk/compare/v0.16.1...v0.16.2) (2026-10-28)
 
 
