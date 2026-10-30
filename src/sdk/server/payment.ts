@@ -52,6 +52,8 @@ import { CreditLedgerError, isFundingRail } from "./credit-ledger";
 import {
   drawSettlementRef,
   type FiatDenomination,
+  deferredX402Id,
+  deferredX402Window,
   fundedMicroFor,
   fundingCommitment,
   IMPLICIT_CREDIT_TTL_MS,
@@ -88,7 +90,11 @@ import {
   type X402BatchSettlementServer,
   X402SettlementSubmissionError,
 } from "./x402-batch-settlement";
-import type { X402ExactSettlementServer } from "./x402-exact-settlement";
+import {
+  type DeferredX402Settler,
+  exactSettlementIntentId,
+  type X402ExactSettlementServer,
+} from "./x402-exact-settlement";
 import type { X402ExactSettlementEffect } from "./x402-exact-settlement-store";
 
 /** Validity window for upfront-flow mppx challenges. */
@@ -254,6 +260,12 @@ export interface UpfrontPaymentOpts {
   x402ExactSettlement?: X402ExactSettlementServer;
   /** Exact generations the facilitator currently advertises. Defaults to both. */
   x402ExactVersions?: X402ExactVersionSupport;
+  /**
+   * Unsigned caller paying with exact x402: verify the authorization now and
+   * send it for settlement only when the job succeeds. Requires
+   * {@link x402ExactSettlement} and a credit ledger.
+   */
+  x402Deferred?: { maxRuntimeSeconds: number; settler: DeferredX402Settler };
   /** Reusable channel acceptor. Only consulted for fund-only `/v1/credit` requests. */
   x402BatchSettlement?: X402BatchSettlementServer;
   /**
@@ -729,7 +741,12 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     requiredMsats &&
     (!opts.fundOnly ||
       stablecoinCreditInstrumentAllowed(opts.fundOnly.allowOneShotStablecoin, "x402_exact"))
-      ? buildX402Requirements(x402Config, x402Resource ?? "/v1/job", x402PriceFiat)
+      ? buildX402Requirements(
+          x402Config,
+          x402Resource ?? "/v1/job",
+          x402PriceFiat,
+          opts.x402Deferred && deferredX402Window(opts.x402Deferred.maxRuntimeSeconds).advertisedTimeoutSeconds
+        )
       : undefined;
   const x402BatchRequirements =
     opts.fundOnly &&
@@ -1099,6 +1116,22 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
             }
           );
         }
+      }
+      if (opts.x402ExactSettlement && opts.x402Deferred && ledgerCtx?.jobId) {
+        return await acceptDeferredExactUpfront({
+          settlement: opts.x402ExactSettlement,
+          deferred: opts.x402Deferred,
+          paymentHeader: x402Payment,
+          config: x402Config,
+          requiredUsdcMicro,
+          resource: x402Resource ?? "/v1/job",
+          btcUsdRate: rate ?? 0,
+          exactVersions: x402ExactVersions,
+          dvmId: opts.dvmId ?? "",
+          requiredMsats,
+          ledgerCtx,
+          x402Requirements,
+        });
       }
       if (opts.x402ExactSettlement) {
         return await acceptDurableExactUpfront({
@@ -2021,6 +2054,7 @@ export type PaymentErrorCode =
   | "payment_invalid"
   | "x402_not_offered"
   | "payment_method_requires_signature"
+  | "payment_authorization_too_short"
   | "x402_settlement_ambiguous"
   | "cashu_unavailable"
   | "cashu_not_p2pk_locked"
@@ -2088,9 +2122,15 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
   },
   payment_method_requires_signature: {
     display:
-      "This service accepts unsigned requests only when they are paid with Cashu, so this payment was not applied to the job.",
+      "This service accepts unsigned requests only when they are paid with Cashu or, where offered, x402, so this payment was not applied to the job.",
     hint: "Pay with Cashu to call without signing, or sign the request (secp256k1 Schnorr) to use another payment method.",
     retryable: false,
+  },
+  payment_authorization_too_short: {
+    display:
+      "The payment authorization expires before this job could finish, so it was not accepted. Nothing was charged.",
+    hint: "Sign a new authorization that stays valid for at least the maxTimeoutSeconds in the payment requirements, and send it again.",
+    retryable: true,
   },
   x402_not_offered: {
     display:
@@ -4008,7 +4048,8 @@ async function verifyAccumulatorReceipt(
 function buildX402Requirements(
   config: X402Config,
   resource: string,
-  priceFiat: PriceFiat
+  priceFiat: PriceFiat,
+  maxTimeoutSeconds?: number
 ): PaymentRequirements[] {
   const requiredUsdcMicro = BigInt(x402RequiredUsdcMicro(priceFiat));
   return [
@@ -4017,6 +4058,7 @@ function buildX402Requirements(
       requiredUsdcMicro,
       resource,
       version: X402_V1_VERSION,
+      maxTimeoutSeconds,
     }),
   ];
 }
@@ -5310,6 +5352,117 @@ async function acceptDurableExactUpfront(args: {
     args.ledgerCtx,
     credited
   );
+}
+
+/**
+ * Unsigned exact x402: verify the authorization and admit the job, leaving the
+ * facilitator `/settle` to the job's terminal. The job's credit and draw ids
+ * are derived from the intent here; the ledger rows appear at settlement, so
+ * a job that fails or times out never has money to give back.
+ */
+async function acceptDeferredExactUpfront(args: {
+  settlement: X402ExactSettlementServer;
+  deferred: NonNullable<UpfrontPaymentOpts["x402Deferred"]>;
+  paymentHeader: string;
+  config: X402Config;
+  requiredUsdcMicro: bigint;
+  resource: string;
+  btcUsdRate: number;
+  exactVersions: X402ExactVersionSupport;
+  dvmId: string;
+  requiredMsats: number;
+  ledgerCtx: LedgerContext;
+  x402Requirements?: PaymentRequirements[];
+}): Promise<PaymentResult> {
+  const refuse = (error: NonNullable<PaymentResult["error"]>["body"], status = 402): PaymentResult => ({
+    paidMsats: 0,
+    receivedProofs: [],
+    error: {
+      body: error,
+      status,
+      ...(args.x402Requirements && { x402Requirements: args.x402Requirements }),
+    },
+  });
+  const invalid = (): PaymentResult =>
+    refuse(paymentErrorBody("payment_invalid", { message: "x402 payment verification failed" }));
+  const intentId = exactSettlementIntentId(args);
+  if (!intentId) return invalid();
+  const authorizedUsdcMicro = Number.parseInt(
+    exactEvmAuthorization(decodePayment(args.paymentHeader)).value,
+    10
+  );
+  const requiredMicro = Number(args.requiredUsdcMicro);
+  const paidMsats = x402SettledShare(args.requiredMsats, requiredMicro, authorizedUsdcMicro);
+  const fundedMicro = x402SettledShare(
+    args.ledgerCtx.priceFiat.amountMicro,
+    requiredMicro,
+    authorizedUsdcMicro
+  );
+  const creditId = deferredX402Id(intentId);
+  const ctx: LedgerContext = {
+    ...args.ledgerCtx,
+    creditEnvelope: { creditId, drawId: creditId },
+    drawBasis: true,
+    jobAdmission: undefined,
+  };
+  const window = deferredX402Window(args.deferred.maxRuntimeSeconds);
+  const prepared = await args.settlement.verifyAndPrepare({
+    paymentHeader: args.paymentHeader,
+    config: args.config,
+    requiredUsdcMicro: args.requiredUsdcMicro,
+    resource: args.resource,
+    exactVersions: args.exactVersions,
+    dvmId: args.dvmId,
+    effect: exactSettlementEffect(ctx, { paidMsats, fundedMicro, nativeAmount: authorizedUsdcMicro }),
+    minValidSeconds: window.minValidSeconds,
+    maxTimeoutSeconds: window.advertisedTimeoutSeconds,
+  });
+  if (prepared.outcome === "rejected") return invalid();
+  if (prepared.outcome === "authorization_too_short") {
+    return refuse(
+      paymentErrorBody("payment_authorization_too_short", {
+        message: `x402 authorization valid until ${prepared.validBefore} is shorter than the ${window.minValidSeconds} seconds this job needs.`,
+        extra: { required_valid_seconds: window.minValidSeconds },
+      })
+    );
+  }
+  if (prepared.outcome === "replayed") {
+    return (
+      mapLedgerCommitError(
+        new ProcessedPaymentReplayError("x402", prepared.intentId),
+        args.x402Requirements,
+        true
+      ) ?? { paidMsats: 0, receivedProofs: [] }
+    );
+  }
+  args.deferred.settler.hold(prepared.intentId, {
+    payload: prepared.payload,
+    requirements: prepared.requirements,
+    config: args.config,
+    btcUsdRate: args.btcUsdRate,
+    validBeforeMs: prepared.validBeforeMs,
+  });
+  return {
+    paidMsats,
+    paymentRail: "x402",
+    receivedProofs: [],
+    nativeAmount: authorizedUsdcMicro,
+    nativeAsset: "usdc",
+    creditId,
+    drawId: creditId,
+    creditCurrency: ctx.priceFiat.currency,
+    drawAmountMicro: ctx.priceFiat.amountMicro,
+    upfrontPayment: {
+      amount_msats: paidMsats,
+      amount_micro: ctx.priceFiat.amountMicro,
+      currency: ctx.priceFiat.currency,
+      rail: "x402",
+      native_amount: authorizedUsdcMicro,
+      native_asset: "usdc",
+      credit_id: creditId,
+      draw_id: creditId,
+    },
+  };
 }
 
 function exactSettlementEffect(

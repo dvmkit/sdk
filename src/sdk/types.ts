@@ -669,6 +669,16 @@ export interface CapabilityConfig<
    * change the quote itself.
    */
   rates?: CapabilityRate[];
+  /**
+   * Longest this capability's handler may run, in whole seconds (1 to 600).
+   * The SDK fails a job that is still running when the bound passes and aborts
+   * `ctx.signal`. Setting it lets an unsigned caller pay this capability with
+   * x402 on a DVM configured with `secp256k1Auth({ allowUnsignedPaid: true })`
+   * and Postgres: the payment is verified before the job and settled only if
+   * it succeeds, so the bound also sets how long an authorization must stay
+   * valid. Leave it unset for long, multi-step or metered capabilities.
+   */
+  maxRuntimeSeconds?: number;
   /** Handle a newly submitted job for this capability (required). */
   onJob: (ctx: SDKJobContext<State, InputType<InputSchema>>) => void | Promise<void>;
   /** Handle a client response to a prompt within a job of this capability. */
@@ -721,6 +731,8 @@ export interface CapabilityDescriptor<
   readonly onQuote?: QuoteConfig;
   /** Rate card published on `/v1/info`. See `CapabilityConfig.rates`. */
   readonly rates?: CapabilityRate[];
+  /** Runtime bound in seconds. See `CapabilityConfig.maxRuntimeSeconds`. */
+  readonly maxRuntimeSeconds?: number;
   readonly onJob: (ctx: SDKJobContext<State, InputType<InputSchema>>) => void | Promise<void>;
   /** Handle a client response to a prompt. */
   readonly onResponse?: (
@@ -901,6 +913,8 @@ export interface DVMConfig<
   onQuote?: QuoteConfig;
   /** Rate card published on `/v1/info`. Flat shape only — see `CapabilityConfig.rates`. */
   rates?: CapabilityRate[];
+  /** Runtime bound in seconds. Flat shape only — see `CapabilityConfig.maxRuntimeSeconds`. */
+  maxRuntimeSeconds?: number;
   /** Payment methods this DVM accepts. Default: derived from configured rails — adds "cashu" when `mints` is set, "x402" when `x402` is set, "tempo" when `tempo` is set. */
   paymentMethods?: PaymentMethod[];
   /** x402 stablecoin payment configuration (provider-side). */

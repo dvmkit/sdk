@@ -224,6 +224,19 @@ function validateCapabilityPrice(
   validatePriceLiteral(price, `configureDVM: capability "${capabilityName}" price`, "price");
 }
 
+/** Longest runtime bound a capability may declare, in seconds. */
+export const MAX_RUNTIME_SECONDS_LIMIT = 600;
+
+function validateMaxRuntimeSeconds(value: unknown, capabilityName: string): void {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > MAX_RUNTIME_SECONDS_LIMIT) {
+    throw new Error(
+      `configureDVM: capability "${capabilityName}" maxRuntimeSeconds must be a whole number ` +
+        `of seconds from 1 to ${MAX_RUNTIME_SECONDS_LIMIT}, got ${JSON.stringify(value)}`
+    );
+  }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function collectTags(config: DVMConfig<any, any>): string[] {
   const tagSet = new Set<string>();
@@ -282,6 +295,7 @@ Record<string, CapabilityDescriptor<any, any>> {
     typeof config.capability === "string" ? config.capability : slugifyCapabilityName(config.name);
   validateCapabilityName(name);
   validateCapabilityPrice(config.price, name, currency);
+  validateMaxRuntimeSeconds(config.maxRuntimeSeconds, name);
 
   validateExampleAgainstInput(name, config.input, config.example);
 
@@ -300,6 +314,7 @@ Record<string, CapabilityDescriptor<any, any>> {
     price: config.price,
     onQuote: config.onQuote,
     rates: snapshotRates(config.rates),
+    maxRuntimeSeconds: config.maxRuntimeSeconds,
     onJob: config.onJob as CapabilityDescriptor<State, InputSchema>["onJob"],
     onResponse: config.onResponse,
     onPayment: config.onPayment,
@@ -336,6 +351,7 @@ Record<string, CapabilityDescriptor<any, any>> {
       throw new Error(`configureDVM: capability "${name}" is missing required onJob handler`);
     }
     validateCapabilityPrice(cap.price, name, currency);
+    validateMaxRuntimeSeconds(cap.maxRuntimeSeconds, name);
     validateExampleAgainstInput(name, cap.input, cap.example);
     const entry: CapabilityDescriptor = {
       name,
@@ -350,6 +366,7 @@ Record<string, CapabilityDescriptor<any, any>> {
       price: cap.price,
       onQuote: cap.onQuote,
       rates: snapshotRates(cap.rates),
+      maxRuntimeSeconds: cap.maxRuntimeSeconds,
       onJob: cap.onJob as CapabilityDescriptor["onJob"],
       onResponse: cap.onResponse,
       onPayment: cap.onPayment,
@@ -372,6 +389,7 @@ function flatPerCapFieldsSet(config: DVMConfig<any, any>): boolean {
     config.price !== undefined ||
     config.onQuote !== undefined ||
     config.rates !== undefined ||
+    config.maxRuntimeSeconds !== undefined ||
     typeof config.onResponse === "function" ||
     typeof config.onPayment === "function" ||
     typeof config.onApproval === "function" ||

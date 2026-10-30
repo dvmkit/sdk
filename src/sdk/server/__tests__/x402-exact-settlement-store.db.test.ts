@@ -181,6 +181,35 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
     await store.markAdmissionComplete(DVM_ID, "intent-job-admission");
     expect((await store.get(DVM_ID, "intent-job-admission"))?.status).toBe("complete");
   });
+
+  it("releases only an intent that was never submitted, and stops counting it as unresolved", async () => {
+    await store.prepare(exactIntent("intent-released"));
+    await store.prepare({ ...exactIntent("intent-submitted"), nonce: `0x${"66".repeat(32)}` });
+    await store.markSubmitting({ dvmId: DVM_ID, intentId: "intent-submitted" });
+
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-released", reason: "failed" })).toBe(true);
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-released", reason: "failed" })).toBe(false);
+    expect(await store.release({ dvmId: DVM_ID, intentId: "intent-submitted", reason: "failed" })).toBe(false);
+
+    expect(await store.get(DVM_ID, "intent-released")).toMatchObject({
+      status: "released",
+      lastOutcome: "failed",
+    });
+    expect((await store.get(DVM_ID, "intent-submitted"))?.status).toBe("submitting");
+    expect((await store.list({ dvmId: DVM_ID, limit: 10 })).map((intent) => intent.id)).toEqual([
+      "intent-submitted",
+    ]);
+  });
+
+  it("lets exactly one of several concurrent claims of the same intent insert it", async () => {
+    const claims = await Promise.all(
+      Array.from({ length: 5 }, () => store.claim(exactIntent("intent-claimed")))
+    );
+
+    expect(claims.filter((claim) => claim.inserted)).toHaveLength(1);
+    expect(new Set(claims.map((claim) => claim.intent.id))).toEqual(new Set(["intent-claimed"]));
+    expect((await store.claim(exactIntent("intent-claimed"))).inserted).toBe(false);
+  });
 });
 
 async function settledIntent(

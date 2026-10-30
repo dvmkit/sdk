@@ -20,7 +20,7 @@ import type { StepRecord } from "../step-cache";
 import type { JobCost, KVStore, PaymentMethod, SDKJobContext } from "../types";
 import { resolveServerBtcUsdRate } from "./btc-rate";
 import type { FiatDenominationFailure, PriceFiat } from "./funding";
-import { pinAskFiat, resolveFxSnapshot } from "./funding";
+import { deferredX402IntentId, pinAskFiat, resolveFxSnapshot } from "./funding";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import { instrumentKVStore } from "./instrumented-kv";
 import type { ServerJob } from "./job";
@@ -413,6 +413,13 @@ export function buildContext(
       // Same reasoning as `prompt` — a cancelled job will never be paid.
       if (terminated("requestPayment")) {
         throw new JobCancelledError(`Job already ${job.status}`);
+      }
+      // Its draw does not exist until the job succeeds, so there is nothing
+      // for a top-up to grow.
+      if (deferredX402IntentId(job.creditId)) {
+        throw new Error(
+          "ctx.requestPayment is unavailable: this job was paid by an x402 authorization that settles only when it succeeds"
+        );
       }
       let amountMsats: number;
       let fiatAmount: { amount: number; currency: Currency } | undefined;
