@@ -4380,6 +4380,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!job) return c.json({ error: "Job not found" }, 404);
     if (!isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
     const snapshot = await this.readJobSnapshot(job);
+    // Live progress such as ctx.working() need not have a persisted status.
+    // Terminal outcomes always come from the durable snapshot.
+    if ("listeners" in job && !isTerminal(snapshot.status) && !isTerminal(job.status)) snapshot.status = job.status;
     const res: Record<string, unknown> = { job_id: snapshot.id, status: snapshot.status };
     Object.assign(res, terminalResponseFields(snapshot), await this.contentFields(snapshot));
     Object.assign(res, await this.drawFundingFields(snapshot));

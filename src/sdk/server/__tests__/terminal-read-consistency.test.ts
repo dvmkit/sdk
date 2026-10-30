@@ -42,6 +42,46 @@ function read(server: Awaited<ReturnType<typeof host>>, job: Body) {
 }
 
 describe("terminal read recovery", () => {
+  it("preserves live working status while a handler is paused, then serves a durable terminal winner", async () => {
+    const store = new MemoryJobStore();
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const server = await createDVMServer(configureDVM({
+      name: "working-read", capability: "work",
+      async onJob(ctx) {
+        ctx.working(30, "Preparing result");
+        await paused;
+        ctx.complete("done");
+      },
+    }), {
+      env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true,
+      receiptKey: "11".repeat(32), dvmId: "example-dvm",
+    });
+    hosts.push(server);
+    try {
+      const submitted = await submit(server);
+      expect(submitted.status).toBe(202);
+      const job = await submitted.json() as Body;
+      const working = await read(server, job);
+      expect(working.status).toBe(200);
+      expect((await working.json() as Body).status).toBe("working");
+
+      // A missed notification must not let live progress mask a committed cancellation.
+      server.jobManager.unwatchDurableStatus(job.job_id);
+      await store.cancelJob(job.job_id, "Caller stopped");
+      const cancelled = await (await read(server, job)).json() as Body;
+      expect(cancelled.status).toBe("cancelled");
+      expect(verifyReceipt(cancelled.receipt!)).toBe(true);
+      expect(cancelled.receipt).toMatchObject({ outcome: "cancelled", reason: "Caller stopped" });
+    } finally {
+      release();
+      const active = [...server.jobManager.activeJobs.values()][0];
+      // Let the resumed handler and its terminal work finish before host teardown.
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      await active?.terminalWork;
+    }
+  });
+
   it("keeps failed terminal saves recoverable on the same job without re-executing the handler", async () => {
     const store = new FaultStore();
     let executions = 0;
