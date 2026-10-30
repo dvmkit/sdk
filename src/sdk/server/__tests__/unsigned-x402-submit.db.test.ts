@@ -205,8 +205,9 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     await vi.waitFor(async () => {
       expect((await jobs.get(job.job_id))?.status).toBe("completed");
       expect((await settlements.get(DVM_ID, intentId))?.status).toBe("complete");
+      // The draw settles in a separate transaction after the intent completes.
+      expect(await ledger.getDraw(drawRef)).toMatchObject({ status: "settled", amountMicro: PRICE_MICRO });
     }, { timeout: 5000 });
-    expect(await ledger.getDraw(drawRef)).toMatchObject({ status: "settled", amountMicro: PRICE_MICRO });
     expect(await payments.get({ dvmId: DVM_ID, rail: "x402", paymentId: TRANSACTION }))
       .toMatchObject({ jobId: job.job_id, ...drawRef });
 
