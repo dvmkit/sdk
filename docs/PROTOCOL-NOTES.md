@@ -298,3 +298,11 @@ The server refuses to start, naming the capability and the entry, when a rate ca
 - No other keys.
 
 The [portable fixture](../protocol-fixtures/capability-rates.json) carries the same limits and the accepted and refused examples, for clients that parse the field.
+
+## Terminal reads and receipt recovery
+
+A streamed `complete` message can arrive before the terminal snapshot commits. Job status reads, submit responses, and request recovery responses coordinate with the owning process's terminal work and attempt receipt repair for up to two seconds, in addition to ordinary store and response-metadata reads. They use a stored snapshot for status, result fields, and receipt. If terminal persistence remains blocked or fails, the response may still report the last committed nonterminal state; it does not publish an in-memory completion as durable evidence.
+
+Later reads retry finalization for the same job while its owning process retains the terminal result. They do not run the handler or request payment again. Another process sharing the store can repair evidence once the terminal row commits. A receipt is signed only from the committed terminal winner, including a competing cancellation, and retries reuse its sequence and write-once receipt bytes. Completion settles a pending credit draw; failure and cancellation release it idempotently.
+
+A terminal receipt can still be absent when the store does not support receipts, no signing key is configured, evidence cannot be recovered, or the repair exceeds the wait bound. Retry the same job to recover available evidence; an absent receipt is not a request for another paid submission. A process that dies before committing its terminal result cannot recover that result from memory. This ordering repair adds no wire fields, signing formats, or storage migrations.
