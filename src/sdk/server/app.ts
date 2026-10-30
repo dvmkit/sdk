@@ -1,4 +1,5 @@
 import { upfrontPaymentFromDraw } from "./upfront-payment";
+import { withJobReadAvailability } from "./job-read-response";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
 import { callerDeadline } from "./job";
 import { BalancePaymentError, commitBalancePayment } from "./balance-payment";
@@ -1500,8 +1501,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
     this.app.post("/v1/request-resume/:requestId", (c) => this.handleCreateJob(c, true));
     this.app.post("/v1/request-result/:requestId", (c) => this.handleRequestResult(c));
-    this.app.get("/v1/job/:id", (c) => this.handleGetJob(c));
-    this.app.get("/v1/job/:id/messages", (c) => this.handleGetMessages(c));
+    this.app.get("/v1/job/:id", (c) => withJobReadAvailability(() => this.handleGetJob(c)));
+    this.app.get("/v1/job/:id/messages", (c) => withJobReadAvailability(() => this.handleGetMessages(c)));
     this.app.post("/v1/job/:id/messages", (c) => this.handlePostMessage(c));
     this.app.delete("/v1/job/:id", (c) => this.handleDeleteJob(c));
     // Registered unconditionally: a DVM that doesn't offer credit
