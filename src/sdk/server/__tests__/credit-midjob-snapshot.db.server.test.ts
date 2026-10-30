@@ -119,12 +119,14 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
         x402: { facilitator: "https://example.com/facilitator", network: "eip155:8453", payTo: "0x1111111111111111111111111111111111111111" },
       });
       hosts.push(instance);
-      return { instance, url: await servers.serve(instance.app) };
+      const snapshots = vi.spyOn(instance.jobManager, "persistJob");
+      return { instance, snapshots, url: await servers.serve(instance.app) };
     }
     try {
       await ledger.fund({ creditId, callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
         expiryMs: Date.now() + 86_400_000, basis: { rail: "x402", paidMsats: 100_000, fundingRef: "initial-funding" } });
-      let { instance, url } = await host(store);
+      const initial = await host(store);
+      let { instance, url } = initial;
       const submit = await fetch(`${url}/v1/job`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ capability: "metered", data: signer.signRequest(PRIVKEY, { action: "go", credit_id: creditId, draw_id: drawId }) }),
@@ -136,6 +138,9 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       const asked = await messages.json() as { messages: { type: string; content: { x402?: { nonce?: string } } }[] };
       const nonce = asked.messages.find(message => message.type === "payment-request")?.content.x402?.nonce;
       expect(nonce).toBeTruthy();
+      // Message delivery can precede both asks' yield snapshots. Drain those
+      // writes so they cannot consume faults intended for payment recovery.
+      await Promise.all(initial.snapshots.mock.results.map(result => result.value));
       let target = store;
       if (cold) {
         // Only the yield snapshot copies payment-request into jobs.messages;
