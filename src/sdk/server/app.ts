@@ -1479,9 +1479,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         deployId: this.opts.env.DVMKIT_DEPLOY_ID ?? "unknown",
       })
     );
+    // Public routes use explicit signatures, job tokens, or payments, not cookies.
+    // Browser wallets need the 402's X-Cashu header in production as well as dev.
+    this.app.use("/v1/*", cors({ origin: "*", credentials: false, exposeHeaders: ["X-Cashu"] }));
     if (this.opts.devMode) {
-      // A browser NUT-24 wallet reads the payment request off the 402's header.
-      this.app.use("*", cors({ exposeHeaders: ["X-Cashu"] }));
       this.app.get("/_dev", (c) => c.html(devPageHtml(this.descriptor.name)));
       this.app.all("/_proxy/*", (c) => this.handleProxy(c));
     }

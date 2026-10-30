@@ -25,6 +25,10 @@ When `paymentMethods` is omitted, methods are derived from ready configuration. 
 
 Reusable x402 channels default to a 24-hour payer withdrawal grace (86400 seconds) on every network. For Base Sepolia (`eip155:84532`) acceptance tests, set `x402.batchSettlement.withdrawDelay: 900` or `DVMKIT_X402_WITHDRAW_DELAY_SECONDS=900` with `DVMKIT_X402_BATCH_SETTLEMENT=true`. Explicit delays must be integer seconds and at least 900 on Base Sepolia; Base mainnet retains the 86400 minimum even in development mode and still requires self-relay. The grace is bound into each channel's immutable configuration: changing the server setting affects new channels, not existing deposits. A shorter testnet run exercises early-withdrawal refusal and post-deadline recovery; retain a separate 24-hour run to cover next-day recovery.
 
+## Browser access
+
+Public `/v1/*` routes enable CORS in production and development with `Access-Control-Allow-Origin: *`, no `Access-Control-Allow-Credentials`, and `X-Cashu` exposed so browser wallets can read the unpaid 402 payment request. Preflights allow the requested headers, including payment, signature, and job-token headers. Access still requires the route's signature, job token, or payment; cookies do not authorize these routes. Admin, internal, health, and development helper routes have no CORS headers.
+
 ## Prepaid credit lifetime
 
 Prepaid balances and implicit per-call credits default to 90 days from funding. A builder can override the lifetime in seconds with `credit.ttl`; for example, `credit: { ttl: 2_592_000 }` retains 30 days. An upgrade preserves existing stored expiries. Each top-up extends expiry to the later of the current expiry and funding time plus the configured lifetime.
