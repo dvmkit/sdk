@@ -1,5 +1,11 @@
 # Protocol notes
 
+## Temporary job-read failures
+
+`GET /v1/job/:id` and `GET /v1/job/:id/messages` return HTTP 503 with `Retry-After: 1` and the [portable `job_read_unavailable` envelope](../protocol-fixtures/job-read-unavailable-v1.json) when a storage connection, startup, or capacity failure prevents a read. The body has `retryable: true`, `display`, and `hint`. Retry the same read after one second, preserving the job ID, credentials, and `after` cursor. Missing credentials remain 401; an unknown job or wrong owner remains 404 when storage can be read. Other internal errors remain 500 without a retry hint.
+
+The failure says nothing about whether the job charged, completed, or released a hold. Do not resubmit the job or repeat a payment to recover its output. A failure before an SSE stream opens returns the same JSON 503; after the stream opens, retain the existing reconnect behavior and resume from the last received cursor. No storage migration or public export changes are required.
+
 ## Payment method discovery
 
 An explicit `paymentMethods` list bounds `payment.methods` on `/v1/info` and `/v1/quote`, the top-level `x402` and `tempo` info blocks, and credit funding rails and terms on info, quotes, and unpaid job responses. Excluded x402 and Tempo blocks are omitted rather than emitted empty. Lightning remains an independent receive-only credit funding leg. The [portable example](../protocol-fixtures/payment-method-discovery-v1.json) describes an x402/Tempo-wired DVM restricted to Cashu.

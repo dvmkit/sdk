@@ -34764,6 +34764,28 @@
           "module": "src/sdk/server/credit-ledger.ts"
         }
       ]
+    },
+    {
+      "module": "src/sdk/server/job-read-response.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "The server maps temporary storage read failures to safe same-job retry guidance before opening a response.",
+          "symbols": [
+            "withJobReadAvailability"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/pg-retry.ts"
+        }
+      ]
     }
   ],
   "consumerBindings": [
