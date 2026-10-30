@@ -623,6 +623,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly jobStore: JobStore;
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly terminalReadRepairs = new Map<string, Promise<void>>();
   /** Cost revisions held only by a terminal handler owner until its durable merge succeeds. */
   private readonly terminalCostHandoffRetryTimers = new Map<
     string,
@@ -4009,11 +4010,36 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       if (isTerminal(target.status)) await this.reportTerminalJob(target.id);
       return;
     }
-    const record = "listeners" in target ? await this.jobStore.get(target.id) : target;
+    let record = "listeners" in target ? await this.jobStore.get(target.id) : target;
+    const active = this._activeJobs.get(target.id);
+    if (active && isTerminal(active.status) && record && !isTerminal(record.status)) {
+      // A reporting callback may hold a pre-commit record. Re-read before
+      // joining a repair so that callback cannot await its own reporting chain.
+      record = await this.jobStore.get(target.id);
+    }
+    if (active && isTerminal(active.status) && record && !isTerminal(record.status)) {
+      // The original terminal save may have failed. Retry the same job's
+      // terminal funnel, sharing one repair across concurrent readers. The
+      // HTTP boundary waits for existing terminal work before entering here;
+      // this funnel must never await its own terminalWork promise.
+      let repair = this.terminalReadRepairs.get(target.id);
+      if (!repair) {
+        repair = this.handleJobTerminal(active).finally(() => {
+          this.terminalReadRepairs.delete(target.id);
+        });
+        this.terminalReadRepairs.set(target.id, repair);
+      }
+      await repair;
+      record = await this.jobStore.get(target.id);
+    }
     if (!record || !isTerminal(record.status)) return;
+    if ("listeners" in target) await this.adoptDurableTerminal(target);
+    else Object.assign(target, record);
     const receipt = await this.issueReceipt(record);
     if (receipt) target.receipt = receipt;
     if (isTerminal(target.status)) await this.reportTerminalJob(target.id);
+    // Reporting can itself finish an evidence write that failed above.
+    if (!target.receipt) target.receipt = (await this.jobStore.get(target.id))?.receipt;
   }
 
   /** Commit the terminal snapshot before resolving money and signing its durable evidence. */

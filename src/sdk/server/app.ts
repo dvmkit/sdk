@@ -3216,7 +3216,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return requestResultNotFound(c, requestId);
     }
 
-    return buildRequestResultResponse(c, requestId, prior, await this.contentFields(prior));
+    const snapshot = await this.readJobSnapshot(prior);
+    return buildRequestResultResponse(c, requestId, snapshot, await this.contentFields(snapshot));
   }
 
   private async handleCreateJob(c: Context<AppEnv>, resumeOnly = false): Promise<Response> {
@@ -3477,7 +3478,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (prior && prior.requestFingerprint === fingerprint &&
         prior.requesterId === c.get("requesterId") &&
         (!this.descriptor.auth || prior.requesterPubkey === authPubkey)) {
-        await this.jobManager.ensureReceipt(prior);
         return await this.submitResponse(c, prior, prior.requesterToken);
       }
     }
@@ -3850,7 +3850,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             this.opts.dvmId ?? "",
             exactAdmission.intentId
           );
-          await this.jobManager.ensureReceipt(prior);
           return await this.submitResponse(c, prior, prior.requesterToken);
         }
       }
@@ -3954,14 +3953,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       await new Promise((resolve) => {
         setTimeout(resolve, 0);
       });
-
-      // a job that finished inside the tick above is about to be
-      // answered with a 200, and that response has to carry the same receipt the
-      // poll would. Signing needs two store round-trips, so wait for the terminal
-      // chain the handler parked on `job.terminalWork` — bounded, because a
-      // wedged store must degrade to "response without a receipt" rather than
-      // hold the caller's request open.
-      await awaitTerminalWork(job);
 
       let response: Response = await this.submitResponse(c, job, jobToken);
       // Dual-serve window: v2 and v1 clients receive the same base64 settlement
@@ -4077,7 +4068,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
       return undefined;
     }
-    await this.jobManager.ensureReceipt(prior);
     return await this.submitResponse(c, prior, prior.requesterToken);
   }
 
@@ -4138,7 +4128,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
       return undefined;
     }
-    await this.jobManager.ensureReceipt(prior);
     return await this.submitResponse(c, prior, prior.requesterToken);
   }
 
@@ -4338,9 +4327,31 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
   }
 
-  private async submitResponse(c: Context<AppEnv>, job: TerminalFieldSource & { lastActivityAt: number; redactedAt?: number }, jobToken: string | undefined): Promise<Response> {
-    // Handler completion can mutate the cached job while the durable metadata read waits.
-    const snapshot = { ...job, messages: [...job.messages] };
+  private async readJobSnapshot(job: ServerJob | JobRecord, repairEvidence = true): Promise<JobRecord> {
+    const store = this.jobManager.store;
+    const initial = await store.get(job.id);
+    if (!initial) throw new Error("Job snapshot unavailable");
+    const active = this.jobManager.activeJobs.get(job.id);
+    let snapshot = initial;
+    await awaitTerminalWork(async () => {
+      let work: Promise<void> | undefined;
+      do {
+        work = active?.terminalWork;
+        await work?.catch(() => undefined);
+        snapshot = await store.get(job.id) ?? initial;
+      } while (active?.terminalWork !== work);
+      // Keep the timeout fallback independent of any repair still in flight.
+      const repaired = structuredClone(snapshot);
+      // A fresh submit already ran evidence and reporting in terminalWork.
+      // Later reads retry missing evidence; failed snapshots need repair now.
+      if (repairEvidence || !isTerminal(repaired.status)) await this.jobManager.ensureReceipt(repaired);
+      snapshot = repaired;
+    });
+    return snapshot;
+  }
+
+  private async submitResponse(c: Context<AppEnv>, job: ServerJob | JobRecord, jobToken: string | undefined): Promise<Response> {
+    const snapshot = await this.readJobSnapshot(job, !("listeners" in job));
     return buildSubmitResponse(c, snapshot, jobToken, await this.contentFields(snapshot));
   }
 
@@ -4365,26 +4376,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Wrong credentials still receive 404.
     if (!jobCredential.presents(c.req)) return c.json(jobCredential.body(), 401);
     const id = c.req.param("id") ?? "";
-    const job = this.jobManager.activeJobs.get(id);
-    if (job) {
-      if (!isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
-      await this.jobManager.ensureReceipt(job);
-      const res: Record<string, unknown> = { job_id: job.id, status: job.status };
-      Object.assign(res, terminalResponseFields(job), await this.contentFields(job));
-      Object.assign(res, await this.drawFundingFields(job));
-      removeUnavailableContent(res);
-      return this.withDeferredSettlement(c.json(res), job.creditId);
-    }
-
-    const record = await this.jobManager.store.get(id);
-    if (!record) return c.json({ error: "Job not found" }, 404);
-    if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
-    await this.jobManager.ensureReceipt(record);
-    const res: Record<string, unknown> = { job_id: record.id, status: record.status };
-    Object.assign(res, terminalResponseFields(record), await this.contentFields(record));
-    Object.assign(res, await this.drawFundingFields(record));
+    const job = this.jobManager.activeJobs.get(id) ?? await this.jobManager.store.get(id);
+    if (!job) return c.json({ error: "Job not found" }, 404);
+    if (!isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
+    const snapshot = await this.readJobSnapshot(job);
+    // Live progress such as ctx.working() need not have a persisted status.
+    // Terminal outcomes always come from the durable snapshot.
+    if ("listeners" in job && !isTerminal(snapshot.status) && !isTerminal(job.status)) snapshot.status = job.status;
+    const res: Record<string, unknown> = { job_id: snapshot.id, status: snapshot.status };
+    Object.assign(res, terminalResponseFields(snapshot), await this.contentFields(snapshot));
+    Object.assign(res, await this.drawFundingFields(snapshot));
     removeUnavailableContent(res);
-    return this.withDeferredSettlement(c.json(res), record.creditId);
+    return this.withDeferredSettlement(c.json(res), snapshot.creditId);
   }
 
   /**
@@ -5171,9 +5174,7 @@ function requestResultNotFound(c: Context<AppEnv>, requestId: string): Response 
   );
 }
 
-/**
- * Ceiling for awaiting a just-terminal job's receipt before responding without it.
- */
+/** Maximum extra wait for terminal persistence and receipt repair on a read. */
 const TERMINAL_WORK_WAIT_MS = 2000;
 
 /**
@@ -5191,22 +5192,19 @@ const TEMPO_ROUTINE_SWEEP_MIN_INTERVAL_MS = 15 * 60 * 1000;
  */
 type TempoSessionWithheldReason = "observer_unhealthy" | "settlement_unhealthy";
 
-/**
- * Await the terminal chain a handler parked on `job.terminalWork`, capped at
- * {@link TERMINAL_WORK_WAIT_MS}. No-op for a job that hasn't terminated (the
- * common case — the caller polls) or for one that terminated through a path
- * that doesn't park work.
- */
-async function awaitTerminalWork(job: ServerJob): Promise<void> {
-  if (!job.terminalWork) return;
+/** Bound read-side coordination; finalization itself must not await this wrapper. */
+async function awaitTerminalWork(work: () => Promise<void>): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    job.terminalWork,
-    new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, TERMINAL_WORK_WAIT_MS);
-    }),
-  ]);
-  clearTimeout(timer);
+  try {
+    await Promise.race([
+      work().catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, TERMINAL_WORK_WAIT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 interface TerminalFieldSource {
