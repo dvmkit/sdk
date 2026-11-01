@@ -23,5 +23,36 @@
       "job_id",
       "job_token"
     ]
+  },
+  "artifacts": {
+    "status": 200,
+    "maxMessagesBytes": 1048576,
+    "body": {
+      "status": "completed",
+      "has_artifacts": true,
+      "artifact_count": 1,
+      "payload_in": "messages"
+    },
+    "requiredFields": [
+      "messages"
+    ],
+    "artifact": {
+      "name": "page.json",
+      "mime_type": "application/json",
+      "encoding": "utf-8",
+      "data": "{\"title\":\"Café ☕\",\"lines\":[\"first\",\"second\"]}\n"
+    },
+    "overCap": {
+      "status": 200,
+      "body": {
+        "status": "completed",
+        "has_artifacts": true,
+        "artifact_count": 1,
+        "payload_in": "messages"
+      },
+      "omittedFields": [
+        "messages"
+      ]
+    }
   }
 }

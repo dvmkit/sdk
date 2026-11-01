@@ -11,6 +11,8 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import type { ArtifactContent } from "../../../lib/messages/types";
+
 import { LOCAL_MINT_URL, localMintAvailable } from "../../../lib/cashu/__tests__/__helpers__/local-mint";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
@@ -64,10 +66,18 @@ function handlerGate() {
   return { release, enter: () => held };
 }
 
-async function startHost(signed: boolean, options: { wait?: number; prompt?: boolean; fail?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
+async function startHost(signed: boolean, options: { wait?: number; prompt?: boolean; fail?: boolean; artifact?: ArtifactContent; redactOnMessageRead?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
   let handlerStarted = false;
   const processingReaders = new Set<() => void>();
   class ObservedStore extends MemoryJobStore {
+    override async getMessages(...args: Parameters<MemoryJobStore["getMessages"]>) {
+      const messages = await super.getMessages(...args);
+      const record = await super.get(args[0]);
+      if (options.redactOnMessageRead && record?.status === "completed" && record.redactedAt === undefined) {
+        await this.redactJob({ jobId: record.id, expectedLastActivityAt: record.lastActivityAt, redactedAt: Date.now() });
+      }
+      return messages;
+    }
     override async get(id: string) {
       const afterAdmission = handlerStarted;
       const snapshot = await super.get(id);
@@ -104,6 +114,7 @@ async function startHost(signed: boolean, options: { wait?: number; prompt?: boo
           await options.onStart?.();
           if (options.prompt) await ctx.prompt("next", "Continue?");
           if (options.fail) { ctx.fail("cannot complete"); return; }
+          if (options.artifact) ctx.artifact(options.artifact);
           ctx.complete(`result:${(ctx.input as { text: string }).text}`);
         },
       },
@@ -263,6 +274,31 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
         expect(text).not.toContain(job.job_token!);
       }, 30_000);
 
+      it("returns artifact bytes and the same durable messages inline on paid retries", async () => {
+        const gate = handlerGate();
+        const host = await startHost(signed, { artifact: inlineContract.artifacts.artifact, onStart: gate.enter });
+        const token = await payRequest(await paymentRequest(host, "artifact"));
+        const processingRead = host.nextProcessingRead();
+        const paying = submit(host, "artifact", token);
+        await processingRead;
+        gate.release();
+        const paid = await paying;
+        expect(paid.status).toBe(inlineContract.artifacts.status);
+        const job = await paid.json();
+        expect(job).toMatchObject(inlineContract.artifacts.body);
+        for (const field of inlineContract.artifacts.requiredFields) expect(job).toHaveProperty(field);
+        expect(job.messages.find((message: { type: string }) => message.type === "artifact").content)
+          .toEqual(inlineContract.artifacts.artifact);
+        const headers = { "X-Job-Token": job.job_token };
+        const history = await fetch(`${host.url}/v1/job/${job.job_id}/messages`, { headers });
+        expect((await history.json()).messages).toEqual(job.messages);
+        const status = await fetch(`${host.url}/v1/job/${job.job_id}`, { headers });
+        expect(await status.json()).not.toHaveProperty("messages");
+        const replay = await submit(host, "artifact", token);
+        expect(replay.status).toBe(200);
+        expect(await replay.json()).toEqual(job);
+      }, 30_000);
+
       it("answers a wrong mint, an unlocked token and a short payment 400 without X-Cashu-Request-Id", async () => {
         const host = await startHost(signed);
         const request = await paymentRequest(host, "bad");
@@ -378,6 +414,59 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
       const body = await response.json() as { messages: { type: string; content: { summary?: string } }[] };
       return body.messages.find((message) => message.type === "complete")?.content.summary;
     }, { timeout: 10_000 }).toBe("result:slow");
+  }, 30_000);
+
+  it("keeps oversized artifacts on the messages endpoint", async () => {
+    const gate = handlerGate();
+    const data = "x".repeat(inlineContract.artifacts.maxMessagesBytes + 1);
+    const host = await startHost(false, { artifact: { mime_type: "application/json", data }, onStart: gate.enter });
+    const token = await payRequest(await paymentRequest(host, "large"));
+    const processingRead = host.nextProcessingRead();
+    const paying = submit(host, "large", token);
+    await processingRead;
+    gate.release();
+    const paid = await paying;
+    expect(paid.status).toBe(inlineContract.artifacts.overCap.status);
+    const job = await paid.json();
+    expect(job).toMatchObject(inlineContract.artifacts.overCap.body);
+    for (const field of inlineContract.artifacts.overCap.omittedFields) expect(job).not.toHaveProperty(field);
+    const history = await fetch(`${host.url}/v1/job/${job.job_id}/messages`, { headers: { "X-Job-Token": job.job_token } });
+    expect((await history.json()).messages.find((message: { type: string }) => message.type === "artifact").content.data).toBe(data);
+  }, 30_000);
+
+  it("omits content redacted during the durable message read", async () => {
+    const gate = handlerGate();
+    const host = await startHost(false, { artifact: inlineContract.artifacts.artifact, redactOnMessageRead: true, onStart: gate.enter });
+    const token = await payRequest(await paymentRequest(host, "redacted"));
+    const processingRead = host.nextProcessingRead();
+    const paying = submit(host, "redacted", token);
+    await processingRead;
+    gate.release();
+    const paid = await paying;
+    expect(paid.status).toBe(200);
+    const job = await paid.json();
+    expect(job).toMatchObject({ content_available: false, has_artifacts: false });
+    expect(job).not.toHaveProperty("messages");
+    expect(job).not.toHaveProperty("summary");
+    const history = await fetch(`${host.url}/v1/job/${job.job_id}/messages`, { headers: { "X-Job-Token": job.job_token } });
+    expect((await history.json()).messages).toEqual([]);
+  }, 30_000);
+
+  it.each(["signed", "request-id"])("does not inline completed artifact messages for %s submits", async (scope) => {
+    const host = await startHost(scope === "signed", { artifact: inlineContract.artifacts.artifact });
+    const token = await payRequest(await paymentRequest(host, "scope"));
+    const data = scope === "signed"
+      ? createSignedRequestVerifier(signedSchema, { domain: { audience: host.info.auth_audience!, method: "POST", path: "/v1/job", capability: "paid" } })
+        .signRequest(new Uint8Array(32).fill(5), { text: "scope" })
+      : { text: "scope" };
+    const paid = await fetch(`${host.url}/v1/job`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Cashu": token, "X-Cashu-Request-Id": randomUUID() },
+      body: JSON.stringify({ capability: "paid", data }),
+    });
+    expect(paid.status).toBe(200);
+    const job = await paid.json();
+    expect(job).toMatchObject(inlineContract.artifacts.body);
+    expect(job).not.toHaveProperty("messages");
   }, 30_000);
 
   it("recovers a still-running job after disconnect without running it twice", async () => {
