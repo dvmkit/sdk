@@ -22984,6 +22984,9 @@
         },
         {
           "module": "src/sdk/server/cashu-payment-request.ts"
+        },
+        {
+          "module": "src/sdk/server/inline-result-wait.ts"
         }
       ]
     },
@@ -34784,6 +34787,31 @@
       "dependencies": [
         {
           "module": "src/lib/pg-retry.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/inline-result-wait.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "The server waits for an accepted unsigned Cashu job response through durable status notifications or local job events.",
+          "symbols": [
+            "waitForInlineResult"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/job.ts"
+        },
+        {
+          "module": "src/sdk/server/job-store.ts"
         }
       ]
     }

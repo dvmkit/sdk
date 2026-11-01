@@ -82,7 +82,12 @@ export function resolveCashuConfig(cashu: CashuConfig | undefined): ResolvedCash
       `configureDVM: cashu.unsignedMinLocktimeSeconds (${unsignedMinLocktimeSeconds}) must not exceed cashu.minLocktimeSeconds less 86400 (${signedWindow}); a payer without a signature can take the signed floor instead by sending X-Cashu-Request-Id`
     );
   }
-  return { minLocktimeSeconds, unsignedMinLocktimeSeconds };
+  const unsignedResultWaitSeconds = cashu.unsignedResultWaitSeconds === undefined ? 10 : cashu.unsignedResultWaitSeconds;
+  if (typeof unsignedResultWaitSeconds !== "number" || !Number.isInteger(unsignedResultWaitSeconds) ||
+    unsignedResultWaitSeconds < 0 || unsignedResultWaitSeconds > 20) {
+    throw new Error("configureDVM: cashu.unsignedResultWaitSeconds must be an integer from 0 to 20");
+  }
+  return { minLocktimeSeconds, unsignedMinLocktimeSeconds, unsignedResultWaitSeconds };
 }
 
 function validFloor(value: unknown, field: string, minimum: number): number | undefined {

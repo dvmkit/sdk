@@ -602,12 +602,20 @@ export interface CashuConfig {
    * floor instead, so a longer unsigned floor would protect nothing.
    */
   unsignedMinLocktimeSeconds?: number;
+  /**
+   * Wait for an unsigned NUT-24 paid submit's result, including replays.
+   * Default 10 seconds; 0 disables waiting. An integer from 0 to 20.
+   * The ceiling leaves room for a cold machine wake within the roughly
+   * 30-second request deadline commonly enforced by an HTTP proxy.
+   */
+  unsignedResultWaitSeconds?: number;
 }
 
-/** A {@link CashuConfig} with both floors filled from their defaults. */
+/** A {@link CashuConfig} with refund floors and the result wait filled from their defaults. */
 export interface ResolvedCashuConfig {
   minLocktimeSeconds: number;
   unsignedMinLocktimeSeconds: number;
+  unsignedResultWaitSeconds: number;
 }
 
 /** Platform default for {@link CreditConfig.min} — a dust floor below which rail fees dominate. */

@@ -91,6 +91,15 @@ describe("configureDVM", () => {
     }
   );
 
+  it.each([-1, 21, 0.5, NaN, Infinity, "10", null])("rejects an invalid unsigned result wait: %s", (value) => {
+    expect(() => configureDVM({ name: "X", capability: "test", cashu: { unsignedResultWaitSeconds: value as number }, onJob: noop }))
+      .toThrow(/cashu\.unsignedResultWaitSeconds must be an integer from 0 to 20/);
+  });
+
+  it.each([0, 10, 20])("accepts an unsigned result wait of %s seconds", (value) => {
+    expect(configureDVM({ name: "X", capability: "test", cashu: { unsignedResultWaitSeconds: value }, onJob: noop }).cashu?.unsignedResultWaitSeconds).toBe(value);
+  });
+
   describe("cashu refund-locktime floors", () => {
     it("leaves the descriptor without floors when the builder sets none", () => {
       expect(configureDVM({ name: "X", capability: "test", onJob: noop }).cashu).toBeUndefined();
@@ -99,8 +108,8 @@ describe("configureDVM", () => {
     it("defaults the unsigned floor to the enforced signed one", () => {
       const resolve = (cashu: { minLocktimeSeconds?: number; unsignedMinLocktimeSeconds?: number }) =>
         configureDVM({ name: "X", capability: "test", cashu, onJob: noop }).cashu;
-      expect(resolve({})).toEqual({ minLocktimeSeconds: 604_800, unsignedMinLocktimeSeconds: 518_400 });
-      expect(resolve({ minLocktimeSeconds: 172_800 })).toEqual({
+      expect(resolve({})).toMatchObject({ minLocktimeSeconds: 604_800, unsignedMinLocktimeSeconds: 518_400 });
+      expect(resolve({ minLocktimeSeconds: 172_800 })).toMatchObject({
         minLocktimeSeconds: 172_800,
         unsignedMinLocktimeSeconds: 86_400,
       });
@@ -108,7 +117,7 @@ describe("configureDVM", () => {
       expect(resolve({ minLocktimeSeconds: 172_800, unsignedMinLocktimeSeconds: 86_400 })?.unsignedMinLocktimeSeconds).toBe(
         86_400
       );
-      expect(resolve({ unsignedMinLocktimeSeconds: 43_200 })).toEqual({
+      expect(resolve({ unsignedMinLocktimeSeconds: 43_200 })).toMatchObject({
         minLocktimeSeconds: 604_800,
         unsignedMinLocktimeSeconds: 43_200,
       });
@@ -161,7 +170,7 @@ describe("configureDVM", () => {
           cashu: { minLocktimeSeconds: 90_000, unsignedMinLocktimeSeconds: 3_600 },
           onJob: noop,
         }).cashu
-      ).toEqual({ minLocktimeSeconds: 90_000, unsignedMinLocktimeSeconds: 3_600 });
+      ).toMatchObject({ minLocktimeSeconds: 90_000, unsignedMinLocktimeSeconds: 3_600 });
     });
   });
 

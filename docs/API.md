@@ -69,7 +69,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `QuoteConfig` | interface | Exported declaration from the built public entry point. |
 | `QuoteContext` | interface | Exported declaration from the built public entry point. |
 | `QuoteResult` | interface | Result returned by the onQuote handler — the fiat-first envelope. |
-| `ResolvedCashuConfig` | interface | A CashuConfig with both floors filled from their defaults. |
+| `ResolvedCashuConfig` | interface | A CashuConfig with refund floors and the result wait filled from their defaults. |
 | `ResolvedCreditConfig` | interface | A CreditConfig with every optional field filled from the platform defaults — what `configureDVM` puts on the descriptor so no downstream consumer re-derives a default. |
 | `resolveFxSourceFromEnv` | function | Resolve an environment override for `createFxFetcher`. |
 | `ResponseContent` | interface | Requester's response to a provider prompt. |
