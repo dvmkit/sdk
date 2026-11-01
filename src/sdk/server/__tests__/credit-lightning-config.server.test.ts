@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Nip47Stub } from "../../../test-support/nip47-stub";
 import { startNip47Stub } from "../../../test-support/nip47-stub";
+import { closeNextNwcPublish } from "../../../test-support/nwc-publish-fault";
 import {
   LightningReceive,
   resolveInvoiceTtl,
@@ -106,6 +107,17 @@ describe("receive-only credential validation", () => {
     const receive = await LightningReceive.create({ uri });
     expect(receive).toBeDefined();
     expect(receive?.available()).toBe(false);
+  });
+
+  it("boots with Lightning unavailable when its socket closes during the permission probe", async () => {
+    stub = await startNip47Stub({ methods: RECEIVE_ONLY });
+    closeNextNwcPublish(stub);
+
+    const receive = await LightningReceive.create({ uri: stub.uri });
+
+    expect(receive).toBeDefined();
+    expect(receive?.available()).toBe(false);
+    expect(stub.requests).toHaveLength(0);
   });
 
   it("logs one unreachable event when a healthy connection's refresh fails", async () => {

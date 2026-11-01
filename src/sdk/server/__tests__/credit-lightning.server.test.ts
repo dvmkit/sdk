@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import type { Nip47Stub } from "../../../test-support/nip47-stub";
 import { startNip47Stub } from "../../../test-support/nip47-stub";
+import { closeNextNwcPublish } from "../../../test-support/nwc-publish-fault";
 import { servedApps } from "../../../test-support/served-app";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
@@ -406,6 +407,25 @@ describe("issue, settle, credit exactly once", () => {
 });
 
 describe("refusals", () => {
+  it("refuses funding after a socket closes before publication and keeps serving requests", async () => {
+    const { url, ledger, stub } = await startHarness();
+    const initialMenu = (await (await quote(url)).json()) as QuoteBody;
+    expect(initialMenu.credit?.funding).toEqual(["lightning"]);
+    closeNextNwcPublish(stub);
+
+    const response = await fundCall(url, "closed-socket");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: "lightning_unavailable" });
+    expect(stub.invoices).toHaveLength(0);
+    expect(await ledger.listPendingInvoices({ callerPubkey: CALLER, limit: 3 })).toEqual([]);
+    expect(await ledger.getForCaller(CALLER)).toEqual([]);
+
+    const nextResponse = await quote(url);
+    expect(nextResponse.status).toBe(200);
+    const menu = (await nextResponse.json()) as QuoteBody;
+    expect(menu.credit?.funding).toEqual([]);
+  });
+
   it("retires an unpaid invoice past its expiry, with no ledger effect", async () => {
     const { url, ledger, stub } = await startHarness();
     const issued = (await (await fundCall(url, "f1")).json()) as FundBody;
