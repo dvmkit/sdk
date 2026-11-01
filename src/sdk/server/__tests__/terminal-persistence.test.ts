@@ -9,17 +9,23 @@ import { JobManager } from "../job-manager";
 import { MemoryJobStore } from "../memory-job-store";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { ReceiptIssuer } from "../receipt-issuer";
+import type { JobRecord } from "../job-store";
 
 const managers: { shutdown(): void | Promise<void> }[] = [];
 afterEach(async () => {
   for (const manager of managers.splice(0)) await manager.shutdown();
   vi.useRealTimers();
 });
-async function setup() {
-  const store = new MemoryJobStore();
+class CostRecoveryStore extends MemoryJobStore {
+  async saveForDvm(record: JobRecord): Promise<void> { await this.save(record); }
+  async listUnreportedTerminalCosts(): Promise<JobRecord[]> { return []; }
+  async markTerminalCostReported(): Promise<boolean> { return true; }
+}
+async function setup(withCostRecovery = false) {
+  const store = withCostRecovery ? new CostRecoveryStore() : new MemoryJobStore();
   const ledger = new MemoryCreditLedger();
   const manager = new JobManager(configureDVM({ name: "durable-result", capability: "work", onJob() {} }), {
-    env: {}, store: new MemoryKVStore(), jobStore: store, creditLedger: ledger, devMode: true,
+    env: {}, store: new MemoryKVStore(), jobStore: store, creditLedger: ledger, devMode: true, dvmId: "example-dvm",
     fxFetcher: { fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }), supportedCurrencies: () => ["usd"] },
     receiptIssuer: new ReceiptIssuer({ secret: "11".repeat(32), dvm: "example", dvmId: "example-dvm" }),
     staleJobTimeoutMs: 0, processingWatchdogMs: 0, heartbeatIntervalMs: 0, orphanDrawSweepIntervalMs: 0,
@@ -76,14 +82,16 @@ describe("terminal result durability", () => {
 
   it("fails and releases after the retry budget, even when append remains unavailable", async () => {
     vi.useFakeTimers();
-    const { job, store, ledger, ctx } = await setup();
+    const { job, store, ledger, ctx } = await setup(true);
     vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("append unavailable"));
+    ctx.cost({ amount: 0.025, currency: "usd" });
     ctx.artifact({ mime_type: "text/plain", data: "result" });
     ctx.complete("done");
     await vi.advanceTimersByTimeAsync(31_000);
     await job.terminalWork;
     const record = (await store.get(job.id))!;
     expect(record.status).toBe("failed");
+    expect(record).toMatchObject({ costAmountMicro: 25_000, costCurrency: "usd", costRevision: 1 });
     expect(record.receipt).toMatchObject({ outcome: "failed", reason: "terminal_persistence_failed" });
     expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("released");
     expect((await ledger.get("credit"))?.availableMicro).toBe(1_000_000);

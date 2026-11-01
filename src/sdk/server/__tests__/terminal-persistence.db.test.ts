@@ -46,7 +46,7 @@ describe.skipIf(!run)("terminal result durability (Postgres)", () => {
   function manager(jobStore = store, creditLedger = ledger) {
     const jm = new JobManager(descriptor, {
       env: {}, store: new MemoryKVStore(), jobStore, creditLedger, devMode: true, fxFetcher,
-      receiptIssuer: issuer, staleJobTimeoutMs: 0, processingWatchdogMs: 0,
+      receiptIssuer: issuer, dvmId: "example-dvm", staleJobTimeoutMs: 0, processingWatchdogMs: 0,
       heartbeatIntervalMs: 0, orphanDrawSweepIntervalMs: 0,
     });
     hosts.push(jm);
@@ -121,10 +121,12 @@ describe.skipIf(!run)("terminal result durability (Postgres)", () => {
         await save(record);
       });
     }
+    ctx.cost({ amount: 0.025, currency: "usd" });
     ctx.artifact({ data: "result" });
     ctx.complete("done");
     await job.terminalWork;
     const record = await check(job.id, "failed", "terminal_persistence_failed");
+    expect(record).toMatchObject({ costAmountMicro: 25_000, costCurrency: "usd", costRevision: 1 });
     await jm.sweepStaleJobs();
     expect((await check(job.id, "failed", "terminal_persistence_failed")).receipt).toEqual(record.receipt);
   }, 40_000);

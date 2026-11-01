@@ -1494,6 +1494,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       job.terminalAtMs = saved.terminalAtMs;
       job.callerWaitMs = saved.callerWaitMs;
       job.timingKnown = saved.timingKnown;
+      await this.tryPersistAdoptedTerminalCost(job, 1);
     } else {
       job.messages = job.messages.filter(m => m.type !== "complete");
       localMessage(job, "provider", "cancel", { reason });
