@@ -40,7 +40,7 @@
     },
     "nut24InlineResult": {
       "fixture": "protocol-fixtures/nut24-inline-result-v1.json",
-      "behavior": "unsigned NUT-24 paid submits and replays return completed results inline within the configured wait; running jobs fall back to 202"
+      "behavior": "unsigned NUT-24 paid submits and replays return completed results inline within the configured wait; running jobs fall back to 202; completed artifact results include durable messages when their serialized UTF-8 array is at most 1048576 bytes and content is available"
     }
   },
   "exports": [

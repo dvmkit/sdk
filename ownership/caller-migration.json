@@ -34798,7 +34798,8 @@
           "destination": "sdk",
           "reason": "The server waits for an accepted unsigned Cashu job response through durable status notifications or local job events.",
           "symbols": [
-            "waitForInlineResult"
+            "waitForInlineResult",
+            "inlineResultMessages"
           ],
           "consumerEvidence": [
             "supported:./server#createDVMHost",
@@ -34812,6 +34813,9 @@
         },
         {
           "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/lib/messages/types.ts"
         }
       ]
     }

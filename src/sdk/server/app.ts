@@ -1,4 +1,4 @@
-import { waitForInlineResult } from "./inline-result-wait";
+import { inlineResultMessages, waitForInlineResult } from "./inline-result-wait";
 import { upfrontPaymentFromDraw } from "./upfront-payment";
 import { withJobReadAvailability } from "./job-read-response";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
@@ -4354,13 +4354,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async submitResponse(c: Context<AppEnv>, job: ServerJob | JobRecord, jobToken: string | undefined): Promise<Response> {
-    if (job.paymentRail === "cashu" && job.paymentTxHash?.startsWith(DERIVED_REQUEST_ID_PREFIX) &&
-      !job.requesterPubkey && c.req.header("X-Cashu") && !c.req.header("X-Cashu-Request-Id")) {
+    const inlineResult = job.paymentRail === "cashu" && job.paymentTxHash?.startsWith(DERIVED_REQUEST_ID_PREFIX) &&
+      !job.requesterPubkey && c.req.header("X-Cashu") && !c.req.header("X-Cashu-Request-Id");
+    if (inlineResult) {
       await waitForInlineResult(this.jobManager.store, job.id, this.jobManager.activeJobs.get(job.id),
         this.descriptor.cashu?.unsignedResultWaitSeconds ?? 10, c.req.raw.signal);
     }
     const snapshot = await this.readJobSnapshot(job, !("listeners" in job));
-    return buildSubmitResponse(c, snapshot, jobToken, await this.contentFields(snapshot));
+    const messages = inlineResult ? await inlineResultMessages(this.jobManager.store, snapshot) : undefined;
+    const fields = await this.contentFields(snapshot);
+    if (messages && fields.content_available !== false) fields.messages = messages;
+    return buildSubmitResponse(c, snapshot, jobToken, fields);
   }
 
   private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt }): Promise<Record<string, unknown>> {

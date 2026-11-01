@@ -3,6 +3,8 @@
  * banking path of a Postgres-backed host. Real Postgres stores, real local
  * mint, no mocked payment layer.
  */
+import { readFileSync } from "node:fs";
+
 import { randomUUID } from "node:crypto";
 
 import { getEncodedToken, type Proof, Wallet } from "@cashu/cashu-ts";
@@ -10,6 +12,8 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
+
+import type { ArtifactContent } from "../../../lib/messages/types";
 
 import { LOCAL_MINT_URL, localMintAvailable } from "../../../lib/cashu/__tests__/__helpers__/local-mint";
 import { servedApps } from "../../../test-support/served-app";
@@ -25,6 +29,8 @@ import { PostgresJobStore } from "../postgres-job-store";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
 import { initWalletAccumulatorTable } from "../wallet-accumulator-store";
+
+const inlineContract = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/nut24-inline-result-v1.json", import.meta.url), "utf8"));
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
@@ -72,7 +78,7 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
     await admin?.end();
   });
 
-  async function startHost(signed: boolean, options: { delay?: number; wait?: number; dvmId?: string; store?: PostgresJobStore; onStart?: () => Promise<void> } = {}): Promise<{ url: string; dvmId: string }> {
+  async function startHost(signed: boolean, options: { artifact?: ArtifactContent; delay?: number; wait?: number; dvmId?: string; store?: PostgresJobStore; onStart?: () => Promise<void> } = {}): Promise<{ url: string; dvmId: string }> {
     const dvmId = options.dvmId ?? `cashu-claim-${randomUUID()}`;
     await seedLockPubkeyState(pool, dvmId, LOCK);
     const dvm = configureDVM({
@@ -85,6 +91,7 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
           async onJob(ctx) {
             await options.onStart?.();
             if (options.delay) await new Promise((resolve) => setTimeout(resolve, options.delay));
+            if (options.artifact) ctx.artifact(options.artifact);
             ctx.complete(`result:${(ctx.input as { text: string }).text}`);
           },
         },
@@ -245,7 +252,7 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
     await peerStore.initStreaming();
     try {
       let runs = 0;
-      const host = await startHost(false, { wait: 20, onStart: () => { runs++; began(); return held; } });
+      const host = await startHost(false, { wait: 20, artifact: inlineContract.artifacts.artifact, onStart: () => { runs++; began(); return held; } });
       const peer = await startHost(false, { wait: 20, dvmId: host.dvmId, store: peerStore });
       const [proofs] = await lockedProofs(1);
       const body = { capability: "paid", data: { text: "first" } };
@@ -264,7 +271,11 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
       expect(recovered.status).toBe(200);
       const job = await paid.json();
       expect(job).toMatchObject({ status: "completed", summary: "result:first" });
-      expect(await recovered.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token, summary: "result:first" });
+      expect(await recovered.json()).toEqual(job);
+      expect(job.messages.find((message: { type: string }) => message.type === "artifact").content).toEqual(inlineContract.artifacts.artifact);
+      const replay = await post(`${peer.url}/v1/job`, body, headers);
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toEqual(job);
       expect(recovered.headers.get("DVM-Job-Identity-V1")).toBe(job.job_id);
       expect(runs).toBe(1);
       const { rows } = await pool.query("SELECT request_id FROM wallet_accumulator WHERE dvm_id=$1", [host.dvmId]);

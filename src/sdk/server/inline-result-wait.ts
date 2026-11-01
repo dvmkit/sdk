@@ -1,6 +1,7 @@
 import type { ServerJob } from "./job";
 import { isTerminal } from "./job";
-import type { JobStore } from "./job-store";
+import type { Message } from "../../lib/messages/types";
+import type { JobRecord, JobStore } from "./job-store";
 import { isStreamableJobStore } from "./job-store";
 
 /** Wait for a persisted response boundary without taking ownership of the job. */
@@ -67,4 +68,19 @@ export function waitForInlineResult(
     }
     notify();
   });
+}
+
+// A held paid retry and its generic client both buffer the body. Keep large
+// results on the messages endpoint to limit server memory and client/context load.
+const INLINE_RESULT_MESSAGES_MAX_BYTES = 1_048_576;
+
+export async function inlineResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {
+  if (job.status !== "completed" || job.redactedAt !== undefined ||
+    !job.messages.some((message) => message.type === "artifact")) return undefined;
+  let messages = job.messages.filter((message) => message.seq > 0);
+  if (isStreamableJobStore(store)) {
+    const durable = await store.getMessages(job.id, 0, { includeHeld: true });
+    if (durable.length > 0) messages = durable;
+  }
+  return Buffer.byteLength(JSON.stringify(messages), "utf8") <= INLINE_RESULT_MESSAGES_MAX_BYTES ? messages : undefined;
 }
