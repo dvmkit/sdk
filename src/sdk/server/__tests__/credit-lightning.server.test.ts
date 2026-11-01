@@ -409,6 +409,8 @@ describe("issue, settle, credit exactly once", () => {
 describe("refusals", () => {
   it("refuses funding after a socket closes before publication and keeps serving requests", async () => {
     const { url, ledger, stub } = await startHarness();
+    const initialMenu = (await (await quote(url)).json()) as QuoteBody;
+    expect(initialMenu.credit?.funding).toEqual(["lightning"]);
     closeNextNwcPublish(stub);
 
     const response = await fundCall(url, "closed-socket");
@@ -421,8 +423,7 @@ describe("refusals", () => {
     const nextResponse = await quote(url);
     expect(nextResponse.status).toBe(200);
     const menu = (await nextResponse.json()) as QuoteBody;
-    expect(menu.credit?.funding).not.toContain("lightning");
-    expect(menu.credit?.funding).toContain("cashu");
+    expect(menu.credit?.funding).toEqual([]);
   });
 
   it("retires an unpaid invoice past its expiry, with no ledger effect", async () => {
