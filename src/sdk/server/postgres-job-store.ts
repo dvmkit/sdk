@@ -160,7 +160,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_seq BIGINT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS redacted_at BIGINT;
       CREATE TABLE IF NOT EXISTS job_content_holds (
-        id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
         data JSONB NOT NULL
       );
       CREATE INDEX IF NOT EXISTS job_content_holds_job_idx ON job_content_holds(job_id);

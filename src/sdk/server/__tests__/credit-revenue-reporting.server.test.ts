@@ -378,6 +378,7 @@ describe("draws are the revenue events", () => {
         21_000,
         "do"
       );
+      await jm.persistJob(job);
       jm.runHandler(job, jm.buildAndAttachContext(job, "hi"));
       await job.terminalWork;
       lines = warn.mock.calls
@@ -522,6 +523,7 @@ describe("a multi-rate credit books what the deposit was worth", () => {
         PRICE_MICRO,
         "do"
       );
+      await jm.persistJob(job);
       jm.runHandler(job, jm.buildAndAttachContext(job, "hi"));
       await job.terminalWork;
       await settleReports();

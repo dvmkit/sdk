@@ -632,7 +632,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly terminalPersistenceRetries = new Map<string, ReturnType<typeof setTimeout>>();
   private terminalPersistenceStopped = false;
   private readonly outgoingQueues = new WeakMap<ServerJob, {
-    msg: Message; opts: AppendOutgoingOptions; pending: ServerJob["pendingPayment"];
+    msg: Message; opts: AppendOutgoingOptions; pending?: ServerJob["pendingPayment"];
   }[]>();
   /** Cost revisions held only by a terminal handler owner until its durable merge succeeds. */
   private readonly terminalCostHandoffRetryTimers = new Map<
@@ -1459,7 +1459,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       try {
         if (await this.adoptDurableTerminal(job)) return;
         await this.flushOutgoing(job);
-        await this.persistSnapshot(job);
+        await this.persistSnapshot(job, true);
         return;
       } catch {
         if (performance.now() >= deadline) break;
@@ -1475,7 +1475,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     this.terminalFailures.set(job, reason);
     const durable = await this.jobStore.get(job.id);
     if (durable && isTerminal(durable.status)) {
-      await this.adoptDurableTerminal(job);
+      const adopted = await this.adoptDurableTerminal(job);
+      if (!adopted && durable.status !== "completed") await this.tryPersistAdoptedTerminalCost(job, 1);
       return;
     }
     job.status = "failed";
@@ -1498,15 +1499,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     } else {
       job.messages = job.messages.filter(m => m.type !== "complete");
       localMessage(job, "provider", "cancel", { reason });
-      await this.persistSnapshot(job);
+      await this.persistSnapshot(job, true);
     }
   }
 
-  private async persistSnapshot(job: ServerJob): Promise<void> {
+  private async persistSnapshot(job: ServerJob, terminalReady = false): Promise<void> {
     if (job.messageAppenderTail) {
       await job.messageAppenderTail.catch(() => undefined);
     }
     if (await this.adoptDurableTerminal(job)) return;
+    // An earlier yield can resume after completion across either await above.
+    // Only the terminal funnel may serialize a terminal snapshot.
+    if (isTerminal(job.status) && !terminalReady) return this.persistJob(job);
     const record = toJobRecord(job);
     if (isTerminal(job.status) && isStreamableJobStore(this.jobStore)) {
       // rebuild the terminal snapshot from the durable `job_messages`
@@ -1874,7 +1878,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.messageAppender = (msg, opts) => {
       let queue = this.outgoingQueues.get(job);
       if (!queue) this.outgoingQueues.set(job, queue = []);
-      queue.push({ msg: structuredClone(msg), opts: { ...opts, appendId: randomBytes(16).toString("hex") }, pending: job.pendingPayment });
+      queue.push({ msg: structuredClone(msg), opts: { ...opts, appendId: randomBytes(16).toString("hex") } });
       const prev = job.messageAppenderTail ?? Promise.resolve();
       job.messageAppenderTail = prev.then(() => this.flushOutgoing(job)).catch(() => {
         diagnosticConsole.error({ level: "job_message_append_failed", jobId, localSeq: msg.seq });
@@ -1887,7 +1891,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (!isStreamableJobStore(store)) return;
     const queue = this.outgoingQueues.get(job);
     while (queue?.length) {
-      const { msg, opts, pending } = queue[0];
+      const entry = queue[0];
+      // requestPayment installs its resolver after emitting the ask. Bind it
+      // when the append starts, retaining that identity through every retry.
+      if (entry.pending === undefined) entry.pending = job.pendingPayment;
+      const { msg, opts, pending } = entry;
       const stored = await store.appendOutgoing(job.id, {
         from: msg.from, type: msg.type, timestamp: msg.timestamp, content: msg.content,
       }, opts);
@@ -4222,9 +4230,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // revenue events — so it has to run before `bookRevenue`, not after.
     if (await this.adoptDurableTerminal(job)) return;
     const durable = await this.jobStore.get(job.id);
-    // A failed yield save must not settle a draw or report completion from an
-    // in-memory terminal that never committed. Retry that save before accounting.
-    if (!durable || !isTerminal(durable.status)) await this.persistJob(job);
+    // Retry an uncommitted terminal before accounting, including cost handoff
+    // after a failure committed without a successful acknowledgement/read-back.
+    if (!durable || !isTerminal(durable.status) || this.terminalFailures.has(job)) await this.persistJob(job);
     await this.attachReceipt(job);
     // Every `false` that costs a revenue booking logs from inside
     // `bookRevenue`; the return value also distinguishes the jobs whose

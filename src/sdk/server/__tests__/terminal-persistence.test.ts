@@ -80,6 +80,71 @@ describe("terminal result durability", () => {
     expect(await store.claimReceiptSeq(job.id)).toBe(seq);
   });
 
+  it("gates an earlier yield save that resumes after completion", async () => {
+    vi.useFakeTimers();
+    const { manager, job, store, ledger, ctx } = await setup();
+    manager.unwatchDurableStatus(job.id);
+    for (let i = 0; i < 4; i++) {
+      const seq = await store.recordInbound(job.id, { from: "requester", type: "response", timestamp: 1, content: { text: String(i) } });
+      await store.verifyAndCredit(job.id, seq, null);
+    }
+    let entered!: () => void;
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const counters = store.getCounters.bind(store);
+    vi.spyOn(store, "getCounters").mockImplementationOnce(async (...args) => {
+      const snapshot = await counters(...args);
+      entered();
+      await gate;
+      return snapshot;
+    });
+    ctx.sendMessage("prompt", { id: "question", text: "Continue?" });
+    await paused;
+    const fault = vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("terminal appends unavailable"));
+    ctx.artifact({ data: "result" });
+    ctx.complete("done");
+    release();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const record = (await store.get(job.id))!;
+      await manager.issueReceipt(record);
+      expect(record.status).toBe("processing");
+      expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("pending");
+    } finally {
+      fault.mockRestore();
+      await vi.advanceTimersByTimeAsync(1000);
+      await job.terminalWork;
+    }
+    const record = (await store.get(job.id))!;
+    expect((await store.getMessages(job.id, 4)).map(m => m.type)).toEqual(["prompt", "artifact", "complete"]);
+    expect(record.receipt).toMatchObject({ outcome: "completed", credit: { amount: 100_000, balance_after: 900_000 } });
+    expect(verifyReceipt(record.receipt!)).toBe(true);
+  });
+
+  it.each(["acknowledgement", "readback"])("recovers declared cost after losing the failure %s", async phase => {
+    vi.useFakeTimers();
+    const { manager, job, store, ledger, ctx } = await setup(true);
+    manager.unwatchDurableStatus(job.id);
+    vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("append unavailable"));
+    const fail = store.failJob.bind(store);
+    const failure = vi.spyOn(store, "failJob").mockImplementationOnce(async (...args) => {
+      const committed = await fail(...args);
+      if (phase === "acknowledgement") throw new Error("lost failure commit acknowledgement");
+      vi.spyOn(store, "get").mockRejectedValueOnce(new Error("failure readback unavailable"));
+      return committed;
+    });
+    ctx.cost({ amount: 0.025, currency: "usd" });
+    ctx.complete("done");
+    await vi.advanceTimersByTimeAsync(31_000);
+    await job.terminalWork;
+    const record = (await store.get(job.id))!;
+    expect(record).toMatchObject({ status: "failed", costAmountMicro: 25_000, costCurrency: "usd", costRevision: 1 });
+    expect(record.receipt).toMatchObject({ outcome: "failed", reason: "terminal_persistence_failed" });
+    expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("released");
+    expect(failure).toHaveBeenCalledTimes(1);
+  });
+
   it("fails and releases after the retry budget, even when append remains unavailable", async () => {
     vi.useFakeTimers();
     const { job, store, ledger, ctx } = await setup(true);

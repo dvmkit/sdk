@@ -74,14 +74,28 @@ describe.skipIf(!run)("terminal result durability (Postgres)", () => {
     return record;
   }
 
-  it("retries a 20-second terminal append outage without losing output beside cross-machine caller messages", async () => {
+  it("retries a 20-second append outage when an earlier yield resumes across completion", async () => {
     const { jm, job, ctx } = await seed();
+    jm.unwatchDurableStatus(job.id);
     // These accepted caller messages never enter the owner's local array. A
     // length-only snapshot guard would mistake this longer log for complete output.
     for (let i = 0; i < 4; i++) {
       const seq = await store.recordInbound(job.id, { from: "requester", type: "response", timestamp: 1, content: { text: String(i) } });
       await store.verifyAndCredit(job.id, seq, null);
     }
+    let entered!: () => void;
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const counters = store.getCounters.bind(store);
+    vi.spyOn(store, "getCounters").mockImplementationOnce(async (...args) => {
+      const snapshot = await counters(...args);
+      entered();
+      await gate;
+      return snapshot;
+    });
+    ctx.sendMessage("prompt", { id: "question", text: "Continue?" });
+    await paused;
     const append = store.appendOutgoing.bind(store);
     const until = Date.now() + 20_000;
     const saveReceipt = store.saveReceipt.bind(store);
@@ -96,12 +110,15 @@ describe.skipIf(!run)("terminal result durability (Postgres)", () => {
     ctx.artifact({ name: "one", data: "first result" });
     ctx.artifact({ name: "two", data: "second result" });
     ctx.complete("done");
+    release();
     await new Promise(resolve => setTimeout(resolve, 50));
     expect((await store.get(job.id))?.status).toBe("processing");
     expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("pending");
     await job.terminalWork;
     const record = await check(job.id, "completed");
-    expect((await store.getMessages(job.id, 4)).map(m => [m.type, m.content])).toEqual([
+    const messages = await store.getMessages(job.id, 4);
+    expect(messages.map(m => m.type)).toEqual(["prompt", "artifact", "artifact", "complete"]);
+    expect(messages.filter(m => m.type !== "prompt").map(m => [m.type, m.content])).toEqual([
       ["artifact", { name: "one", data: "first result" }], ["artifact", { name: "two", data: "second result" }], ["complete", { summary: "done" }],
     ]);
     const other = manager(new PostgresJobStore(db), new CreditLedger(db));
