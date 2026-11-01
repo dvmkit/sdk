@@ -42,6 +42,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
   private data = new Map<string, JobRecord>();
   private messages = new Map<string, StoredMessage[]>();
   private nextSeq = new Map<string, number>();
+  private outgoingAppends = new Map<string, Map<string, number>>();
   private messageSubscribers = new Map<string, Set<MessageSubscriber>>();
   private notifySubscribers = new Map<string, Set<() => void>>();
   private reactivationLocks = new Set<string>();
@@ -162,6 +163,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
   delete(id: string): Promise<void> {
     this.contentHolds.delete(id);
     this.data.delete(id);
+    this.outgoingAppends.delete(id);
     this.messages.delete(id);
     this.nextSeq.delete(id);
     this.receiptSeqs.delete(id);
@@ -266,6 +268,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     if (!record || record.redactedAt !== undefined) {
       return Promise.reject(new Error(`appendOutgoing: job ${jobId} not found`));
     }
+    const prior = opts?.appendId ? this.outgoingAppends.get(jobId)?.get(opts.appendId) : undefined;
+    if (prior !== undefined) return Promise.resolve(prior);
     const seq = this.allocateSeq(jobId);
     const fullMessage = { ...message, seq } as Message;
     if (opts?.awaitingInput && !isTerminal(record.status)) {
@@ -304,6 +308,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     }
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
     if (seq > record.seq) record.seq = seq;
+    if (opts?.appendId) {
+      let appends = this.outgoingAppends.get(jobId);
+      if (!appends) this.outgoingAppends.set(jobId, appends = new Map());
+      appends.set(opts.appendId, seq);
+    }
     this.notify(jobId);
     return Promise.resolve(seq);
   }
@@ -454,6 +463,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     return this.terminateJob(jobId, reason, "cancelled", null);
   }
 
+  failJob(jobId: string, reason: string): Promise<boolean> {
+    return this.terminateJob(jobId, reason, "failed", null);
+  }
+
+
   getCounters(jobId: string): Promise<JobCounters | undefined> {
     const record = this.data.get(jobId);
     if (!record) return Promise.resolve(undefined);
@@ -559,13 +573,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
     if (!eligible) return Promise.resolve(false);
-    let terminalMessages = record.messages;
+    const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
+    const terminalMessages = messages.length ? messages : record.messages;
     if (expectedActivityBefore !== null) {
-      const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
-      const history = messages.length ? messages : record.messages;
-      terminalMessages = history;
-      const deadline = callerDeadline({ ...record, messages: history });
-      const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(history));
+      const deadline = callerDeadline({ ...record, messages: terminalMessages });
+      const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
       if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve(false);
     }
     const seq = this.allocateSeq(jobId);
@@ -580,7 +592,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     // ordering so any subscribeMessages listener still hanging on the
     // snapshot sees the cancel via the live stream before terminal cleanup.
     this.messagesFor(jobId).push({ message: cancelMsg, status: "verified" });
-    record.endedBy = expectedActivityBefore === null || terminalStatus === "cancelled" ? "caller" : "provider";
+    record.endedBy = terminalStatus === "cancelled" ? "caller" : "provider";
     applyTiming(record, structuredClone(record), Date.now(), terminalStatus);
     record.status = terminalStatus;
     record.summary = record.summary ?? reason;

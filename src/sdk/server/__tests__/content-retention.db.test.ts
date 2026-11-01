@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { dropSchemas, pinnedPool, recreateSchema } from "../../../test-support/schema-isolation";
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -61,6 +63,29 @@ describe.skipIf(!RUN)("durable content holds and financial export", () => {
     await restarted.appendOutgoing("example-job", { type: "text", from: "provider", timestamp: 1, content: { text: "late" } });
     await restarted.recordInbound("example-job", { type: "text", from: "requester", timestamp: 1, content: { text: "late" } });
     expect((await restarted.get("example-job"))?.lastActivityAt).toBe(ACTIVITY);
+  });
+
+  it("deletes hold data, history and append identities with a job on a fresh database", async () => {
+    const schema = `content_delete_${randomUUID().replaceAll("-", "")}`;
+    await recreateSchema(schema);
+    const fresh = await pinnedPool(schema);
+    try {
+      const jobs = new PostgresJobStore(fresh);
+      await jobs.init();
+      await jobs.save(contentJob());
+      await jobs.mutateContentHold("example-job", place);
+      await jobs.appendOutgoing("example-job", { from: "provider", type: "text", timestamp: 1, content: { text: "late" } }, { appendId: "example-append" });
+      await jobs.delete("example-job");
+      expect(await jobs.get("example-job")).toBeUndefined();
+      const retained = await fresh.query(`
+        SELECT job_id FROM job_content_holds
+        UNION ALL SELECT job_id FROM job_content_hold_events
+        UNION ALL SELECT job_id FROM job_outgoing_appends`);
+      expect(retained.rows).toEqual([]);
+    } finally {
+      await fresh.end();
+      await dropSchemas(schema);
+    }
   });
 
   it("refuses a stale retention scan clock before erasing terminal content", async () => {

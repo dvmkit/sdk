@@ -4357,15 +4357,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return buildSubmitResponse(c, snapshot, jobToken, await this.contentFields(snapshot));
   }
 
-  private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number }): Promise<Record<string, unknown>> {
+  private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt }): Promise<Record<string, unknown>> {
     const store = this.jobManager.store;
     const responseStatus = job.status;
+    const evidence = isTerminal(job.status) && this.jobManager.receiptsEnabled && !job.receipt
+      ? { receipt_pending: true } : {};
     if (isContentHoldStore(store)) {
       const snapshot = await store.getContentSnapshot(job.id);
-      if (snapshot) return { ...contentMetadata({ ...snapshot.job, status: responseStatus }, this.descriptor.jobRetentionDays, snapshot.history.holds) };
+      if (snapshot) return { ...evidence, ...contentMetadata({ ...snapshot.job, status: responseStatus }, this.descriptor.jobRetentionDays, snapshot.history.holds) };
     }
     // Unsupported custom stores cannot vouch for durable availability or holds.
-    return isContentHoldStore(store) ? { ...contentMetadata(job, this.descriptor.jobRetentionDays) } : {};
+    return isContentHoldStore(store) ? { ...evidence, ...contentMetadata(job, this.descriptor.jobRetentionDays) } : evidence;
   }
 
   private async messageFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number }, messages: Message[]): Promise<Record<string, unknown>> {

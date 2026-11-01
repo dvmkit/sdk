@@ -134,7 +134,6 @@ describe("terminal read recovery", () => {
     const job = manager.createJob({ input: "hello" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
     await manager.persistJob(job);
     manager.runHandler(job, manager.buildAndAttachContext(job, "hello"));
-    await job.terminalWork;
     stale = await store.get(job.id);
     store.fail = false;
     await manager.ensureReceipt(stale!);

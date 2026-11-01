@@ -273,6 +273,8 @@ export interface PaymentCreditDelta {
 
 /** Atomic side effects applied with an outgoing provider message. */
 export interface AppendOutgoingOptions {
+  /** Stable identity for retrying an append whose commit acknowledgement was lost. */
+  appendId?: string;
   /** A suspending SDK prompt/payment yield; event-driven messages leave status unchanged. */
   awaitingInput?: boolean;
   pendingPaymentDelta?: number;
@@ -689,6 +691,9 @@ export interface StreamableJobStore extends JobStore {
    * machine won).
    */
   cancelJob(jobId: string, reason: string): Promise<boolean>;
+
+  /** Atomically fail a nonterminal job with its final reason and durable message history. */
+  failJob?(jobId: string, reason: string): Promise<boolean>;
 
   /**
    * Bump `last_activity_at` to `now` (Unix ms) for the given jobs that are

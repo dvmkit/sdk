@@ -5,6 +5,14 @@
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean }",
       "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff"
+    },
+    "StreamableJobStore.appendOutgoing": {
+      "options": "optional { appendId?: string, ... }",
+      "appendId": "a retry with the same job and append identity returns its original sequence without reapplying counters, including after terminal log cleanup"
+    },
+    "StreamableJobStore.failJob": {
+      "optional": true,
+      "behavior": "atomically fail a nonterminal job with a cancel reason and its verified durable history"
     }
   },
   "wireContracts": {
@@ -22,6 +30,13 @@
         "upfront_payment"
       ],
       "unit": "integer millisatoshis; optional integer credit micro-units and native atomic units"
+    },
+    "receiptPending": {
+      "fixture": "protocol-fixtures/job-receipt-pending-v1.json",
+      "optionalFields": [
+        "receipt_pending"
+      ],
+      "behavior": "true on terminal responses while a configured signed receipt is not durably stored; omitted once receipt is present or receipts are disabled"
     }
   },
   "exports": [
