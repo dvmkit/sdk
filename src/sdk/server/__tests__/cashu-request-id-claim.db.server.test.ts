@@ -60,26 +60,31 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
     await ledger.init();
     jobStore = new PostgresJobStore(pool);
     await jobStore.init();
+    await jobStore.initStreaming();
     await initWalletAccumulatorTable(pool);
     await initLockPubkeyTable(pool);
   });
 
   afterAll(async () => {
+    await jobStore?.shutdownStreaming();
     await pool?.end();
     await admin?.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     await admin?.end();
   });
 
-  async function startHost(signed: boolean): Promise<{ url: string; dvmId: string }> {
-    const dvmId = `cashu-claim-${randomUUID()}`;
+  async function startHost(signed: boolean, options: { delay?: number; wait?: number; dvmId?: string; store?: PostgresJobStore; onStart?: () => Promise<void> } = {}): Promise<{ url: string; dvmId: string }> {
+    const dvmId = options.dvmId ?? `cashu-claim-${randomUUID()}`;
     await seedLockPubkeyState(pool, dvmId, LOCK);
     const dvm = configureDVM({
       name: "cashu-claim",
+      ...(options.wait === undefined ? {} : { cashu: { unsignedResultWaitSeconds: options.wait } }),
       capabilities: {
         paid: {
           input: signed ? signedSchema : z.object({ text: z.string().min(1) }),
           price: "$0.016",
-          onJob(ctx) {
+          async onJob(ctx) {
+            await options.onStart?.();
+            if (options.delay) await new Promise((resolve) => setTimeout(resolve, options.delay));
             ctx.complete(`result:${(ctx.input as { text: string }).text}`);
           },
         },
@@ -96,7 +101,7 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
     const { app } = await createDVMServer(dvm, {
       env: {},
       store: new MemoryKVStore(),
-      jobStore,
+      jobStore: options.store ?? jobStore,
       fxFetcher: fx,
       creditLedger: ledger,
       receiptKey: "77".repeat(32),
@@ -180,12 +185,14 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
   }, 30_000);
 
   it("banks a payment sent without a request id under its proof set's id, and recovers it on retry", async () => {
-    const host = await startHost(false);
+    const host = await startHost(false, { delay: 150 });
     const [proofs] = await lockedProofs(1);
     const body = { capability: "paid", data: { text: "first" } };
     const first = await post(`${host.url}/v1/job`, body, { "X-Cashu": token(proofs!) });
     expect(first.status).toBe(200);
     const job = (await first.json()) as { job_id: string; job_token: string };
+    expect(job).toMatchObject({ status: "completed", summary: "result:first" });
+    expect(first.headers.get("DVM-Job-Identity-V1")).toBe(job.job_id);
     const { rows } = await pool.query<{ request_id: string }>(
       "SELECT DISTINCT request_id FROM wallet_accumulator WHERE dvm_id = $1",
       [host.dvmId]
@@ -196,9 +203,78 @@ describe.skipIf(!live)("a Cashu request id is claimed by its first proof set on 
 
     const retry = await post(`${host.url}/v1/job`, body, { "X-Cashu": token(proofs!) });
     expect(retry.status).toBe(200);
-    expect(await retry.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token });
+    expect(await retry.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token, status: "completed", summary: "result:first" });
     expect(await rowsUnder(host.dvmId, rows[0]!.request_id)).toBe(banked);
   }, 30_000);
+
+  it("returns a running job inline on another host through Postgres notifications without a second charge", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => { began = resolve; });
+    let readProcessing!: () => void;
+    const processingRead = new Promise<void>((resolve) => { readProcessing = resolve; });
+    class PeerStore extends PostgresJobStore {
+      subscribed = false;
+      processingReads = 0;
+      readsInFlight = 0;
+      override async get(id: string) {
+        this.readsInFlight++;
+        try {
+          const snapshot = await super.get(id);
+          if (this.subscribed && snapshot?.status === "processing") {
+            this.processingReads++;
+            // Drain both initial waiter reads before release, so neither can
+            // observe completion without a later notification.
+            setImmediate(() => {
+              if (this.processingReads >= 2 && this.readsInFlight === 0) readProcessing();
+            });
+          }
+          return snapshot;
+        } finally {
+          this.readsInFlight--;
+        }
+      }
+      override async subscribeNotifications(id: string, notify: () => void): Promise<() => void> {
+        const stop = await super.subscribeNotifications(id, notify);
+        this.subscribed = true;
+        return stop;
+      }
+    }
+    const peerStore = new PeerStore(pool);
+    await peerStore.initStreaming();
+    try {
+      let runs = 0;
+      const host = await startHost(false, { wait: 20, onStart: () => { runs++; began(); return held; } });
+      const peer = await startHost(false, { wait: 20, dvmId: host.dvmId, store: peerStore });
+      const [proofs] = await lockedProofs(1);
+      const body = { capability: "paid", data: { text: "first" } };
+      const headers = { "X-Cashu": token(proofs!) };
+      const first = post(`${host.url}/v1/job`, body, headers);
+      await started;
+      const retry = post(`${peer.url}/v1/job`, body, headers);
+      await processingRead;
+      const releasedAt = performance.now();
+      release();
+      const recovered = await retry;
+      expect(performance.now() - releasedAt).toBeLessThan(5000);
+      const paid = await first;
+      expect(performance.now() - releasedAt).toBeLessThan(5000);
+      expect(paid.status).toBe(200);
+      expect(recovered.status).toBe(200);
+      const job = await paid.json();
+      expect(job).toMatchObject({ status: "completed", summary: "result:first" });
+      expect(await recovered.json()).toMatchObject({ job_id: job.job_id, job_token: job.job_token, summary: "result:first" });
+      expect(recovered.headers.get("DVM-Job-Identity-V1")).toBe(job.job_id);
+      expect(runs).toBe(1);
+      const { rows } = await pool.query("SELECT request_id FROM wallet_accumulator WHERE dvm_id=$1", [host.dvmId]);
+      expect(rows).toHaveLength(proofs!.length);
+      expect(new Set(rows.map((row: { request_id: string }) => row.request_id)).size).toBe(1);
+    } finally {
+      release();
+      await peerStore.shutdownStreaming();
+    }
+  }, 60_000);
 
   it("refuses POST /v1/credit funding with other proofs under a used request id", async () => {
     const host = await startHost(true);

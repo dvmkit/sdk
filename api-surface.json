@@ -37,6 +37,10 @@
         "receipt_pending"
       ],
       "behavior": "true on terminal responses while a configured signed receipt is not durably stored; omitted once receipt is present or receipts are disabled"
+    },
+    "nut24InlineResult": {
+      "fixture": "protocol-fixtures/nut24-inline-result-v1.json",
+      "behavior": "unsigned NUT-24 paid submits and replays return completed results inline within the configured wait; running jobs fall back to 202"
     }
   },
   "exports": [
@@ -1147,5 +1151,15 @@
         "x402WalletFromConfig"
       ]
     }
-  ]
+  ],
+  "descriptorContracts": {
+    "CashuConfig.unsignedResultWaitSeconds": {
+      "type": "optional integer",
+      "default": 10,
+      "minimum": 0,
+      "maximum": 20,
+      "resolved": "ResolvedCashuConfig.unsignedResultWaitSeconds: number",
+      "behavior": "0 disables the bounded inline result wait for unsigned NUT-24 submits and replays"
+    }
+  }
 }

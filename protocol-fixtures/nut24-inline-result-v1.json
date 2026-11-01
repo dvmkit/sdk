@@ -1,0 +1,27 @@
+{
+  "description": "Unsigned NUT-24 paid POST /v1/job without X-Cashu-Request-Id waits for a result by default, including identical payment retries.",
+  "identityHeader": "DVM-Job-Identity-V1",
+  "completed": {
+    "status": 200,
+    "requiredFields": [
+      "job_id",
+      "job_token",
+      "status",
+      "summary",
+      "has_artifacts",
+      "payload_in"
+    ],
+    "body": {
+      "status": "completed",
+      "has_artifacts": false,
+      "payload_in": "summary"
+    }
+  },
+  "fallback": {
+    "status": 202,
+    "requiredFields": [
+      "job_id",
+      "job_token"
+    ]
+  }
+}

@@ -2,6 +2,8 @@
  * NUT-24 per-call Cashu: the unpaid 402 carries an `X-Cashu` payment request,
  * and a wallet pays it with only an `X-Cashu` token. Real host, real local mint.
  */
+import { readFileSync } from "node:fs";
+
 import { randomUUID } from "node:crypto";
 
 import { decodePaymentRequest, getEncodedToken, type P2PKOptions, type Proof, Wallet } from "@cashu/cashu-ts";
@@ -13,9 +15,12 @@ import { LOCAL_MINT_URL, localMintAvailable } from "../../../lib/cashu/__tests__
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import { proofSetRequestId } from "../cashu-payment-request";
+import { MemoryJobStore } from "../memory-job-store";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { serve } from "../serve";
 import { createSignedRequestVerifier } from "../signed-request";
+
+const inlineContract = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/nut24-inline-result-v1.json", import.meta.url), "utf8"));
 
 const live = await localMintAvailable();
 
@@ -38,6 +43,7 @@ interface Host {
   };
   /** Sets the BTC/USD rate the host's fx source serves from now on. */
   setRate(rate: number): void;
+  nextProcessingRead(): Promise<void>;
   /** Holds every fx fetch from now on until {@link Host.release} answers it. */
   holdFetches(): void;
   /** Resolves once `count` fetches are waiting. */
@@ -51,7 +57,30 @@ afterEach(async () => {
   await Promise.all(closers.splice(0).map((close) => close()));
 });
 
-async function startHost(signed: boolean): Promise<Host> {
+function handlerGate() {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  closers.push(async () => { release(); });
+  return { release, enter: () => held };
+}
+
+async function startHost(signed: boolean, options: { wait?: number; prompt?: boolean; fail?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
+  let handlerStarted = false;
+  const processingReaders = new Set<() => void>();
+  class ObservedStore extends MemoryJobStore {
+    override async get(id: string) {
+      const afterAdmission = handlerStarted;
+      const snapshot = await super.get(id);
+      if (afterAdmission && snapshot?.status === "processing") {
+        const readers = [...processingReaders];
+        processingReaders.clear();
+        // Let snapshot consumers finish before the test releases the handler.
+        setImmediate(() => { for (const ready of readers) ready(); });
+      }
+      return snapshot;
+    }
+  }
+  const jobStore = new ObservedStore();
   let rate = 100_000;
   let holding = false;
   const waiting: ((usd: number) => void)[] = [];
@@ -65,24 +94,30 @@ async function startHost(signed: boolean): Promise<Host> {
   };
   const descriptor = configureDVM({
     name: "nut24-payment-request",
+    ...(options.wait === undefined ? {} : { cashu: { unsignedResultWaitSeconds: options.wait } }),
     capabilities: {
       paid: {
         input: signed ? signedSchema : z.object({ text: z.string().min(1) }),
         price: PRICE,
-        onJob(ctx) {
+        async onJob(ctx) {
+          handlerStarted = true;
+          await options.onStart?.();
+          if (options.prompt) await ctx.prompt("next", "Continue?");
+          if (options.fail) { ctx.fail("cannot complete"); return; }
           ctx.complete(`result:${(ctx.input as { text: string }).text}`);
         },
       },
     },
     ...(signed ? { auth: secp256k1Auth({ allowUnsignedPaid: true }) } : {}),
   });
-  const running = await serve(descriptor, { devMode: true, port: 0, env: {}, mints: [LOCAL_MINT_URL], fx });
+  const running = await serve(descriptor, { devMode: true, port: 0, env: {}, jobStore, mints: [LOCAL_MINT_URL], fx });
   closers.push(() => running.close());
   const info = (await (await fetch(`${running.url}/v1/info`)).json()) as Host["info"];
   return {
     url: running.url,
     info,
     setRate: (next) => (rate = next),
+    nextProcessingRead: () => new Promise((resolve) => { processingReaders.add(resolve); }),
     holdFetches: () => (holding = true),
     async waitingFetches(count) {
       for (let n = 0; waiting.length < count && n < 400; n++) await new Promise((r) => setTimeout(r, 5));
@@ -98,9 +133,10 @@ async function startHost(signed: boolean): Promise<Host> {
   };
 }
 
-function submit(host: Host, text: string, token?: string, requestId?: string): Promise<Response> {
+function submit(host: Host, text: string, token?: string, requestId?: string, signal?: AbortSignal): Promise<Response> {
   return fetch(`${host.url}/v1/job`, {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       ...(token && { "X-Cashu": token }),
@@ -195,19 +231,28 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
       }, 30_000);
 
       it("accepts a token sent with only X-Cashu and recovers the job when the same token is retried", async () => {
-        const host = await startHost(signed);
+        const gate = handlerGate();
+        const host = await startHost(signed, { onStart: gate.enter });
         const token = await payRequest(await paymentRequest(host, "mine"));
 
-        const paid = await submit(host, "mine", token);
-        expect(paid.status).toBe(200);
+        const processingRead = host.nextProcessingRead();
+        const paying = submit(host, "mine", token);
+        await processingRead;
+        gate.release();
+        const paid = await paying;
+        expect(paid.status).toBe(inlineContract.completed.status);
         const job = (await paid.json()) as Job;
         expect(job.summary).toBe("result:mine");
+        for (const field of inlineContract.completed.requiredFields) expect(job).toHaveProperty(field);
+        expect(job).toMatchObject(inlineContract.completed.body);
+        expect(paid.headers.get(inlineContract.identityHeader)).toBe(job.job_id);
 
         const retry = await submit(host, "mine", token);
         expect(retry.status).toBe(200);
         const recovered = (await retry.json()) as Job;
         expect(recovered.job_id).toBe(job.job_id);
         expect(recovered.job_token).toBe(job.job_token);
+        expect(recovered.summary).toBe("result:mine");
 
         // The token is bound to the request it paid: another body recovers nothing and runs nothing.
         const other = await submit(host, "other", token);
@@ -315,6 +360,103 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
       }, 60_000);
     });
   }
+
+  it("returns the unchanged accepted response at expiry and leaves the result available to polling", async () => {
+    const gate = handlerGate();
+    const host = await startHost(false, { wait: 1, onStart: gate.enter });
+    const token = await payRequest(await paymentRequest(host, "slow"));
+    const paid = await submit(host, "slow", token);
+    expect(paid.status).toBe(inlineContract.fallback.status);
+    const job = await paid.json() as Required<Pick<Job, "job_id" | "job_token">>;
+    for (const field of inlineContract.fallback.requiredFields) expect(job).toHaveProperty(field);
+    expect(job).not.toHaveProperty("status");
+    expect(job).not.toHaveProperty("summary");
+    expect(paid.headers.get(inlineContract.identityHeader)).toBe(job.job_id);
+    gate.release();
+    await expect.poll(async () => {
+      const response = await fetch(`${host.url}/v1/job/${job.job_id}/messages`, { headers: { "X-Job-Token": job.job_token } });
+      const body = await response.json() as { messages: { type: string; content: { summary?: string } }[] };
+      return body.messages.find((message) => message.type === "complete")?.content.summary;
+    }, { timeout: 10_000 }).toBe("result:slow");
+  }, 30_000);
+
+  it("recovers a still-running job after disconnect without running it twice", async () => {
+    let runs = 0;
+    const gate = handlerGate();
+    const host = await startHost(false, { onStart: () => { runs++; return gate.enter(); } });
+    const token = await payRequest(await paymentRequest(host, "disconnected"));
+    const controller = new AbortController();
+    const firstProcessingRead = host.nextProcessingRead();
+    const first = submit(host, "disconnected", token, undefined, controller.signal);
+    const dropped = expect(first).rejects.toThrow();
+    await firstProcessingRead;
+    controller.abort();
+    await dropped;
+    const replayProcessingRead = host.nextProcessingRead();
+    const recovering = submit(host, "disconnected", token);
+    await replayProcessingRead;
+    gate.release();
+    const retry = await recovering;
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ summary: "result:disconnected", status: "completed" });
+    expect(runs).toBe(1);
+  }, 30_000);
+
+  it("returns awaiting-input promptly instead of waiting for the deadline", async () => {
+    const gate = handlerGate();
+    const host = await startHost(false, { wait: 20, prompt: true, onStart: gate.enter });
+    const token = await payRequest(await paymentRequest(host, "prompt"));
+    const processingRead = host.nextProcessingRead();
+    const paying = submit(host, "prompt", token);
+    await processingRead;
+    const releasedAt = performance.now();
+    gate.release();
+    const paid = await paying;
+    expect(paid.status).toBe(202);
+    expect(await paid.json()).toMatchObject({ status: "awaiting-input", job_id: expect.any(String), job_token: expect.any(String) });
+    expect(performance.now() - releasedAt).toBeLessThan(5000);
+  }, 30_000);
+
+  it("returns failure inline with the same status mapping as replay", async () => {
+    const gate = handlerGate();
+    const host = await startHost(false, { fail: true, onStart: gate.enter });
+    const token = await payRequest(await paymentRequest(host, "fail"));
+    const processingRead = host.nextProcessingRead();
+    const paying = submit(host, "fail", token);
+    await processingRead;
+    gate.release();
+    const paid = await paying;
+    expect(paid.status).toBe(202);
+    const job = await paid.json();
+    const state = await fetch(`${host.url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
+    expect(await state.json()).toMatchObject({ status: "failed" });
+    const retry = await submit(host, "fail", token);
+    expect(retry.status).toBe(202);
+    expect(await retry.json()).toMatchObject(job);
+  }, 30_000);
+
+  it.each(["disabled", "request-id", "signed"])("keeps asynchronous submits immediate for %s callers", async (scope) => {
+    const gate = handlerGate();
+    const host = await startHost(scope === "signed", { wait: scope === "disabled" ? 0 : 20, onStart: gate.enter });
+    const request = await paymentRequest(host, "scope");
+    const token = await payRequest(request);
+    const started = Date.now();
+    let paid: Response;
+    if (scope === "signed") {
+      const signer = createSignedRequestVerifier(signedSchema, {
+        domain: { audience: host.info.auth_audience!, method: "POST", path: "/v1/job", capability: "paid" },
+      });
+      paid = await fetch(`${host.url}/v1/job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Cashu": token, "X-Cashu-Request-Id": randomUUID() },
+        body: JSON.stringify({ capability: "paid", data: signer.signRequest(new Uint8Array(32).fill(5), { text: "scope" }) }),
+      });
+    } else paid = await submit(host, "scope", token, scope === "request-id" ? randomUUID() : undefined);
+    expect(paid.status).toBe(202);
+    expect(await paid.json()).not.toHaveProperty("summary");
+    expect(Date.now() - started).toBeLessThan(8000);
+    gate.release();
+  }, 30_000);
 
   it("keeps the signed 402 free of a payment request it could not accept without a request id", async () => {
     const host = await startHost(true);
