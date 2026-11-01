@@ -160,7 +160,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_seq BIGINT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS redacted_at BIGINT;
       CREATE TABLE IF NOT EXISTS job_content_holds (
-        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
         data JSONB NOT NULL
       );
       CREATE INDEX IF NOT EXISTS job_content_holds_job_idx ON job_content_holds(job_id);
@@ -261,6 +261,15 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       );
       ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'verified';
       ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS created_at_ms BIGINT;
+
+      -- Survives terminal message cleanup so a lost COMMIT acknowledgement can
+      -- be retried without allocating another sequence or applying counters twice.
+      CREATE TABLE IF NOT EXISTS job_outgoing_appends (
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        append_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        PRIMARY KEY (job_id, append_id)
+      );
 
       -- per-DVM monotonic receipt counter. Single row by
       -- construction (the CHECK pins the key), and per-DVM by construction
@@ -772,7 +781,9 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     if (this.hostingCleanupFence) {
       throw new Error("Hosted job deletion cannot discard obligation evidence");
     }
-    await this.pool.query("DELETE FROM jobs WHERE id = $1", [id]);
+    await this.pool.query(
+      `WITH deleted AS (DELETE FROM jobs WHERE id=$1 RETURNING id)
+       DELETE FROM job_outgoing_appends WHERE job_id IN (SELECT id FROM deleted)`, [id]);
     await this.deleteResolvedMessages(id).catch(() => undefined);
   }
 
@@ -953,6 +964,18 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      if (opts?.appendId) {
+        const owner = await client.query("SELECT id FROM jobs WHERE id=$1 AND redacted_at IS NULL FOR UPDATE", [jobId]);
+        if (!owner.rows.length) throw new Error(`appendOutgoing: job ${jobId} not found`);
+        const prior = await client.query<{ seq: number }>(
+          "SELECT seq FROM job_outgoing_appends WHERE job_id=$1 AND append_id=$2",
+          [jobId, opts.appendId]
+        );
+        if (prior.rows[0]) {
+          await client.query("COMMIT");
+          return prior.rows[0].seq;
+        }
+      }
       const { rows } = await client.query<{ seq: number }>(
         `UPDATE jobs SET next_seq = next_seq + 1, last_activity_at = CASE WHEN status IN ('completed','failed','cancelled') THEN last_activity_at ELSE $2 END,
            awaiting_input_at_ms = CASE WHEN $3::boolean AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -1031,6 +1054,10 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
             opts.pendingPaymentFiatCurrency ?? null,
           ]
         );
+      }
+      if (opts?.appendId) {
+        await client.query("INSERT INTO job_outgoing_appends (job_id, append_id, seq) VALUES ($1,$2,$3)",
+          [jobId, opts.appendId, seq]);
       }
       await client.query("SELECT pg_notify('job_messages', $1)", [jobId]);
       await client.query("COMMIT");
@@ -1303,6 +1330,10 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     return this.terminateJob(jobId, reason, "cancelled", null, "caller");
   }
 
+  failJob(jobId: string, reason: string): Promise<boolean> {
+    return this.terminateJob(jobId, reason, "failed", null, "provider");
+  }
+
   cancelJobForHosting(jobId: string, reason: string): Promise<boolean> {
     return this.terminateJob(jobId, reason, "cancelled", null, "provider");
   }
@@ -1524,15 +1555,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         await client.query("ROLLBACK");
         return false;
       }
-      let terminalMessages: Message[] | undefined;
+      const record = rowToRecord(rows[0]);
+      const { rows: messages } = await client.query<{ data: Message }>(
+        "SELECT data FROM job_messages WHERE job_id=$1 AND status='verified' ORDER BY seq", [jobId]);
+      const terminalMessages = messages.length ? messages.map((row) => row.data) : record.messages;
       if (staleOnly) {
-        const record = rowToRecord(rows[0]);
-        const { rows: messages } = await client.query<{ data: Message }>(
-          "SELECT data FROM job_messages WHERE job_id=$1 AND status='verified' ORDER BY seq", [jobId]);
-        const history = messages.length ? messages.map((row) => row.data) : record.messages;
-        terminalMessages = history;
-        const deadline = callerDeadline({ ...record, messages: history });
-        const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(history));
+        const deadline = callerDeadline({ ...record, messages: terminalMessages });
+        const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
         if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) {
           await client.query("ROLLBACK");
           return false;
@@ -1567,12 +1596,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
            awaiting_input_at_ms = NULL,
            status = $6,
            summary = COALESCE(summary, $2),
-           messages = ${staleOnly ? "$3::jsonb" : "COALESCE(messages, '[]'::jsonb) || $3::jsonb"},
+           messages = $3::jsonb,
            seq = $4,
            next_seq = $4 + 1,
            last_activity_at = $5
          WHERE id = $1`,
-        [jobId, reason, JSON.stringify([...(terminalMessages ?? []), cancelMsg]), nextSeq, now, terminalStatus,
+        [jobId, reason, JSON.stringify([...terminalMessages, cancelMsg]), nextSeq, now, terminalStatus,
           staleOnly ? (terminalStatus === "cancelled" ? "caller" : "provider") : endedBy]
       );
       await client.query("SELECT pg_notify('job_messages', $1)", [jobId]);

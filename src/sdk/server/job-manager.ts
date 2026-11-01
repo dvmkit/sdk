@@ -61,6 +61,7 @@ import {
   toJobRecord,
 } from "./job";
 import type {
+  AppendOutgoingOptions,
   JobRecord,
   JobRetentionCursor,
   JobStatus,
@@ -257,6 +258,8 @@ export const CREDIT_INBOUND_ATTEMPTS = 3;
 
 /** Base backoff between Tx C attempts, multiplied by the attempt number. */
 const CREDIT_INBOUND_BACKOFF_MS = 50;
+const TERMINAL_PERSIST_RETRY_MS = 30_000;
+
 const TERMINAL_COST_HANDOFF_RETRY_INITIAL_MS = 100;
 const TERMINAL_COST_HANDOFF_RETRY_MAX_MS = 30_000;
 
@@ -624,6 +627,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly terminalReadRepairs = new Map<string, Promise<void>>();
+  private readonly terminalSnapshots = new WeakMap<ServerJob, Promise<void>>();
+  private readonly terminalFailures = new WeakMap<ServerJob, string>();
+  private readonly terminalPersistenceRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  private terminalPersistenceStopped = false;
+  private readonly outgoingQueues = new WeakMap<ServerJob, {
+    msg: Message; opts: AppendOutgoingOptions; pending: ServerJob["pendingPayment"];
+  }[]>();
   /** Cost revisions held only by a terminal handler owner until its durable merge succeeds. */
   private readonly terminalCostHandoffRetryTimers = new Map<
     string,
@@ -1415,6 +1425,83 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * subscriber's NOTIFY-driven fetch can see it).
    */
   async persistJob(job: ServerJob): Promise<void> {
+    if (!isTerminal(job.status)) return this.persistSnapshot(job);
+    let work = this.terminalSnapshots.get(job);
+    if (!work) {
+      work = this.persistTerminalSnapshot(job).then(() => {
+        clearTimeout(this.terminalPersistenceRetries.get(job.id));
+        this.terminalPersistenceRetries.delete(job.id);
+      }).catch(error => {
+        if (this.terminalFailures.has(job)) this.scheduleTerminalPersistenceRetry(job);
+        throw error;
+      }).finally(() => this.terminalSnapshots.delete(job));
+      this.terminalSnapshots.set(job, work);
+    }
+    return work;
+  }
+
+  private scheduleTerminalPersistenceRetry(job: ServerJob): void {
+    if (this.terminalPersistenceStopped || this.terminalPersistenceRetries.has(job.id)) return;
+    const timer = setTimeout(() => {
+      this.terminalPersistenceRetries.delete(job.id);
+      job.terminalWork = this.handleJobTerminal(job).catch(() => {
+        this.scheduleTerminalPersistenceRetry(job);
+      });
+    }, 1000);
+    timer.unref?.();
+    this.terminalPersistenceRetries.set(job.id, timer);
+  }
+
+  private async persistTerminalSnapshot(job: ServerJob): Promise<void> {
+    const deadline = performance.now() + TERMINAL_PERSIST_RETRY_MS;
+    await job.messageAppenderTail;
+    while (!this.terminalFailures.has(job)) {
+      try {
+        if (await this.adoptDurableTerminal(job)) return;
+        await this.flushOutgoing(job);
+        await this.persistSnapshot(job);
+        return;
+      } catch {
+        if (performance.now() >= deadline) break;
+        await new Promise(resolve => setTimeout(resolve, Math.min(500, deadline - performance.now())));
+      }
+    }
+    // Never retry an in-memory completion after deciding to release its hold.
+    // A read-back/terminal CAS arbitrates an ambiguous snapshot COMMIT first.
+    const reason = this.terminalFailures.get(job) ?? (job.status === "completed"
+      ? "terminal_persistence_failed"
+      : (job.messages.findLast(m => m.type === "cancel")?.content as { reason?: string } | undefined)?.reason
+        ?? job.summary ?? "terminal_persistence_failed");
+    this.terminalFailures.set(job, reason);
+    const durable = await this.jobStore.get(job.id);
+    if (durable && isTerminal(durable.status)) {
+      await this.adoptDurableTerminal(job);
+      return;
+    }
+    job.status = "failed";
+    job.summary = reason;
+    this.outgoingQueues.delete(job);
+    const store = this.jobStore;
+    if (isStreamableJobStore(store) && store.failJob) {
+      await store.failJob(job.id, reason);
+      const saved = await store.get(job.id);
+      if (!saved || !isTerminal(saved.status)) throw new JobSnapshotPersistenceError("failure not committed");
+      job.status = saved.status;
+      job.summary = saved.summary;
+      job.messages = saved.messages;
+      job.seq = saved.seq;
+      job.endedBy = saved.endedBy;
+      job.terminalAtMs = saved.terminalAtMs;
+      job.callerWaitMs = saved.callerWaitMs;
+      job.timingKnown = saved.timingKnown;
+    } else {
+      job.messages = job.messages.filter(m => m.type !== "complete");
+      localMessage(job, "provider", "cancel", { reason });
+      await this.persistSnapshot(job);
+    }
+  }
+
+  private async persistSnapshot(job: ServerJob): Promise<void> {
     if (job.messageAppenderTail) {
       await job.messageAppenderTail.catch(() => undefined);
     }
@@ -1782,46 +1869,32 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   private wireMessageAppender(job: ServerJob): void {
     if (!isStreamableJobStore(this.jobStore)) return;
-    const store = this.jobStore;
     const jobId = job.id;
     job.messageAppender = (msg, opts) => {
+      let queue = this.outgoingQueues.get(job);
+      if (!queue) this.outgoingQueues.set(job, queue = []);
+      queue.push({ msg: structuredClone(msg), opts: { ...opts, appendId: randomBytes(16).toString("hex") }, pending: job.pendingPayment });
       const prev = job.messageAppenderTail ?? Promise.resolve();
-      const next = prev.then(() => {
-        const pending = job.pendingPayment;
-        return store
-          .appendOutgoing(
-            jobId,
-            {
-              from: msg.from,
-              type: msg.type,
-              timestamp: msg.timestamp,
-              content: msg.content,
-            },
-            opts
-          )
-          .then((stored) => {
-            if (msg.type === "payment-request" && pending && job.pendingPayment === pending) {
-              this.paymentAskSeqs.set(pending, stored);
-            }
-          })
-          .catch((_err: unknown) => {
-            diagnosticConsole.error(
-              {
-                level: "job_message_append_failed",
-                jobId,
-                // In-memory counter, NOT the authoritative DB-allocated seq:
-                // `appendOutgoing` allocates the real seq via `UPDATE ...
-                // RETURNING` inside the transaction that just failed, so no DB
-                // seq was assigned for this message.
-                localSeq: msg.seq,
-                note: undefined,
-                error: undefined,
-              }
-            );
-          });
+      job.messageAppenderTail = prev.then(() => this.flushOutgoing(job)).catch(() => {
+        diagnosticConsole.error({ level: "job_message_append_failed", jobId, localSeq: msg.seq });
       });
-      job.messageAppenderTail = next;
     };
+  }
+
+  private async flushOutgoing(job: ServerJob): Promise<void> {
+    const store = this.jobStore;
+    if (!isStreamableJobStore(store)) return;
+    const queue = this.outgoingQueues.get(job);
+    while (queue?.length) {
+      const { msg, opts, pending } = queue[0];
+      const stored = await store.appendOutgoing(job.id, {
+        from: msg.from, type: msg.type, timestamp: msg.timestamp, content: msg.content,
+      }, opts);
+      if (msg.type === "payment-request" && pending && job.pendingPayment === pending) {
+        this.paymentAskSeqs.set(pending, stored);
+      }
+      queue.shift();
+    }
   }
 
   startIdleTimer(job: ServerJob, deadline = callerDeadline(job, this.descriptor.idleTimeout * 1000)): void {
@@ -3857,7 +3930,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // stranded number would read as a permanent suppression gap.
       const seq = await store.claimReceiptSeq(record.id);
       const receipt = issuer.issue(record, seq, undefined, credit);
-      const saved = (await store.saveReceipt(record.id, receipt)) ?? receipt;
+      const saved = await store.saveReceipt(record.id, receipt);
+      if (!saved) return undefined;
       await this.observePaidCompletion(record);
       return saved;
     } catch (_err) {
@@ -3898,6 +3972,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async resolveCreditDraw(record: JobRecord): Promise<ReceiptCredit | undefined> {
     const ledger = this.opts.creditLedger;
     if (!ledger || !record.creditId || !record.drawId) return undefined;
+    const args = this.drawResolutionArgs(record.creditId, record.drawId);
+    const existing = await ledger.getDraw(args);
+    if (existing?.status === "settled" && this.settlesDraw(record.status)) {
+      return { credit_id: existing.creditId, draw_id: existing.drawId, amount: existing.amountMicro,
+        balance_after: existing.balanceAfterMicro, ledger_seq: existing.ledgerSeq };
+    }
     const deferredIntent = deferredX402IntentId(record.creditId);
     if (deferredIntent) {
       // The authorization was only verified at admission; no ledger row exists
@@ -3919,7 +3999,6 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         return undefined;
       }
     }
-    const args = this.drawResolutionArgs(record.creditId, record.drawId);
     try {
       const res = this.settlesDraw(record.status)
         ? await ledger.settle(args)
@@ -4520,6 +4599,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   shutdown(): void {
+    this.terminalPersistenceStopped = true;
     for (const [id] of this.idleTimers) {
       this.clearIdleTimer(id);
     }
@@ -4527,6 +4607,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       clearTimeout(timer);
       this.cleanupTimers.delete(id);
     }
+    for (const timer of this.terminalPersistenceRetries.values()) clearTimeout(timer);
+    this.terminalPersistenceRetries.clear();
     for (const [id, timer] of this.terminalCostHandoffRetryTimers) {
       clearTimeout(timer);
       this.terminalCostHandoffRetryTimers.delete(id);

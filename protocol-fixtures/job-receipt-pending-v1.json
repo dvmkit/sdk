@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "pending": { "status": "completed", "receipt_pending": true },
+  "semantics": "A terminal result is durable but its configured signed receipt is not yet stored. Read the same job again; do not submit or pay again. Once stored, receipt replaces receipt_pending. Providers without receipt support omit both."
+}

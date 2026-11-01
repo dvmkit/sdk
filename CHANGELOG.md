@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Terminal result durability
+
+- Retry failed outgoing appends and terminal snapshots for up to 30 seconds before settling a completed credit draw. Exhausted completion retries fail the job with `terminal_persistence_failed` and release its draw when storage is reachable; refusal receipts retain their own reason after failed step writes.
+- Deduplicate outgoing append retries across lost acknowledgements, including payment counters and terminal log cleanup. Postgres initialization adds `job_outgoing_appends`; custom streaming stores must honor stable `appendId` values. Existing receipt bytes remain write-once.
+- Receipt persistence may lag settlement after the full result is durable. Terminal responses with receipt support expose `receipt_pending: true` until a signed receipt is stored. Later reads after restart rebuild missing receipts from the stored result and resolved draw, reuse the receipt sequence, and do not settle an already settled draw again. Historical missing output is not reconstructed.
+
 ### Breaking changes
 
 - Prepaid and implicit per-call credits now default to 90 days instead of 30 days. Builders hold unspent balances longer before expiry release. Existing credits retain their stored expiry until their next top-up; funding extends expiry to the later of its current value and funding time plus the configured TTL. Set `credit: { ttl: 2_592_000 }` to keep a 30-day lifetime. Explicit TTL overrides remain supported; no database migration is required.
