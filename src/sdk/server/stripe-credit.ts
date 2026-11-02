@@ -253,7 +253,7 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
           return {
             ok: false,
             reason: "unavailable",
-            message: "the charge attempt could not be recorded, so the card was not charged",
+            message: "the charge attempt could not be recorded, so this request did not charge the card",
           };
         }
         if (!attempt.called) return invalidCredential(credentialFailure(err));
