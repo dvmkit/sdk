@@ -371,6 +371,48 @@ describe("the charge journal", () => {
   });
 });
 
+describe("a charge the journal cannot record", () => {
+  it("is refused before Stripe is called, and the same credential books once the journal is back", async () => {
+    const account = fakeStripeAccount();
+    let journalDown = true;
+    const recorded: string[] = [];
+    const journal: CardChargeJournal = {
+      record: (challengeId) => {
+        if (journalDown) return Promise.reject(new Error("connection terminated"));
+        recorded.push(challengeId);
+        return Promise.resolve();
+      },
+      listUnresolved: () => Promise.resolve([]),
+      resolve: () => Promise.resolve(),
+    };
+    const { app, ledger } = await cardServer({
+      stripe: null,
+      serverOpts: {
+        stripeCredit: createStripeCreditRail({
+          secretKey: "sk_test_fake",
+          networkId: "profile_test",
+          hmacSecret: HMAC,
+          apiBase: "https://stripe.invalid",
+          fetch: account.fetchImpl,
+          chargeJournal: journal,
+        }),
+      },
+    });
+    const credential = await credentialFor(app, "journal-down");
+
+    const refused = await fund(app, { fundId: "journal-down", credential });
+    expect(refused.status).toBe(503);
+    expect(await refused.json()).toMatchObject({ reason: "unavailable", retryable: true });
+    expect(account.calls).toHaveLength(0);
+    expect(await ledger.get(derivedFundCreditId(CALLER, "journal-down"))).toBeUndefined();
+
+    journalDown = false;
+    expect((await fund(app, { fundId: "journal-down", credential })).status).toBe(200);
+    expect(recorded).toEqual([Credential.deserialize(credential).challenge.id]);
+    expect(account.intents.size).toBe(1);
+  });
+});
+
 describe("drain methods and funding rails that do not pair", () => {
   it("refuses a stripe drain of credit no card paid for", async () => {
     const account = fakeStripeAccount();

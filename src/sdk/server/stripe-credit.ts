@@ -78,8 +78,11 @@ export type StripeChargeOutcome =
        * `mismatch`: Stripe reported a PaymentIntent whose amount or currency is not this
        * top-up's. It is not booked.
        * `indeterminate`: the charge may or may not exist.
+       * `unavailable`: refused before any Stripe call because the charge attempt could not
+       * be journaled; nothing was charged and the same credential can be resent.
        */
       reason:
+        | "unavailable"
         | "invalid_credential"
         | "declined"
         | "requires_action"
@@ -193,22 +196,25 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       if (credential.challenge.method !== "stripe" || credential.challenge.intent !== "charge") {
         return invalidCredential("the credential is not for a stripe charge challenge");
       }
+      const attempt: ChargeAttempt = {};
       // Journaled only once mppx has verified the challenge and is about to call Stripe, so a
       // forged or expired credential leaves no row for the stranded-charge search to chase.
+      // No row, no charge: a charge the journal never saw could not be found and refunded
+      // if its booking then failed.
       const journal = opts.chargeJournal;
       const beforeCharge = journal
         ? async () => {
             try {
               await journal.record(credential.challenge.id);
-            } catch {
-              // Recovery aid only: the charge and its booking do not depend on it.
+            } catch (err) {
+              attempt.journalFailed = true;
               diagnosticConsole.warn({ event: "card_charge_journal_failed" });
+              throw err;
             }
           }
         : undefined;
       // The decimal amount ("0.60"); mppx turns it into cents for Stripe.
       const amount = fiatMicroToMethodAmount(amountMicro, "stripe");
-      const attempt: ChargeAttempt = {};
       const broadcast = (secretKey: string) =>
         build(fetchClient({ apiBase, secretKey: opts.secretKey, fetchImpl, attempt, beforeCharge }), secretKey)
           .broadcastCredential(serialized, {
@@ -243,6 +249,13 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
         }
         return { ok: true, paymentIntentId: attempt.paymentIntentId, replayed: attempt.replayed === true };
       } catch (err) {
+        if (attempt.journalFailed) {
+          return {
+            ok: false,
+            reason: "unavailable",
+            message: "the charge attempt could not be recorded, so the card was not charged",
+          };
+        }
         if (!attempt.called) return invalidCredential(credentialFailure(err));
         const stripeError = attempt.failure?.codes;
         const known = {
@@ -295,6 +308,8 @@ interface StripeClientLike {
 
 interface ChargeAttempt {
   called?: boolean;
+  /** The journal write failed after verification; Stripe was never called. */
+  journalFailed?: boolean;
   paymentIntentId?: string;
   status?: string;
   amount?: number;
@@ -321,8 +336,8 @@ function fetchClient(args: {
   return {
     paymentIntents: {
       async create(params, options) {
-        args.attempt.called = true;
         await args.beforeCharge?.();
+        args.attempt.called = true;
         const response = await args.fetchImpl(`${args.apiBase}/v1/payment_intents`, {
           method: "POST",
           headers: {

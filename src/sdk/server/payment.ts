@@ -887,6 +887,14 @@ function cardChargeRefusal(outcome: CardChargeFailure, challenges: Challenge.Cha
       retryable: false,
       challenges: [] as Challenge.Challenge[],
     },
+    // Nothing reached Stripe and the approval is unused, so the same credential still works.
+    unavailable: {
+      status: 503,
+      display: "The service couldn't record the payment attempt, so the card was not charged and no credit was added.",
+      hint: "Resend this exact fund request with the same credential and fund_id (re-sign it if the signature has expired), within five minutes of the original request. Nothing was charged, and the approval was not used. If resends keep failing, stop and tell your human.",
+      retryable: true,
+      challenges: [] as Challenge.Challenge[],
+    },
     // No fresh challenge: a new challenge would mean a second PaymentIntent.
     indeterminate: {
       status: 503,
