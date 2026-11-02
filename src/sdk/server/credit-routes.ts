@@ -29,6 +29,8 @@ import type {
   DrainReleaseResult,
 } from "./credit-ledger";
 import {
+  CARD_EXPIRY_DRAIN_PREFIX,
+  cardExpiryDrainId,
   CreditLedgerError,
   DRAIN_METHODS,
   isDrainMethod,
@@ -53,6 +55,7 @@ import {
 } from "./payment";
 import type { ReceiptIssuer } from "./receipt-issuer";
 import type { StripeCreditRail } from "./stripe-credit";
+import { cardRefundSummary, runStripeDrain, usdFromCents } from "./stripe-drain-leg";
 import type { DVMAuthScheme } from "./secp256k1-auth";
 import type { CanonicalEnvelope } from "./signed-request";
 import { SignedRequestError } from "./signed-request";
@@ -439,6 +442,11 @@ async function handleDrain(
       if (isHttpResponse(completed)) return completed;
       existing = completed;
     }
+    // A poll of a card refund is also its retry: a refund Stripe left unfinished is
+    // advanced here, and the plan on the drain keeps it from being made twice.
+    if (existing.method === "stripe" && existing.status === "pending" && deps.stripeCredit) {
+      existing = (await runStripeDrain(stripeLegDeps(deps, deps.stripeCredit), existing)).drain;
+    }
     return respondDrain(c, deps, { record: await deliverIfParked(deps, existing), credit });
   }
 
@@ -472,11 +480,20 @@ async function handleDrain(
   if (rejected) return rejected;
 
   // Card credit goes back to the card it came from, and only that way: a payout on any
-  // other rail would turn a card charge (which can still be disputed) into crypto.
-  if (isCardFundedRail(credit.rail)) return c.json(cardCreditNotDrainable(credit), 409);
+  // other rail would turn a card charge (which can still be disputed) into crypto. A card
+  // refund, in turn, can only return what a card paid.
+  if (isCardFundedRail(credit.rail) && drain.method !== "stripe") {
+    return c.json(cardCreditNotDrainable(credit), 409);
+  }
+  if (drain.method === "stripe" && !isCardFundedRail(credit.rail)) {
+    return c.json(cardRefundOfNonCardCredit(credit), 409);
+  }
 
   const target = validateDrainTarget(drain);
   if ("error" in target) return c.json(target.error, 400);
+  if (target.method === "stripe") {
+    return handleCardRefundDrain(c, deps, { creditId, drainId: drain.drain_id, callerPubkey: args.callerPubkey });
+  }
   // Refuse an incompatible funding rail before asking for that rail’s payout shape.
   const railMismatch = railMismatchRefusal(credit, target.method);
   if (railMismatch) return c.json(railMismatch, 400);
@@ -1464,7 +1481,10 @@ async function respondDrain(
  * caller's wallet holds a separate Cashu lock keypair, and parked notes must
  * be locked to a key it can actually witness-spend.
  */
+const MAX_CARD_REFUND_DRAIN_ID = 128;
+
 function validateDrainTarget(drain: {
+  drain_id: string;
   method?: string;
   payout?: { refund_pubkey?: string; address?: string };
 }): { method: DrainMethod; payout: Record<string, string> } | { error: Record<string, unknown> } {
@@ -1474,7 +1494,7 @@ function validateDrainTarget(drain: {
   const missingFields = (): { error: Record<string, unknown> } =>
     refuse(
       "A new drain requires drain.method and drain.payout.",
-      'Send drain: { drain_id, method: "cashu" | "x402" | "tempo", payout: { … } }. Only a poll of an existing drain_id may omit them.'
+      'Send drain: { drain_id, method: "cashu" | "x402" | "tempo", payout: { … } }, or { drain_id, method: "stripe" } for card-funded credit. Only a poll of an existing drain_id may omit them.'
     );
   const method = drain.method;
   if (!method) return missingFields();
@@ -1484,9 +1504,34 @@ function validateDrainTarget(drain: {
     return {
       error: paymentErrorBody("drain_method_unsupported", {
         message: `"${method}" is not a payout rail this service reclaims over.`,
-        extra: { supported_methods: [...DRAIN_METHODS], drain_registered: false },
+        // Payout rails only: a card refund is not one, and card credit is pointed at it by its own refusal.
+        extra: { supported_methods: DRAIN_METHODS.filter((m) => m !== "stripe"), drain_registered: false },
       }),
     };
+  }
+  if (method === "stripe") {
+    // A card refund goes back to the card that paid; there is nothing to name.
+    const named = Object.values(drain.payout ?? {}).some((value) => value !== undefined && value !== "");
+    if (named) {
+      return refuse(
+        "stripe drains carry no payout destination: the refund goes back to the card that paid for the credit.",
+        'Send drain: { drain_id, method: "stripe" } with no payout.'
+      );
+    }
+    // The drain id travels to Stripe in refund metadata, whose values stop at 500 characters.
+    if (drain.drain_id.length > MAX_CARD_REFUND_DRAIN_ID) {
+      return refuse(
+        `stripe drain ids are at most ${MAX_CARD_REFUND_DRAIN_ID} characters.`,
+        "Choose a shorter drain_id, such as a UUID."
+      );
+    }
+    if (drain.drain_id.startsWith(CARD_EXPIRY_DRAIN_PREFIX)) {
+      return refuse(
+        `drain ids starting "${CARD_EXPIRY_DRAIN_PREFIX}" are reserved for the refund this service makes when a card balance expires.`,
+        "Choose a drain_id that does not start with that prefix, such as a UUID."
+      );
+    }
+    return { method: "stripe", payout: {} };
   }
   if (!drain.payout && method !== "tempo") return missingFields();
   switch (method) {
@@ -1522,12 +1567,73 @@ function cardCreditNotDrainable(credit: CreditSnapshot): Record<string, unknown>
     error: "card_credit_not_drainable",
     message: "This credit was funded by card. Card credit is refunded to the card that paid for it, never paid out on another rail.",
     display: credit.expired
-      ? "This balance was paid by card and has expired. It will be refunded to that card; it can't be reclaimed from here."
-      : "This balance was paid by card, so it can only go back to that card. Reclaiming it from here isn't available yet.",
-    hint: credit.expired
-      ? "Don't retry this drain on another method; none will be accepted for card-funded credit. The balance can no longer pay for jobs; it will be refunded to the card it came from."
-      : "Don't retry this drain on another method; none will be accepted for card-funded credit. Keep using the balance for jobs until it expires. Refunds back to the card will be added in a later release.",
+      ? "This balance was paid by card and has expired, so it can only go back to that card. It will be refunded there automatically, or you can ask for the refund now."
+      : "This balance was paid by card, so it can only go back to that card.",
+    hint: 'Drain it with method "stripe" and no payout (\'dvm credit drain <dvm> --method stripe\'); no other method is accepted for card-funded credit. The refund goes to the card, less the refund\'s share of Stripe\'s card processing fee.',
     retryable: false,
+  };
+}
+
+function cardRefundOfNonCardCredit(credit: CreditSnapshot): Record<string, unknown> {
+  return {
+    error: "invalid_request",
+    message: `This credit was funded over ${credit.rail ?? "another rail"}, not by card, so it cannot be refunded to a card.`,
+    hint: "Reclaim it on the rail that funded it; method \"stripe\" only refunds credit that a card paid for.",
+    retryable: false,
+    ...(credit.rail ? { credit_rail: credit.rail } : {}),
+  };
+}
+
+/**
+ * Debit the whole available balance into a `stripe` drain, then refund it to the card in the
+ * same request. A refund Stripe does not finish leaves the drain `pending`, owed to the card;
+ * polling the same drain_id retries it.
+ */
+async function handleCardRefundDrain(
+  c: Context<AppEnv>,
+  deps: CreditRouteDeps,
+  args: { creditId: string; drainId: string; callerPubkey: string }
+): Promise<Response> {
+  const stripeCredit = deps.stripeCredit;
+  if (!stripeCredit) {
+    return c.json(
+      {
+        error: "card_refund_unavailable",
+        message: "This service is not configured for card refunds right now, so nothing was drained.",
+        hint: "Retry later with the same drain_id. Your balance is unchanged and stays yours.",
+        retryable: true,
+      },
+      503
+    );
+  }
+  try {
+    const result = await deps.ledger.requestDrain({
+      creditId: args.creditId,
+      drainId: args.drainId,
+      callerPubkey: args.callerPubkey,
+      method: "stripe",
+      payout: {},
+    });
+    let record = result.drain;
+    if (!result.replayed && deps.receiptIssuer) {
+      record = await countersignDrain(deps, record, "requested");
+    }
+    record = (await runStripeDrain(stripeLegDeps(deps, stripeCredit), record)).drain;
+    return await respondDrain(c, deps, { record, credit: result.credit });
+  } catch (err) {
+    if (err instanceof CreditLedgerError) {
+      return drainLedgerErrorResponse(err, args.creditId, args.drainId);
+    }
+    throw err;
+  }
+}
+
+function stripeLegDeps(deps: CreditRouteDeps, stripeCredit: StripeCreditRail) {
+  return {
+    ledger: deps.ledger,
+    drainReport: deps.drainReport,
+    stripe: stripeCredit.refunds,
+    ...(deps.receiptIssuer && { receiptIssuer: deps.receiptIssuer }),
   };
 }
 
@@ -1596,11 +1702,69 @@ function drainBody(record: CreditDrainRecord): Record<string, unknown> {
     created_at: record.createdAt,
     ...(record.token !== null ? { token: record.token } : {}),
     ...(record.sentRef !== null ? { sent: record.sentRef } : {}),
+    ...(record.method === "stripe" ? cardRefundBody(record) : {}),
     receipts: record.receipts,
   };
 }
 
+/**
+ * A card refund's figures in dollars. `refunded_usd + stripe_fee_share_usd` is the credit
+ * refunded; any sub-cent remainder of `amount_micro` is credit no card refund can carry.
+ */
+function cardRefundBody(record: CreditDrainRecord): Record<string, unknown> {
+  if (!record.cardRefund) return { refund_ids: [] };
+  const summary = cardRefundSummary(record.cardRefund);
+  return {
+    refund_ids: summary.refundIds,
+    card_refund: {
+      refunded_usd: usdFromCents(summary.refundedCents),
+      stripe_fee_share_usd: usdFromCents(summary.feeShareCents),
+      refunded_cents: summary.refundedCents,
+      stripe_fee_share_cents: summary.feeShareCents,
+      sub_cent_micro: summary.subCentMicro,
+      refunds: record.cardRefund.entries.map((entry) => ({
+        refund_id: entry.refundId,
+        amount_cents: entry.amountCents,
+        fee_share_cents: entry.feeShareCents,
+        status: entry.status,
+      })),
+    },
+  };
+}
+
+function cardRefundCopy(record: CreditDrainRecord): { display: string; hint: string } {
+  const sent = record.status === "sent";
+  if (!record.cardRefund) {
+    return {
+      display:
+        "The refund to your card is approved and the balance is set aside for it, but the card processor hasn't been reached yet.",
+      hint: "Poll this op with the same drain_id; each poll retries the refund. The balance stays owed to the card until it goes through.",
+    };
+  }
+  const summary = cardRefundSummary(record.cardRefund);
+  const gross = usdFromCents(summary.grossCents);
+  const fee =
+    summary.feeShareCents > 0
+      ? ` ${usdFromCents(summary.feeShareCents)} of the ${gross} balance was kept to cover this refund's share of Stripe's card processing fee: Stripe charged that fee when the card paid and does not return it on a refund.`
+      : "";
+  const dust =
+    summary.subCentMicro > 0 ? " Less than one cent of the balance could not be refunded, because cards are refunded in whole cents." : "";
+  if (sent) {
+    return {
+      display: `${usdFromCents(summary.refundedCents)} went back to the card that paid for this credit.${fee}${dust} Card refunds usually show on the statement within 5 to 10 business days.`,
+      hint: "See refund_ids for the Stripe refund references. Nothing else to do.",
+    };
+  }
+  return {
+    display: `A refund of ${usdFromCents(summary.refundedCents)} to the card that paid for this credit is under way and the balance is set aside for it.${fee}${dust}`,
+    hint: "Poll this op with the same drain_id; each poll retries any refund the card processor hasn't finished, and it flips to sent once every refund has gone through. No refund is made twice.",
+  };
+}
+
 function drainCopy(record: CreditDrainRecord): { display: string; hint: string } {
+  if (record.method === "stripe" && (record.status === "pending" || record.status === "sent")) {
+    return cardRefundCopy(record);
+  }
   switch (record.status) {
     case "pending":
       if (record.method === "cashu") {
@@ -2326,6 +2490,22 @@ async function checkTargetCredit(
         message: `Credit ${args.creditId} is terminal because its Tempo backing finalized before the DVM was protected.`,
       });
     }
+    if (mine.status === "refunded" || mine.status === "disputed") {
+      return jsonPaymentError("credit_closed", 409, {
+        message:
+          mine.status === "refunded"
+            ? `Credit ${args.creditId} is closed: its expired card balance was refunded to the card.`
+            : `Credit ${args.creditId} is frozen: a card payment that funded it is disputed.`,
+      });
+    }
+    // An expired card balance is owed back to the card; a top-up must not revive it before
+    // the sweep refunds it.
+    if (isCardFundedRail(mine.rail) && mine.expiryMs <= Date.now()) {
+      return jsonPaymentError("credit_closed", 409, {
+        message: `Credit ${args.creditId} expired; its card balance is being refunded to the card.`,
+        hint: "Omit credit_id (or use a new fund_id) to open a new prepaid balance. The expired balance comes back to the card on its own.",
+      });
+    }
     if (mine.currency !== args.menu.currency) {
       return jsonPaymentError("payment_invalid", 400, {
         message: `Credit ${args.creditId} is denominated in ${mine.currency}, not ${args.menu.currency}.`,
@@ -2530,7 +2710,7 @@ function channelDrainMethodConflictResponse(rail: "Tempo" | "x402"): Response {
 
 interface DrainConflictCopy {
   display: string;
-  hint: (ids: { creditId: string; drainId: string }) => string;
+  hint: (ids: { creditId: string; drainId: string; blockingDrainId?: string }) => string;
   retryable: boolean;
   /** Whether the caller keeps this `drain_id`; `credit.ts` drops it on `false`. */
   drainRegistered: boolean;
@@ -2555,6 +2735,14 @@ const DRAIN_CONFLICT_COPY: Record<DrainConflictReason, DrainConflictCopy> = {
       "A job on this prepaid balance finished while the refund was being paid out, so the service rolled the refund back rather than send the wrong amount. Nothing changed.",
     hint: () =>
       "Retry with a fresh drain_id — the next attempt reads the balance again and refunds what is actually left.",
+    retryable: true,
+    drainRegistered: false,
+  },
+  card_refund_pending: {
+    display:
+      "A refund of this prepaid balance to your card is already in progress, so a second one was not started. Nothing changed.",
+    hint: ({ blockingDrainId }) =>
+      `Poll drain ${blockingDrainId ?? "the earlier card refund"} (the same drain request again) until it is sent; it returns the balance it covers. Start a new card refund only after that, if any balance is left.`,
     retryable: true,
     drainRegistered: false,
   },
@@ -2659,9 +2847,12 @@ function drainLedgerErrorResponse(
     return jsonPaymentError("drain_conflict", 409, {
       message: error.message,
       display: copy?.display,
-      hint: copy?.hint({ creditId, drainId }),
+      hint: copy?.hint({ creditId, drainId, blockingDrainId: error.details.blockingDrainId }),
       retryable: copy?.retryable,
-      extra: { drain_registered: copy?.drainRegistered ?? false },
+      extra: {
+        drain_registered: copy?.drainRegistered ?? false,
+        ...(error.details.blockingDrainId && { blocking_drain_id: error.details.blockingDrainId }),
+      },
     });
   }
   if (error.code === "settlement_pending") {
@@ -2675,6 +2866,9 @@ function drainLedgerErrorResponse(
         : {}),
       ...(error.details.blockingDrainId ? { blockingDrainId: error.details.blockingDrainId } : {}),
     });
+  }
+  if (error.code === "credit_closed") {
+    return jsonPaymentError("credit_closed", 409, { message: error.message });
   }
   if (error.code === "caller_mismatch" || error.code === "credit_not_found") {
     // Same probe-blind answer as the top-of-route gate — a race with a
@@ -2698,6 +2892,7 @@ function mapLedgerCode(err: CreditLedgerError): Parameters<typeof paymentErrorBo
     case "insufficient_credit":
     case "credit_expired":
     case "credit_unbacked":
+    case "credit_closed":
     case "credit_not_found":
     case "tempo_channel_closing":
     case "settlement_pending":
@@ -2729,6 +2924,8 @@ function creditBody(
     // Nominal expiry does not itself reclaim ownership; a committed sweep can remove undrawn
     // value.
     drainable: credit.status === "active" && credit.availableMicro > 0,
+    // The drain an expired card balance went back to the card under; poll it like any drain.
+    ...(credit.status === "refunded" && { refund_drain_id: cardExpiryDrainId(credit.expiryMs) }),
     ...(reconciliationPending && { reconciliation_pending: true }),
     ledger_seq: credit.lastLedgerSeq,
   };

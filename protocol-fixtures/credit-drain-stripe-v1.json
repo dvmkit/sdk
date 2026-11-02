@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "description": "Refunding card-funded prepaid credit to the card: POST /v1/credit op drain with method stripe and no payout. The refund goes back as partial refunds of the funding PaymentIntents, oldest first. The caller bears the share of Stripe's processing fee proportional to what is refunded: refund = gross - round(fee x gross / charged), per PaymentIntent, in cents. `refund_ids` lists Stripe refund ids (`re_...`); their values are account-specific and not fixed here. The example is a $2.00 card top-up (Stripe fee 2.9% + 30 cents = 36 cents) with $0.30 drawn.",
+  "drain_request": {
+    "op": "drain",
+    "credit_id": "<card-funded credit>",
+    "drain": { "drain_id": "refund-1", "method": "stripe" }
+  },
+  "fee_example": {
+    "charged_cents": 200,
+    "stripe_fee_cents": 36,
+    "drained_micro": 1700000,
+    "gross_cents": 170,
+    "fee_share_cents": 31,
+    "refunded_cents": 139
+  },
+  "sent": {
+    "status": 200,
+    "body": {
+      "op": "drain",
+      "drain": {
+        "method": "stripe",
+        "status": "sent",
+        "amount_micro": 1700000,
+        "currency": "usd",
+        "card_refund": {
+          "refunded_usd": "$1.39",
+          "stripe_fee_share_usd": "$0.31",
+          "refunded_cents": 139,
+          "stripe_fee_share_cents": 31,
+          "sub_cent_micro": 0
+        },
+        "sent": {
+          "refunded_cents": 139,
+          "fee_share_cents": 31,
+          "sub_cent_micro": 0
+        }
+      },
+      "credit": { "balance_micro": 0, "remaining_micro": 0 }
+    }
+  },
+  "pending": {
+    "status": 200,
+    "body": {
+      "op": "drain",
+      "drain": { "method": "stripe", "status": "pending", "amount_micro": 1700000 },
+      "credit": { "balance_micro": 0 }
+    }
+  },
+  "refusals": {
+    "card_credit_other_method": {
+      "status": 409,
+      "body": { "error": "card_credit_not_drainable", "retryable": false }
+    },
+    "stripe_for_non_card_credit": {
+      "status": 409,
+      "body": { "error": "invalid_request", "retryable": false }
+    },
+    "stripe_with_payout": {
+      "status": 400,
+      "body": { "error": "invalid_request" }
+    },
+    "closed_card_credit": {
+      "status": 409,
+      "body": { "error": "credit_closed", "retryable": false }
+    }
+  }
+}

@@ -771,7 +771,10 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         const localPool = pgPool;
         previousHmacSecret = async () => (await loadMppSecretState(localPool))?.previous?.secret;
       }
-      stripeCredit = createStripeCreditRail({ ...stripeCreditConfig, previousHmacSecret });
+      const chargeJournal = pgPool
+        ? await (await import("./card-charge-journal")).createPostgresCardChargeJournal(pgPool)
+        : undefined;
+      stripeCredit = createStripeCreditRail({ ...stripeCreditConfig, previousHmacSecret, chargeJournal });
     }
 
     // Raw mode string for the boot summary (`"platform"` | a URL | undefined).

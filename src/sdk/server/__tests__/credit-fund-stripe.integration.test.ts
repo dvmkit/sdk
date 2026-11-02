@@ -1,6 +1,6 @@
 /* Card-funded credit against Stripe test mode: a real test Shared Payment Token, a real
- * PaymentIntent, and the ledger booking it. Runs only with STRIPE_TEST_SECRET_KEY (an sk_test_
- * key); every other run skips it and stays offline. */
+ * PaymentIntent, the ledger booking it, and the refund of what is left. Runs only with STRIPE_TEST_SECRET_KEY (an sk_test_
+ * or rk_test_ key); every other run skips it and stays offline. */
 import { Credential } from "mppx";
 import { describe, expect, it } from "vitest";
 
@@ -10,6 +10,7 @@ import { createStripeCreditRail } from "../stripe-credit";
 import {
   CALLER,
   cardServer,
+  drain,
   fund,
   HMAC,
   paymentChallenges,
@@ -17,8 +18,9 @@ import {
 } from "./__helpers__/card-credit";
 
 const KEY = process.env.STRIPE_TEST_SECRET_KEY;
-if (KEY && !KEY.startsWith("sk_test_")) {
-  throw new Error("STRIPE_TEST_SECRET_KEY must be a Stripe test-mode key (sk_test_…)");
+// A restricted test key (rk_test_) proves the permissions OPERATING.md lists.
+if (KEY && !/^(sk|rk)_test_/.test(KEY)) {
+  throw new Error("STRIPE_TEST_SECRET_KEY must be a Stripe test-mode key (sk_test_… or rk_test_…)");
 }
 if (KEY) announceTier("stripe test mode", "ran", "STRIPE_TEST_SECRET_KEY is set");
 
@@ -47,11 +49,15 @@ async function testSpt(paymentMethod: string, cents: number): Promise<string> {
   return body.id;
 }
 
-async function paymentIntent(id: string): Promise<{ amount: number; status: string }> {
-  const response = await fetch(`https://api.stripe.com/v1/payment_intents/${id}`, {
+async function stripeGet<T>(path: string): Promise<T> {
+  const response = await fetch(`https://api.stripe.com${path}`, {
     headers: { Authorization: `Basic ${Buffer.from(`${KEY}:`).toString("base64")}` },
   });
-  return (await response.json()) as { amount: number; status: string };
+  return (await response.json()) as T;
+}
+
+async function paymentIntent(id: string): Promise<{ amount: number; status: string }> {
+  return stripeGet(`/v1/payment_intents/${id}`);
 }
 
 async function liveServer() {
@@ -68,8 +74,8 @@ async function liveServer() {
   });
 }
 
-async function credential(app: App, fundId: string, spt: string): Promise<string> {
-  const discovery = await fund(app, { fundId, amountMicro: AMOUNT_MICRO });
+async function credential(app: App, fundId: string, spt: string, amountMicro = AMOUNT_MICRO): Promise<string> {
+  const discovery = await fund(app, { fundId, amountMicro });
   expect(discovery.status).toBe(402);
   const [challenge] = paymentChallenges(discovery);
   expect(challenge?.method).toBe("stripe");
@@ -111,4 +117,43 @@ describe.skipIf(!KEY)("card-funded credit in Stripe test mode", () => {
     expect(typeof body.hint).toBe("string");
     expect(await ledger.get(derivedFundCreditId(CALLER, "live-decline"))).toBeUndefined();
   }, 30_000);
+
+  it("refunds what is left of a $2 top-up to the card, less the matching share of Stripe's fee", async () => {
+    const { app, ledger } = await liveServer();
+    const card = await credential(app, "live-refund", await testSpt("pm_card_visa", 200), 2_000_000);
+    expect((await fund(app, { fundId: "live-refund", credential: card, amountMicro: 2_000_000 })).status).toBe(200);
+    const creditId = derivedFundCreditId(CALLER, "live-refund");
+    await ledger.draw({ creditId, drawId: "job", amountMicro: 300_000, jobId: "job" });
+    await ledger.settle({ creditId, drawId: "job" });
+
+    // Stripe attaches the charge's fee a few seconds after the charge; until then the drain
+    // stays pending and each poll (the same drain request again) retries it.
+    let body: { drain: Record<string, any>; credit: Record<string, any> } | undefined;
+    for (let poll = 0; poll < 20; poll++) {
+      const response = await drain(app, { creditId, drainId: "refund", method: "stripe", payout: {} });
+      expect(response.status).toBe(200);
+      body = await response.json();
+      if (body!.drain.status !== "pending") break;
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+    body = body!;
+    expect(body.drain).toMatchObject({ method: "stripe", status: "sent", amount_micro: 1_700_000 });
+    expect(body.credit.balance_micro).toBe(0);
+    expect(body.drain.refund_ids).toHaveLength(1);
+
+    // The fee comes from Stripe's own balance transaction, read here independently of the leg.
+    const [lot] = await ledger.listFundingLots(creditId);
+    const intent = await stripeGet<{ latest_charge: { balance_transaction: { amount: number; fee: number } } }>(
+      `/v1/payment_intents/${lot!.fundingRef}?expand[]=latest_charge.balance_transaction`
+    );
+    // Both in the account's settlement currency, which need not be USD: the ratio carries over.
+    const { amount: settled, fee } = intent.latest_charge.balance_transaction;
+    const feeShare = Math.round((fee * 170) / settled);
+    expect(body.drain.card_refund).toMatchObject({ refunded_cents: 170 - feeShare, stripe_fee_share_cents: feeShare });
+
+    const refund = await stripeGet<{ amount: number; payment_intent: string; status: string }>(
+      `/v1/refunds/${body.drain.refund_ids[0]}`
+    );
+    expect(refund).toMatchObject({ amount: 170 - feeShare, payment_intent: lot!.fundingRef, status: "succeeded" });
+  }, 120_000);
 });

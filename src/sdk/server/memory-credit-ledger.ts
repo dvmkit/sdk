@@ -5,6 +5,7 @@ import type {
   CreditFundingEvidence,
   BitcoinDepositLiability,
   BlockedInvoiceCursor,
+  CardRefundPlan,
   ChannelDrainCursor,
   CreditDrainRecord,
   CreditFundingBasis,
@@ -39,6 +40,8 @@ import type {
 } from "./credit-ledger";
 import {
   allocateDrawValue,
+  assertCardDrainMatchesRail,
+  cardRefundPendingConflict,
   assertFundingBasis,
   clipEarmark,
   CreditLedgerError,
@@ -1155,13 +1158,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
           `credit ${args.creditId} belongs to a different caller pubkey`
         );
       }
-      if (isCardFundedRail(credit.rail)) {
-        // Card credit is refunded to the card; no other payout rail may carry it out.
-        throw new CreditLedgerError(
-          "rail_mismatch",
-          `credit ${args.creditId} was funded by card and cannot be drained`
-        );
-      }
+      assertCardDrainMatchesRail(args.creditId, credit.rail, args.method);
       const existing = credit.drains.get(args.drainId);
       if (existing) {
         if (
@@ -1180,6 +1177,12 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         };
       }
       if (credit.status !== "active") throw terminalCreditError(args.creditId);
+      if (args.method === "stripe") {
+        const blocking = [...credit.drains.values()].find(
+          (drain) => drain.method === "stripe" && drain.status === "pending"
+        );
+        if (blocking) throw cardRefundPendingConflict(args.creditId, blocking.drainId);
+      }
       if (x402Refund) throw x402SettlementPending(args.creditId, x402Refund);
       const pending = pendingSums(credit);
       const availableMicro = credit.balanceMicro - pending.micro;
@@ -1249,6 +1252,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         writtenOffAt: null,
         provenRefundNative: null,
         refundPaymentProven: false,
+        cardRefund: null,
       };
       applyLotDebits(credit, drain.lotDebits, -1);
       credit.drains.set(args.drainId, drain);
@@ -1566,6 +1570,23 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     });
   }
 
+  saveCardRefund(args: {
+    creditId: string;
+    drainId: string;
+    plan: CardRefundPlan;
+    onlyIfUnset?: boolean;
+  }): Promise<CardRefundPlan | null> {
+    return run(() => {
+      const drain = this.credits.get(args.creditId)?.drains.get(args.drainId);
+      if (!drain) return null;
+      const writable = drain.method === "stripe" && drain.status === "pending";
+      if (writable && !(args.onlyIfUnset && drain.cardRefund)) {
+        drain.cardRefund = structuredClone(args.plan);
+      }
+      return drain.cardRefund ? structuredClone(drain.cardRefund) : null;
+    });
+  }
+
   appendDrainReceipt(args: {
     creditId: string;
     drainId: string;
@@ -1753,6 +1774,7 @@ interface MemoryDrain {
   writtenOffAt: number | null;
   provenRefundNative: string | null;
   refundPaymentProven: boolean;
+  cardRefund: CardRefundPlan | null;
 }
 
 interface MemoryDraw {
@@ -1953,6 +1975,7 @@ function drainRecord(drain: MemoryDrain, credit: MemoryCredit): CreditDrainRecor
     writtenOffAt: drain.writtenOffAt,
     provenRefundNative: drain.provenRefundNative,
     refundPaymentProven: drain.refundPaymentProven,
+    cardRefund: drain.cardRefund ? structuredClone(drain.cardRefund) : null,
   };
 }
 

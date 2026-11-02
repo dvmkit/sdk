@@ -167,7 +167,7 @@ export type App = Awaited<ReturnType<typeof cardServer>>["app"];
 
 export async function fund(
   app: App,
-  args: { fundId: string; amountMicro?: number; credential?: string; commitment?: string }
+  args: { fundId: string; amountMicro?: number; credential?: string; commitment?: string; creditId?: string }
 ): Promise<Response> {
   const commitment =
     args.commitment ?? (args.credential ? fundingCommitment(args.credential) : "00".repeat(32));
@@ -180,6 +180,7 @@ export async function fund(
     body: JSON.stringify(
       creditSigner.signRequest(PRIVKEY, {
         op: "fund",
+        ...(args.creditId && { credit_id: args.creditId }),
         fund: {
           amount_micro: args.amountMicro ?? 600_000,
           fund_id: args.fundId,

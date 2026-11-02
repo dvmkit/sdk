@@ -435,6 +435,9 @@ export class CreditLedger {
     // over cost. NULL on every row parked out of the accumulator, which is the
     // ordinary case and needs no evidence — the consumed rows are the record.
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS fulfilment JSONB`);
+    // A card refund's plan and progress, fixed before the first Stripe call so every retry
+    // sends the same amounts under the same idempotency keys. NULL on every other rail.
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS card_refund JSONB`);
     // the operator's decision on a channel drain the payout floor
     // refused. Two nullable columns rather than a separate drain status, because
     // a write-off books nothing and moves no money — the drain is still
@@ -2643,13 +2646,7 @@ export class CreditLedger {
           `credit ${args.creditId} belongs to a different caller pubkey`
         );
       }
-      if (isCardFundedRail(credit.rail)) {
-        // Card credit is refunded to the card; no other payout rail may carry it out.
-        throw new CreditLedgerError(
-          "rail_mismatch",
-          `credit ${args.creditId} was funded by card and cannot be drained`
-        );
-      }
+      assertCardDrainMatchesRail(args.creditId, credit.rail, args.method);
       const existing = await this.readDrain(client, args.creditId, args.drainId);
       if (existing) {
         if (
@@ -2668,6 +2665,10 @@ export class CreditLedger {
         };
       }
       if (credit.status !== "active") throw terminalCreditError(args.creditId, credit.status);
+      if (args.method === "stripe") {
+        const blockingDrainId = await this.pendingCardRefundDrainId(client, args.creditId);
+        if (blockingDrainId) throw cardRefundPendingConflict(args.creditId, blockingDrainId);
+      }
       // Under the credit lock, off the locked row, for the same reason as
       // `draw` — the cooperative drain holds this row across its facilitator
       // call, so a read above the lock would answer from before the wedge it
@@ -2801,6 +2802,175 @@ export class CreditLedger {
       [args.creditId, args.drainId]
     );
     return rows.length > 0 ? drainRecordFromJoinRow(rows[0]) : undefined;
+  }
+
+  /**
+   * Store a card refund's plan or progress on its pending `stripe` drain. With `onlyIfUnset`
+   * the first plan wins and every later caller gets that stored plan back, so concurrent
+   * retries send one set of amounts under one set of idempotency keys. Returns what is
+   * stored after the write; null when the drain is not a pending stripe drain with a plan.
+   */
+  async saveCardRefund(args: {
+    creditId: string;
+    drainId: string;
+    plan: CardRefundPlan;
+    onlyIfUnset?: boolean;
+  }): Promise<CardRefundPlan | null> {
+    const { rows } = await this.pool.query<{ card_refund: CardRefundPlan | null }>(
+      `UPDATE credit_drains SET card_refund = $3
+        WHERE credit_id = $1 AND drain_id = $2 AND method = 'stripe' AND status = 'pending'
+          AND ($4::boolean IS FALSE OR card_refund IS NULL)
+        RETURNING card_refund`,
+      [args.creditId, args.drainId, JSON.stringify(args.plan), args.onlyIfUnset === true]
+    );
+    if (rows.length > 0) return rows[0].card_refund;
+    return (await this.readDrain(this.pool, args.creditId, args.drainId))?.card_refund ?? null;
+  }
+
+  /**
+   * Expired card credits still holding balance, with no pending holds and no card refund in
+   * progress, oldest expiry first. A credit waiting on its refund drops out of the page, so
+   * one that can never finish does not crowd out the rest.
+   */
+  async listExpiredCardCredits(args: { nowMs?: number; limit?: number } = {}): Promise<string[]> {
+    const { rows } = await this.pool.query<{ credit_id: string }>(
+      `SELECT c.credit_id FROM credits c
+        WHERE c.expiry_ms <= $1 AND c.balance_micro > 0 AND c.status = 'active'
+          AND c.rail = ANY($3::text[])
+          AND NOT EXISTS (
+            SELECT 1 FROM credit_draws d WHERE d.credit_id = c.credit_id AND d.status = 'pending'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM credit_drains r
+             WHERE r.credit_id = c.credit_id AND r.method = 'stripe' AND r.status = 'pending'
+          )
+        ORDER BY c.expiry_ms
+        LIMIT $2`,
+      [args.nowMs ?? Date.now(), args.limit ?? DEFAULT_EXPIRY_SWEEP_LIMIT, [...CARD_FUNDED_RAILS]]
+    );
+    return rows.map((row) => row.credit_id);
+  }
+
+  /**
+   * Turn an expired card credit's whole balance into a pending `stripe` drain owed back to
+   * the card, and close the credit (`refunded`) in the same transaction. Closing is what
+   * makes this terminal: a later top-up cannot revive a balance that went back to the card,
+   * and the builder never receives it. Returns undefined when the credit no longer
+   * qualifies under its lock (not card, not expired, empty, holds pending, or closed).
+   */
+  async openCardExpiryRefund(args: {
+    creditId: string;
+    nowMs?: number;
+  }): Promise<CreditDrainRecord | undefined> {
+    const nowMs = args.nowMs ?? Date.now();
+    return this.withCreditLock(args.creditId, async (client, credit) => {
+      const balanceMicro = toSafeInt(credit.balance_micro);
+      const expiryMs = toSafeInt(credit.expiry_ms);
+      if (!isCardFundedRail(credit.rail) || credit.status !== "active") return undefined;
+      if (expiryMs > nowMs || balanceMicro <= 0) return undefined;
+      if ((await this.pendingSums(client, credit.credit_id)).micro > 0) return undefined;
+      // One card refund at a time: a second plan against the same PaymentIntents could
+      // over-allocate them. The pending one finishes first; a later pass refunds the rest.
+      if (await this.pendingCardRefundDrainId(client, credit.credit_id)) return undefined;
+      const ledgerSeq = toSafeInt(credit.last_ledger_seq) + 1;
+      const { rows } = await client.query<DrainRow>(
+        `INSERT INTO credit_drains
+           (credit_id, drain_id, method, payout, amount_micro, balance_after_micro,
+            drained_msats, drained_native, owed_sats, lot_debits, ledger_seq, status, created_at)
+         VALUES ($1, $2, 'stripe', '{}'::jsonb, $3, 0, $4, $5, NULL, NULL, $6, 'pending', $7)
+         ON CONFLICT (credit_id, drain_id) DO NOTHING
+         RETURNING *`,
+        [
+          credit.credit_id,
+          cardExpiryDrainId(expiryMs),
+          balanceMicro,
+          toSafeInt(credit.msats_remaining),
+          credit.native_remaining === null ? null : toSafeInt(credit.native_remaining),
+          ledgerSeq,
+          nowMs,
+        ]
+      );
+      // The id is reserved (callers cannot open drains named `expiry-…`), so this is only a
+      // guard: an existing row means this expiry was already handled.
+      if (rows.length === 0) return undefined;
+      await client.query(
+        `UPDATE credits
+            SET balance_micro = 0, last_ledger_seq = $2, msats_remaining = 0,
+                native_remaining = CASE WHEN native_remaining IS NULL THEN NULL ELSE 0 END,
+                status = 'refunded'
+          WHERE credit_id = $1`,
+        [credit.credit_id, ledgerSeq]
+      );
+      return drainRecordFromRow(rows[0], credit);
+    });
+  }
+
+  /**
+   * Freeze every active credit a disputed card payment funded (`disputed`): no draw, top-up
+   * or drain moves its balance while the card network decides. Returns the credits this
+   * call froze; already-frozen or closed credits are left as they are.
+   */
+  async freezeCardCreditsForPaymentIntent(paymentIntentId: string): Promise<string[]> {
+    const { rows } = await this.pool.query<{ credit_id: string }>(
+      `SELECT DISTINCT credit_id FROM credit_funding_lots
+        WHERE funding_ref = $1 AND rail = ANY($2::text[])`,
+      [paymentIntentId, [...CARD_FUNDED_RAILS]]
+    );
+    const frozen: string[] = [];
+    for (const { credit_id } of rows) {
+      const changed = await this.withCreditLock(credit_id, async (client, credit) => {
+        if (credit.status !== "active") return false;
+        await client.query(`UPDATE credits SET status = 'disputed' WHERE credit_id = $1`, [
+          credit_id,
+        ]);
+        return true;
+      });
+      if (changed) frozen.push(credit_id);
+    }
+    return frozen;
+  }
+
+  /**
+   * Frozen credits this PaymentIntent funded, each with every card PaymentIntent that funded
+   * it: the sweep checks all of them with Stripe before lifting a freeze.
+   */
+  async disputedCardCreditsFundedBy(
+    paymentIntentId: string
+  ): Promise<{ creditId: string; paymentIntentIds: string[] }[]> {
+    const { rows } = await this.pool.query<{ credit_id: string; refs: string[] }>(
+      `SELECT l.credit_id, array_agg(DISTINCT l.funding_ref) AS refs
+         FROM credit_funding_lots l JOIN credits c ON c.credit_id = l.credit_id
+        WHERE c.status = 'disputed' AND l.rail = ANY($2::text[]) AND l.funding_ref IS NOT NULL
+          AND l.credit_id IN (
+            SELECT credit_id FROM credit_funding_lots WHERE funding_ref = $1 AND rail = ANY($2::text[])
+          )
+        GROUP BY l.credit_id`,
+      [paymentIntentId, [...CARD_FUNDED_RAILS]]
+    );
+    return rows.map((row) => ({ creditId: row.credit_id, paymentIntentIds: row.refs }));
+  }
+
+  /**
+   * Lift a dispute freeze: the credit is `active` and refundable again, including at expiry.
+   * The caller decides that no top-up of the credit has an open or lost dispute. Returns
+   * false when the credit was not frozen.
+   */
+  async unfreezeCardCredit(creditId: string): Promise<boolean> {
+    return this.withCreditLock(creditId, async (client, credit) => {
+      if (credit.status !== "disputed") return false;
+      await client.query(`UPDATE credits SET status = 'active' WHERE credit_id = $1`, [creditId]);
+      return true;
+    });
+  }
+
+  /** True when a funding lot books this PaymentIntent: the charge reached a credit. */
+  async cardFundingBooked(paymentIntentId: string): Promise<boolean> {
+    const { rows } = await this.pool.query(
+      `SELECT 1 FROM credit_funding_lots
+        WHERE funding_ref = $1 AND rail = ANY($2::text[]) LIMIT 1`,
+      [paymentIntentId, [...CARD_FUNDED_RAILS]]
+    );
+    return rows.length > 0;
   }
 
   /**
@@ -3643,6 +3813,19 @@ export class CreditLedger {
    * a new draw allocates against. One round-trip, since every
    * caller needs the micro sum anyway.
    */
+  private async pendingCardRefundDrainId(
+    q: CreditLedgerQuerier,
+    creditId: string
+  ): Promise<string | undefined> {
+    const { rows } = await q.query<{ drain_id: string }>(
+      `SELECT drain_id FROM credit_drains
+        WHERE credit_id = $1 AND method = 'stripe' AND status = 'pending'
+        ORDER BY created_at LIMIT 1`,
+      [creditId]
+    );
+    return rows[0]?.drain_id;
+  }
+
   private async pendingSums(
     q: CreditLedgerQuerier,
     creditId: string
@@ -3684,7 +3867,7 @@ export class CreditLedger {
             : 0,
       expiryMs,
       expired: expiryMs <= nowMs,
-      status: row.status === "unbacked" ? "unbacked" : "active",
+      status: creditStatusOf(row.status),
       lastLedgerSeq: toSafeInt(row.last_ledger_seq),
       createdAt: toSafeInt(row.created_at),
       rail: row.rail,
@@ -3763,6 +3946,28 @@ export interface CreditLedgerLike {
     nowMs?: number;
     limit?: number;
   }): Promise<{ released: CreditExpiryRelease[] }>;
+  /** See {@link CreditLedger.saveCardRefund}. */
+  saveCardRefund?(args: {
+    creditId: string;
+    drainId: string;
+    plan: CardRefundPlan;
+    onlyIfUnset?: boolean;
+  }): Promise<CardRefundPlan | null>;
+  /**
+   * Card-refund sweep reads and writes. Optional and Postgres-only, like the expiry sweep:
+   * see {@link CreditLedger.openCardExpiryRefund}.
+   */
+  listExpiredCardCredits?(args?: { nowMs?: number; limit?: number }): Promise<string[]>;
+  openCardExpiryRefund?(args: {
+    creditId: string;
+    nowMs?: number;
+  }): Promise<CreditDrainRecord | undefined>;
+  freezeCardCreditsForPaymentIntent?(paymentIntentId: string): Promise<string[]>;
+  disputedCardCreditsFundedBy?(
+    paymentIntentId: string
+  ): Promise<{ creditId: string; paymentIntentIds: string[] }[]>;
+  unfreezeCardCredit?(creditId: string): Promise<boolean>;
+  cardFundingBooked?(paymentIntentId: string): Promise<boolean>;
   /**
    * Ask that gate directly, so a route can refuse a wedged channel **before**
    * the rail moves anything. Optional on the same terms as the
@@ -4086,7 +4291,12 @@ export type CreditLedgerPool = Pick<Pool, "query" | "connect">;
  * x402 credit with no remaining liability can be restored to active by channel
  * reconciliation.
  */
-export type CreditStatus = "active" | "unbacked";
+/**
+ * `unbacked`: Tempo backing finalized before the DVM was protected. `refunded`: card credit
+ * whose expired balance went back to the card. `disputed`: a card funding behind it was
+ * disputed, which freezes the remaining balance. None accepts draws, top-ups or drains.
+ */
+export type CreditStatus = "active" | "unbacked" | "refunded" | "disputed";
 
 /** Draw lifecycle: two-phase hold → terminal settle/release. */
 export type DrawStatus = "pending" | "settled" | "released";
@@ -4095,9 +4305,14 @@ export type DrawStatus = "pending" | "settled" | "released";
  * Drain payout rails. Direct Lightning send is excluded: deployments reclaiming Bitcoin can
  * use Cashu notes without putting a spending wallet credential in the DVM.
  */
-export type DrainMethod = "cashu" | "x402" | "tempo";
+export type DrainMethod = "cashu" | "x402" | "tempo" | "stripe";
 
-export const DRAIN_METHODS = ["cashu", "x402", "tempo"] as const satisfies readonly DrainMethod[];
+export const DRAIN_METHODS = [
+  "cashu",
+  "x402",
+  "tempo",
+  "stripe",
+] as const satisfies readonly DrainMethod[];
 
 /**
  * True when `value` names a payout rail this build reclaims over.
@@ -4290,6 +4505,43 @@ export interface CreditDrainRecord {
   provenRefundNative?: string | null;
   /** Sticky proof that some refund was paid; false/absent does not prove zero. */
   refundPaymentProven?: boolean;
+  /** A `stripe` drain's refunds to the card: plan and progress. Null until planned. */
+  cardRefund?: CardRefundPlan | null;
+}
+
+/**
+ * One refund of card credit against one funding PaymentIntent. Amounts are US cents.
+ *
+ * `amountCents = grossCents − feeShareCents`: the caller bears the share of Stripe's
+ * processing fee proportional to what goes back, because Stripe keeps its whole fee
+ * on a refund.
+ */
+export interface CardRefundEntry {
+  lotId: string;
+  paymentIntentId: string;
+  /** Credit returned against this charge, before the fee share. */
+  grossCents: number;
+  feeShareCents: number;
+  /** What goes back to the card. Zero when the fee share eats the whole slice. */
+  amountCents: number;
+  /**
+   * Part of the idempotency key. Bumped only after Stripe definitively rejected or failed a
+   * refund, because Stripe replays a key's first answer, errors included.
+   */
+  attempt: number;
+  refundId: string | null;
+  /** Stripe's refund status, `planned` before any refund exists, `rejected` when refused. */
+  status: "planned" | "pending" | "requires_action" | "succeeded" | "failed" | "canceled" | "rejected";
+  /** Stripe's enum code for the last refusal or failure; never Stripe's free text. */
+  lastError: string | null;
+}
+
+export interface CardRefundPlan {
+  /** Whole cents of the drained credit: `floor(amountMicro / 10_000)`. */
+  grossCents: number;
+  /** Drained credit below one cent, which no card refund can carry. */
+  subCentMicro: number;
+  entries: CardRefundEntry[];
 }
 
 /**
@@ -4800,6 +5052,7 @@ export type CreditLedgerErrorCode =
   | "credit_not_found"
   | "credit_expired"
   | "credit_unbacked"
+  | "credit_closed"
   | "tempo_channel_closing"
   | "tempo_settlement_pending"
   | "settlement_pending"
@@ -4843,9 +5096,15 @@ export type CreditLedgerErrorCode =
  * refund_floor shortfall needs operator resolution, unlike duplicate payout; foreign_credit
  * discloses no liability to the wrong owner; drain_id_retired requires a fresh ID.
  */
-export type DrainConflictReason = "pending_draws" | "balance_moved" | "refund_floor";
+export type DrainConflictReason =
+  | "pending_draws"
+  | "balance_moved"
+  | "refund_floor"
+  | "card_refund_pending";
 
 export interface CreditLedgerErrorDetails {
+  /** On `credit_closed`: why the card-funded credit no longer moves money. */
+  creditStatus?: "refunded" | "disputed";
   /** On `drain_conflict`: which conflict it is, so a route can answer it without matching on prose. */
   drainConflict?: DrainConflictReason;
   /** On `insufficient_credit`: the spendable balance the draw exceeded. */
@@ -4928,10 +5187,64 @@ export function x402SettlementPending(
 }
 
 function terminalCreditError(creditId: string, status: string): CreditLedgerError {
+  if (status === "refunded" || status === "disputed") {
+    return new CreditLedgerError(
+      "credit_closed",
+      status === "refunded"
+        ? `credit ${creditId} is closed: its expired card balance was refunded to the card`
+        : `credit ${creditId} is frozen: a card payment that funded it is disputed`,
+      { creditStatus: status }
+    );
+  }
   return new CreditLedgerError(
     "credit_unbacked",
     `credit ${creditId} is terminal (${status}); its Tempo backing finalized before the DVM was protected`
   );
+}
+
+/**
+ * Card credit leaves only as a refund to the card, and only card credit can: any other
+ * pairing of funding rail and drain method is a `rail_mismatch`.
+ */
+export function assertCardDrainMatchesRail(
+  creditId: string,
+  rail: string | null,
+  method: DrainMethod
+): void {
+  const card = isCardFundedRail(rail);
+  if (card === (method === "stripe")) return;
+  throw new CreditLedgerError(
+    "rail_mismatch",
+    card
+      ? `credit ${creditId} was funded by card and is refunded only to that card (method stripe)`
+      : `credit ${creditId} was not funded by card, so it cannot be refunded to one`,
+    { expectedRail: rail }
+  );
+}
+
+/**
+ * Drain ids an expiry refund of card credit takes, one per expiry instant. The prefix is
+ * reserved: a caller cannot open a drain under it, so the sweep's id is never taken.
+ */
+export const CARD_EXPIRY_DRAIN_PREFIX = "expiry-";
+
+export function cardExpiryDrainId(expiryMs: number): string {
+  return `${CARD_EXPIRY_DRAIN_PREFIX}${expiryMs}`;
+}
+
+/** A second card refund drain while one is unfinished could over-allocate a PaymentIntent. */
+export function cardRefundPendingConflict(creditId: string, blockingDrainId: string): CreditLedgerError {
+  return new CreditLedgerError(
+    "drain_conflict",
+    `credit ${creditId} already has card refund ${blockingDrainId} in progress`,
+    { drainConflict: "card_refund_pending", blockingDrainId }
+  );
+}
+
+function creditStatusOf(status: string): CreditStatus {
+  return status === "unbacked" || status === "refunded" || status === "disputed"
+    ? status
+    : "active";
 }
 
 /** Postgres `unique_violation` (SQLSTATE 23505), however the driver wrapped it. */
@@ -5115,6 +5428,7 @@ interface DrainRow {
   hold_reason: TempoDrainHoldReason | null;
   proven_refund_native: string | null;
   refund_payment_proven: boolean;
+  card_refund?: CardRefundPlan | null;
 }
 
 /**
@@ -5313,6 +5627,7 @@ function drainRecordFromRow(row: DrainRow, credit: DrainCreditJoin): CreditDrain
     holdReason: row.hold_reason ?? null,
     provenRefundNative: row.proven_refund_native ?? null,
     refundPaymentProven: row.refund_payment_proven ?? false,
+    cardRefund: row.card_refund ?? null,
   };
 }
 

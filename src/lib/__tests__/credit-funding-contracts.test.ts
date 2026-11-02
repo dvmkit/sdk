@@ -14,7 +14,7 @@ import { microToSats } from "../payment-amounts";
 describe("shared credit funding contracts", () => {
   it("preserves the funding and reclaim wire registries and stablecoin subset", () => {
     expect(CREDIT_FUND_RAILS).toEqual(["cashu", "lightning", "x402", "tempo", "stripe"]);
-    expect(CREDIT_DRAIN_RAILS).toEqual(["cashu", "x402", "tempo"]);
+    expect(CREDIT_DRAIN_RAILS).toEqual(["cashu", "x402", "tempo", "stripe"]);
     expect(STABLECOIN_FUND_RAILS).toEqual(["x402", "tempo"]);
     expect(CREDIT_FUND_RAILS.filter(isStablecoinFundRail)).toEqual(["x402", "tempo"]);
   });

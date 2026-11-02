@@ -887,6 +887,14 @@ function cardChargeRefusal(outcome: CardChargeFailure, challenges: Challenge.Cha
       retryable: false,
       challenges: [] as Challenge.Challenge[],
     },
+    // Nothing reached Stripe and the approval is unused, so the same credential still works.
+    unavailable: {
+      status: 503,
+      display: "The service couldn't record the payment attempt, so this request did not charge the card and no credit was added.",
+      hint: "Resend this exact fund request with the same credential and fund_id (re-sign it if the signature has expired), within five minutes of the original request. This request charged nothing. If an earlier request with this credential got no answer, it may have charged the card; resending records that charge instead of charging again. If resends keep failing, stop and tell your human.",
+      retryable: true,
+      challenges: [] as Challenge.Challenge[],
+    },
     // No fresh challenge: a new challenge would mean a second PaymentIntent.
     indeterminate: {
       status: 503,
@@ -2326,6 +2334,7 @@ export type PaymentErrorCode =
   | "insufficient_credit"
   | "credit_expired"
   | "credit_unbacked"
+  | "credit_closed"
   | "credit_not_found"
   | "tempo_channel_closing"
   | "settlement_pending"
@@ -2480,6 +2489,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     display:
       "This prepaid balance is closed because its Tempo channel finalized before the service could collect the value it had accepted. No drawable or reclaimable balance remains.",
     hint: "Do not retry, top up, or drain this credit. Pay per call or open a separate prepaid balance.",
+    retryable: false,
+  },
+  credit_closed: {
+    display:
+      "This card-funded balance is closed: either its expired balance was refunded to the card, or a dispute on the card payment froze it. It can't pay for jobs, take a top-up, or be drained.",
+    hint: "Do not retry with this credit_id. Pay per call, or open a new prepaid balance by funding without a credit_id.",
     retryable: false,
   },
   credit_not_found: {
@@ -5909,6 +5924,7 @@ function creditLedgerErrorResult(
     err.code === "insufficient_credit" ||
     err.code === "credit_expired" ||
     err.code === "credit_unbacked" ||
+    err.code === "credit_closed" ||
     err.code === "credit_not_found" ||
     err.code === "tempo_channel_closing" ||
     err.code === "settlement_pending" ||

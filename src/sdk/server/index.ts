@@ -95,6 +95,14 @@ export type {
   StripeErrorCodes,
 } from "./stripe-credit";
 export { createStripeCreditRail } from "./stripe-credit";
+export type {
+  StripeChargeFacts,
+  StripeDispute,
+  StripePaymentIntentSummary,
+  StripeRefund,
+  StripeRefundApi,
+} from "./stripe-refund-api";
+export type { CardChargeAttempt, CardChargeJournal } from "./card-charge-journal";
 export type { CreditRequest, CreditRouteDeps } from "./credit-routes";
 export { CREDIT_REQUEST_SCHEMA, handleCreditRequest } from "./credit-routes";
 export type { PriceFiat } from "./funding";
