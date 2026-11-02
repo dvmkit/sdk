@@ -7,6 +7,13 @@ import type { CreditLedgerLike, CreditSnapshot } from "./credit-ledger";
 import { isNonChannelBitcoinRail } from "./credit-lots";
 
 /**
+ * Smallest card top-up, in USD micro-units. Stripe refuses a USD charge below
+ * $0.50, so the funding menu never advertises a lower card floor whatever the
+ * builder's `credit.min` says.
+ */
+export const STRIPE_CREDIT_MIN_MICRO = 500_000;
+
+/**
  * Public, cacheable prepaid terms exclude caller IDs and balances. toCreditTerms explicitly
  * whitelists this shape so later caller-specific menu fields cannot leak into /v1/info.
  */
@@ -47,6 +54,12 @@ export interface CreditTerms {
    * make the advertised amount insufficient.
    */
   lightning_min_micro?: number;
+  /**
+   * Present with offered card funding. `network_id` is the seller's Stripe profile id, which
+   * the caller's spend request names; the card is charged once, immediately, in `currency`.
+   * `min_micro` is the card floor, never below Stripe's $0.50.
+   */
+  stripe?: { network_id: string; min_micro: number; currency: "usd" };
 }
 
 /**
@@ -95,6 +108,8 @@ export interface BuildCreditMenuArgs {
    * current request-time rates.
    */
   lightningFundingMinSats?: number;
+  /** Seller's Stripe network profile id when card credit is configured. */
+  stripeNetworkId?: string;
   /**
    * Read the configured accepted mint list, not its health-filtered advertisement. Non-channel
    * Bitcoin refunds need a mint, but configuration alone does not establish refund solvency.
@@ -187,6 +202,15 @@ export async function buildCreditMenu(args: BuildCreditMenuArgs): Promise<Credit
   const funding = args.funding.filter((rail) => {
     if (rail === "tempo") return tempoMethods.length > 0;
     if (rail === "x402") return x402Schemes.length > 0;
+    // Cards are charged in USD only, so a credit in another currency cannot take one; a
+    // ceiling under Stripe's minimum charge leaves no top-up a card can make.
+    if (rail === "stripe") {
+      return (
+        args.stripeNetworkId !== undefined &&
+        currency === "usd" &&
+        bounds.maxMicro >= STRIPE_CREDIT_MIN_MICRO
+      );
+    }
     /**
      * Non-channel Bitcoin refunds use Cashu notes, so a configured mint is required even when
      * explicit paymentMethods bypass default filtering. This establishes a possible refund rail,
@@ -215,6 +239,15 @@ export async function buildCreditMenu(args: BuildCreditMenuArgs): Promise<Credit
     // while the rail stays wired, and terms for a rail the menu doesn't offer
     // are the same misadvertisement in the other direction.
     ...(funding.includes("x402") && x402Schemes.length > 0 && { x402: { schemes: x402Schemes } }),
+
+    ...(funding.includes("stripe") &&
+      args.stripeNetworkId !== undefined && {
+        stripe: {
+          network_id: args.stripeNetworkId,
+          min_micro: Math.max(bounds.minMicro, STRIPE_CREDIT_MIN_MICRO),
+          currency: "usd" as const,
+        },
+      }),
   };
 
   // Needs an fx snapshot even on a USD DVM — the floor is sats —
@@ -333,6 +366,7 @@ export function toCreditTerms(menu: CreditMenu): CreditTerms {
     ...(menu.lightning_min_micro !== undefined && {
       lightning_min_micro: menu.lightning_min_micro,
     }),
+    ...(menu.stripe && { stripe: { ...menu.stripe } }),
   };
 }
 

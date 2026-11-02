@@ -78,6 +78,7 @@ import {
 } from "./mpp-units";
 import { cashuPaymentRequest } from "./cashu-payment-request";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
+import type { StripeCreditRail } from "./stripe-credit";
 import { ProcessedPaymentReplayError } from "./processed-payment-store";
 import type { CreditDepositEnqueue, CreditDepositPayload } from "./revenue-reporter";
 import { DEFAULT_CASHU_LOCK_WINDOW_SECONDS } from "../cashu-locktime";
@@ -672,6 +673,266 @@ export async function verifyUpfrontPayment(opts: UpfrontPaymentOpts): Promise<Pa
     };
   }
   return result;
+}
+
+/**
+ * A `POST /v1/credit` top-up funded by card (`fund.method: "stripe"`). Only the
+ * credit route calls it, and the Stripe rail it needs is held apart from the
+ * Tempo handle, so no job surface can issue or accept a stripe challenge.
+ *
+ * Order matters for money: every refusal that can be known before the charge
+ * (commitment, credit binding, whole cents) runs first, because a ledger
+ * refusal after a successful charge would leave the caller's card charged
+ * with no balance. The charge and the booking are separate commits; the
+ * PaymentIntent id is the processed-payment key, so a retry of the same
+ * credential after a crash between them books the charge exactly once (Stripe
+ * returns the same PaymentIntent for the same challenge and token).
+ */
+export async function verifyCardFunding(
+  opts: UpfrontPaymentOpts & {
+    stripeCredit: StripeCreditRail | undefined;
+    fundOnly: FundOnlyRequest & { creditId: string };
+    amountMicro: number;
+  }
+): Promise<PaymentResult> {
+  return withPaymentDiagnostics(() => verifyCardFundingInScope(opts));
+}
+
+async function verifyCardFundingInScope(
+  opts: UpfrontPaymentOpts & {
+    stripeCredit: StripeCreditRail | undefined;
+    fundOnly: FundOnlyRequest & { creditId: string };
+    amountMicro: number;
+  }
+): Promise<PaymentResult> {
+  const rail = opts.stripeCredit;
+  const { fundOnly, amountMicro } = opts;
+  const resourcePath = opts.resourcePath ?? "/v1/credit";
+  if (!rail || !opts.creditLedger) {
+    return creditRefusal("payment_invalid", "This DVM does not accept card funding.", {
+      status: 409,
+      hint: "Fund the credit over one of the rails listed in credit.funding on /v1/info.",
+    });
+  }
+  if (amountMicro % 10_000 !== 0) {
+    return creditRefusal(
+      "payment_invalid",
+      `A card top-up must be a whole number of cents; ${amountMicro} micro-USD is not.`,
+      { status: 400, hint: "Round fund.amount_micro to a multiple of 10000 (one cent) and sign again." }
+    );
+  }
+  const challenge = async (): Promise<Challenge.Challenge[]> => [
+    await rail.issueChallenge({
+      amountMicro,
+      resourcePath,
+      expires: new Date(Date.now() + UPFRONT_CHALLENGE_TTL_MS).toISOString(),
+    }),
+  ];
+  const credential = typeof opts.mppCredential === "string" ? opts.mppCredential : undefined;
+  if (!credential) {
+    return {
+      paidMsats: 0,
+      receivedProofs: [],
+      error: {
+        body: {
+          error: "payment_required",
+          amount_micro: amountMicro,
+          currency: "usd",
+          display: "This top-up needs a card payment approved in Link.",
+          hint: "Build an MPP credential for the attached method=\"stripe\" challenge from the shared payment token (spt_…) your human approved, set fund.commitment to its SHA-256, and resend this fund request, freshly signed, with the credential in the Authorization header.",
+        },
+        status: 402,
+        mppChallenges: await challenge(),
+      },
+    };
+  }
+  if (fundingCommitment(credential) !== fundOnly.commitment) {
+    logCreditRejected("fund_commitment_mismatch", fundOnly.creditId);
+    return creditRefusal(
+      "funding_commitment_mismatch",
+      "fund.commitment does not match the SHA-256 of the attached funding artifact."
+    );
+  }
+  const refusal = crossRailRefusal(await opts.creditLedger.get(fundOnly.creditId), {
+    creditId: fundOnly.creditId,
+    binding: { rail: "stripe" },
+  });
+  if (refusal) return refusal;
+
+  const charged = await withPaymentStage("verifier_broadcast", () =>
+    rail.charge(credential, { amountMicro, resourcePath })
+  );
+  if (!charged.ok) {
+    logCreditRejected(`stripe_${charged.reason}`, fundOnly.creditId, cardLogFields(charged));
+    return cardChargeRefusal(charged, await challenge());
+  }
+
+  const ledgerCtx: LedgerContext = {
+    ledger: opts.creditLedger,
+    processedPayments: opts.processedPayments,
+    enqueueCreditDeposit: opts.enqueueCreditDeposit,
+    priceFiat: { currency: "usd", amountMicro },
+    // A card charge is valued in cents, never through a sats quote.
+    requiredMsats: 0,
+    callerId: opts.callerPubkey ?? opts.requesterId ?? "anonymous",
+    hostingAdmissionId: opts.hostingAdmissionId,
+    hostingPaymentArtifactHash: opts.hostingPaymentArtifactHash,
+    dvmId: opts.dvmId ?? "",
+    fundOnly,
+    drawBasis: false,
+    ttlMs: opts.creditTtlMs ?? IMPLICIT_CREDIT_TTL_MS,
+  };
+  const cents = amountMicro / 10_000;
+  let credited: CommittedFunding;
+  try {
+    credited = await commitMarkedFunding(ledgerCtx, {
+      rail: "stripe",
+      paymentId: charged.paymentIntentId,
+      paidMsats: 0,
+      fundedMicro: amountMicro,
+      nativeAmount: cents,
+      nativeAsset: "usd-cents",
+    });
+  } catch (err) {
+    const mapped = mapLedgerCommitError(err, undefined, true);
+    if (mapped) {
+      logCredentialRejected("stripe", "upfront", err);
+      return mapped.error?.body.error === "replay_rejected" ? cardReplayRefusal(mapped) : mapped;
+    }
+    // The card is charged and nothing is booked. The same credential reaches the same
+    // PaymentIntent, so a resend books it; a new credential would be a new charge.
+    logCreditRejected("stripe_booking_failed", fundOnly.creditId, {
+      payment_intent: charged.paymentIntentId,
+    });
+    return {
+      paidMsats: 0,
+      receivedProofs: [],
+      error: {
+        body: paymentErrorBody("payment_invalid", {
+          message: "The card was charged but the credit could not be recorded.",
+          display: "Your card was charged, but the credit wasn't recorded yet. Sending the same request again will record it without charging again.",
+          hint: "Resend this exact fund request with the same credential and fund_id (re-sign it if the signature has expired). Do not build a new credential: that would be a second charge.",
+          retryable: true,
+          extra: { rail: "stripe", reason: "booking_failed" },
+        }),
+        status: 503,
+      },
+    };
+  }
+  return withDrawBasis(
+    {
+      paidMsats: 0,
+      paymentRail: "stripe",
+      receivedProofs: [],
+      paymentTxHash: charged.paymentIntentId,
+      nativeAmount: cents,
+      nativeAsset: "usd-cents",
+    },
+    ledgerCtx,
+    credited
+  );
+}
+
+type CardChargeFailure = Extract<Awaited<ReturnType<StripeCreditRail["charge"]>>, { ok: false }>;
+
+/** Log fields for a card refusal: the category and Stripe's enums, never upstream text. */
+function cardLogFields(outcome: CardChargeFailure): Record<string, unknown> {
+  return {
+    message: outcome.message,
+    ...(outcome.stripeError?.type && { stripe_error_type: outcome.stripeError.type }),
+    ...(outcome.stripeError?.code && { stripe_error_code: outcome.stripeError.code }),
+    ...(outcome.stripeError?.declineCode && { decline_code: outcome.stripeError.declineCode }),
+    ...(outcome.paymentIntentId && { payment_intent: outcome.paymentIntentId }),
+  };
+}
+
+/** Agent-facing refusal for a card charge that booked nothing. */
+function cardChargeRefusal(outcome: CardChargeFailure, challenges: Challenge.Challenge[]): PaymentResult {
+  const newApproval =
+    "Ask your human to approve a new top-up in Link for at least this amount, then build a credential from the new shared payment token for the challenge attached to this response, and resend the fund request, freshly signed.";
+  const copy = {
+    invalid_credential: {
+      status: 402,
+      display: "The card payment couldn't be verified, so nothing was charged.",
+      hint: "Build a new credential for the challenge attached to this response, from a shared payment token that hasn't been charged, and resend the fund request, freshly signed.",
+      retryable: false,
+      challenges,
+    },
+    declined: {
+      status: 402,
+      display: "The card was declined, so nothing was charged and no credit was added.",
+      hint: `${newApproval} A different card is more likely to work.`,
+      retryable: false,
+      challenges,
+    },
+    requires_action: {
+      status: 402,
+      display: "The card needs an extra verification step that can't be completed here, so no credit was added.",
+      hint: "Ask your human to approve a new top-up in Link with a card that doesn't require an extra authentication step, then fund again with the new shared payment token.",
+      retryable: false,
+      challenges,
+    },
+    token_unusable: {
+      status: 402,
+      display: "The card approval can't be used for this top-up (it was already used, is for a smaller amount, or has lapsed), so nothing was charged.",
+      hint: `If you already sent this shared payment token in an earlier fund request that got no answer, resend that same request (same credential and fund_id) first: it may have been charged, and the resend records it without charging again. Only if no earlier request used this token: ${newApproval.charAt(0).toLowerCase()}${newApproval.slice(1)} An approval can be charged only once, up to the amount it was approved for.`,
+      retryable: false,
+      challenges,
+    },
+    // Charged, but not as this top-up: never booked, and a resend would not change it.
+    mismatch: {
+      status: 502,
+      display: "The card processor reported a charge that doesn't match this top-up, so no credit was added.",
+      hint: "Don't retry with this approval. Tell your human the top-up failed and give the provider the payment_intent reference so they can check the charge.",
+      retryable: false,
+      challenges: [] as Challenge.Challenge[],
+    },
+    // No fresh challenge: a new challenge would mean a second PaymentIntent.
+    indeterminate: {
+      status: 503,
+      display: "The card processor didn't confirm the payment. The card may or may not have been charged; no credit was added yet.",
+      hint: "Resend this exact fund request with the same credential and fund_id (re-sign it if the signature has expired), within five minutes of the original request. If the earlier attempt was charged and its answer was lost, the resend records that charge instead of charging again. Do not build a new credential from the same approval. If resends keep failing, stop and tell your human; the provider can trace any charge from its records.",
+      retryable: true,
+      challenges: [] as Challenge.Challenge[],
+    },
+  }[outcome.reason];
+  return {
+    paidMsats: 0,
+    receivedProofs: [],
+    error: {
+      body: paymentErrorBody("payment_invalid", {
+        message: `Card funding refused (${outcome.reason}): ${outcome.message}.`,
+        display: copy.display,
+        hint: copy.hint,
+        retryable: copy.retryable,
+        extra: {
+          rail: "stripe",
+          reason: outcome.reason,
+          ...(outcome.stripeError?.code && { stripe_error_code: outcome.stripeError.code }),
+          ...(outcome.stripeError?.declineCode && { decline_code: outcome.stripeError.declineCode }),
+          ...(outcome.reason === "mismatch" && outcome.paymentIntentId && { payment_intent: outcome.paymentIntentId }),
+        },
+      }),
+      status: copy.status,
+      ...(copy.challenges.length > 0 && { mppChallenges: copy.challenges }),
+    },
+  };
+}
+
+/** The shared replay refusal speaks of ecash proofs; a card replay needs its own words. */
+function cardReplayRefusal(mapped: PaymentResult): PaymentResult {
+  if (!mapped.error) return mapped;
+  return {
+    ...mapped,
+    error: {
+      ...mapped.error,
+      body: {
+        ...mapped.error.body,
+        display: "This card payment was already used to add credit, so it wasn't charged or added again.",
+        hint: "Don't resend this credential. To add more credit, ask your human to approve a new top-up in Link and fund with the new shared payment token under a new fund_id.",
+      },
+    },
+  };
 }
 
 async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<PaymentResult> {
@@ -4126,7 +4387,7 @@ function railAsFundingMethod(rail: string | null): FundingMethod | undefined {
 
 /** What one rail actually paid, as handed to the ledger leg. */
 interface RailFunding {
-  rail: "cashu" | "x402" | "tempo";
+  rail: "cashu" | "x402" | "tempo" | "stripe";
   /** Rail settlement reference: cashu request id / EVM tx hash / mpp challenge id. */
   paymentId: string;
   paidMsats: number;
@@ -5498,7 +5759,7 @@ function exactSettlementEffect(
  */
 async function commitMarkedFunding(
   ctx: LedgerContext,
-  funding: RailFunding & { rail: "x402" | "tempo" },
+  funding: RailFunding & { rail: "x402" | "tempo" | "stripe" },
   outerTx?: CreditLedgerQuerier
 ): Promise<CommittedFunding> {
   const store = ctx.processedPayments;
@@ -5882,7 +6143,7 @@ async function crossCreditChannelRefusal(
 type CreditInstrument = NonNullable<CreditDepositPayload["instrument"]>;
 
 interface IncomingCreditBinding {
-  rail: "cashu" | "x402" | "tempo";
+  rail: "cashu" | "x402" | "tempo" | "stripe";
   instrument?: CreditInstrument;
   channelId?: string;
 }
@@ -6122,7 +6383,7 @@ function x402NotOfferedResult(currency?: string): PaymentResult {
 
 // Fixed categories identify failures without reflecting upstream exception text.
 function logCredentialRejected(
-  rail: "tempo" | "x402",
+  rail: "tempo" | "x402" | "stripe",
   phase: "upfront" | "mid-job",
   err: unknown
 ): void {

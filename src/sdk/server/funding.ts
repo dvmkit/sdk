@@ -299,7 +299,10 @@ export function fundingCommitment(artifact: string): string {
  * Deterministic credit id for an implicit N=1 funding — namespaced so a
  * caller-chosen explicit `credit_id` can never collide with it.
  */
-export function implicitCreditId(rail: "cashu" | "x402" | "tempo", paymentId: string): string {
+export function implicitCreditId(
+  rail: "cashu" | "x402" | "tempo" | "stripe",
+  paymentId: string
+): string {
   return `imp:${rail}:${paymentId}`;
 }
 

@@ -479,8 +479,13 @@ export interface CapabilityRate {
  * on, nothing to verify inline, and no `lightning` entry in `/v1/info` or
  * `/v1/quote`'s `payment.methods`. Keeping the two types distinct is what
  * stops that dead rail from reappearing every time the funding menu grows.
+ *
+ * `stripe` funds a credit with a Stripe Shared Payment Token over an MPP
+ * `method="stripe"` challenge that only `POST /v1/credit` issues. The card is
+ * charged once, immediately, into the DVM owner's Stripe account; it is never
+ * a per-call job payment method.
  */
-export type FundingMethod = PaymentMethod | "lightning";
+export type FundingMethod = PaymentMethod | "lightning" | "stripe";
 
 /**
  * Whether the payment rail returns value when a job fails. No rail reverses

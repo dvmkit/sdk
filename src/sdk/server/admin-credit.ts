@@ -34,7 +34,7 @@ import type {
 } from "./credit-ledger";
 import type { DrainFulfilment } from "./credit-ledger";
 import { CreditLedgerError, DRAIN_METHODS } from "./credit-ledger";
-import { netOwedSats } from "./credit-lots";
+import { isCardFundedRail, netOwedSats } from "./credit-lots";
 import { derivedFundCreditId, isDerivedCreditId } from "./funding";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { LightningReceive } from "./lightning-receive";
@@ -389,7 +389,7 @@ async function handlePendingDrains(
   const auth = await requireAuth(c, opts);
   if ("response" in auth) return auth.response;
 
-  const pending = await opts.ledger.listPendingDrains();
+  const pending = await withoutCardCredit(opts.ledger, await opts.ledger.listPendingDrains());
   // Fetch FX only for Cashu drains lacking a recorded in-kind obligation. An outage must not
   // block listing already-priced liabilities.
   const needsRate = pending.some((d) => d.method === "cashu" && d.owedSats === null);
@@ -480,7 +480,7 @@ async function handleBitcoinLiability(
   if ("response" in auth) return auth.response;
 
   const deposit = await opts.ledger.bitcoinDepositLiability();
-  const pending = await opts.ledger.listPendingDrains();
+  const pending = await withoutCardCredit(opts.ledger, await opts.ledger.listPendingDrains());
   const promised = pending.filter((d) => d.method === "cashu" && d.status === "pending");
   const drainSats = promised.reduce((sum, d) => sum + (d.owedSats ?? 0), 0);
   const drainsUnpriced = promised.filter((d) => d.owedSats === null).length;
@@ -2706,4 +2706,19 @@ function parseSerializedDleq(raw: unknown): { e: string; s: string; r?: string }
   if (typeof dleq.e !== "string" || typeof dleq.s !== "string") return undefined;
   if (dleq.r !== undefined && typeof dleq.r !== "string") return undefined;
   return { e: dleq.e, s: dleq.s, ...(dleq.r !== undefined ? { r: dleq.r } : {}) };
+}
+
+/**
+ * Card credit is refunded to the card, never by a payout worker. The ledger refuses card
+ * drains; this keeps any row that predates that guard out of the payout queue as well.
+ */
+async function withoutCardCredit(
+  ledger: CreditLedgerLike,
+  drains: CreditDrainRecord[]
+): Promise<CreditDrainRecord[]> {
+  const card = new Set<string>();
+  for (const creditId of new Set(drains.map((drain) => drain.creditId))) {
+    if (isCardFundedRail((await ledger.get(creditId))?.rail)) card.add(creditId);
+  }
+  return drains.filter((drain) => !card.has(drain.creditId));
 }

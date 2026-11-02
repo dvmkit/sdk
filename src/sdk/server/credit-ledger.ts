@@ -11,6 +11,8 @@ import {
   type FundingLot,
   inKindDrawMsats,
   isInKindDepletion,
+  CARD_FUNDED_RAILS,
+  isCardFundedRail,
   isNonChannelBitcoinRail,
   type LotDebit,
   netOwedSats,
@@ -889,7 +891,9 @@ export class CreditLedger {
   /**
    * Release expired undrawn balances, retaining readable credit records. Tempo rail or
    * channel-backed credits are excluded because their collateral returns to the caller
-   * through the channel lifecycle.
+   * through the channel lifecycle. Card-funded credits are excluded because an expired card
+   * balance is owed back to the card, never released to the builder: it stays on the credit,
+   * where expiry already refuses new draws, until a card refund returns it.
    *
    * Pending holds prevent release: jobs accepted before expiry may still settle or release.
    * Candidates are rechecked under the same parent-credit lock used by draw writes. The
@@ -911,6 +915,7 @@ export class CreditLedger {
           AND c.status = 'active'
           AND c.tempo_channel_id IS NULL
           AND COALESCE(c.rail, '') <> 'tempo'
+          AND NOT (COALESCE(c.rail, '') = ANY($3::text[]))
           AND NOT EXISTS (
             SELECT 1 FROM credit_expiry_releases r
              WHERE r.credit_id = c.credit_id AND r.reversed_at IS NULL
@@ -921,7 +926,7 @@ export class CreditLedger {
           )
         ORDER BY c.expiry_ms
         LIMIT $2`,
-      [nowMs, limit]
+      [nowMs, limit, [...CARD_FUNDED_RAILS]]
     );
 
     const released: CreditExpiryRelease[] = [];
@@ -951,6 +956,7 @@ export class CreditLedger {
     const balanceMicro = toSafeInt(credit.balance_micro);
     if (expiryMs > nowMs || balanceMicro <= 0 || credit.status !== "active") return undefined;
     if (credit.tempo_channel_id !== null || credit.rail === "tempo") return undefined;
+    if (isCardFundedRail(credit.rail)) return undefined;
     const pending = await this.pendingSums(client, credit.credit_id);
     if (pending.micro > 0) return undefined;
     const { rows: open } = await client.query<{ one: number }>(
@@ -1001,7 +1007,8 @@ export class CreditLedger {
   /**
    * Record non-channel Bitcoin funding lots on the funding transaction. An implicit payment
    * also needs a lot: its draw is initially only a hold, and failure releases the whole
-   * balance for reclaim. Channel collateral is excluded from Bitcoin lots.
+   * balance for reclaim. Channel collateral is excluded from Bitcoin lots. A card funding
+   * records a lot per charge so a later refund can address the charge that bought it.
    *
    * A zero-sats basis still records a lot, distinguishing covered but basisless credit from a
    * missing-lot coverage gap.
@@ -1013,7 +1020,7 @@ export class CreditLedger {
     basis: CreditFundingBasis,
     nowMs: number
   ): Promise<void> {
-    if (!isNonChannelBitcoinRail(basis.rail)) return;
+    if (!isNonChannelBitcoinRail(basis.rail) && !isCardFundedRail(basis.rail)) return;
     if (basis.tempoSession || basis.x402Channel) return;
     await q.query(
       `INSERT INTO credit_funding_lots
@@ -2634,6 +2641,13 @@ export class CreditLedger {
         throw new CreditLedgerError(
           "caller_mismatch",
           `credit ${args.creditId} belongs to a different caller pubkey`
+        );
+      }
+      if (isCardFundedRail(credit.rail)) {
+        // Card credit is refunded to the card; no other payout rail may carry it out.
+        throw new CreditLedgerError(
+          "rail_mismatch",
+          `credit ${args.creditId} was funded by card and cannot be drained`
         );
       }
       const existing = await this.readDrain(client, args.creditId, args.drainId);
@@ -4492,6 +4506,7 @@ export const FUNDING_RAILS: Record<FundingMethod, true> = {
   x402: true,
   tempo: true,
   lightning: true,
+  stripe: true,
 };
 
 /**

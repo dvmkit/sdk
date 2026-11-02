@@ -7,7 +7,7 @@ export type X402CreditFlavour = typeof X402_BATCH_SETTLEMENT_SCHEME | typeof X40
  * Rails accepted by caller funding selection and pin validation. Each rail's orchestration still
  * owns its availability and payment protocol.
  */
-export const CREDIT_FUND_RAILS = ["cashu", "lightning", "x402", "tempo"] as const;
+export const CREDIT_FUND_RAILS = ["cashu", "lightning", "x402", "tempo", "stripe"] as const;
 
 export type CreditFundRail = (typeof CREDIT_FUND_RAILS)[number];
 

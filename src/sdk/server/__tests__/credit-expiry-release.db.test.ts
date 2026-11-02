@@ -196,6 +196,34 @@ describe.skipIf(!RUN)("credit-expiry releases", () => {
     expect(await releaseRows("tempo-backed")).toEqual([]);
   });
 
+  it("leaves an expired card credit owed to the card: no release, no report, balance kept", async () => {
+    await ledger.fund({
+      creditId: "card-funded",
+      callerPubkey: CALLER,
+      currency: "usd",
+      amountMicro: 600_000,
+      expiryMs: Date.now() - 60_000,
+      basis: {
+        rail: "stripe",
+        paidMsats: 0,
+        nativeAsset: "usd-cents",
+        nativeAmount: 60,
+        fundingRef: "pi_card_1",
+      },
+    });
+    await expiredCredit("bitcoin-funded", 400_000);
+
+    const swept = await ledger.sweepExpiredCredits();
+    expect(swept.released.map((release) => release.creditId)).toEqual(["bitcoin-funded"]);
+    expect(reported.map((report) => report.creditId)).toEqual(["bitcoin-funded"]);
+    expect(await releaseRows("card-funded")).toEqual([]);
+    expect(await balanceOf("card-funded")).toBe(600_000);
+    // Expiry still closes the balance to new spending while it waits for its card refund.
+    await expect(
+      ledger.draw({ creditId: "card-funded", drawId: "late", amountMicro: 100_000 })
+    ).rejects.toMatchObject({ code: "credit_expired" });
+  });
+
   it("skips a credit with a pending hold, then releases it once the hold resolves", async () => {
     const expiryMs = await expiredCredit("held", 900_000);
     await ledger.draw({

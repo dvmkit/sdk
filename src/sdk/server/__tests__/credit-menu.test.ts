@@ -166,6 +166,50 @@ describe("credit menu assembly", () => {
     expect(menu?.x402).toBeUndefined();
   });
 
+  it("raises the advertised card floor to Stripe's $0.50 above a lower credit minimum", async () => {
+    const menu = await buildCreditMenu(
+      args({ funding: ["cashu", "stripe"], stripeNetworkId: "profile_test" })
+    );
+    expect(menu?.funding).toEqual(["cashu", "stripe"]);
+    expect(menu?.min_micro).toBe(100_000);
+    expect(menu?.stripe).toEqual({ network_id: "profile_test", min_micro: 500_000, currency: "usd" });
+  });
+
+  it("keeps a credit minimum above $0.50 as the card floor", async () => {
+    const menu = await buildCreditMenu(
+      args({
+        config: { ...CONFIG, min: "$1.25" },
+        funding: ["stripe"],
+        stripeNetworkId: "profile_test",
+      })
+    );
+    expect(menu?.stripe?.min_micro).toBe(1_250_000);
+  });
+
+  it("omits card funding when the rail isn't configured or the menu isn't USD", async () => {
+    const unconfigured = await buildCreditMenu(args({ funding: ["cashu", "stripe"] }));
+    expect(unconfigured?.funding).toEqual(["cashu"]);
+    expect(unconfigured?.stripe).toBeUndefined();
+
+    const eur = await buildCreditMenu(
+      args({ currency: "eur", funding: ["cashu", "stripe"], stripeNetworkId: "profile_test" })
+    );
+    expect(eur?.funding).toEqual(["cashu"]);
+    expect(eur?.stripe).toBeUndefined();
+  });
+
+  it("omits card funding when the credit ceiling is under Stripe's $0.50 minimum", async () => {
+    const capped = await buildCreditMenu(
+      args({
+        config: { ...CONFIG, max: "$0.40" },
+        funding: ["cashu", "stripe"],
+        stripeNetworkId: "profile_test",
+      })
+    );
+    expect(capped?.funding).toEqual(["cashu"]);
+    expect(capped?.stripe).toBeUndefined();
+  });
+
   it("needs no fx at all for a USD quote (bounds are already USD)", async () => {
     const menu = await buildCreditMenu(args({ fxFetcher: deadFx }));
     expect(menu?.min_micro).toBe(100_000);

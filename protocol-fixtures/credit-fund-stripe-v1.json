@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "description": "Card-funded prepaid credit over an MPP method=\"stripe\" charge. The caller's human approves a top-up in Link, which mints a Shared Payment Token (spt_…); the agent builds an MPP credential from it for the challenge the DVM issued, binds the credential's SHA-256 into the signed fund request as fund.commitment, and the DVM charges the token once and books the PaymentIntent as the funding. Amounts are USD micro-units on the wire and cents on the challenge. Card credit is offered only on POST /v1/credit; /v1/job never lists or accepts method=\"stripe\".",
+  "menu": {
+    "credit": {
+      "funding_includes": "stripe",
+      "stripe": { "network_id": "profile_test", "min_micro": 500000, "currency": "usd" }
+    },
+    "payment_methods_exclude": ["stripe"]
+  },
+  "fund_request": {
+    "op": "fund",
+    "fund": {
+      "method": "stripe",
+      "amount_micro": 600000,
+      "fund_id": "<caller-chosen>",
+      "commitment": "<sha256 hex of the Authorization credential>"
+    }
+  },
+  "discovery": {
+    "status": 402,
+    "body": { "error": "payment_required", "amount_micro": 600000, "currency": "usd" },
+    "challenge": {
+      "method": "stripe",
+      "intent": "charge",
+      "request": {
+        "amount": "60",
+        "currency": "usd",
+        "methodDetails": { "networkId": "profile_test", "paymentMethodTypes": ["card"] }
+      }
+    }
+  },
+  "funded": {
+    "status": 200,
+    "body": { "op": "fund", "funded_micro": 600000, "replayed": false, "credit": { "currency": "usd", "balance_micro": 600000 } },
+    "lot": { "rail": "stripe", "funding_ref_prefix": "pi_", "credited_micro": 600000 }
+  },
+  "refusals": {
+    "below_minimum": {
+      "status": 400,
+      "body": { "error": "below_rail_minimum", "rail": "stripe", "min_micro": 500000, "currency": "usd" }
+    },
+    "declined": {
+      "status": 402,
+      "body": { "error": "payment_invalid", "rail": "stripe", "reason": "declined", "retryable": false }
+    },
+    "token_unusable": {
+      "status": 402,
+      "body": { "error": "payment_invalid", "rail": "stripe", "reason": "token_unusable", "retryable": false }
+    },
+    "drain_card_credit": {
+      "status": 409,
+      "body": { "error": "card_credit_not_drainable", "retryable": false }
+    },
+    "commitment_mismatch": {
+      "status": 402,
+      "body": { "error": "funding_commitment_mismatch" }
+    },
+    "replayed_credential": {
+      "status": 409,
+      "body": { "error": "replay_rejected" }
+    }
+  }
+}

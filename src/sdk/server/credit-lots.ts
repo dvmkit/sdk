@@ -24,6 +24,22 @@ export const NON_CHANNEL_BITCOIN_RAILS = [
 
 export type NonChannelBitcoinRail = (typeof NON_CHANNEL_BITCOIN_RAILS)[number];
 
+/**
+ * Rails whose credit is a card charge the seller refunds through its card
+ * processor rather than in kind. Each funding keeps its own lot so the charge
+ * that bought it (`fundingRef`, the PaymentIntent id) stays addressable for a
+ * partial refund. A card lot carries no sats basis and is never priced in
+ * kind; no Bitcoin path reads it, because every such path is gated on
+ * {@link isNonChannelBitcoinRail} of the credit's own rail.
+ */
+export const CARD_FUNDED_RAILS = ["stripe"] as const satisfies readonly FundingMethod[];
+
+export type CardFundedRail = (typeof CARD_FUNDED_RAILS)[number];
+
+export function isCardFundedRail(rail: string | null | undefined): rail is CardFundedRail {
+  return typeof rail === "string" && (CARD_FUNDED_RAILS as readonly string[]).includes(rail);
+}
+
 export function isNonChannelBitcoinRail(
   rail: string | null | undefined
 ): rail is NonChannelBitcoinRail {
@@ -47,7 +63,7 @@ export function isNonChannelBitcoinRail(
 export interface FundingLot {
   lotId: string;
   creditId: string;
-  rail: NonChannelBitcoinRail;
+  rail: NonChannelBitcoinRail | CardFundedRail;
   /** Sats this funding delivered. `0` on a credit funded before a rail basis was recorded. */
   satsFunded: number;
   /** Explicit original-asset evidence, including a refund whose integer share is zero sats. */

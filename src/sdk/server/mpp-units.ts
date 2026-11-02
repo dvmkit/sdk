@@ -2,14 +2,17 @@ import { msatsToUsd } from "../../lib/payment-amounts";
 
 /**
  * Decimal places for each MPP method's native amount unit. Tempo USDC uses 6
- * decimals (TIP-20 stablecoin convention).
+ * decimals (TIP-20 stablecoin convention); a Stripe card charge is in USD
+ * cents.
  */
 function decimalsFor(methodName: string): number {
   switch (methodName) {
     case "tempo":
       return 6;
+    case "stripe":
+      return 2;
     default:
-      throw new Error(`mpp-units: unknown method '${methodName}' (expected 'tempo')`);
+      throw new Error(`mpp-units: unknown method '${methodName}' (expected 'tempo' or 'stripe')`);
   }
 }
 
@@ -52,12 +55,14 @@ export function methodDecimals(methodName: string): number {
 }
 
 /** Native asset tag for a given MPP method. */
-export function methodNativeAsset(methodName: string): "sats" | "usdc" {
+export function methodNativeAsset(methodName: string): "usdc" | "usd-cents" {
   switch (methodName) {
     case "tempo":
       return "usdc";
+    case "stripe":
+      return "usd-cents";
     default:
-      throw new Error(`mpp-units: unknown method '${methodName}' (expected 'tempo')`);
+      throw new Error(`mpp-units: unknown method '${methodName}' (expected 'tempo' or 'stripe')`);
   }
 }
 
