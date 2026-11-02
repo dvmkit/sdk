@@ -115,9 +115,11 @@ export interface SignedRequestVerifier<T> {
   ): T & CanonicalEnvelope;
 }
 
+/** Authentication failure; signature_required means no envelope fields were supplied. */
 export type SignedRequestFailure =
   | "schema_invalid"
   | "timestamp_drift"
+  | "signature_required"
   | "signature_invalid"
   | "replay_detected";
 
@@ -137,6 +139,14 @@ export const SIGNED_ENVELOPE_TYPES = {
 export const SIGNED_ENVELOPE_FIELDS = Object.keys(
   SIGNED_ENVELOPE_TYPES
 ) as readonly (keyof CanonicalEnvelope)[];
+
+/** Any envelope field selects signed verification, even when its value is malformed. */
+export function carriesSignedEnvelope(input: unknown): boolean {
+  return (
+    input !== null && typeof input === "object" && !Array.isArray(input) &&
+    SIGNED_ENVELOPE_FIELDS.some(field => field in input)
+  );
+}
 
 export class SignedRequestError extends Error {
   readonly code = "auth_error" as const;

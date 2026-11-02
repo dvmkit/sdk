@@ -16,6 +16,12 @@
     }
   },
   "wireContracts": {
+    "signatureRequired": {
+      "fixture": "protocol-fixtures/signature-required-v1.json",
+      "status": 401,
+      "subReason": "signature_required",
+      "behavior": "no envelope fields on a request requiring authentication; partial or invalid envelopes retain signature_invalid"
+    },
     "callerDeadline": {
       "fixture": "protocol-fixtures/caller-deadline-v1.json",
       "optionalFields": [

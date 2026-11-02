@@ -3,6 +3,7 @@ import {
   type SignedRequestDomain,
 } from "../../lib/signed-request-statement";
 import type { ZodLike } from "../types";
+import { callerInputIssues } from "./auth-error";
 import { protocolEnvelopeIgnoreFields } from "./request-envelope";
 import type {
   CanonicalEnvelope,
@@ -10,6 +11,7 @@ import type {
   SignedRequestVerifier,
 } from "./signed-request";
 import {
+  carriesSignedEnvelope,
   createDefaultReplayStore,
   createSignedRequestVerifier,
   SignedRequestError,
@@ -142,8 +144,20 @@ export function secp256k1Auth(opts: Secp256k1AuthOpts = {}): DVMAuthScheme {
     id: SIGNED_REQUEST_AUTH_ID,
     allowUnsignedPaid: opts.allowUnsignedPaid === true,
     checkAuth<T>(schema: ZodLike<T>, input: unknown, domain?: SignedRequestDomain) {
-      const envelope = getVerifier(schema).checkAuth(input, domain);
-      return { pubkey: envelope.pubkey, envelope };
+      try {
+        const envelope = getVerifier(schema).checkAuth(input, domain);
+        return { pubkey: envelope.pubkey, envelope };
+      } catch (err) {
+        // Input violations keep precedence; only an absent envelope gets the
+        // onboarding diagnostic. A partial envelope remains a signing failure.
+        if (
+          err instanceof SignedRequestError && err.sub_reason === "schema_invalid" &&
+          !carriesSignedEnvelope(input) && callerInputIssues(err.issues).length === 0
+        ) {
+          throw new SignedRequestError("signed request required", "signature_required");
+        }
+        throw err;
+      }
     },
     recheckSignature<T>(schema: ZodLike<T>, input: unknown, domain?: SignedRequestDomain): void {
       getVerifier(schema).verifySignature(input, domain);

@@ -1,0 +1,9 @@
+{
+  "status": 401,
+  "body": {
+    "error": "auth_error",
+    "sub_reason": "signature_required",
+    "display": "This capability requires a signed request",
+    "hint": "Run `npx @dvmkit/dvm-cli init`, then use `dvm request` to sign and send the request, or implement secp256k1+BIP-340 Schnorr signing with the domain-bound envelope described at https://dvmkit.com/docs/protocol."
+  }
+}

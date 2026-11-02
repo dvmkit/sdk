@@ -291,7 +291,8 @@ function typecheckConsumer(consumer, resolution) {
   writeFileSync(
     entry,
     [
-      `import { configureDVM, type UpfrontPayment, type JobRecord } from "${manifest.name}";`,
+      `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
+      `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
       `import { type UpfrontPayment as ServerUpfrontPayment, readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, type CreditFundingEvidence, type FundingRecord, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { MemoryJobStore } from "${manifest.name}/testing";`,
@@ -302,6 +303,8 @@ function typecheckConsumer(consumer, resolution) {
       "export const acceptedUpfront: UpfrontPayment = { amount_msats: 150000, amount_micro: 100000, currency: 'usd', credit_id: 'example-credit', draw_id: 'example-draw' };",
       "export const originalUpfront: JobRecord['upfrontPayment'] = acceptedUpfront;",
       "export const serverUpfront: ServerUpfrontPayment = acceptedUpfront;",
+      "export const missingSignature: SignedRequestFailure = 'signature_required';",
+      "export const serverMissingSignature: ServerSignedRequestFailure = missingSignature;",
       "export const historyStore: StreamableJobStore = new MemoryJobStore();",
       "export const verifiedSnapshotHistory = historyStore.getMessages('example-job', 0, { includeHeld: true });",
       "export const credentials: WalletCredentialConfig = { tempo: { method: 'tempo', network: 'moderato' } };",

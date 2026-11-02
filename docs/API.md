@@ -82,7 +82,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `SignedRequestAudience` | interface | Attested service identity a signed caller statement is intended for. |
 | `SignedRequestDomain` | interface | Operation fields kept outside the signed input to prevent schema substitution. |
 | `SignedRequestError` | class | Exported declaration from the built public entry point. |
-| `SignedRequestFailure` | type | Exported declaration from the built public entry point. |
+| `SignedRequestFailure` | type | Authentication failure; signature_required means no envelope fields were supplied. |
 | `SignedRequestReplayStore` | interface | Exported declaration from the built public entry point. |
 | `SignedRequestSignOpts` | interface | Exported declaration from the built public entry point. |
 | `signedRequestStatementHeader` | function | Build the versioned header persisted beside a caller's flat input envelope. |
@@ -263,7 +263,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `SignedRequestAudience` | interface | Attested service identity a signed caller statement is intended for. |
 | `SignedRequestDomain` | interface | Operation fields kept outside the signed input to prevent schema substitution. |
 | `SignedRequestError` | class | Exported declaration from the built public entry point. |
-| `SignedRequestFailure` | type | Exported declaration from the built public entry point. |
+| `SignedRequestFailure` | type | Authentication failure; signature_required means no envelope fields were supplied. |
 | `signedRequestInput` | function | Raw structured input for authentication and durable replay. |
 | `SignedRequestReplayStore` | interface | Exported declaration from the built public entry point. |
 | `SignedRequestSignOpts` | interface | Exported declaration from the built public entry point. |
