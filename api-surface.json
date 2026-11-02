@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.21.2",
+  "version": "0.22.0",
   "storeContracts": {
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean }",
