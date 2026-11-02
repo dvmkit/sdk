@@ -1123,6 +1123,175 @@ describe("POST /admin/credit/park-drain", () => {
       expect(res.status).toBe(400);
     });
   });
+
+  /* Refund-only service: Cashu receiving off, no wallet_accumulator table. */
+  describe("without accumulator mode", () => {
+    const EVIDENCE = {
+      source: "jit_mint" as const,
+      mint_url: MINT_URL,
+      quote_id: "quote-1",
+      face_sats: 400,
+      reserve_sats: 8,
+      invoice_msats: 400_400,
+    };
+    const JIT_BODY = {
+      credit_id: "c1",
+      drain_id: "d1",
+      consumed_row_ids: [] as string[],
+      keep_proofs: [] as unknown[],
+      mint_evidence: EVIDENCE,
+    };
+    const park = (app: Hono, body: Record<string, unknown>) =>
+      call(app, "POST", "/admin/credit/park-drain", body);
+    const touchesAccumulator = (queries: { text: string }[]) =>
+      queries.some((q) => q.text.includes("wallet_accumulator") || q.text.includes("melt_status"));
+
+    it("parks a valid JIT refund and the caller collects the same token", async () => {
+      const { app, ledger, queries } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      const res = await park(app, { ...JIT_BODY, token: refundToken() });
+      expect(res.status).toBe(200);
+
+      const drain = await ledger.getDrain({ creditId: "c1", drainId: "d1" });
+      expect(drain).toMatchObject({ status: "parked", token: refundToken() });
+      expect(drain?.fulfilment).toMatchObject({ source: "jit_mint", mintUrl: MINT_URL, faceSats: 400 });
+      const pickedUp = await ledger.markDrainPickedUp({ creditId: "c1", drainId: "d1" });
+      expect(pickedUp.drain.token).toBe(refundToken());
+
+      expect(touchesAccumulator(queries)).toBe(false);
+      const texts = queries.map((q) => q.text);
+      expect(texts.indexOf("COMMIT")).toBeGreaterThan(texts.indexOf("BEGIN"));
+    });
+
+    it.each([
+      ["no evidence", { consumed_row_ids: [], keep_proofs: [] }],
+      ["malformed evidence", { consumed_row_ids: [], keep_proofs: [], mint_evidence: { source: "jit_mint" } }],
+      ["evidence of an unknown source", { consumed_row_ids: [], keep_proofs: [], mint_evidence: { ...EVIDENCE, source: "swap" } }],
+      ["accumulator rows", { consumed_row_ids: ["r1"], keep_proofs: PARK_BODY.keep_proofs }],
+    ])("keeps refusing %s with the accumulator error", async (_name, extra) => {
+      const { app, ledger, queries } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      const res = await park(app, { credit_id: "c1", drain_id: "d1", token: refundToken(), ...extra });
+      expect(res.status).toBe(503);
+      await expect(res.json()).resolves.toMatchObject({ error: "accumulator_not_wired" });
+      expect((await ledger.getDrain({ creditId: "c1", drainId: "d1" }))?.status).toBe("pending");
+      expect(queries).toHaveLength(0);
+    });
+
+    it("keeps refusing a non-JSON body with the accumulator error", async () => {
+      const { app, queries } = makeHarness({ accumulatorWired: false });
+      const res = await app.request("/admin/credit/park-drain", {
+        method: "POST",
+        headers: { Authorization: signAuth("POST", "/admin/credit/park-drain") },
+        body: "not json",
+      });
+      expect(res.status).toBe(503);
+      expect(queries).toHaveLength(0);
+    });
+
+    it("refuses accumulator rows or change alongside valid evidence without a transition", async () => {
+      const { app, ledger, queries } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      for (const extra of [
+        { consumed_row_ids: ["r1"] },
+        { keep_proofs: PARK_BODY.keep_proofs },
+      ]) {
+        const res = await park(app, { ...JIT_BODY, token: refundToken(), ...extra });
+        expect(res.status).toBe(400);
+      }
+      expect((await ledger.getDrain({ creditId: "c1", drainId: "d1" }))?.status).toBe("pending");
+      expect(touchesAccumulator(queries)).toBe(false);
+    });
+
+    it("refuses unauthenticated requests", async () => {
+      const { app, ledger } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      const res = await app.request("/admin/credit/park-drain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...JIT_BODY, token: refundToken() }),
+      });
+      expect(res.status).toBe(401);
+      expect((await ledger.getDrain({ creditId: "c1", drainId: "d1" }))?.status).toBe("pending");
+    });
+
+    describe("refusals leave the drain pending", () => {
+      const cases: [string, (h: Harness) => Record<string, unknown>, number][] = [
+        ["wrong mint", () => ({ mint_evidence: { ...EVIDENCE, mint_url: "https://elsewhere.example.com" } }), 422],
+        ["wrong face value", () => ({ mint_evidence: { ...EVIDENCE, face_sats: 4_000 } }), 422],
+        ["a token locked to another key", () => ({ token: refundToken("02" + "99".repeat(32)) }), 422],
+        [
+          "a SPENT proof",
+          (h) => {
+            h.proofStates[0] = { state: CheckStateEnum.SPENT };
+            return {};
+          },
+          422,
+        ],
+        [
+          "an UNKNOWN proof state",
+          (h) => {
+            h.proofStates[0] = { state: "UNKNOWN" as never };
+            return {};
+          },
+          422,
+        ],
+        [
+          "an unreachable mint",
+          (h) => {
+            h.checkProofsStates.mockRejectedValueOnce(new Error("down"));
+            return {};
+          },
+          502,
+        ],
+      ];
+      it.each(cases)("%s", async (_name, mutate, status) => {
+        const h = makeHarness({ accumulatorWired: false });
+        await seedDrain(h.ledger);
+        const extra = mutate(h);
+        const res = await park(h.app, { ...JIT_BODY, token: refundToken(), ...extra });
+        expect(res.status).toBe(status);
+        expect((await h.ledger.getDrain({ creditId: "c1", drainId: "d1" }))?.status).toBe("pending");
+        expect(touchesAccumulator(h.queries)).toBe(false);
+      });
+
+      it("an unknown drain", async () => {
+        const { app, ledger } = makeHarness({ accumulatorWired: false });
+        await seedDrain(ledger);
+        const res = await park(app, { ...JIT_BODY, drain_id: "ghost", token: refundToken() });
+        expect(res.status).toBe(404);
+      });
+    });
+
+    it("replays the same token before and after pickup, and conflicts on a different token", async () => {
+      const { app, ledger } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      const other = refundToken(REFUND_PUBKEY).replace(/.$/, (c) => (c === "A" ? "B" : "A"));
+      expect(other).not.toBe(refundToken());
+      expect((await park(app, { ...JIT_BODY, token: refundToken() })).status).toBe(200);
+      expect((await park(app, { ...JIT_BODY, token: refundToken() })).status).toBe(200);
+      expect((await park(app, { ...JIT_BODY, token: other })).status).toBe(409);
+
+      await ledger.markDrainPickedUp({ creditId: "c1", drainId: "d1" });
+      const replay = await park(app, { ...JIT_BODY, token: refundToken() });
+      expect(replay.status).toBe(200);
+      await expect(replay.json()).resolves.toMatchObject({ status: "picked_up" });
+      expect((await park(app, { ...JIT_BODY, token: other })).status).toBe(409);
+      expect((await ledger.getDrain({ creditId: "c1", drainId: "d1" }))?.token).toBe(refundToken());
+    });
+
+    it("keeps one fulfilment under concurrent attempts", async () => {
+      const { app, ledger } = makeHarness({ accumulatorWired: false });
+      await seedDrain(ledger);
+      const results = await Promise.all(
+        Array.from({ length: 4 }, () => park(app, { ...JIT_BODY, token: refundToken() }))
+      );
+      expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200]);
+      const drain = await ledger.getDrain({ creditId: "c1", drainId: "d1" });
+      expect(drain).toMatchObject({ status: "parked", token: refundToken() });
+      expect(drain?.fulfilment).toMatchObject({ source: "jit_mint", quoteId: "quote-1" });
+    });
+  });
 });
 
 describe("POST /admin/credit/mark-drain-sent", () => {

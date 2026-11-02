@@ -522,13 +522,33 @@ async function handleBitcoinLiability(
 
 /**
  * Atomically retire consumed accumulator rows, insert change and park the refund token.
+ * A just-in-time mint park (valid `mint_evidence`, no rows, no change) needs no accumulator and
+ * is accepted whether or not accumulator mode is on.
  * Independently check caller P2PK locks, accepted builder change locks and NUT-7 UNSPENT
  * states; a tool’s token is not trusted merely because the tool is authenticated.
  */
 async function handleParkDrain(c: Context, opts: InstallAdminCreditRoutesOpts): Promise<Response> {
   const auth = await requireAuth(c, opts);
   if ("response" in auth) return auth.response;
-  if (!opts.accumulatorWired) {
+  let body: {
+    credit_id?: unknown;
+    drain_id?: unknown;
+    token?: unknown;
+    consumed_row_ids?: unknown;
+    keep_proofs?: unknown;
+    mint_evidence?: unknown;
+  } | null = null;
+  try {
+    body = await c.req.json();
+  } catch {
+    body = null;
+  }
+  // Only a just-in-time mint park is accumulator-independent: it consumes no rows and stores no
+  // change. Absent or malformed evidence never relaxes the accumulator requirement.
+  const earlyEvidence =
+    typeof body === "object" && body !== null ? parseMintEvidence(body.mint_evidence) : undefined;
+  const accumulatorFree = earlyEvidence !== undefined && earlyEvidence !== "invalid";
+  if (!opts.accumulatorWired && !accumulatorFree) {
     return c.json(
       {
         error: "accumulator_not_wired",
@@ -537,18 +557,7 @@ async function handleParkDrain(c: Context, opts: InstallAdminCreditRoutesOpts): 
       503
     );
   }
-
-  let body: {
-    credit_id?: unknown;
-    drain_id?: unknown;
-    token?: unknown;
-    consumed_row_ids?: unknown;
-    keep_proofs?: unknown;
-    mint_evidence?: unknown;
-  };
-  try {
-    body = await c.req.json();
-  } catch {
+  if (typeof body !== "object" || body === null) {
     return c.json({ error: "invalid_body", message: "Request body must be JSON." }, 400);
   }
   const creditId = body.credit_id;
@@ -752,7 +761,9 @@ async function handleParkDrain(c: Context, opts: InstallAdminCreditRoutesOpts): 
     );
   }
 
-  const consumed = await fetchRowsForMelt(opts.db, opts.dvmId, rowIds);
+  // A just-in-time park has no rows to look up; skipping the call keeps `wallet_accumulator`
+  // untouched on services that never created it.
+  const consumed = mintEvidence ? [] : await fetchRowsForMelt(opts.db, opts.dvmId, rowIds);
   if (consumed.length !== rowIds.length) {
     const found = new Set(consumed.map((r) => r.id));
     return c.json(
@@ -782,7 +793,7 @@ async function handleParkDrain(c: Context, opts: InstallAdminCreditRoutesOpts): 
   const client = await opts.db.connect();
   try {
     await client.query("BEGIN");
-    await markRowsDrained(client, rowIds, drainId, nowMs);
+    if (!mintEvidence) await markRowsDrained(client, rowIds, drainId, nowMs);
     if (keepProofs.length > 0) {
       await insertAccumulatorRows(opts.db, {
         dvmId: opts.dvmId,

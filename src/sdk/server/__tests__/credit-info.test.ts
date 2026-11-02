@@ -25,7 +25,7 @@ const stubFx: FxFetcher = {
   supportedCurrencies: () => ["usd"],
 };
 
-async function info(credit: boolean): Promise<Record<string, unknown>> {
+async function info(credit: boolean, extra: Partial<SDKServerOpts> = {}): Promise<Record<string, unknown>> {
   const ledger = durableLedger();
   await fundCredit(ledger, {
     creditId: "private-credit",
@@ -51,11 +51,23 @@ async function info(credit: boolean): Promise<Record<string, unknown>> {
     mints: ["https://mint.example.com"],
     paymentMethods: ["cashu"],
     fxFetcher: stubFx,
+    ...extra,
   });
   return (await (await app.request("/v1/info")).json()) as Record<string, unknown>;
 }
 
 describe("prepaid credit on /v1/info", () => {
+  it("advertises JIT refund park only where the admin park route is mounted, with Cashu receiving off", async () => {
+    const pool = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never;
+    const mounted = await info(true, {
+      db: pool, dvmId: "credit-info", lockPubkey: `02${"11".repeat(32)}`,
+    });
+    expect(mounted.credit).toMatchObject({ jit_refund_park: true });
+    expect(await info(true)).toHaveProperty("credit.min_micro");
+    expect((await info(true)).credit).not.toHaveProperty("jit_refund_park");
+    expect((await info(true, { db: pool, dvmId: "credit-info" })).credit).not.toHaveProperty("jit_refund_park");
+  });
+
   it("advertises public terms for an opted-in container DVM", async () => {
     const body = await info(true);
     expect(body.credit).toMatchObject({

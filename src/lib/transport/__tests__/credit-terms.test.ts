@@ -41,6 +41,14 @@ describe("parseCreditTerms", () => {
     });
   });
 
+  it("accepts JIT refund park support only as literal true", () => {
+    expect(parseCreditTerms({ ...TERMS, jit_refund_park: true })?.jit_refund_park).toBe(true);
+    for (const value of [false, "true", 1]) {
+      expect(parseCreditTerms({ ...TERMS, jit_refund_park: value })?.jit_refund_park).toBeUndefined();
+    }
+    expect(parseCreditTerms(TERMS)?.jit_refund_park).toBeUndefined();
+  });
+
   it("keeps caller echoes on quote and 402 menus", () => {
     const parsed = parseCreditMenu({ ...TERMS, credit_id: "credit-1", balance_micro: 200_000 });
     expect(parsed).toMatchObject({ credit_id: "credit-1", balance_micro: 200_000 });

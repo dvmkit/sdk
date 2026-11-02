@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "discovery": {
+    "receiving_off_supported": {
+      "credit": {
+        "min_micro": 100000,
+        "max_micro": 5000000,
+        "ttl_ms": 7776000000,
+        "currency": "usd",
+        "funding": ["lightning"],
+        "jit_refund_park": true
+      }
+    },
+    "old_server_unsupported": {
+      "credit": {
+        "min_micro": 100000,
+        "max_micro": 5000000,
+        "ttl_ms": 7776000000,
+        "currency": "usd",
+        "funding": ["lightning"]
+      }
+    }
+  },
+  "park_request": {
+    "method": "POST",
+    "path": "/admin/credit/park-drain",
+    "body": {
+      "credit_id": "example-credit",
+      "drain_id": "example-drain",
+      "token": "<cashu token locked to the drain's refund_pubkey>",
+      "consumed_row_ids": [],
+      "keep_proofs": [],
+      "mint_evidence": {
+        "source": "jit_mint",
+        "mint_url": "https://mint.example.com",
+        "quote_id": "example-quote",
+        "face_sats": 400,
+        "reserve_sats": 8,
+        "invoice_msats": 400400
+      }
+    }
+  }
+}
