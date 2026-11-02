@@ -167,6 +167,7 @@ import { MemoryCreditLedger } from "./memory-credit-ledger";
 import { MintHealthTracker } from "./mint-health-tracker";
 import { advertisedMethods, installHostedTempoChargeGuard,
   installHostedTempoCloseGuard, type MppxServer } from "./mpp-setup";
+import type { StripeCreditRail } from "./stripe-credit";
 import type {
   PaymentErrorDetail,
   PaymentInfo,
@@ -316,6 +317,11 @@ export interface SDKServerOpts {
   x402FacilitatorHealth?: X402FacilitatorHealthLike;
   /** MPP multi-rail payment handle (built via `createMppFromOpts`). */
   mpp?: MppxServer;
+  /**
+   * Card-funded prepaid credit (built via `createStripeCreditRail`). Only `POST /v1/credit`
+   * holds it, so no job surface can issue or accept a stripe challenge.
+   */
+  stripeCredit?: StripeCreditRail;
   /**
    * Tracks already-consumed upfront-flow MPP credentials so the same
    * credential can't satisfy `POST /v1/job` twice within its `expires`
@@ -2002,6 +2008,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       methods.push("x402");
     }
     if (this.opts.lightningReceive?.available()) methods.push("lightning");
+    if (this.opts.stripeCredit) methods.push("stripe");
     return methods;
   }
 
@@ -2291,6 +2298,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       tempoWithheld: mppSplit.withheld,
       x402Schemes: this.creditX402Schemes(),
       lightningFundingMinSats: this.opts.lightningReceive?.fundingMinSats,
+      stripeNetworkId: this.opts.stripeCredit?.networkId,
       // Configured, not advertised: `advertisedMints()` is health
       // filtered, and a rail that comes and goes with a mint's uptime is worse
       // product than one that is honestly absent.
@@ -2388,6 +2396,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           }
         : undefined,
       tempoSettlementReadiness: this.opts.tempoSettlementReadiness,
+      stripeCredit: this.opts.stripeCredit,
     });
   }
 

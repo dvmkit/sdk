@@ -11,7 +11,7 @@ export interface UpfrontPayment {
   amount_micro?: number;
   currency?: string;
   /** Funding rail for a credit hold, or the accepted per-call rail. */
-  rail?: "cashu" | "x402" | "tempo" | "lightning";
+  rail?: "cashu" | "x402" | "tempo" | "lightning" | "stripe";
   /** Allocated rail-native atomic units, distinct from credit denomination. */
   native_amount?: number;
   native_asset?: string;

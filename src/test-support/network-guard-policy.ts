@@ -45,6 +45,12 @@ export const TESTNET_TIERS: readonly TestnetTier[] = [
       X402_FACILITATOR_DEFAULT,
     ],
   },
+  {
+    // src/sdk/server/__tests__/credit-fund-stripe.integration.test.ts (Stripe test mode)
+    name: "stripe",
+    enabledBy: ["STRIPE_TEST_SECRET_KEY"],
+    urls: () => ["https://api.stripe.com"],
+  },
 ];
 
 /** Thrown by the network guard for an outbound `fetch` it refuses to make. */

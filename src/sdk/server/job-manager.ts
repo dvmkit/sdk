@@ -3887,7 +3887,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const currency = draw?.railValue.creditCurrency;
     if (draw?.status !== "settled" || draw.amountMicro <= 0 || !currency ||
         !rail || !isFundingRail(rail)) return;
-    const testFunds = rail === "lightning" ? null : this.opts.paymentMode?.rails[rail].testFunds ?? null;
+    const testFunds =
+      rail === "lightning" || rail === "stripe" ? null : this.opts.paymentMode?.rails[rail].testFunds ?? null;
     try {
       await callback({ jobId: record.id, rail, amountMicro: draw.amountMicro, currency, testFunds });
     } catch (error) {

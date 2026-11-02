@@ -37,7 +37,7 @@ export interface ProcessedPaymentStore {
 }
 
 /** Rails that commit through the marker (Cashu commits via the accumulator). */
-export type ProcessedPaymentRail = "x402" | "tempo";
+export type ProcessedPaymentRail = "x402" | "tempo" | "stripe";
 
 /** One recorded funding marker. */
 export interface ProcessedPaymentRecord {

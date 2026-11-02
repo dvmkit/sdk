@@ -22987,6 +22987,9 @@
         },
         {
           "module": "src/sdk/server/inline-result-wait.ts"
+        },
+        {
+          "module": "src/sdk/server/stripe-credit.ts"
         }
       ]
     },
@@ -24778,6 +24781,8 @@
           "destination": "sdk",
           "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
           "symbols": [
+            "CARD_FUNDED_RAILS",
+            "CardFundedRail",
             "DRAIN_DELIVERY_RESERVE_SATS",
             "FundingLot",
             "LotDebit",
@@ -24787,6 +24792,7 @@
             "depleteLots",
             "fifoOrder",
             "inKindDrawMsats",
+            "isCardFundedRail",
             "isInKindDepletion",
             "isNonChannelBitcoinRail",
             "lotOwedSats",
@@ -25086,6 +25092,7 @@
             "CreditMenuConfigInputs",
             "CreditTerms",
             "LIGHTNING_FLOOR_FX_MARGIN",
+            "STRIPE_CREDIT_MIN_MICRO",
             "attachCreditMenu",
             "buildCreditMenu",
             "creditMenuConfigured",
@@ -25122,6 +25129,7 @@
             "supported:./server#MountOpts",
             "supported:./server#OwnerDisplay",
             "supported:./server#PlatformReporterOpts",
+            "supported:./server#STRIPE_CREDIT_MIN_MICRO",
             "supported:./server#attachCreditMenu",
             "supported:./server#buildCreditMenu",
             "supported:./server#createDVMHost",
@@ -25281,6 +25289,12 @@
         },
         {
           "module": "src/sdk/server/x402-drain-leg.ts"
+        },
+        {
+          "module": "src/sdk/server/stripe-credit.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-lots.ts"
         }
       ]
     },
@@ -25702,6 +25716,9 @@
         },
         {
           "module": "src/sdk/server/memory-credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/stripe-credit.ts"
         }
       ]
     },
@@ -26569,6 +26586,9 @@
         },
         {
           "module": "src/sdk/server/content-retention.ts"
+        },
+        {
+          "module": "src/sdk/server/stripe-credit.ts"
         }
       ]
     },
@@ -28542,6 +28562,74 @@
       ]
     },
     {
+      "module": "src/sdk/server/stripe-credit.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "CreateStripeCreditRailOpts",
+            "StripeChargeOutcome",
+            "StripeCreditConfig",
+            "StripeCreditRail",
+            "StripeErrorCodes",
+            "createStripeCreditRail",
+            "stripeCreditConfigFromEnv"
+          ],
+          "consumerEvidence": [
+            "acceptance:./internal#PaymentInfo",
+            "acceptance:./internal#createDVMServer",
+            "acceptance:./server#CREDIT_REQUEST_SCHEMA",
+            "acceptance:./server#createDVMHost",
+            "acceptance:./server#serve",
+            "builder:./server#DVMHostOpts",
+            "builder:./server#DVMServeResult",
+            "builder:./server#PaidJobCompletion",
+            "builder:./server#serve",
+            "service:./internal#PaymentInfo",
+            "service:./internal#processIncomingPayment",
+            "service:./internal#verifyUpfrontPayment",
+            "service:./server#DVMHost",
+            "service:./server#DVMHostOpts",
+            "service:./server#createDVMHost",
+            "service:./server#serve",
+            "supported:./server#BuilderIdentity",
+            "supported:./server#CREDIT_REQUEST_SCHEMA",
+            "supported:./server#CreateStripeCreditRailOpts",
+            "supported:./server#CreditRequest",
+            "supported:./server#CreditRouteDeps",
+            "supported:./server#DVMHost",
+            "supported:./server#DVMHostOpts",
+            "supported:./server#DVMServeResult",
+            "supported:./server#JobManager",
+            "supported:./server#JobManagerOpts",
+            "supported:./server#MountOpts",
+            "supported:./server#OwnerDisplay",
+            "supported:./server#PaidJobCompletion",
+            "supported:./server#PaymentMode",
+            "supported:./server#PlatformReporterOpts",
+            "supported:./server#StripeChargeOutcome",
+            "supported:./server#StripeCreditConfig",
+            "supported:./server#StripeCreditRail",
+            "supported:./server#StripeErrorCodes",
+            "supported:./server#createDVMHost",
+            "supported:./server#createStripeCreditRail",
+            "supported:./server#handleCreditRequest",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/mpp-units.ts"
+        },
+        {
+          "module": "src/sdk/server/mpp-setup.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/server/payment-diagnostics.ts",
       "allocations": [
         {
@@ -28842,6 +28930,9 @@
         },
         {
           "module": "src/sdk/server/cashu-payment-request.ts"
+        },
+        {
+          "module": "src/sdk/server/stripe-credit.ts"
         }
       ]
     },

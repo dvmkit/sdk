@@ -17,8 +17,8 @@ Keep repository content publishable: no private repository names, tracker identi
 - Never acknowledge money movement without its durable accounting fact. Rail acceptance, credit funding/drawing, settlement evidence, and outbox/report writes must preserve their existing atomic or fail-closed ordering.
 - Prices passed by builders are major currency units; durable credit and settlement amounts use checked integer micro-units. Do not introduce floating-point comparison or rounding on a money boundary.
 - Completion settles a pending draw. Failure and cancellation release it. `ctx.fail(..., { refund: true })` is an annotation and must not be treated as the mechanism that moves money.
-- Prepaid balances remain caller-owned until the documented expiry release. Reusable channels return undrawn collateral through their lifecycle. One-payment stablecoin credit remains opt-in because unused balances create a manual reclaim obligation.
-- Cashu, x402, and Tempo are per-call payment methods. Lightning is a receive-only prepaid-credit funding leg, not an attached-proof job payment method. Never place spending credentials in a DVM process merely to make reclaim automatic.
+- Prepaid balances remain caller-owned until the documented expiry release. Reusable channels return undrawn collateral through their lifecycle. One-payment stablecoin credit remains opt-in because unused balances create a manual reclaim obligation. Card credit is also one payment, and its unused balance is owed back to the card as an automatic refund, never as a manual reclaim.
+- Cashu, x402, and Tempo are per-call payment methods. Lightning is a receive-only prepaid-credit funding leg, not an attached-proof job payment method. Card (`stripe`) is a prepaid-credit funding rail only: `/v1/job` never offers or accepts it. Never place spending credentials in a DVM process merely to make reclaim automatic.
 
 ## Contracts and tests
 

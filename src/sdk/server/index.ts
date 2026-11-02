@@ -84,8 +84,17 @@ export {
   attachCreditMenu,
   buildCreditMenu,
   selectPrimaryCredit,
+  STRIPE_CREDIT_MIN_MICRO,
   toCreditView,
 } from "./credit-menu";
+export type {
+  CreateStripeCreditRailOpts,
+  StripeChargeOutcome,
+  StripeCreditConfig,
+  StripeCreditRail,
+  StripeErrorCodes,
+} from "./stripe-credit";
+export { createStripeCreditRail } from "./stripe-credit";
 export type { CreditRequest, CreditRouteDeps } from "./credit-routes";
 export { CREDIT_REQUEST_SCHEMA, handleCreditRequest } from "./credit-routes";
 export type { PriceFiat } from "./funding";

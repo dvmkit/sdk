@@ -58,6 +58,11 @@ import {
   TEMPO_MODERATO_CHAIN_ID,
   TEMPO_MODERATO_RPC,
 } from "./mpp-setup";
+import {
+  createStripeCreditRail,
+  stripeCreditConfigFromEnv,
+  type StripeCreditRail,
+} from "./stripe-credit";
 import type { PayoutReporter, TempoPayoutReader, TempoSessionSettled } from "./payout-reporter";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import type { ReplayStoreBackend } from "./secp256k1-auth";
@@ -165,6 +170,11 @@ export interface DVMHostOpts {
   cashuMode?: CashuMode;
   /** MPP handle override. Defaults to env-resolved via `createMppFromOpts`. */
   mpp?: MppxServer;
+  /**
+   * Card-credit rail override. Defaults to env-resolved from `DVMKIT_STRIPE_SECRET_KEY` and
+   * `DVMKIT_STRIPE_NETWORK_ID`, with `DVMKIT_TEMPO_SECRET_KEY` binding its challenges.
+   */
+  stripeCredit?: StripeCreditRail;
   /** x402 stablecoin payment configuration. Defaults to env-resolved. */
   x402?: X402Config;
   /** Payment methods override. Defaults to derived from configured rails. */
@@ -536,6 +546,9 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       envMaybe.DVMKIT_RECEIPT_KEY ??
       (opts.devMode ? generateEphemeralReceiptKey().secret : undefined);
 
+    let stripeCredit = opts.stripeCredit;
+    const stripeCreditConfig = stripeCredit ? undefined : stripeCreditConfigFromEnv(envMaybe);
+
     let mpp = opts.mpp;
     let mppSecretState: MppSecretState | null = null;
     // An injected handle owns whatever stores its own methods were built with.
@@ -740,6 +753,25 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       } else {
         mpp = createMppFromOpts(mppOpts, env as NodeJS.ProcessEnv);
       }
+    }
+
+    if (stripeCreditConfig) {
+      // Card challenges share the Tempo HMAC secret, so they share its rotation window: a
+      // resend that crosses a key rotation must still book the charge it made.
+      let previousHmacSecret: (() => Promise<string | undefined>) | undefined;
+      if (pgPool) {
+        const { initMppSecretStateTable, applyMppSecretRotation, loadMppSecretState, DEFAULT_ROTATION_WINDOW_MS } =
+          await import("./mpp-secret-state");
+        if (!mppSecretState) {
+          await initMppSecretStateTable(pgPool);
+          mppSecretState = (
+            await applyMppSecretRotation(pgPool, stripeCreditConfig.hmacSecret, DEFAULT_ROTATION_WINDOW_MS)
+          ).state;
+        }
+        const localPool = pgPool;
+        previousHmacSecret = async () => (await loadMppSecretState(localPool))?.previous?.secret;
+      }
+      stripeCredit = createStripeCreditRail({ ...stripeCreditConfig, previousHmacSecret });
     }
 
     // Raw mode string for the boot summary (`"platform"` | a URL | undefined).
@@ -1006,6 +1038,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         x402: descX402WithDualServe,
         x402FacilitatorHealth: descX402Health,
         mpp: descMpp,
+        stripeCredit,
         consumedCredentialStore: opts.consumedCredentialStore ?? sharedPgConsumedStore,
         adminCashuNonceStore: sharedPgConsumedStore,
         cashuMode: cashuOpts.cashuMode,
@@ -1099,6 +1132,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       x402: bootX402,
       x402Support: bootX402Support,
       lightningReceive,
+      stripeCredit,
       fxSource,
       hasPlatformToken: !!platformToken,
       hasDvmId: !!cashuOpts.dvmId,
@@ -1539,6 +1573,7 @@ interface BootSummary {
   x402Support?: X402FacilitatorSupport;
   /** Lightning credit-funding receive leg, when one is configured. */
   lightningReceive?: LightningReceive;
+  stripeCredit?: StripeCreditRail;
   fxSource?: string;
   /** Whether a platform reporter token is wired — never the token itself. */
   hasPlatformToken: boolean;
@@ -1623,6 +1658,9 @@ function logBootSummary(s: BootSummary): void {
         ? `receive-only NWC (${s.lightningReceive.available() ? "reachable" : "unreachable — omitted from the funding menu"})`
         : "(unconfigured)"
     }`
+  );
+  diagnosticConsole.log(
+    `  Card credit:   ${s.stripeCredit ? `stripe (network ${s.stripeCredit.networkId})` : "(unconfigured)"}`
   );
   diagnosticConsole.log(
     `  Platform rep.: ${revenueReporterBannerState({

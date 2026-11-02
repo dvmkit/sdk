@@ -47,6 +47,14 @@
     "nut24InlineResult": {
       "fixture": "protocol-fixtures/nut24-inline-result-v1.json",
       "behavior": "unsigned NUT-24 paid submits and replays return completed results inline within the configured wait; running jobs fall back to 202; completed artifact results include durable messages when their serialized UTF-8 array is at most 1048576 bytes and content is available"
+    },
+    "cardCreditFunding": {
+      "fixture": "protocol-fixtures/credit-fund-stripe-v1.json",
+      "optionalFields": [
+        "credit.stripe"
+      ],
+      "unit": "integer USD micro-units on the wire; integer cents on the MPP challenge",
+      "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it"
     }
   },
   "exports": [
@@ -182,6 +190,7 @@
         "ContentHoldStore",
         "ContentHoldsResponse",
         "CreateSignedRequestVerifierOpts",
+        "CreateStripeCreditRailOpts",
         "CreateX402BatchSettlementServerOpts",
         "CreditDrawRefundArgs",
         "CreditDrawRefundResult",
@@ -282,6 +291,7 @@
         "SSRFGuardOpts",
         "SSRFReason",
         "SSRFResolver",
+        "STRIPE_CREDIT_MIN_MICRO",
         "Secp256k1AuthOpts",
         "SignedRequestAudience",
         "SignedRequestDomain",
@@ -293,6 +303,10 @@
         "SignedRequestVerifier",
         "StalePendingDrawCursor",
         "StreamableJobStore",
+        "StripeChargeOutcome",
+        "StripeCreditConfig",
+        "StripeCreditRail",
+        "StripeErrorCodes",
         "TempoCloseReportSummary",
         "TempoCloseReportsResponse",
         "TempoDrainDecision",
@@ -340,6 +354,7 @@
         "createDVMHost",
         "createPinnedFetch",
         "createSignedRequestVerifier",
+        "createStripeCreditRail",
         "createX402BatchSettlementServer",
         "creditEnvelopeIgnoreFields",
         "drawSettlementRef",

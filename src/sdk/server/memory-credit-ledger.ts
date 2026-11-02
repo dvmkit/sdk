@@ -53,6 +53,7 @@ import {
   type FundingLot,
   inKindDrawMsats,
   isInKindDepletion,
+  isCardFundedRail,
   isNonChannelBitcoinRail,
   type LotDebit,
   lotOwedSats,
@@ -1154,6 +1155,13 @@ export class MemoryCreditLedger implements CreditLedgerLike {
           `credit ${args.creditId} belongs to a different caller pubkey`
         );
       }
+      if (isCardFundedRail(credit.rail)) {
+        // Card credit is refunded to the card; no other payout rail may carry it out.
+        throw new CreditLedgerError(
+          "rail_mismatch",
+          `credit ${args.creditId} was funded by card and cannot be drained`
+        );
+      }
       const existing = credit.drains.get(args.drainId);
       if (existing) {
         if (
@@ -1789,7 +1797,7 @@ function recordLot(
   basis: CreditFundingBasis,
   nowMs: number
 ): void {
-  if (!isNonChannelBitcoinRail(basis.rail)) return;
+  if (!isNonChannelBitcoinRail(basis.rail) && !isCardFundedRail(basis.rail)) return;
   if (basis.tempoSession || basis.x402Channel) return;
   credit.lots.push({
     lotId: `lot:${randomUUID()}`,

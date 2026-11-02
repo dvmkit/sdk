@@ -12,9 +12,10 @@ export interface ReceiptPayment {
   /**
    * Rail of the most recent successful credit; `null` when nothing was paid.
    * `lightning` appears on a draw against a credit the caller funded by
-   * invoice — it is a funding rail, never an attached-proof one.
+   * invoice — it is a funding rail, never an attached-proof one. `stripe`
+   * likewise appears only on a draw against card-funded credit.
    */
-  rail: "cashu" | "x402" | "tempo" | "lightning" | null;
+  rail: "cashu" | "x402" | "tempo" | "lightning" | "stripe" | null;
   /** Rail-native upfront amount (sats / USDC microunits), `null` when absent. */
   native_amount: number | null;
   native_asset: string | null;

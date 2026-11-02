@@ -35,6 +35,7 @@ import {
   isFundingRail,
   x402SettlementPending,
 } from "./credit-ledger";
+import { isCardFundedRail } from "./credit-lots";
 import type { CreditMenu } from "./credit-menu";
 import { lightningFloorMicro } from "./credit-menu";
 import { derivedFundCreditId, isDerivedCreditId } from "./funding";
@@ -47,9 +48,11 @@ import {
   paymentErrorBody,
   TempoSessionChannelMismatchError,
   verifyTempoSessionManagementCredential,
+  verifyCardFunding,
   verifyUpfrontPayment,
 } from "./payment";
 import type { ReceiptIssuer } from "./receipt-issuer";
+import type { StripeCreditRail } from "./stripe-credit";
 import type { DVMAuthScheme } from "./secp256k1-auth";
 import type { CanonicalEnvelope } from "./signed-request";
 import { SignedRequestError } from "./signed-request";
@@ -95,9 +98,10 @@ export const CREDIT_REQUEST_SCHEMA = z.object({
       /**
        * Lightning names an invoice request; MPP names the charge/session
        * intent before a credential exists, so a bound credit can refuse the
-       * wrong instrument before issuing or broadcasting anything.
+       * wrong instrument before issuing or broadcasting anything. Stripe names
+       * a card top-up: its MPP `method="stripe"` challenge is issued only here.
        */
-      method: z.enum(["lightning", "tempo"]).optional(),
+      method: z.enum(["lightning", "tempo", "stripe"]).optional(),
       /** Required with `method: "tempo"`; invalid on every other funding rail. */
       intent: z.enum(["charge", "session"]).optional(),
     })
@@ -175,6 +179,8 @@ export interface CreditRouteDeps {
   /** Hosting gate around a fresh funding operation, after caller auth and before any rail effect. */
   withFundingAdmission?: (c: Context<AppEnv>, body: CreditRequest, run: () => Promise<Response>) => Promise<Response>;
   tempoSettlementReadiness?: TempoSettlementReadiness;
+  /** Card-credit rail; absent refuses `method: "stripe"`. */
+  stripeCredit?: StripeCreditRail;
 }
 
 export async function handleCreditRequest(
@@ -464,6 +470,10 @@ async function handleDrain(
 
   const rejected = await burnNonce(c, deps, args.envelope);
   if (rejected) return rejected;
+
+  // Card credit goes back to the card it came from, and only that way: a payout on any
+  // other rail would turn a card charge (which can still be disputed) into crypto.
+  if (isCardFundedRail(credit.rail)) return c.json(cardCreditNotDrainable(credit), 409);
 
   const target = validateDrainTarget(drain);
   if ("error" in target) return c.json(target.error, 400);
@@ -1507,6 +1517,20 @@ function validateDrainTarget(drain: {
   }
 }
 
+function cardCreditNotDrainable(credit: CreditSnapshot): Record<string, unknown> {
+  return {
+    error: "card_credit_not_drainable",
+    message: "This credit was funded by card. Card credit is refunded to the card that paid for it, never paid out on another rail.",
+    display: credit.expired
+      ? "This balance was paid by card and has expired. It will be refunded to that card; it can't be reclaimed from here."
+      : "This balance was paid by card, so it can only go back to that card. Reclaiming it from here isn't available yet.",
+    hint: credit.expired
+      ? "Don't retry this drain on another method; none will be accepted for card-funded credit. The balance can no longer pay for jobs; it will be refunded to the card it came from."
+      : "Don't retry this drain on another method; none will be accepted for card-funded credit. Keep using the balance for jobs until it expires. Refunds back to the card will be added in a later release.",
+    retryable: false,
+  };
+}
+
 /**
  * Channel-less stablecoin refunds must use the credit’s funding rail. Reusable channels
  * return collateral through their own lifecycle; non-channel Bitcoin refunds use Cashu.
@@ -1517,6 +1541,7 @@ function railMismatchRefusal(
 ): Record<string, unknown> | undefined {
   if (method !== "x402" && method !== "tempo") return undefined;
   if (!isFundingRail(credit.rail) || credit.rail === method) return undefined;
+  if (isCardFundedRail(credit.rail)) return cardCreditNotDrainable(credit);
   const target =
     credit.rail === "cashu" || credit.rail === "lightning"
       ? "--method cashu"
@@ -1742,6 +1767,15 @@ async function handleFund(
   });
   if (sizing) return sizing;
 
+  if (fund.method === "stripe" && (!menu.stripe || !deps.stripeCredit)) {
+    return jsonPaymentError("payment_invalid", 409, {
+      message: "This DVM does not offer card funding for prepaid credit.",
+      display: "This service doesn't take card payments for prepaid credit. Nothing was charged.",
+      hint: "Fund the credit over one of the rails listed in credit.funding on /v1/info.",
+      extra: { alternatives: menu.funding.filter((rail) => rail !== "stripe") },
+    });
+  }
+
   // Preserve a bound instrument’s specific refusal. A fresh one-shot stablecoin deposit is
   // refused before settlement unless explicitly enabled; an already-committed replay remains
   // valid.
@@ -1756,22 +1790,25 @@ async function handleFund(
     });
   }
 
-  let requiredMsats: number;
-  try {
-    const fx = await deps.fxFetcher.fetch();
-    requiredMsats =
-      fiatToSatsCeil(fund.amount_micro / 1_000_000, fxRateFor(fx, menu.currency)) * 1000;
-  } catch {
-    return c.json(
-      {
-        error: "fx_rate_unavailable",
-        message: `Could not price a ${menu.currency} top-up in sats right now.`,
-        display: "The service can't work out the exchange rate right now. Nothing was charged.",
-        hint: "Retry in a few moments.",
-        retryable: true,
-      },
-      503
-    );
+  // A card top-up is charged in USD cents and never priced through a sats quote.
+  let requiredMsats = 0;
+  if (fund.method !== "stripe") {
+    try {
+      const fx = await deps.fxFetcher.fetch();
+      requiredMsats =
+        fiatToSatsCeil(fund.amount_micro / 1_000_000, fxRateFor(fx, menu.currency)) * 1000;
+    } catch {
+      return c.json(
+        {
+          error: "fx_rate_unavailable",
+          message: `Could not price a ${menu.currency} top-up in sats right now.`,
+          display: "The service can't work out the exchange rate right now. Nothing was charged.",
+          hint: "Retry in a few moments.",
+          retryable: true,
+        },
+        503
+      );
+    }
   }
 
   if (fund.method === "lightning") {
@@ -1795,18 +1832,26 @@ async function handleFund(
       "dvm.credit.fund",
       { required_msats: requiredMsats },
       () =>
-        verifyUpfrontPayment({
-          ...railOpts,
-          requiredMsats,
-          priceFiat: { currency: menu.currency, amountMicro: fund.amount_micro },
-          callerPubkey: args.callerPubkey,
-          fundOnly: {
-            creditId,
-            fundId: fund.fund_id,
-            commitment,
-            allowOneShotStablecoin: deps.creditConfig?.allowOneShotStablecoin,
-          },
-        }),
+        fund.method === "stripe"
+          ? verifyCardFunding({
+              ...railOpts,
+              stripeCredit: deps.stripeCredit,
+              amountMicro: fund.amount_micro,
+              callerPubkey: args.callerPubkey,
+              fundOnly: { creditId, fundId: fund.fund_id, commitment },
+            })
+          : verifyUpfrontPayment({
+              ...railOpts,
+              requiredMsats,
+              priceFiat: { currency: menu.currency, amountMicro: fund.amount_micro },
+              callerPubkey: args.callerPubkey,
+              fundOnly: {
+                creditId,
+                fundId: fund.fund_id,
+                commitment,
+                allowOneShotStablecoin: deps.creditConfig?.allowOneShotStablecoin,
+              },
+            }),
       { onError: () => ({ "error.code": "credit_fund_failed" }) }
     );
     error = result.error;
@@ -2187,6 +2232,20 @@ async function checkSizing(
     return jsonPaymentError("credit_below_min", 400, {
       message: `Top-up of ${args.amountMicro} is below the ${menu.min_micro} minimum.`,
       extra: { min_micro: menu.min_micro, max_micro: menu.max_micro, currency: menu.currency },
+    });
+  }
+  // The card processor's own floor, above a lower credit minimum.
+  if (args.rail === "stripe" && menu.stripe && args.amountMicro < menu.stripe.min_micro) {
+    return jsonPaymentError("below_rail_minimum", 400, {
+      message: `Top-up of ${args.amountMicro} micro-${menu.currency.toUpperCase()} is below the ${menu.stripe.min_micro} micro-${menu.currency.toUpperCase()} card minimum.`,
+      display: "Card top-ups start at $0.50. Nothing was charged.",
+      hint: `Ask for a top-up of at least ${menu.stripe.min_micro} micro-USD ($0.50) and sign the fund request again with that amount.`,
+      extra: {
+        rail: "stripe",
+        min_micro: menu.stripe.min_micro,
+        alternatives: menu.funding.filter((rail) => rail !== "stripe"),
+        currency: menu.currency,
+      },
     });
   }
 
