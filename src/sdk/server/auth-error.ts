@@ -38,11 +38,13 @@ export function authErrorBody(
     };
   }
 
-  // Envelope-side: a missing/malformed envelope, an envelope that parsed but
-  // came back mistyped, or a real signature failure. One answer for all of them.
+  // Schema failures with no disclosed input issues describe a malformed
+  // envelope. The auth scheme classifies an absent envelope separately.
   const subReason = err.sub_reason === "schema_invalid" ? "signature_invalid" : err.sub_reason;
   const display = (() => {
     switch (subReason) {
+      case "signature_required":
+        return "This capability requires a signed request";
       case "signature_invalid":
         return "Request signature didn't match the supplied pubkey";
       case "timestamp_drift":
@@ -61,7 +63,9 @@ export function authErrorBody(
     error: "auth_error",
     sub_reason: subReason,
     display,
-    hint: "Regenerate the request with the current timestamp + a fresh nonce; sign with secp256k1+BIP-340 Schnorr over the canonical JSON form of the input.",
+    hint: subReason === "signature_required"
+      ? "Run `npx @dvmkit/dvm-cli init`, then use `dvm request` to sign and send the request, or implement secp256k1+BIP-340 Schnorr signing with the domain-bound envelope described at https://dvmkit.com/docs/protocol."
+      : "Regenerate the request with the current timestamp + a fresh nonce; sign with secp256k1+BIP-340 Schnorr over the canonical JSON form of the input.",
   };
 }
 

@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import signatureRequired from "../../../../protocol-fixtures/signature-required-v1.json";
 
 import { configureDVM } from "../../configure";
 import { MemoryKVStore } from "../../store";
@@ -156,22 +157,43 @@ describe("a schema-invalid input gets one answer from /v1/quote and /v1/job", ()
     expect(quote.body.message).toContain("audio_url");
   });
 
-  it("leaves an unsigned request to the auth gate, on the schema shape that declares the envelope required", async () => {
-    const app = await startDVM({ schema: requiredEnvelopeSchema, auth: true });
-    // Valid input, no signing envelope. The input parse fails naming `pubkey` /
-    // `signature`, but that is a signing failure — answering it as an input
-    // problem is the mistake in reverse, so both routes defer.
+  it.each([requiredEnvelopeSchema, optionalEnvelopeSchema])("asks for a signature when no envelope was supplied (%#)", async schema => {
+    const app = await startDVM({ schema, auth: true, free: true });
+    // Required envelope fields fail input parsing; optional ones reach auth
+    // directly. Both schema shapes must produce the same diagnostic.
     const [quote, job] = await bothEndpoints(app, { audio_url: "https://example.com/a.mp3" });
 
-    expect(quote.status).toBe(job.status);
-    expect(quote.status).toBe(401);
-    expect(quote.body.error).toBe(job.body.error);
-    expect(quote.body.error).toBe("auth_error");
-    expect(quote.body.sub_reason).toBe("signature_invalid");
-    expect(job.body.sub_reason).toBe("signature_invalid");
-    expect(quote.body.display).toBe("Request signature didn't match the supplied pubkey");
-    expect(job.body.display).toBe(quote.body.display);
-    expect(quote.body.hint).toContain("Schnorr");
+    for (const answer of [quote, job]) {
+      expect(answer.status).toBe(signatureRequired.status);
+      expect(answer.body).toEqual(signatureRequired.body);
+    }
+  });
+
+  it.each(["pubkey", "signature", "timestamp", "nonce", "auth_statement"])(
+    "keeps a partial or malformed %s envelope inside signature_invalid on both routes",
+    async field => {
+      const app = await startDVM({ schema: requiredEnvelopeSchema, auth: true });
+      const answers = await bothEndpoints(app, { audio_url: "https://example.com/a.mp3", [field]: null });
+      for (const answer of answers) {
+        expect(answer.status).toBe(401);
+        expect(answer.body).toMatchObject({
+          error: "auth_error", sub_reason: "signature_invalid",
+          display: "Request signature didn't match the supplied pubkey",
+        });
+      }
+    }
+  );
+
+  it("keeps a present but wrong signature inside signature_invalid on both routes", async () => {
+    const app = await startDVM({ schema: requiredEnvelopeSchema, auth: true });
+    const data = sign(requiredEnvelopeSchema, { audio_url: "https://example.com/a.mp3" });
+    const answers = await bothEndpoints(app, { ...data, audio_url: "https://example.com/b.mp3" });
+    for (const answer of answers) {
+      expect(answer.status).toBe(401);
+      expect(answer.body).toMatchObject({
+        sub_reason: "signature_invalid", display: "Request signature didn't match the supplied pubkey",
+      });
+    }
   });
 
   it("names the input when a body is both misshapen and unsigned — input wins on both", async () => {

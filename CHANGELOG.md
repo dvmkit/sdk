@@ -22,6 +22,8 @@
 
 ### Bug fixes
 
+- Requests with no signing envelope now receive HTTP 401 `auth_error` with `signature_required` and instructions for signing through the CLI or protocol. Malformed envelopes and wrong signatures retain `signature_invalid`; eligible unsigned paid calls retain their 402 challenge. Clients that enumerate auth sub-reasons must accept the new value. See `protocol-fixtures/signature-required-v1.json`.
+
 - NWC requests now return a transport error when a relay socket closes between connection and publication, instead of leaving an unhandled rejection that can terminate the process. The pinned `nostr-tools` dependency is updated to 2.25.4, whose publish path handles send failures; Lightning invoice funding returns its existing unavailable response.
 
 - Shared Postgres pools now recover through a full pool of stale idle connections after suspend/resume, including admin, job, and credit queries. Direct checkouts pass a bounded read-only probe before callers receive them, evicting detected stale connections before transaction or advisory-lock work. Recovery limits attempts by pool size and stops starting retries when the connection-timeout window expires; request-specific recovery deadlines remain supported. No API or storage migration is required.

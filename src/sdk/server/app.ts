@@ -3096,7 +3096,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (err instanceof SignedRequestError) return err;
       throw err;
     }
-    return new SignedRequestError("signed request required", "signature_invalid");
+    return new SignedRequestError("signed request required", "signature_required");
   }
 
   /**

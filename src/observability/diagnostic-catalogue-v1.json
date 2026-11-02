@@ -863,6 +863,7 @@
     "server_error",
     "sha256_mismatch",
     "signature_invalid",
+    "signature_required",
     "size_mismatch",
     "source_unreachable",
     "ssrf_blocked",

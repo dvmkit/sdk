@@ -1,6 +1,6 @@
 import { CREDIT_ENVELOPE_KEYS } from "./credit-envelope";
 import type { DVMAuthScheme } from "./secp256k1-auth";
-import { SIGNED_ENVELOPE_FIELDS, signedRequestInput } from "./signed-request";
+import { carriesSignedEnvelope, SIGNED_ENVELOPE_FIELDS, signedRequestInput } from "./signed-request";
 import type { ZodLike } from "../types";
 
 /**
@@ -14,9 +14,7 @@ export function takesUnsignedPath(
   body: { input?: string; data?: unknown }
 ): boolean {
   if (!auth?.allowUnsignedPaid) return false;
-  const raw = signedRequestInput(body);
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return true;
-  return !SIGNED_ENVELOPE_FIELDS.some((field) => field in raw);
+  return !carriesSignedEnvelope(signedRequestInput(body));
 }
 
 /** True when a raw request input names any prepaid-credit envelope key. */

@@ -1,5 +1,11 @@
 # Protocol notes
 
+## Missing request signatures
+
+An unsigned `POST /v1/job` or `POST /v1/quote` that requires authentication returns HTTP 401 `auth_error` with `sub_reason: "signature_required"`. The [portable response](../protocol-fixtures/signature-required-v1.json) includes a display explaining that signing is required and a hint with two ways to sign: run `npx @dvmkit/dvm-cli init`, then `dvm request`, or implement the domain-bound signing envelope from the [protocol guide](https://dvmkit.com/docs/protocol).
+
+A body is unsigned only when its raw structured input contains none of `pubkey`, `signature`, `timestamp`, `nonce` or `auth_statement`. A partial or malformed envelope, or a wrong signature, retains `signature_invalid` and its existing display. Input-schema violations retain their existing precedence. This adds an auth sub-reason; clients that enumerate sub-reasons must accept the new value. It does not change which requests require signing: eligible unsigned paid submits still receive their 402 challenge, while free capabilities, quotes and unsigned calls refused before payment require signing. No storage migration is required.
+
 ## Temporary job-read failures
 
 `GET /v1/job/:id` and `GET /v1/job/:id/messages` return HTTP 503 with `Retry-After: 1` and the [portable `job_read_unavailable` envelope](../protocol-fixtures/job-read-unavailable-v1.json) when a storage connection, startup, or capacity failure prevents a read. The body has `retryable: true`, `display`, and `hint`. Retry the same read after one second, preserving the job ID, credentials, and `after` cursor. Missing credentials remain 401; an unknown job or wrong owner remains 404 when storage can be read. Other internal errors remain 500 without a retry hint.
