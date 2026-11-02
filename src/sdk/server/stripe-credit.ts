@@ -5,8 +5,11 @@ import { Credential, Errors as MppxErrors, PaymentRequest } from "mppx";
 import { Mppx } from "mppx/server";
 import { charge as stripeCharge } from "mppx/stripe/server";
 
+import { diagnosticConsole } from "../../observability/diagnostic-console";
+import type { CardChargeJournal } from "./card-charge-journal";
 import { MPPX_HMAC_MISMATCH_REASON } from "./mpp-setup";
 import { fiatMicroToMethodAmount } from "./mpp-units";
+import { createStripeRefundApi, type StripeRefundApi } from "./stripe-refund-api";
 
 /** The env vars that opt a DVM into card-funded credit. */
 export interface StripeCreditConfig {
@@ -114,6 +117,10 @@ export interface StripeCreditRail {
     credential: string,
     args: { amountMicro: number; resourcePath: string }
   ): Promise<StripeChargeOutcome>;
+  /** The same Stripe account's refund, dispute and lookup calls, for returning card credit. */
+  refunds: StripeRefundApi;
+  /** The charge-attempt journal the sweep reads to find charges that were never booked. */
+  chargeJournal?: CardChargeJournal;
 }
 
 export interface CreateStripeCreditRailOpts extends StripeCreditConfig {
@@ -123,6 +130,11 @@ export interface CreateStripeCreditRailOpts extends StripeCreditConfig {
    * across a redeploy can book the charge it made.
    */
   previousHmacSecret?: () => Promise<string | undefined>;
+  /**
+   * Where each charge attempt's challenge id is noted before Stripe is called, so a charge
+   * that is never booked can be found and refunded. See {@link CardChargeJournal}.
+   */
+  chargeJournal?: CardChargeJournal;
   /** Stripe API origin. Tests point it at a local fake. */
   apiBase?: string;
   fetch?: typeof fetch;
@@ -160,6 +172,8 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
 
   return {
     networkId: opts.networkId,
+    refunds: createStripeRefundApi({ secretKey: opts.secretKey, apiBase, fetch: fetchImpl }),
+    ...(opts.chargeJournal && { chargeJournal: opts.chargeJournal }),
 
     async issueChallenge({ amountMicro, resourcePath, expires }) {
       return issuer.challenge.stripe.charge({
@@ -178,6 +192,12 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       }
       if (credential.challenge.method !== "stripe" || credential.challenge.intent !== "charge") {
         return invalidCredential("the credential is not for a stripe charge challenge");
+      }
+      try {
+        await opts.chargeJournal?.record(credential.challenge.id);
+      } catch {
+        // Recovery aid only: the charge and its booking do not depend on it.
+        diagnosticConsole.warn({ event: "card_charge_journal_failed" });
       }
       // The decimal amount ("0.60"); mppx turns it into cents for Stripe.
       const amount = fiatMicroToMethodAmount(amountMicro, "stripe");

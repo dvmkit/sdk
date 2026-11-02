@@ -45,7 +45,7 @@ async function consoleOutput<T>(run: () => Promise<T>): Promise<{ result: T; log
   return { result, logged: lines.join("\n") };
 }
 
-describe("card-funded credit cannot be drained", () => {
+describe("card-funded credit drains only back to the card", () => {
   it("refuses cashu, x402 and tempo drains and records no drain", async () => {
     const { app, ledger } = await cardServer();
     const credential = await credentialFor(app, "held");
@@ -62,14 +62,14 @@ describe("card-funded credit cannot be drained", () => {
       expect(response.status, attempt.method).toBe(refusals.drain_card_credit.status);
       const body = await response.json();
       expect(body).toMatchObject(refusals.drain_card_credit.body);
-      expect(body.hint).not.toMatch(/cashu|ecash|--method/i);
-      expect(body.hint).toMatch(/Keep using the balance for jobs/);
+      expect(body.hint).not.toMatch(/cashu|ecash/i);
+      expect(body.hint).toMatch(/method "stripe"/);
     }
     expect((await ledger.get(creditId))?.balanceMicro).toBe(600_000);
     expect(await ledger.listPendingDrains()).toEqual([]);
   });
 
-  it("tells the caller an expired card balance goes back to the card, not to jobs", async () => {
+  it("tells the caller an expired card balance goes back to the card", async () => {
     const { app, ledger } = await cardServer();
     await ledger.fund({
       creditId: "expired-card",
@@ -87,8 +87,8 @@ describe("card-funded credit cannot be drained", () => {
     });
     expect(response.status).toBe(409);
     const body = await response.json();
-    expect(body.hint).not.toMatch(/using the balance for jobs/);
-    expect(body.hint).toMatch(/refunded to the card/);
+    expect(body.display).toMatch(/has expired/);
+    expect(body.display).toMatch(/refunded there automatically/);
   });
 
   it("refuses a card-credit drain at the ledger, whichever route asks", async () => {

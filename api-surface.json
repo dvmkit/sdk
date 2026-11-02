@@ -55,6 +55,16 @@
       ],
       "unit": "integer USD micro-units on the wire; integer cents on the MPP challenge",
       "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it"
+    },
+    "cardCreditRefund": {
+      "fixture": "protocol-fixtures/credit-drain-stripe-v1.json",
+      "optionalFields": [
+        "drain.refund_ids",
+        "drain.card_refund",
+        "credit.refund_drain_id"
+      ],
+      "unit": "integer USD micro-units for the drained credit; integer cents for refunds and the fee share",
+      "behavior": "POST /v1/credit drain with method stripe and no payout refunds card-funded credit to the card as partial refunds of the funding PaymentIntents, oldest first, less the refund's proportional share of Stripe's processing fee; card credit drains on no other method and stripe drains no other credit; a refund Stripe does not finish leaves the drain pending and a poll retries it; an expired card balance is refunded the same way and the credit closes (credit_closed)"
     }
   },
   "exports": [
@@ -176,6 +186,8 @@
         "CREDIT_ENVELOPE_KEYS",
         "CREDIT_REQUEST_SCHEMA",
         "CanonicalEnvelope",
+        "CardChargeAttempt",
+        "CardChargeJournal",
         "ClientCompatibility",
         "ClientCompatibilityEnv",
         "ClientCompatibilityGate",
@@ -303,10 +315,15 @@
         "SignedRequestVerifier",
         "StalePendingDrawCursor",
         "StreamableJobStore",
+        "StripeChargeFacts",
         "StripeChargeOutcome",
         "StripeCreditConfig",
         "StripeCreditRail",
+        "StripeDispute",
         "StripeErrorCodes",
+        "StripePaymentIntentSummary",
+        "StripeRefund",
+        "StripeRefundApi",
         "TempoCloseReportSummary",
         "TempoCloseReportsResponse",
         "TempoDrainDecision",

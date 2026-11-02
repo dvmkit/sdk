@@ -99,6 +99,7 @@ import {
 } from "./consumed-credential-store";
 import { type CreditEnvelope, CreditEnvelopeError, extractCreditEnvelope } from "./credit-envelope";
 import type { CreditExpirySweepOpts } from "./credit-expiry-sweep";
+import { startCardRefundSweep } from "./card-refund-sweep";
 import { startCreditExpirySweep } from "./credit-expiry-sweep";
 import { CreditLedger, type CreditLedgerLike, type CreditSnapshot, type DrawRecord } from "./credit-ledger";
 import type { PostgresTempoChargeStore } from "./tempo-charge-store";
@@ -544,6 +545,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   let payoutReporter: PayoutReporter | undefined;
   let unsubscribeTempoSettlementReadiness: (() => void) | undefined;
   let creditExpirySweep: ReturnType<typeof startCreditExpirySweep>;
+  let cardRefundSweep: ReturnType<typeof startCardRefundSweep>;
   let x402ChannelStorage: PostgresX402ChannelStorage | undefined;
   let x402BatchSettlement: X402BatchSettlementServer | undefined;
   let server: DVMServer<State, InputSchema> | undefined;
@@ -582,6 +584,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
       await capture(() => payoutReporter?.stop());
       await capture(() => revenueReporter?.stop());
       await capture(() => creditExpirySweep?.stop());
+      await capture(() => cardRefundSweep?.stop());
       await capture(() => unsubscribeTempoSettlementReadiness?.());
       if (settlementStopped) await capture(() => settlementStopped);
       if (x402ChannelStorage) {
@@ -967,6 +970,20 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   // recovered payload is already in its durable queue; JobManager keeps a
   // periodic pass running for crashes on sibling machines after this boot.
   await server.jobManager.recoverTerminalCosts();
+  // Card refunds share the expiry sweep's cadence: they include the expiry refund of card
+  // credit, which the release sweep deliberately leaves alone.
+  if (opts.stripeCredit) {
+    cardRefundSweep = startCardRefundSweep(
+      {
+        ledger: creditLedger,
+        stripe: opts.stripeCredit.refunds,
+        drainReport: { db: opts.db, dvmId, enqueueCreditDrain },
+        ...(server.drainReceiptIssuer && { receiptIssuer: server.drainReceiptIssuer }),
+        ...(opts.stripeCredit.chargeJournal && { journal: opts.stripeCredit.chargeJournal }),
+      },
+      opts.creditExpirySweep
+    );
+  }
   return {
     app: server.app,
     authAudience: server.authAudience,
@@ -1060,6 +1077,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   private tempoSweepLastAttemptMs = 0;
   private readonly receiptIssuer?: ReceiptIssuer;
   private readonly creditLedger: CreditLedgerLike;
+
+  /** Countersigns reclaim events outside a request, such as a card refund the sweep finishes. */
+  get drainReceiptIssuer(): ReceiptIssuer | undefined {
+    return this.receiptIssuer;
+  }
   private readonly processedPayments: ProcessedPaymentStore;
   readonly authAudience?: SignedRequestAudience;
   /** Lazily constructed when a refreshed facilitator probe gains batch support. */
@@ -1573,6 +1595,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         // DVM wired with an in-memory session store resolves to a rail with no
         // close-intent read and the verbs answer 503.
         tempoDrainRail: () => Promise.resolve(this.opts.mpp),
+        ...(this.opts.stripeCredit && { stripeRefunds: this.opts.stripeCredit.refunds }),
         ...(this.opts.hostedSettlementReports ? {
           hostedSettlementReports: { store: this.opts.hostedSettlementReports },
         } : {}),

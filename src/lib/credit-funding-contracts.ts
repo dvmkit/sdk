@@ -13,9 +13,10 @@ export type CreditFundRail = (typeof CREDIT_FUND_RAILS)[number];
 
 /**
  * Lightning invoices fund credit but do not provide a reclaim credential; reclaim uses the other
- * supported payout rails.
+ * supported payout rails. `stripe` refunds card-funded credit to the card, and is the only
+ * rail that credit drains on.
  */
-export const CREDIT_DRAIN_RAILS = ["cashu", "x402", "tempo"] as const;
+export const CREDIT_DRAIN_RAILS = ["cashu", "x402", "tempo", "stripe"] as const;
 
 export type CreditDrainRail = (typeof CREDIT_DRAIN_RAILS)[number];
 

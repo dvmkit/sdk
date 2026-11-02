@@ -34,7 +34,7 @@ import type {
 } from "./credit-ledger";
 import type { DrainFulfilment } from "./credit-ledger";
 import { CreditLedgerError, DRAIN_METHODS } from "./credit-ledger";
-import { isCardFundedRail, netOwedSats } from "./credit-lots";
+import { netOwedSats } from "./credit-lots";
 import { derivedFundCreditId, isDerivedCreditId } from "./funding";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { LightningReceive } from "./lightning-receive";
@@ -59,6 +59,8 @@ import {
   X402_SPEND_BLOCKING_SETTLEMENT_STATUSES,
   type X402SettlementCursor,
 } from "./x402-channel-store";
+import { cardRefundSummary, runStripeDrain } from "./stripe-drain-leg";
+import type { StripeRefundApi } from "./stripe-refund-api";
 import { completeX402ChannelDrain } from "./x402-drain-leg";
 import {
   X402ExactSettlementEvidenceMissingError,
@@ -115,6 +117,8 @@ export interface InstallAdminCreditRoutesOpts {
   onTempoDrainReconciled?: TransactionalPayoutHook<TempoCloseReconciled>;
   hostedSettlementReports?: { store: HostedSettlementReportObligations };
   walletProvider?: typeof getWallet;
+  /** Stripe calls that refund card credit; absent when the DVM has no card rail. */
+  stripeRefunds?: StripeRefundApi;
   /** Override for the current time (tests). Returns ms since epoch. */
   now?: () => number;
 }
@@ -389,7 +393,7 @@ async function handlePendingDrains(
   const auth = await requireAuth(c, opts);
   if ("response" in auth) return auth.response;
 
-  const pending = await withoutCardCredit(opts.ledger, await opts.ledger.listPendingDrains());
+  const pending = await opts.ledger.listPendingDrains();
   // Fetch FX only for Cashu drains lacking a recorded in-kind obligation. An outage must not
   // block listing already-priced liabilities.
   const needsRate = pending.some((d) => d.method === "cashu" && d.owedSats === null);
@@ -421,8 +425,14 @@ async function handlePendingDrains(
       : (d.owedSats ?? netOwedSats(fiatToSatsCeil(d.amountMicro / 1_000_000, rateFor(d.currency))));
     // Channel-backed stablecoin drains belong to cooperative reconciliation, not manual
     // settlement. Classifying them as manual could hide the pending close behind an
-    // operator’s sent booking.
-    const settlement = automatic ? "automatic" : d.channelId === null ? "manual" : "channel";
+    // operator’s sent booking. Card refunds are made by Stripe calls, never by hand.
+    const settlement = automatic
+      ? "automatic"
+      : d.method === "stripe"
+        ? "card"
+        : d.channelId === null
+          ? "manual"
+          : "channel";
     return {
       credit_id: d.creditId,
       drain_id: d.drainId,
@@ -439,6 +449,7 @@ async function handlePendingDrains(
       settlement,
       channel_id: d.channelId,
       created_at: d.createdAt,
+      ...(d.method === "stripe" && { card_refund: cardRefundStatus(d) }),
     };
   });
 
@@ -460,6 +471,9 @@ async function handlePendingDrains(
     channel_micro: drains
       .filter((d) => d.settlement === "channel")
       .reduce((sum, d) => sum + d.amount_micro, 0),
+    card_micro: drains
+      .filter((d) => d.settlement === "card")
+      .reduce((sum, d) => sum + d.amount_micro, 0),
   };
 
   // Carry health-filtered mints on this response because a zero-float worker has no
@@ -480,7 +494,7 @@ async function handleBitcoinLiability(
   if ("response" in auth) return auth.response;
 
   const deposit = await opts.ledger.bitcoinDepositLiability();
-  const pending = await withoutCardCredit(opts.ledger, await opts.ledger.listPendingDrains());
+  const pending = await opts.ledger.listPendingDrains();
   const promised = pending.filter((d) => d.method === "cashu" && d.status === "pending");
   const drainSats = promised.reduce((sum, d) => sum + (d.owedSats ?? 0), 0);
   const drainsUnpriced = promised.filter((d) => d.owedSats === null).length;
@@ -894,6 +908,10 @@ async function handleMarkDrainSent(
       409
     );
   }
+
+  // A card refund is booked only on Stripe's word: this verb retries its refunds rather than
+  // taking the operator's. The plan on the drain makes a retry safe to repeat.
+  if (existing?.method === "stripe") return retryCardRefund(c, opts, existing);
 
   // Commit the terminal CAS and drain report together. Only the non-replayed transition
   // queues it; recovery calls may repeat this endpoint.
@@ -2708,17 +2726,63 @@ function parseSerializedDleq(raw: unknown): { e: string; s: string; r?: string }
   return { e: dleq.e, s: dleq.s, ...(dleq.r !== undefined ? { r: dleq.r } : {}) };
 }
 
-/**
- * Card credit is refunded to the card, never by a payout worker. The ledger refuses card
- * drains; this keeps any row that predates that guard out of the payout queue as well.
- */
-async function withoutCardCredit(
-  ledger: CreditLedgerLike,
-  drains: CreditDrainRecord[]
-): Promise<CreditDrainRecord[]> {
-  const card = new Set<string>();
-  for (const creditId of new Set(drains.map((drain) => drain.creditId))) {
-    if (isCardFundedRail((await ledger.get(creditId))?.rail)) card.add(creditId);
+/** A pending card refund's progress, for the operator deciding whether to retry it. */
+function cardRefundStatus(drain: CreditDrainRecord): Record<string, unknown> {
+  const plan = drain.cardRefund;
+  if (!plan) return { planned: false };
+  const summary = cardRefundSummary(plan);
+  return {
+    planned: true,
+    refunded_cents: summary.refundedCents,
+    fee_share_cents: summary.feeShareCents,
+    sub_cent_micro: summary.subCentMicro,
+    refund_ids: summary.refundIds,
+    refunds: plan.entries.map((entry) => ({
+      payment_intent: entry.paymentIntentId,
+      refund_id: entry.refundId,
+      amount_cents: entry.amountCents,
+      fee_share_cents: entry.feeShareCents,
+      attempt: entry.attempt,
+      status: entry.status,
+      last_error: entry.lastError,
+    })),
+  };
+}
+
+async function retryCardRefund(
+  c: Context,
+  opts: InstallAdminCreditRoutesOpts,
+  drain: CreditDrainRecord
+): Promise<Response> {
+  if (drain.status === "sent") {
+    return c.json({ status: "sent", credit_id: drain.creditId, drain_id: drain.drainId, replayed: true });
   }
-  return drains.filter((drain) => !card.has(drain.creditId));
+  if (!opts.stripeRefunds) {
+    return c.json(
+      {
+        error: "card_refund_unavailable",
+        message: "This DVM has no Stripe secret key configured, so it cannot refund to the card.",
+      },
+      503
+    );
+  }
+  const { drain: after, completed } = await runStripeDrain(
+    {
+      ledger: opts.ledger,
+      drainReport: { db: opts.db, dvmId: opts.dvmId, enqueueCreditDrain: opts.enqueueCreditDrain },
+      stripe: opts.stripeRefunds,
+      ...(opts.receiptIssuer && { receiptIssuer: opts.receiptIssuer }),
+    },
+    drain
+  );
+  return c.json(
+    {
+      status: after.status,
+      credit_id: after.creditId,
+      drain_id: after.drainId,
+      replayed: after.status === "sent" && !completed,
+      card_refund: cardRefundStatus(after),
+    },
+    after.status === "sent" ? 200 : 202
+  );
 }

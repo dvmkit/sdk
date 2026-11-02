@@ -19,6 +19,7 @@ const EXPECTED_RETRYABLE: Record<PaymentErrorCode, boolean> = {
   insufficient_credit: true,
   credit_expired: true,
   credit_unbacked: false,
+  credit_closed: false,
   credit_not_found: true,
   tempo_channel_closing: false,
   // only the operator finishing or closing out the wedged refund

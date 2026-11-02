@@ -2326,6 +2326,7 @@ export type PaymentErrorCode =
   | "insufficient_credit"
   | "credit_expired"
   | "credit_unbacked"
+  | "credit_closed"
   | "credit_not_found"
   | "tempo_channel_closing"
   | "settlement_pending"
@@ -2480,6 +2481,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     display:
       "This prepaid balance is closed because its Tempo channel finalized before the service could collect the value it had accepted. No drawable or reclaimable balance remains.",
     hint: "Do not retry, top up, or drain this credit. Pay per call or open a separate prepaid balance.",
+    retryable: false,
+  },
+  credit_closed: {
+    display:
+      "This card-funded balance is closed: either its expired balance was refunded to the card, or a dispute on the card payment froze it. It can't pay for jobs, take a top-up, or be drained.",
+    hint: "Do not retry with this credit_id. Pay per call, or open a new prepaid balance by funding without a credit_id.",
     retryable: false,
   },
   credit_not_found: {
@@ -5909,6 +5916,7 @@ function creditLedgerErrorResult(
     err.code === "insufficient_credit" ||
     err.code === "credit_expired" ||
     err.code === "credit_unbacked" ||
+    err.code === "credit_closed" ||
     err.code === "credit_not_found" ||
     err.code === "tempo_channel_closing" ||
     err.code === "settlement_pending" ||
