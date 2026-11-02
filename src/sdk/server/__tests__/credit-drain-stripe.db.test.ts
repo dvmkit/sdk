@@ -281,6 +281,13 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     });
     await ledger.release({ creditId: "waiting", drawId: "hold" });
 
+    // Waiting credits leave the listing's page to the rest, and are refused if asked directly.
+    const listed = await ledger.listExpiredCardCredits({ nowMs: now });
+    expect(listed).toContain("neighbour");
+    expect(listed).not.toContain("waiting");
+    expect(listed).not.toContain("squatter");
+    expect(await ledger.openCardExpiryRefund({ creditId: "waiting", nowMs: now })).toBeUndefined();
+
     const summary = await runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {} }, { nowMs: now });
     expect(summary.failedSteps).toEqual([]);
     // Credits from earlier tests share this schema, so look only at these two.
@@ -324,6 +331,31 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     // Nothing was spent: $2.00 less the whole 36-cent fee.
     expect([...account.refunds.values()].map((r) => [r.payment_intent, r.amount])).toEqual([["pi_won", 164]]);
     expect((await ledger.get("lost"))?.status).toBe("disputed");
+  });
+
+  it("keeps a credit frozen for a lost dispute that has aged out of the recent listing", async () => {
+    const account = fakeStripeAccount();
+    const DAY_MS = 24 * HOUR_MS;
+    const now = Date.now();
+    const expiryMs = now + 400 * DAY_MS;
+    for (const pi of ["pi_aged_lost", "pi_recent_won"]) {
+      await cardCredit(account, { creditId: "two-disputes", pi, cents: 1000, expiryMs, fundedAtMs: now - 300 * DAY_MS });
+    }
+    const sweep = (nowMs: number) =>
+      runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {} }, { nowMs });
+
+    // 100 days ago the lost dispute was recent, and froze the credit.
+    account.dispute("pi_aged_lost", "lost", now - 200 * DAY_MS);
+    expect((await sweep(now - 100 * DAY_MS)).frozen).toContain("two-disputes");
+
+    // Now it is older than the listing reaches, and a dispute on the other top-up is won.
+    account.dispute("pi_recent_won", "won", now - 10 * DAY_MS);
+    const pass = await sweep(now);
+    expect(pass.unfrozen).not.toContain("two-disputes");
+    expect((await ledger.get("two-disputes"))?.status).toBe("disputed");
+    await expect(
+      ledger.draw({ creditId: "two-disputes", drawId: "j", amountMicro: 15_000_000, jobId: "j" })
+    ).rejects.toMatchObject({ code: "credit_closed" });
   });
 
   it("keeps searching for a charge Stripe does not show yet, within a day", async () => {

@@ -2827,7 +2827,11 @@ export class CreditLedger {
     return (await this.readDrain(this.pool, args.creditId, args.drainId))?.card_refund ?? null;
   }
 
-  /** Expired card credits still holding balance and no pending holds, oldest expiry first. */
+  /**
+   * Expired card credits still holding balance, with no pending holds and no card refund in
+   * progress, oldest expiry first. A credit waiting on its refund drops out of the page, so
+   * one that can never finish does not crowd out the rest.
+   */
   async listExpiredCardCredits(args: { nowMs?: number; limit?: number } = {}): Promise<string[]> {
     const { rows } = await this.pool.query<{ credit_id: string }>(
       `SELECT c.credit_id FROM credits c
@@ -2835,6 +2839,10 @@ export class CreditLedger {
           AND c.rail = ANY($3::text[])
           AND NOT EXISTS (
             SELECT 1 FROM credit_draws d WHERE d.credit_id = c.credit_id AND d.status = 'pending'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM credit_drains r
+             WHERE r.credit_id = c.credit_id AND r.method = 'stripe' AND r.status = 'pending'
           )
         ORDER BY c.expiry_ms
         LIMIT $2`,
@@ -2923,37 +2931,36 @@ export class CreditLedger {
   }
 
   /**
-   * Lift the freeze on credits this PaymentIntent funded once its disputes are settled in
-   * the caller's favour (won, or a closed warning). A credit stays frozen while any other
-   * PaymentIntent that funded it is in `stillBlocking` (open or lost). Returns the credits
-   * this call unfroze; they are `active` again and refundable, including at expiry.
+   * Frozen credits this PaymentIntent funded, each with every card PaymentIntent that funded
+   * it: the sweep checks all of them with Stripe before lifting a freeze.
    */
-  async unfreezeCardCreditsForPaymentIntent(
-    paymentIntentId: string,
-    stillBlocking: readonly string[]
-  ): Promise<string[]> {
-    const { rows } = await this.pool.query<{ credit_id: string }>(
-      `SELECT DISTINCT credit_id FROM credit_funding_lots
-        WHERE funding_ref = $1 AND rail = ANY($2::text[])`,
+  async disputedCardCreditsFundedBy(
+    paymentIntentId: string
+  ): Promise<{ creditId: string; paymentIntentIds: string[] }[]> {
+    const { rows } = await this.pool.query<{ credit_id: string; refs: string[] }>(
+      `SELECT l.credit_id, array_agg(DISTINCT l.funding_ref) AS refs
+         FROM credit_funding_lots l JOIN credits c ON c.credit_id = l.credit_id
+        WHERE c.status = 'disputed' AND l.rail = ANY($2::text[]) AND l.funding_ref IS NOT NULL
+          AND l.credit_id IN (
+            SELECT credit_id FROM credit_funding_lots WHERE funding_ref = $1 AND rail = ANY($2::text[])
+          )
+        GROUP BY l.credit_id`,
       [paymentIntentId, [...CARD_FUNDED_RAILS]]
     );
-    const unfrozen: string[] = [];
-    for (const { credit_id } of rows) {
-      const changed = await this.withCreditLock(credit_id, async (client, credit) => {
-        if (credit.status !== "disputed") return false;
-        const { rows: blocking } = await client.query(
-          `SELECT 1 FROM credit_funding_lots
-            WHERE credit_id = $1 AND rail = ANY($2::text[]) AND funding_ref = ANY($3::text[])
-            LIMIT 1`,
-          [credit_id, [...CARD_FUNDED_RAILS], [...stillBlocking]]
-        );
-        if (blocking.length > 0) return false;
-        await client.query(`UPDATE credits SET status = 'active' WHERE credit_id = $1`, [credit_id]);
-        return true;
-      });
-      if (changed) unfrozen.push(credit_id);
-    }
-    return unfrozen;
+    return rows.map((row) => ({ creditId: row.credit_id, paymentIntentIds: row.refs }));
+  }
+
+  /**
+   * Lift a dispute freeze: the credit is `active` and refundable again, including at expiry.
+   * The caller decides that no top-up of the credit has an open or lost dispute. Returns
+   * false when the credit was not frozen.
+   */
+  async unfreezeCardCredit(creditId: string): Promise<boolean> {
+    return this.withCreditLock(creditId, async (client, credit) => {
+      if (credit.status !== "disputed") return false;
+      await client.query(`UPDATE credits SET status = 'active' WHERE credit_id = $1`, [creditId]);
+      return true;
+    });
   }
 
   /** True when a funding lot books this PaymentIntent: the charge reached a credit. */
@@ -3956,10 +3963,10 @@ export interface CreditLedgerLike {
     nowMs?: number;
   }): Promise<CreditDrainRecord | undefined>;
   freezeCardCreditsForPaymentIntent?(paymentIntentId: string): Promise<string[]>;
-  unfreezeCardCreditsForPaymentIntent?(
-    paymentIntentId: string,
-    stillBlocking: readonly string[]
-  ): Promise<string[]>;
+  disputedCardCreditsFundedBy?(
+    paymentIntentId: string
+  ): Promise<{ creditId: string; paymentIntentIds: string[] }[]>;
+  unfreezeCardCredit?(creditId: string): Promise<boolean>;
   cardFundingBooked?(paymentIntentId: string): Promise<boolean>;
   /**
    * Ask that gate directly, so a route can refuse a wedged channel **before**

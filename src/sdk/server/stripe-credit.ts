@@ -193,17 +193,24 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       if (credential.challenge.method !== "stripe" || credential.challenge.intent !== "charge") {
         return invalidCredential("the credential is not for a stripe charge challenge");
       }
-      try {
-        await opts.chargeJournal?.record(credential.challenge.id);
-      } catch {
-        // Recovery aid only: the charge and its booking do not depend on it.
-        diagnosticConsole.warn({ event: "card_charge_journal_failed" });
-      }
+      // Journaled only once mppx has verified the challenge and is about to call Stripe, so a
+      // forged or expired credential leaves no row for the stranded-charge search to chase.
+      const journal = opts.chargeJournal;
+      const beforeCharge = journal
+        ? async () => {
+            try {
+              await journal.record(credential.challenge.id);
+            } catch {
+              // Recovery aid only: the charge and its booking do not depend on it.
+              diagnosticConsole.warn({ event: "card_charge_journal_failed" });
+            }
+          }
+        : undefined;
       // The decimal amount ("0.60"); mppx turns it into cents for Stripe.
       const amount = fiatMicroToMethodAmount(amountMicro, "stripe");
       const attempt: ChargeAttempt = {};
       const broadcast = (secretKey: string) =>
-        build(fetchClient({ apiBase, secretKey: opts.secretKey, fetchImpl, attempt }), secretKey)
+        build(fetchClient({ apiBase, secretKey: opts.secretKey, fetchImpl, attempt, beforeCharge }), secretKey)
           .broadcastCredential(serialized, {
             request: { amount },
             meta: { path: resourcePath, nonce: readNonce(credential.challenge) },
@@ -309,11 +316,13 @@ function fetchClient(args: {
   secretKey: string;
   fetchImpl: typeof fetch;
   attempt: ChargeAttempt;
+  beforeCharge?: () => Promise<void>;
 }): StripeClientLike {
   return {
     paymentIntents: {
       async create(params, options) {
         args.attempt.called = true;
+        await args.beforeCharge?.();
         const response = await args.fetchImpl(`${args.apiBase}/v1/payment_intents`, {
           method: "POST",
           headers: {

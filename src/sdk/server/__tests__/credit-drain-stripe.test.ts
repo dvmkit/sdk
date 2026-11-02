@@ -4,16 +4,28 @@ import { readFileSync } from "node:fs";
 
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { Hono } from "hono";
+import { Credential } from "mppx";
 import { describe, expect, it, vi } from "vitest";
 
 import { buildAdminChallenge } from "../admin-cashu";
 import { installAdminCreditRoutes } from "../admin-credit";
+import type { CardChargeJournal } from "../card-charge-journal";
 import { MemoryConsumedCredentialStore } from "../consumed-credential-store";
 import type { CreditLedgerLike } from "../credit-ledger";
 import { derivedFundCreditId } from "../funding";
 import { toLockPubkey } from "../lock-pubkey-store";
+import { createStripeCreditRail } from "../stripe-credit";
 import { createStripeRefundApi } from "../stripe-refund-api";
-import { CALLER, cardServer, credentialFor, drain, fund, type App } from "./__helpers__/card-credit";
+import {
+  CALLER,
+  cardServer,
+  credentialFor,
+  drain,
+  fund,
+  HMAC,
+  paymentChallenges,
+  type App,
+} from "./__helpers__/card-credit";
 import { fundCredit } from "./__helpers__/credit-fixtures";
 import { cardFee, fakeStripeAccount, type FakeStripeAccount } from "./__helpers__/fake-stripe-account";
 
@@ -314,6 +326,48 @@ describe("a top-up of an expired card credit", () => {
     expect(await response.json()).toMatchObject({ error: "credit_closed" });
     expect(response.headers.get("WWW-Authenticate")).toBeNull();
     expect(account.calls).toHaveLength(0);
+  });
+});
+
+describe("the charge journal", () => {
+  it("records a charge only after its challenge verifies, so a forged one leaves no row", async () => {
+    const account = fakeStripeAccount();
+    const recorded: string[] = [];
+    const journal: CardChargeJournal = {
+      record: (challengeId) => {
+        recorded.push(challengeId);
+        return Promise.resolve();
+      },
+      listUnresolved: () => Promise.resolve([]),
+      resolve: () => Promise.resolve(),
+    };
+    const { app } = await cardServer({
+      stripe: null,
+      serverOpts: {
+        stripeCredit: createStripeCreditRail({
+          secretKey: "sk_test_fake",
+          networkId: "profile_test",
+          hmacSecret: HMAC,
+          apiBase: "https://stripe.invalid",
+          fetch: account.fetchImpl,
+          chargeJournal: journal,
+        }),
+      },
+    });
+
+    const discovery = await fund(app, { fundId: "forged" });
+    const [challenge] = paymentChallenges(discovery);
+    const forged = Credential.serialize(
+      Credential.from({ challenge: { ...challenge!, id: "made-up-challenge-id" }, payload: { spt: "spt_test" } })
+    );
+    const refused = await fund(app, { fundId: "forged", credential: forged });
+    expect(refused.status).not.toBe(200);
+    expect(recorded).toEqual([]);
+    expect(account.calls).toHaveLength(0);
+
+    const genuine = await credentialFor(app, "genuine");
+    expect((await fund(app, { fundId: "genuine", credential: genuine })).status).toBe(200);
+    expect(recorded).toEqual([Credential.deserialize(genuine).challenge.id]);
   });
 });
 

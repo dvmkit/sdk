@@ -89,6 +89,10 @@ export interface StripeRefundApi {
     createdGte: number;
     startingAfter?: string;
   }): Promise<{ disputes: StripeDispute[]; hasMore: boolean }>;
+  /** Every dispute on one PaymentIntent, however old (first page of 100; a charge has one). */
+  listDisputesForPaymentIntent(
+    paymentIntentId: string
+  ): Promise<{ disputes: StripeDispute[]; hasMore: boolean }>;
   /** PaymentIntents whose `metadata[key]` equals `value`, via Stripe's search API. */
   searchPaymentIntentsByMetadata(key: string, value: string): Promise<StripePaymentIntentSummary[]>;
 }
@@ -175,6 +179,20 @@ export function createStripeRefundApi(opts: StripeRefundApiOpts): StripeRefundAp
     async listDisputes(args) {
       const query = new URLSearchParams({ "created[gte]": String(args.createdGte), limit: "100" });
       if (args.startingAfter) query.set("starting_after", args.startingAfter);
+      const page = await call("GET", "/v1/disputes", { query });
+      return {
+        disputes: arrayOf(page.data).map((d) => ({
+          id: stringOr(d.id, ""),
+          paymentIntentId: typeof d.payment_intent === "string" ? d.payment_intent : null,
+          status: stringOr(d.status, "unknown"),
+          created: integerOr(d.created, 0),
+        })),
+        hasMore: page.has_more === true,
+      };
+    },
+
+    async listDisputesForPaymentIntent(paymentIntentId) {
+      const query = new URLSearchParams({ payment_intent: paymentIntentId, limit: "100" });
       const page = await call("GET", "/v1/disputes", { query });
       return {
         disputes: arrayOf(page.data).map((d) => ({

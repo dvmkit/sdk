@@ -66,14 +66,18 @@ export function fakeStripeAccount() {
     return full;
   }
 
-  /** Open a dispute. Stripe keeps `charge.disputed` true for good, whatever the outcome. */
-  function dispute(paymentIntentId: string, status = "needs_response"): void {
+  /**
+   * Open a dispute, created at `createdMs`. The account's dispute list honours `created[gte]`
+   * and `payment_intent` as Stripe's does. Stripe keeps `charge.disputed` true for good,
+   * whatever the outcome.
+   */
+  function dispute(paymentIntentId: string, status = "needs_response", createdMs = Date.now()): void {
     const intent = intents.get(paymentIntentId);
     if (intent) intent.disputed = true;
     disputes.unshift({
       id: `dp_${disputes.length + 1}`,
       payment_intent: paymentIntentId,
-      created: Math.floor(Date.now() / 1000),
+      created: Math.floor(createdMs / 1000),
       status,
     });
   }
@@ -203,7 +207,12 @@ export function fakeStripeAccount() {
       return refund ? Response.json(refundBody(refund)) : missing();
     }
     if (method === "GET" && path === "/v1/disputes") {
-      return Response.json({ data: disputes, has_more: false });
+      const pi = url.searchParams.get("payment_intent");
+      const createdGte = Number(url.searchParams.get("created[gte]") ?? 0);
+      const data = disputes.filter(
+        (entry) => (pi === null || entry.payment_intent === pi) && entry.created >= createdGte
+      );
+      return Response.json({ data, has_more: false });
     }
     return missing();
   }) as typeof fetch;

@@ -194,9 +194,10 @@ export function startCardRefundSweep(
 
 /**
  * Freeze credits whose funding payment has an open or lost dispute, and unfreeze those
- * whose disputes all ended in the merchant's favour. Unfreezing waits for a complete
- * listing: a page that failed or was cut off could hide a dispute still open on another
- * PaymentIntent of the same credit.
+ * whose disputes all ended in the merchant's favour. The recent listing only nominates
+ * candidates: a credit is unfrozen after every PaymentIntent that funded it is checked
+ * with Stripe one by one, with no date bound, so a lost dispute keeps it frozen however
+ * old it is.
  */
 async function applyDisputes(
   deps: CardRefundSweepDeps,
@@ -205,11 +206,9 @@ async function applyDisputes(
 ): Promise<void> {
   const freeze = deps.ledger.freezeCardCreditsForPaymentIntent?.bind(deps.ledger);
   if (!freeze) return;
-  const unfreeze = deps.ledger.unfreezeCardCreditsForPaymentIntent?.bind(deps.ledger);
   const statusesByIntent = new Map<string, string[]>();
   const createdGte = Math.floor((nowMs - DISPUTE_LOOKBACK_MS) / 1000);
   let startingAfter: string | undefined;
-  let complete = false;
   try {
     for (let page = 0; page < MAX_DISPUTE_PAGES; page++) {
       const { disputes, hasMore } = await deps.stripe.listDisputes({
@@ -222,28 +221,46 @@ async function applyDisputes(
         statuses.push(dispute.status);
         statusesByIntent.set(dispute.paymentIntentId, statuses);
       }
-      if (!hasMore || disputes.length === 0) {
-        complete = true;
-        break;
-      }
+      if (!hasMore || disputes.length === 0) break;
       startingAfter = disputes[disputes.length - 1].id;
     }
   } finally {
     // Freeze on whatever was seen, even from a listing that failed part way.
-    const blocking = [...statusesByIntent]
-      .filter(([, statuses]) => statuses.some((status) => !DISPUTE_SETTLED_FOR_MERCHANT.has(status)))
-      .map(([paymentIntentId]) => paymentIntentId);
+    const blocking = new Set(
+      [...statusesByIntent]
+        .filter(([, statuses]) => !allSettledForMerchant(statuses))
+        .map(([paymentIntentId]) => paymentIntentId)
+    );
     for (const paymentIntentId of blocking) {
       result.frozen.push(...(await freeze(paymentIntentId)));
     }
-    if (complete && unfreeze) {
-      const blockingSet = new Set(blocking);
-      for (const paymentIntentId of statusesByIntent.keys()) {
-        if (blockingSet.has(paymentIntentId)) continue;
-        result.unfrozen.push(...(await unfreeze(paymentIntentId, blocking)));
-      }
+    for (const paymentIntentId of statusesByIntent.keys()) {
+      if (!blocking.has(paymentIntentId)) result.unfrozen.push(...(await unfreezeSettled(deps, paymentIntentId)));
     }
   }
+}
+
+async function unfreezeSettled(deps: CardRefundSweepDeps, paymentIntentId: string): Promise<string[]> {
+  const candidates = deps.ledger.disputedCardCreditsFundedBy?.bind(deps.ledger);
+  const unfreeze = deps.ledger.unfreezeCardCredit?.bind(deps.ledger);
+  if (!candidates || !unfreeze) return [];
+  const unfrozen: string[] = [];
+  for (const credit of await candidates(paymentIntentId)) {
+    let settled = true;
+    for (const fundingIntent of credit.paymentIntentIds) {
+      const { disputes, hasMore } = await deps.stripe.listDisputesForPaymentIntent(fundingIntent);
+      if (hasMore || !allSettledForMerchant(disputes.map((dispute) => dispute.status))) {
+        settled = false;
+        break;
+      }
+    }
+    if (settled && (await unfreeze(credit.creditId))) unfrozen.push(credit.creditId);
+  }
+  return unfrozen;
+}
+
+function allSettledForMerchant(statuses: readonly string[]): boolean {
+  return statuses.every((status) => DISPUTE_SETTLED_FOR_MERCHANT.has(status));
 }
 
 async function refundStranded(
