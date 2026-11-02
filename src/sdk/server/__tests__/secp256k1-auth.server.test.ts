@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import signatureRequired from "../../../../protocol-fixtures/signature-required-v1.json";
 import { configureDVM } from "../../configure";
 import { createDVMHost } from "../host";
 import { secp256k1Auth } from "../secp256k1-auth";
@@ -84,7 +85,7 @@ describe("DVM-level secp256k1 auth slot", () => {
     expect(info.auth_audience).toEqual(AUTH_AUDIENCE);
   });
 
-  it("rejects POST /v1/job with an unsigned envelope as 401 auth_error", async () => {
+  it("rejects an unsigned POST /v1/job with the signature_required response", async () => {
     const { host } = buildHost();
     server = await host.serve();
 
@@ -96,11 +97,8 @@ describe("DVM-level secp256k1 auth slot", () => {
         data: { action: "publish" },
       }),
     });
-    expect(res.status).toBe(401);
-    await expect(res.json()).resolves.toMatchObject({
-      error: "auth_error",
-      sub_reason: "signature_invalid",
-    });
+    expect(res.status).toBe(signatureRequired.status);
+    await expect(res.json()).resolves.toEqual(signatureRequired.body);
   });
 
   it("rejects POST /v1/job with a tampered signature as 401 signature_invalid", async () => {
