@@ -178,6 +178,8 @@ async function planCardRefund(
   deps: StripeDrainLegDeps,
   drain: CreditDrainRecord
 ): Promise<CardRefundPlan> {
+  // Oldest first, as the ledger lists them: Stripe refunds a charge only for a limited time
+  // after it was made, so the charges nearest that limit go back first.
   const lots = (await deps.ledger.listFundingLots(drain.creditId)).filter(
     (lot) => isCardFundedRail(lot.rail) && lot.fundingRef?.startsWith("pi_")
   );
@@ -219,7 +221,6 @@ function assertRefundable(charge: StripeChargeFacts): void {
   if (charge.status !== "succeeded" || charge.currency !== "usd") {
     throw new CardRefundPlanError("charge_not_refundable");
   }
-  if (charge.disputed) throw new CardRefundPlanError("charge_disputed");
   if (!charge.fee) throw new CardRefundPlanError("fee_not_settled");
 }
 
@@ -237,7 +238,7 @@ async function advanceRefundOnce(
   drain: CreditDrainRecord,
   entry: CardRefundEntry
 ): Promise<void> {
-  const tag = `${drain.creditId}:${drain.drainId}`;
+  const tag = refundDrainTag(drain);
   try {
     if (entry.refundId && isOpenStatus(entry.status)) {
       const refund = await stripe.retrieveRefund(entry.refundId);
@@ -331,6 +332,16 @@ function failureCode(err: unknown): string {
     return err.code ?? err.type ?? (err.status === 0 ? "stripe_unreachable" : `http_${err.status}`);
   }
   return "internal_error";
+}
+
+/**
+ * The drain a refund belongs to, in its Stripe metadata. Stripe caps a metadata value at 500
+ * characters; a credit id and drain id that would not fit are carried as their digest.
+ */
+function refundDrainTag(drain: CreditDrainRecord): string {
+  const tag = `${drain.creditId}:${drain.drainId}`;
+  if (tag.length <= 200) return tag;
+  return `sha256:${createHash("sha256").update(tag).digest("hex")}`;
 }
 
 function logPending(drain: CreditDrainRecord, fields: Record<string, unknown>): void {

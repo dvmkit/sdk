@@ -9,7 +9,7 @@ import { runCardRefundSweep } from "../card-refund-sweep";
 import { cardExpiryDrainId, CreditLedger } from "../credit-ledger";
 import type { CreditDrainPayload } from "../revenue-reporter";
 import { createStripeCreditRail } from "../stripe-credit";
-import { createStripeRefundApi } from "../stripe-refund-api";
+import { createStripeRefundApi, StripeApiError } from "../stripe-refund-api";
 import { CALLER, cardServer, credentialFor, drain, fund, HMAC } from "./__helpers__/card-credit";
 import { fakeStripeAccount, type FakeStripeAccount } from "./__helpers__/fake-stripe-account";
 
@@ -58,10 +58,11 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
   /** A card credit funded at `pi` for `cents`, expiring at `expiryMs`. */
   async function cardCredit(
     account: FakeStripeAccount,
-    args: { creditId: string; pi: string; cents: number; expiryMs: number }
+    args: { creditId: string; pi: string; cents: number; expiryMs: number; fundedAtMs?: number }
   ) {
     account.seedIntent({ id: args.pi, amount: args.cents });
     await ledger.fund({
+      ...(args.fundedAtMs !== undefined && { nowMs: args.fundedAtMs }),
       creditId: args.creditId,
       callerPubkey: CALLER,
       currency: "usd",
@@ -221,5 +222,122 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     );
     expect(rerun.strandedRefunds).toEqual([]);
     expect(account.refunds.size).toBe(1);
+  });
+
+  it("keeps sweeping when the dispute listing fails, or one credit cannot be refunded", async () => {
+    const account = fakeStripeAccount();
+    const now = Date.now();
+    await cardCredit(account, { creditId: "sweep-a", pi: "pi_sweep_a", cents: 200, expiryMs: now - 2 * HOUR_MS });
+    await cardCredit(account, { creditId: "sweep-b", pi: "pi_sweep_b", cents: 200, expiryMs: now - HOUR_MS });
+    // A restricted key without dispute access gets a 403 on every listing.
+    const stripe = {
+      ...stripeApi(account),
+      listDisputes: () => Promise.reject(new StripeApiError(403, { type: "invalid_request_error" })),
+    };
+    const brokenLedger = Object.create(ledger, {
+      openCardExpiryRefund: {
+        value: (args: { creditId: string; nowMs?: number }) =>
+          args.creditId === "sweep-a"
+            ? Promise.reject(new Error("connection reset"))
+            : ledger.openCardExpiryRefund(args),
+      },
+    }) as CreditLedger;
+
+    const summary = await runCardRefundSweep({ ledger: brokenLedger, stripe, drainReport: {} }, { nowMs: now });
+    expect(summary.failedSteps).toEqual(["disputes"]);
+    expect(summary.expiryRefunds).toEqual(["sweep-b"]);
+    expect(await ledger.get("sweep-b")).toMatchObject({ status: "refunded", balanceMicro: 0 });
+    expect((await ledger.get("sweep-a"))?.status).toBe("active");
+  });
+
+  it("does not open an expiry refund beside an unfinished card refund, even one named like it", async () => {
+    const account = fakeStripeAccount();
+    const now = Date.now();
+    const expiryMs = now - HOUR_MS;
+    const fundedAtMs = expiryMs - 2 * HOUR_MS;
+    await cardCredit(account, { creditId: "squatter", pi: "pi_squat", cents: 200, expiryMs, fundedAtMs });
+    await cardCredit(account, { creditId: "neighbour", pi: "pi_next", cents: 200, expiryMs: expiryMs + 1, fundedAtMs });
+    // Straight to the ledger, past the route that reserves the name: the sweep must survive it.
+    await ledger.draw({ creditId: "squatter", drawId: "hold", amountMicro: 300_000, jobId: "hold", nowMs: fundedAtMs + 1 });
+    await ledger.requestDrain({
+      creditId: "squatter",
+      drainId: cardExpiryDrainId(expiryMs),
+      callerPubkey: CALLER,
+      method: "stripe",
+      payout: {},
+      nowMs: fundedAtMs + 2,
+    });
+    await ledger.release({ creditId: "squatter", drawId: "hold" });
+    // The same race with an ordinary drain id.
+    await cardCredit(account, { creditId: "waiting", pi: "pi_wait", cents: 200, expiryMs, fundedAtMs });
+    await ledger.draw({ creditId: "waiting", drawId: "hold", amountMicro: 300_000, jobId: "hold", nowMs: fundedAtMs + 1 });
+    await ledger.requestDrain({
+      creditId: "waiting",
+      drainId: "mine",
+      callerPubkey: CALLER,
+      method: "stripe",
+      payout: {},
+      nowMs: fundedAtMs + 2,
+    });
+    await ledger.release({ creditId: "waiting", drawId: "hold" });
+
+    const summary = await runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {} }, { nowMs: now });
+    expect(summary.failedSteps).toEqual([]);
+    // Credits from earlier tests share this schema, so look only at these two.
+    expect(summary.expiryRefunds).toContain("neighbour");
+    expect(summary.expiryRefunds).not.toContain("squatter");
+    expect(summary.expiryRefunds).not.toContain("waiting");
+    // The released $0.30 waits for the unfinished refund; it is not planned against the same charge twice.
+    expect(await ledger.get("squatter")).toMatchObject({ status: "active", balanceMicro: 300_000 });
+    expect(await ledger.get("waiting")).toMatchObject({ status: "active", balanceMicro: 300_000 });
+    const { rows } = await db.query(
+      `SELECT credit_id FROM credit_drains WHERE credit_id IN ('squatter', 'waiting') ORDER BY credit_id`
+    );
+    expect(rows.map((row) => row.credit_id)).toEqual(["squatter", "waiting"]);
+  });
+
+  it("unfreezes a credit whose dispute was won and refunds it at expiry; a lost one stays frozen", async () => {
+    const account = fakeStripeAccount();
+    const now = Date.now();
+    const expiryMs = now + HOUR_MS;
+    await cardCredit(account, { creditId: "won", pi: "pi_won", cents: 200, expiryMs });
+    await cardCredit(account, { creditId: "lost", pi: "pi_lost", cents: 200, expiryMs });
+    account.dispute("pi_won");
+    account.dispute("pi_lost");
+    const sweep = (nowMs: number) =>
+      runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {} }, { nowMs });
+    expect((await sweep(now)).frozen.sort()).toEqual(["lost", "won"]);
+
+    account.settleDisputes("pi_won", "won");
+    account.settleDisputes("pi_lost", "lost");
+    const settled = await sweep(now + 1000);
+    expect(settled.unfrozen).toEqual(["won"]);
+    expect(settled.frozen).toEqual([]);
+    expect((await ledger.get("won"))?.status).toBe("active");
+    expect((await ledger.get("lost"))?.status).toBe("disputed");
+
+    // A later pass does not freeze it again, and expiry refunds it like any card credit.
+    const later = await sweep(expiryMs + HOUR_MS);
+    expect(later.frozen).toEqual([]);
+    expect(later.expiryRefunds).toContain("won");
+    expect(await ledger.get("won")).toMatchObject({ status: "refunded", balanceMicro: 0 });
+    // Nothing was spent: $2.00 less the whole 36-cent fee.
+    expect([...account.refunds.values()].map((r) => [r.payment_intent, r.amount])).toEqual([["pi_won", 164]]);
+    expect((await ledger.get("lost"))?.status).toBe("disputed");
+  });
+
+  it("keeps searching for a charge Stripe does not show yet, within a day", async () => {
+    const account = fakeStripeAccount();
+    const journal = await createPostgresCardChargeJournal(db);
+    await journal.record("challenge-not-indexed-yet");
+    const sweep = (nowMs: number) =>
+      runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {}, journal }, { nowMs });
+    const unresolved = async (nowMs: number) =>
+      (await journal.listUnresolved({ olderThanMs: nowMs, limit: 100 })).map((a) => a.challengeId);
+
+    await sweep(Date.now() + HOUR_MS);
+    expect(await unresolved(Date.now() + HOUR_MS)).toContain("challenge-not-indexed-yet");
+    await sweep(Date.now() + 25 * HOUR_MS);
+    expect(await unresolved(Date.now() + 25 * HOUR_MS)).not.toContain("challenge-not-indexed-yet");
   });
 });

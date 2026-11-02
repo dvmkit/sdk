@@ -29,6 +29,7 @@ import type {
   DrainReleaseResult,
 } from "./credit-ledger";
 import {
+  CARD_EXPIRY_DRAIN_PREFIX,
   cardExpiryDrainId,
   CreditLedgerError,
   DRAIN_METHODS,
@@ -1480,7 +1481,10 @@ async function respondDrain(
  * caller's wallet holds a separate Cashu lock keypair, and parked notes must
  * be locked to a key it can actually witness-spend.
  */
+const MAX_CARD_REFUND_DRAIN_ID = 128;
+
 function validateDrainTarget(drain: {
+  drain_id: string;
   method?: string;
   payout?: { refund_pubkey?: string; address?: string };
 }): { method: DrainMethod; payout: Record<string, string> } | { error: Record<string, unknown> } {
@@ -1512,6 +1516,19 @@ function validateDrainTarget(drain: {
       return refuse(
         "stripe drains carry no payout destination: the refund goes back to the card that paid for the credit.",
         'Send drain: { drain_id, method: "stripe" } with no payout.'
+      );
+    }
+    // The drain id travels to Stripe in refund metadata, whose values stop at 500 characters.
+    if (drain.drain_id.length > MAX_CARD_REFUND_DRAIN_ID) {
+      return refuse(
+        `stripe drain ids are at most ${MAX_CARD_REFUND_DRAIN_ID} characters.`,
+        "Choose a shorter drain_id, such as a UUID."
+      );
+    }
+    if (drain.drain_id.startsWith(CARD_EXPIRY_DRAIN_PREFIX)) {
+      return refuse(
+        `drain ids starting "${CARD_EXPIRY_DRAIN_PREFIX}" are reserved for the refund this service makes when a card balance expires.`,
+        "Choose a drain_id that does not start with that prefix, such as a UUID."
       );
     }
     return { method: "stripe", payout: {} };
@@ -2481,6 +2498,14 @@ async function checkTargetCredit(
             : `Credit ${args.creditId} is frozen: a card payment that funded it is disputed.`,
       });
     }
+    // An expired card balance is owed back to the card; a top-up must not revive it before
+    // the sweep refunds it.
+    if (isCardFundedRail(mine.rail) && mine.expiryMs <= Date.now()) {
+      return jsonPaymentError("credit_closed", 409, {
+        message: `Credit ${args.creditId} expired; its card balance is being refunded to the card.`,
+        hint: "Omit credit_id (or use a new fund_id) to open a new prepaid balance. The expired balance comes back to the card on its own.",
+      });
+    }
     if (mine.currency !== args.menu.currency) {
       return jsonPaymentError("payment_invalid", 400, {
         message: `Credit ${args.creditId} is denominated in ${mine.currency}, not ${args.menu.currency}.`,
@@ -2685,7 +2710,7 @@ function channelDrainMethodConflictResponse(rail: "Tempo" | "x402"): Response {
 
 interface DrainConflictCopy {
   display: string;
-  hint: (ids: { creditId: string; drainId: string }) => string;
+  hint: (ids: { creditId: string; drainId: string; blockingDrainId?: string }) => string;
   retryable: boolean;
   /** Whether the caller keeps this `drain_id`; `credit.ts` drops it on `false`. */
   drainRegistered: boolean;
@@ -2710,6 +2735,14 @@ const DRAIN_CONFLICT_COPY: Record<DrainConflictReason, DrainConflictCopy> = {
       "A job on this prepaid balance finished while the refund was being paid out, so the service rolled the refund back rather than send the wrong amount. Nothing changed.",
     hint: () =>
       "Retry with a fresh drain_id — the next attempt reads the balance again and refunds what is actually left.",
+    retryable: true,
+    drainRegistered: false,
+  },
+  card_refund_pending: {
+    display:
+      "A refund of this prepaid balance to your card is already in progress, so a second one was not started. Nothing changed.",
+    hint: ({ blockingDrainId }) =>
+      `Poll drain ${blockingDrainId ?? "the earlier card refund"} (the same drain request again) until it is sent; it returns the balance it covers. Start a new card refund only after that, if any balance is left.`,
     retryable: true,
     drainRegistered: false,
   },
@@ -2814,9 +2847,12 @@ function drainLedgerErrorResponse(
     return jsonPaymentError("drain_conflict", 409, {
       message: error.message,
       display: copy?.display,
-      hint: copy?.hint({ creditId, drainId }),
+      hint: copy?.hint({ creditId, drainId, blockingDrainId: error.details.blockingDrainId }),
       retryable: copy?.retryable,
-      extra: { drain_registered: copy?.drainRegistered ?? false },
+      extra: {
+        drain_registered: copy?.drainRegistered ?? false,
+        ...(error.details.blockingDrainId && { blocking_drain_id: error.details.blockingDrainId }),
+      },
     });
   }
   if (error.code === "settlement_pending") {

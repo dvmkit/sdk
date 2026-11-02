@@ -10,7 +10,9 @@ import type { StripeRefundApi } from "./stripe-refund-api";
  * The periodic half of card refunds, run on the credit-expiry cadence. Stripe is polled,
  * never heard from: there is no webhook route. Each pass, in this order:
  *
- * 1. Disputes: a dispute on a funding PaymentIntent freezes the credit it funded.
+ * 1. Disputes: an open or lost dispute on a funding PaymentIntent freezes the credit it
+ *    funded; once every dispute on its PaymentIntents is won (or a warning closed), the
+ *    credit is unfrozen and refundable again.
  * 2. Expiry: an expired card credit's balance becomes a refund to the card and the credit
  *    closes. It is never released to the builder.
  * 3. Retry: every pending card refund is advanced (Stripe still processing, rejected,
@@ -19,7 +21,9 @@ import type { StripeRefundApi } from "./stripe-refund-api";
  *    booked, is refunded in full.
  *
  * Every step is idempotent and Postgres-only, like the expiry sweep: a ledger without the
- * optional card methods skips the steps that need them.
+ * optional card methods skips the steps that need them. A step, or one credit within a step,
+ * that fails is logged and skipped, so one bad credit or a missing key permission cannot stop
+ * the rest of the pass.
  */
 export interface CardRefundSweepDeps {
   ledger: CreditLedgerLike;
@@ -31,10 +35,13 @@ export interface CardRefundSweepDeps {
 
 export interface CardRefundSweepResult {
   frozen: string[];
+  unfrozen: string[];
   expiryRefunds: string[];
   completed: string[];
   pending: string[];
   strandedRefunds: string[];
+  /** Steps that threw, by name; the rest of the pass still ran. */
+  failedSteps: string[];
 }
 
 export interface CardRefundSweepOpts {
@@ -45,12 +52,19 @@ export interface CardRefundSweepOpts {
 /** How far back each pass looks for disputes. Card networks allow about 120 days. */
 const DISPUTE_LOOKBACK_MS = 180 * 24 * 60 * 60 * 1000;
 const MAX_DISPUTE_PAGES = 10;
+/** Dispute statuses that leave the caller's money with the merchant: no freeze. */
+const DISPUTE_SETTLED_FOR_MERCHANT = new Set(["won", "warning_closed"]);
 /**
  * How old an attempt must be before an unbooked charge counts as stranded: well past the
  * five-minute challenge, after which a resend can no longer book it, and past the delay
  * before Stripe's search index shows a new PaymentIntent.
  */
 const STRANDED_AFTER_MS = 30 * 60 * 1000;
+/**
+ * How long an attempt with no PaymentIntent in Stripe's search keeps being searched. Most
+ * such attempts never reached Stripe; the window covers a search index that lags for hours.
+ */
+const STRANDED_SEARCH_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Give up on an attempt whose PaymentIntent never settles; it is logged for an operator. */
 const STRANDED_ABANDON_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -62,10 +76,12 @@ export async function runCardRefundSweep(
   const limit = opts.limit ?? 200;
   const result: CardRefundSweepResult = {
     frozen: [],
+    unfrozen: [],
     expiryRefunds: [],
     completed: [],
     pending: [],
     strandedRefunds: [],
+    failedSteps: [],
   };
   const legDeps = {
     ledger: deps.ledger,
@@ -73,34 +89,52 @@ export async function runCardRefundSweep(
     drainReport: deps.drainReport,
     ...(deps.receiptIssuer && { receiptIssuer: deps.receiptIssuer }),
   };
-
-  if (deps.ledger.freezeCardCreditsForPaymentIntent) {
-    result.frozen = await freezeDisputed(deps, nowMs);
-  }
-
-  if (deps.ledger.listExpiredCardCredits && deps.ledger.openCardExpiryRefund) {
-    for (const creditId of await deps.ledger.listExpiredCardCredits({ nowMs, limit })) {
-      const drain = await deps.ledger.openCardExpiryRefund({ creditId, nowMs });
-      if (drain) result.expiryRefunds.push(creditId);
-    }
-  }
-
-  const pending = (await deps.ledger.listPendingDrains()).filter(
-    (drain) => drain.method === "stripe" && drain.status === "pending"
-  );
-  for (const drain of pending.slice(0, limit)) {
+  const step = async (name: string, run: () => Promise<void>): Promise<void> => {
     try {
-      const { drain: after } = await runStripeDrain(legDeps, drain);
-      (after.status === "sent" ? result.completed : result.pending).push(
-        `${drain.creditId}:${drain.drainId}`
-      );
+      await run();
     } catch {
-      result.pending.push(`${drain.creditId}:${drain.drainId}`);
+      result.failedSteps.push(name);
+      diagnosticConsole.error({ event: "card_refund_sweep_step_failed", stage: name });
     }
+  };
+
+  await step("disputes", () => applyDisputes(deps, nowMs, result));
+
+  const { listExpiredCardCredits, openCardExpiryRefund } = deps.ledger;
+  if (listExpiredCardCredits && openCardExpiryRefund) {
+    await step("expiry", async () => {
+      for (const creditId of await listExpiredCardCredits.call(deps.ledger, { nowMs, limit })) {
+        try {
+          const drain = await openCardExpiryRefund.call(deps.ledger, { creditId, nowMs });
+          if (drain) result.expiryRefunds.push(creditId);
+        } catch {
+          diagnosticConsole.error({ event: "card_refund_expiry_failed", credit_id: creditId });
+        }
+      }
+    });
   }
 
-  if (deps.journal && deps.ledger.cardFundingBooked) {
-    result.strandedRefunds = await refundStranded(deps, deps.journal, nowMs, limit);
+  await step("retry", async () => {
+    const pending = (await deps.ledger.listPendingDrains()).filter(
+      (drain) => drain.method === "stripe" && drain.status === "pending"
+    );
+    for (const drain of pending.slice(0, limit)) {
+      try {
+        const { drain: after } = await runStripeDrain(legDeps, drain);
+        (after.status === "sent" ? result.completed : result.pending).push(
+          `${drain.creditId}:${drain.drainId}`
+        );
+      } catch {
+        result.pending.push(`${drain.creditId}:${drain.drainId}`);
+      }
+    }
+  });
+
+  const journal = deps.journal;
+  if (journal && deps.ledger.cardFundingBooked) {
+    await step("stranded", async () => {
+      result.strandedRefunds = await refundStranded(deps, journal, nowMs, limit);
+    });
   }
   return result;
 }
@@ -124,6 +158,7 @@ export function startCardRefundSweep(
       .then((summary) => {
         const moved =
           summary.frozen.length +
+          summary.unfrozen.length +
           summary.expiryRefunds.length +
           summary.completed.length +
           summary.pending.length +
@@ -132,6 +167,7 @@ export function startCardRefundSweep(
         diagnosticConsole.log({
           event: "card_refund_sweep",
           frozen: summary.frozen.length,
+          unfrozen: summary.unfrozen.length,
           expiry_refunds: summary.expiryRefunds.length,
           completed: summary.completed.length,
           pending: summary.pending.length,
@@ -156,24 +192,58 @@ export function startCardRefundSweep(
   };
 }
 
-async function freezeDisputed(deps: CardRefundSweepDeps, nowMs: number): Promise<string[]> {
+/**
+ * Freeze credits whose funding payment has an open or lost dispute, and unfreeze those
+ * whose disputes all ended in the merchant's favour. Unfreezing waits for a complete
+ * listing: a page that failed or was cut off could hide a dispute still open on another
+ * PaymentIntent of the same credit.
+ */
+async function applyDisputes(
+  deps: CardRefundSweepDeps,
+  nowMs: number,
+  result: CardRefundSweepResult
+): Promise<void> {
   const freeze = deps.ledger.freezeCardCreditsForPaymentIntent?.bind(deps.ledger);
-  if (!freeze) return [];
-  const frozen: string[] = [];
+  if (!freeze) return;
+  const unfreeze = deps.ledger.unfreezeCardCreditsForPaymentIntent?.bind(deps.ledger);
+  const statusesByIntent = new Map<string, string[]>();
   const createdGte = Math.floor((nowMs - DISPUTE_LOOKBACK_MS) / 1000);
   let startingAfter: string | undefined;
-  for (let page = 0; page < MAX_DISPUTE_PAGES; page++) {
-    const { disputes, hasMore } = await deps.stripe.listDisputes({
-      createdGte,
-      ...(startingAfter && { startingAfter }),
-    });
-    for (const dispute of disputes) {
-      if (dispute.paymentIntentId) frozen.push(...(await freeze(dispute.paymentIntentId)));
+  let complete = false;
+  try {
+    for (let page = 0; page < MAX_DISPUTE_PAGES; page++) {
+      const { disputes, hasMore } = await deps.stripe.listDisputes({
+        createdGte,
+        ...(startingAfter && { startingAfter }),
+      });
+      for (const dispute of disputes) {
+        if (!dispute.paymentIntentId) continue;
+        const statuses = statusesByIntent.get(dispute.paymentIntentId) ?? [];
+        statuses.push(dispute.status);
+        statusesByIntent.set(dispute.paymentIntentId, statuses);
+      }
+      if (!hasMore || disputes.length === 0) {
+        complete = true;
+        break;
+      }
+      startingAfter = disputes[disputes.length - 1].id;
     }
-    if (!hasMore || disputes.length === 0) break;
-    startingAfter = disputes[disputes.length - 1].id;
+  } finally {
+    // Freeze on whatever was seen, even from a listing that failed part way.
+    const blocking = [...statusesByIntent]
+      .filter(([, statuses]) => statuses.some((status) => !DISPUTE_SETTLED_FOR_MERCHANT.has(status)))
+      .map(([paymentIntentId]) => paymentIntentId);
+    for (const paymentIntentId of blocking) {
+      result.frozen.push(...(await freeze(paymentIntentId)));
+    }
+    if (complete && unfreeze) {
+      const blockingSet = new Set(blocking);
+      for (const paymentIntentId of statusesByIntent.keys()) {
+        if (blockingSet.has(paymentIntentId)) continue;
+        result.unfrozen.push(...(await unfreeze(paymentIntentId, blocking)));
+      }
+    }
   }
-  return frozen;
 }
 
 async function refundStranded(
@@ -192,6 +262,14 @@ async function refundStranded(
         "mpp_challenge_id",
         attempt.challengeId
       );
+      if (intents.length === 0) {
+        // Nothing found yet: most likely the charge never reached Stripe, but a lagging
+        // search index looks the same. Search again on later passes, within a window.
+        if (nowMs - attempt.createdAt > STRANDED_SEARCH_WINDOW_MS) {
+          await journal.resolve(attempt.challengeId, "not_found");
+        }
+        continue;
+      }
       let unsettled = false;
       let refundedHere = 0;
       for (const intent of intents) {

@@ -1,6 +1,6 @@
 /* Card-funded credit against Stripe test mode: a real test Shared Payment Token, a real
  * PaymentIntent, the ledger booking it, and the refund of what is left. Runs only with STRIPE_TEST_SECRET_KEY (an sk_test_
- * key); every other run skips it and stays offline. */
+ * or rk_test_ key); every other run skips it and stays offline. */
 import { Credential } from "mppx";
 import { describe, expect, it } from "vitest";
 
@@ -18,8 +18,9 @@ import {
 } from "./__helpers__/card-credit";
 
 const KEY = process.env.STRIPE_TEST_SECRET_KEY;
-if (KEY && !KEY.startsWith("sk_test_")) {
-  throw new Error("STRIPE_TEST_SECRET_KEY must be a Stripe test-mode key (sk_test_…)");
+// A restricted test key (rk_test_) proves the permissions OPERATING.md lists.
+if (KEY && !/^(sk|rk)_test_/.test(KEY)) {
+  throw new Error("STRIPE_TEST_SECRET_KEY must be a Stripe test-mode key (sk_test_… or rk_test_…)");
 }
 if (KEY) announceTier("stripe test mode", "ran", "STRIPE_TEST_SECRET_KEY is set");
 

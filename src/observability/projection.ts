@@ -69,10 +69,13 @@ const DECIMAL_RE = /^(?:0|[1-9]\d{0,77})$/;
 const CARD_REFUND_EVENTS = new Set([
   "card_charge_stranded_refunded",
   "card_charge_unsettled",
+  "card_refund_expiry_failed",
   "card_refund_pending",
   "card_refund_sweep",
+  "card_refund_sweep_step_failed",
 ]);
-const CARD_REFUND_COUNTS = new Set(["frozen", "expiry_refunds", "completed", "pending", "stranded_refunds"]);
+const CARD_REFUND_COUNTS = new Set(["frozen", "unfrozen", "expiry_refunds", "completed", "pending", "stranded_refunds"]);
+const CARD_REFUND_STAGES = new Set(["plan", "refund", "disputes", "expiry", "retry", "stranded"]);
 const CARD_REFUND_STATUSES = new Set(["planned", "pending", "requires_action", "succeeded", "failed", "canceled", "rejected"]);
 const STRIPE_EVENT_RE = /^evt_[A-Za-z0-9]{1,64}$/;
 const REDACTED_SEGMENT_RE = /^:(?:uuid|hex|n|b58|token)$/;
@@ -485,7 +488,8 @@ function projectCardRefundField(key: string, value: unknown): unknown {
     return typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,512}$/.test(value) ? value : undefined;
   if (key === "payment_intent")
     return typeof value === "string" && /^pi_[A-Za-z0-9]{1,64}$/.test(value) ? value : undefined;
-  if (key === "stage") return value === "plan" || value === "refund" ? value : undefined;
+  if (key === "stage")
+    return typeof value === "string" && CARD_REFUND_STAGES.has(value) ? value : undefined;
   if (key === "refund_status")
     return typeof value === "string" && CARD_REFUND_STATUSES.has(value) ? value : undefined;
   if (CARD_REFUND_COUNTS.has(key)) return isNonnegativeSafeInteger(value) ? value : undefined;

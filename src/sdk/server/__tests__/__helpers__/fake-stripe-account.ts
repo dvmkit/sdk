@@ -44,6 +44,8 @@ export function fakeStripeAccount() {
   const control = {
     /** Refuse the next N refund creates with a 400, as Stripe does for a refused refund. */
     rejectRefunds: 0,
+    /** Drop the connection on the next N refund creates before Stripe records anything. */
+    unreachableRefunds: 0,
     /** Create the next N refunds, then drop the connection before the answer arrives. */
     loseRefundResponses: 0,
     /** Status new refunds take. */
@@ -64,15 +66,31 @@ export function fakeStripeAccount() {
     return full;
   }
 
-  function dispute(paymentIntentId: string): void {
+  /** Open a dispute. Stripe keeps `charge.disputed` true for good, whatever the outcome. */
+  function dispute(paymentIntentId: string, status = "needs_response"): void {
     const intent = intents.get(paymentIntentId);
     if (intent) intent.disputed = true;
     disputes.unshift({
       id: `dp_${disputes.length + 1}`,
       payment_intent: paymentIntentId,
       created: Math.floor(Date.now() / 1000),
-      status: "needs_response",
+      status,
     });
+  }
+
+  /** Close every dispute on a PaymentIntent with `status` (won, lost). */
+  function settleDisputes(paymentIntentId: string, status: string): void {
+    for (const entry of disputes) if (entry.payment_intent === paymentIntentId) entry.status = status;
+  }
+
+  /** Stripe refuses a refund while a dispute is open, and after it is lost. */
+  function refundBlocked(paymentIntentId: string): boolean {
+    return disputes.some(
+      (entry) =>
+        entry.payment_intent === paymentIntentId &&
+        entry.status !== "won" &&
+        entry.status !== "warning_closed"
+    );
   }
 
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -124,6 +142,10 @@ export function fakeStripeAccount() {
       });
     }
     if (method === "POST" && path === "/v1/refunds") {
+      if (control.unreachableRefunds > 0) {
+        control.unreachableRefunds -= 1;
+        throw new TypeError("fetch failed: connect ETIMEDOUT");
+      }
       const key = idempotencyKey ?? `anon-${calls.length}`;
       const known = refundByKey.get(key);
       if (known) return Response.json(refundBody(refunds.get(known) as FakeRefund));
@@ -137,7 +159,7 @@ export function fakeStripeAccount() {
           { status: 400 }
         );
       }
-      if (intent.disputed) {
+      if (refundBlocked(intent.id)) {
         return Response.json(
           { error: { type: "invalid_request_error", code: "charge_disputed" } },
           { status: 400 }
@@ -191,7 +213,17 @@ export function fakeStripeAccount() {
     refundByKey.clear();
   }
 
-  return { calls, intents, refunds, control, fetchImpl, seedIntent, dispute, forgetIdempotencyKeys };
+  return {
+    calls,
+    intents,
+    refunds,
+    control,
+    fetchImpl,
+    seedIntent,
+    dispute,
+    settleDisputes,
+    forgetIdempotencyKeys,
+  };
 }
 
 export type FakeStripeAccount = ReturnType<typeof fakeStripeAccount>;

@@ -15,7 +15,7 @@ import { toLockPubkey } from "../lock-pubkey-store";
 import { createStripeRefundApi } from "../stripe-refund-api";
 import { CALLER, cardServer, credentialFor, drain, fund, type App } from "./__helpers__/card-credit";
 import { fundCredit } from "./__helpers__/credit-fixtures";
-import { fakeStripeAccount, type FakeStripeAccount } from "./__helpers__/fake-stripe-account";
+import { cardFee, fakeStripeAccount, type FakeStripeAccount } from "./__helpers__/fake-stripe-account";
 
 interface Exchange {
   status: number;
@@ -230,6 +230,90 @@ describe("a card refund Stripe does not finish", () => {
     for (const refund of account.refunds.values()) refund.status = "succeeded";
     expect((await (await cardDrain(app, creditId)).json()).drain.status).toBe("sent");
     expect(account.refunds.size).toBe(1);
+  });
+});
+
+describe("one card refund at a time", () => {
+  it("refuses a second card refund while the first is unfinished, then refunds what is left", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger } = await cardServer({ stripe: account });
+    const now = Date.now();
+    for (const [index, pi] of ["pi_1", "pi_2"].entries()) {
+      account.seedIntent({ id: pi, amount: 1000 });
+      await ledger.fund({
+        creditId: "busy",
+        callerPubkey: CALLER,
+        currency: "usd",
+        amountMicro: 10_000_000,
+        expiryMs: now + DAY_MS,
+        basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 1000, fundingRef: pi },
+        nowMs: now - (2 - index) * 1000,
+      });
+    }
+    // A job holds $5 while the first refund ($15) starts; its first call to Stripe is lost
+    // before Stripe records anything, so the oldest charge has no refund yet.
+    await ledger.draw({ creditId: "busy", drawId: "hold", amountMicro: 5_000_000, jobId: "hold" });
+    account.control.unreachableRefunds = 1;
+    const first = await (await cardDrain(app, "busy", "A")).json();
+    expect(first.drain.status).toBe("pending");
+    await ledger.release({ creditId: "busy", drawId: "hold" });
+
+    // A second plan now could size its refund against charge room the first still needs.
+    const second = await cardDrain(app, "busy", "B");
+    expect(second.status).toBe(409);
+    const refusal = await second.json();
+    expect(refusal).toMatchObject({ error: "drain_conflict", retryable: true, blocking_drain_id: "A" });
+    expect(refusal.hint).toMatch(/Poll drain A/);
+    expect((await ledger.get("busy"))?.balanceMicro).toBe(5_000_000);
+
+    expect((await (await cardDrain(app, "busy", "A")).json()).drain.status).toBe("sent");
+    const last = await (await cardDrain(app, "busy", "B")).json();
+    expect(last.drain.status).toBe("sent");
+    // Every refund fit its charge (none refused as too large), and the whole $20 went back
+    // less each $10 charge's full fee: 2000 − 2 × 59 cents.
+    const refunded = [...account.refunds.values()].reduce((sum, refund) => sum + refund.amount, 0);
+    expect(refunded).toBe(2000 - 2 * cardFee(1000));
+    expect((await ledger.get("busy"))?.balanceMicro).toBe(0);
+  });
+});
+
+describe("drain ids a card refund cannot take", () => {
+  it("reserves the expiry refund's drain ids and caps their length", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, creditId } = await fundedCard(account, {
+      fundId: "ids",
+      amountMicro: 600_000,
+      drawnMicro: 0,
+    });
+    for (const drainId of ["expiry-1790000000000", "x".repeat(129)]) {
+      const response = await cardDrain(app, creditId, drainId);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "invalid_request" });
+    }
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(600_000);
+    expect(refundCreates(account)).toHaveLength(0);
+  });
+});
+
+describe("a top-up of an expired card credit", () => {
+  it("is refused before any challenge or charge, so the expired balance still goes back to the card", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger } = await cardServer({ stripe: account });
+    account.seedIntent({ id: "pi_old", amount: 60 });
+    await ledger.fund({
+      creditId: "old",
+      callerPubkey: CALLER,
+      currency: "usd",
+      amountMicro: 600_000,
+      expiryMs: Date.now() - 1000,
+      nowMs: Date.now() - DAY_MS,
+      basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 60, fundingRef: "pi_old" },
+    });
+    const response = await fund(app, { fundId: "revive", creditId: "old" });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "credit_closed" });
+    expect(response.headers.get("WWW-Authenticate")).toBeNull();
+    expect(account.calls).toHaveLength(0);
   });
 });
 

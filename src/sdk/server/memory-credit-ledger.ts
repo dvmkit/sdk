@@ -41,6 +41,7 @@ import type {
 import {
   allocateDrawValue,
   assertCardDrainMatchesRail,
+  cardRefundPendingConflict,
   assertFundingBasis,
   clipEarmark,
   CreditLedgerError,
@@ -1176,6 +1177,12 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         };
       }
       if (credit.status !== "active") throw terminalCreditError(args.creditId);
+      if (args.method === "stripe") {
+        const blocking = [...credit.drains.values()].find(
+          (drain) => drain.method === "stripe" && drain.status === "pending"
+        );
+        if (blocking) throw cardRefundPendingConflict(args.creditId, blocking.drainId);
+      }
       if (x402Refund) throw x402SettlementPending(args.creditId, x402Refund);
       const pending = pendingSums(credit);
       const availableMicro = credit.balanceMicro - pending.micro;
