@@ -96,6 +96,46 @@ describe("builder admin route mounting", () => {
     }
   });
 
+  it("lets a JIT refund park past the accumulator guard without Cashu receiving", async () => {
+    const { app, shutdown } = await createDVMServer(DVM, {
+      env: {},
+      store: new MemoryKVStore(),
+      db: fakePool(),
+      dvmId: DVM_ID,
+      lockPubkey: LOCK_PUBKEY,
+    });
+
+    try {
+      const path = "/admin/credit/park-drain";
+      const response = await app.request(path, {
+        method: "POST",
+        headers: {
+          Authorization: authorization("POST", path),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          credit_id: "ghost",
+          drain_id: "ghost",
+          token: "cashuB",
+          consumed_row_ids: [],
+          keep_proofs: [],
+          mint_evidence: {
+            source: "jit_mint",
+            mint_url: "https://mint.example.com",
+            quote_id: "q",
+            face_sats: 1,
+            reserve_sats: 0,
+            invoice_msats: 1000,
+          },
+        }),
+      });
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({ error: "drain_not_found" });
+    } finally {
+      await shutdown();
+    }
+  });
+
   it("retains Cashu routes and the accumulator park path in dual-rail mode", async () => {
     const { app, shutdown } = await createDVMServer(DVM, {
       env: {},

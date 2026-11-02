@@ -1514,9 +1514,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Builder admin auth belongs to the persisted lock identity, independent
     // of whether this DVM accepts Cashu. Accumulator routes retain their
     // stricter mode gate; generic credit repair routes need only the identity.
-    if (this.opts.db && this.opts.dvmId && this.opts.lockPubkey) {
-      const db = this.opts.db;
-      const dvmId = this.opts.dvmId;
+    if (this.adminCreditRoutesMounted()) {
+      const db = this.opts.db!;
+      const dvmId = this.opts.dvmId!;
       const payoutReporter = this.opts.payoutReporter;
       const accumulatorWired = this.opts.cashuMode === "p2pk-accumulator";
       if (accumulatorWired) {
@@ -1533,8 +1533,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         });
       }
       // The drain and repair surface shares builder-lock auth. `park-drain`
-      // enforces the accumulator capability itself so callers get a typed
-      // refusal while every accumulator-independent route remains available.
+      // enforces the accumulator capability itself, except for a just-in-time
+      // mint park, which needs none; callers get a typed refusal otherwise.
       installAdminContentRoutes(this.app, {
         dvmId, store: this.jobManager.store, retentionDays: this.descriptor.jobRetentionDays,
         getLockPubkeyState: () => this.loadActiveLockPubkeyState(db, dvmId), nonceStore: this.adminCashuNonceStore,
@@ -2256,6 +2256,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     };
   }
 
+  /** Builder-lock admin routes (including JIT refund park) need only these three. */
+  private adminCreditRoutesMounted(): boolean {
+    return !!(this.opts.db && this.opts.dvmId && this.opts.lockPubkey);
+  }
+
   private balancePaymentSupported(includeDisabled = false): boolean {
     return (includeDisabled || this.opts.env.DVMKIT_BALANCE_PAYMENTS !== "false") && !!this.descriptor.credit && !!this.opts.db && this.creditLedger instanceof CreditLedger &&
       this.jobManager.store instanceof PostgresJobStore && !!this.authAudience && !!this.descriptor.auth;
@@ -2297,6 +2302,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       callerPubkey,
     });
     if (menu && this.balancePaymentSupported()) menu.balance_payment = true;
+    if (menu && this.adminCreditRoutesMounted()) menu.jit_refund_park = true;
     return menu;
   }
 

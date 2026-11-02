@@ -114,6 +114,11 @@ export interface Quote {
 export interface CreditTerms {
   /** Signed balance payments on the job messages endpoint are supported. */
   balance_payment?: true;
+  /**
+   * The authenticated builder park-drain route accepts a validated just-in-time mint refund
+   * even when Cashu receiving is off. Absent or false means unsupported; never infer it.
+   */
+  jit_refund_park?: true;
   /** Smallest funding accepted, in 1e-6 units of `currency`. */
   min_micro: number;
   /** Largest residual balance a caller may hold, in 1e-6 units of `currency`. */
@@ -202,6 +207,7 @@ export function parseCreditTerms(raw: unknown): CreditTerms | undefined {
 
   return {
     ...(credit.balance_payment === true && { balance_payment: true }),
+    ...(credit.jit_refund_park === true && { jit_refund_park: true }),
     min_micro: credit.min_micro,
     max_micro: credit.max_micro,
     ttl_ms: credit.ttl_ms,
