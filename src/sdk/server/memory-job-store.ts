@@ -14,13 +14,20 @@ import type {
   RequestIdClaim,
   RequestIdClaimResult,
   StreamableJobStore,
+  VerifyAndCreditOptions,
   VerifyAndCreditResult,
 } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
+import {
+  decidePaymentDisposition,
+  PaymentIntentOpenError,
+  type PaymentArrivalStore,
+  type RecordedPaymentArrival,
+} from "./payment-arrival";
 
 interface StoredMessage {
   message: Message;
-  status: "verified" | "pending-verification" | "failed-verify";
+  status: "verified" | "pending-verification" | "failed-verify" | "balance";
 }
 
 interface MessageSubscriber {
@@ -32,13 +39,19 @@ interface StoredRequestIdClaim extends RequestIdClaim {
   holderToken?: string;
 }
 
+interface PaymentIntent {
+  leaseExpiresAtMs: number;
+  resolved: boolean;
+}
+
 /**
  * In-memory JobStore implementing the transactional + streaming surface;
  * used by unit tests and not production-safe — there's no real
  * concurrency control beyond JS's single-threaded execution.
  */
-export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
+export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, PaymentArrivalStore {
   private contentHolds = new Map<string, ContentHoldHistory>();
+  private paymentIntents = new Map<string, Map<number, PaymentIntent>>();
   private data = new Map<string, JobRecord>();
   private messages = new Map<string, StoredMessage[]>();
   private nextSeq = new Map<string, number>();
@@ -137,6 +150,10 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     ) {
       return Promise.resolve();
     }
+    if (existing && !isTerminal(existing.status) && isTerminal(record.status)) {
+      const until = this.openIntentUntil(record.id, Date.now());
+      if (until !== undefined) return Promise.reject(new PaymentIntentOpenError(record.id, until));
+    }
     // `receipt` and `receiptSeq` are owned by `saveReceipt` /
     // `claimReceiptSeq`, never by the snapshot path — mirrors the Postgres
     // store, whose `save` statement simply doesn't list those columns. Without
@@ -155,13 +172,14 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     this.nextSeq.set(record.id, Math.max(cur, record.seq + 1));
     if (isTerminal(record.status)) {
       this.notify(record.id);
-      this.messages.delete(record.id);
+      this.deleteResolvedMessages(record.id);
     }
     return Promise.resolve();
   }
 
   delete(id: string): Promise<void> {
     this.contentHolds.delete(id);
+    this.paymentIntents.delete(id);
     this.data.delete(id);
     this.outgoingAppends.delete(id);
     this.messages.delete(id);
@@ -333,10 +351,43 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     return Promise.resolve(seq);
   }
 
+  recordPaymentArrival(
+    jobId: string,
+    message: { from: "requester"; type: "payment"; timestamp: number; content: Record<string, unknown> },
+    opts: { arrivedAtMs: number; leaseMs: number }
+  ): Promise<RecordedPaymentArrival> {
+    const record = this.data.get(jobId);
+    if (!record || record.redactedAt !== undefined) {
+      return Promise.reject(new Error(`recordPaymentArrival: job ${jobId} not found`));
+    }
+    const ask = this.messagesFor(jobId).findLast((entry) => entry.status === "verified" &&
+      entry.message.from === "provider" && entry.message.type === "payment-request")?.message;
+    const disposition = decidePaymentDisposition({
+      status: record.status,
+      pendingPaymentMsats: record.pendingPaymentMsats,
+      ask,
+      arrivedAtMs: opts.arrivedAtMs,
+    });
+    const seq = this.allocateSeq(jobId);
+    this.messagesFor(jobId).push({ message: { ...message, seq } as Message, status: "pending-verification" });
+    if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
+    if (seq > record.seq) record.seq = seq;
+    let intents = this.paymentIntents.get(jobId);
+    if (!intents) this.paymentIntents.set(jobId, intents = new Map());
+    intents.set(seq, { leaseExpiresAtMs: opts.arrivedAtMs + opts.leaseMs, resolved: false });
+    this.fireNotifyOnly(jobId);
+    return Promise.resolve({ seq, disposition });
+  }
+
+  openPaymentIntentUntil(jobId: string, nowMs: number): Promise<number | undefined> {
+    return Promise.resolve(this.openIntentUntil(jobId, nowMs));
+  }
+
   verifyAndCredit(
     jobId: string,
     seq: number,
-    credit: PaymentCreditDelta | null
+    credit: PaymentCreditDelta | null,
+    opts?: VerifyAndCreditOptions
   ): Promise<VerifyAndCreditResult> {
     const record = this.data.get(jobId);
     if (!record) return Promise.reject(new Error(`verifyAndCredit: job ${jobId} not found`));
@@ -350,8 +401,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
         ...creditBinding(record),
       });
     }
-    stored.status = "verified";
-    if (credit) {
+    this.resolveIntent(jobId, seq);
+    // An ended job takes no payment and no credit binding; the caller lands the money as balance.
+    const refused = credit !== null && isTerminal(record.status);
+    stored.status = opts?.landedAsBalance || refused ? "balance" : "verified";
+    if (credit && !refused) {
       record.paidMsats += credit.paidMsatsDelta;
       // the pinned fiat ask dies with the msat ask it denominates. A
       // partially-paid ask keeps its envelope so the remainder still funds at
@@ -394,13 +448,14 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
       counters: snapshotCounters(record),
       alreadyVerified: false,
       ...creditBinding(record),
+      ...(refused && { creditRefused: "job_ended" as const }),
     });
   }
 
   getVerifiedInbound(jobId: string, seq: number): Promise<VerifyAndCreditResult | undefined> {
     const record = this.data.get(jobId);
     const stored = this.messagesFor(jobId).find((m) => m.message.seq === seq);
-    if (!record || stored?.status !== "verified") return Promise.resolve(undefined);
+    if (!record || (stored?.status !== "verified" && stored?.status !== "balance")) return Promise.resolve(undefined);
     return Promise.resolve({
       counters: snapshotCounters(record),
       alreadyVerified: true,
@@ -412,6 +467,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     const stored = this.messagesFor(jobId).find((m) => m.message.seq === seq);
     if (stored?.status === "pending-verification") {
       stored.status = "failed-verify";
+      this.resolveIntent(jobId, seq);
       this.notify(jobId);
     }
     return Promise.resolve();
@@ -573,6 +629,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
     if (!eligible) return Promise.resolve(false);
+    const until = this.openIntentUntil(jobId, Date.now());
+    if (until !== undefined) return Promise.reject(new PaymentIntentOpenError(jobId, until));
     const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
     const terminalMessages = messages.length ? messages : record.messages;
     if (expectedActivityBefore !== null) {
@@ -600,8 +658,33 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore {
     record.seq = seq;
     record.lastActivityAt = Date.now();
     this.notify(jobId);
-    this.messages.delete(jobId);
+    this.deleteResolvedMessages(jobId);
     return Promise.resolve(true);
+  }
+
+  /** The latest lease among this job's unresolved, unexpired payment intents. */
+  private openIntentUntil(jobId: string, nowMs: number): number | undefined {
+    let until: number | undefined;
+    for (const intent of this.paymentIntents.get(jobId)?.values() ?? []) {
+      if (!intent.resolved && intent.leaseExpiresAtMs > nowMs) until = Math.max(until ?? 0, intent.leaseExpiresAtMs);
+    }
+    return until;
+  }
+
+  /**
+   * Terminal log cleanup. Mirrors `PostgresJobStore`: a payment still being
+   * verified keeps its row, so its outcome can still be recorded.
+   */
+  private deleteResolvedMessages(jobId: string): void {
+    const pending = this.messagesFor(jobId).filter((entry) =>
+      entry.status === "pending-verification" && entry.message.type === "payment");
+    if (pending.length) this.messages.set(jobId, pending);
+    else this.messages.delete(jobId);
+  }
+
+  private resolveIntent(jobId: string, seq: number): void {
+    const intent = this.paymentIntents.get(jobId)?.get(seq);
+    if (intent) intent.resolved = true;
   }
 
   private allocateSeq(jobId: string): number {

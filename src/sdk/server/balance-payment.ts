@@ -3,6 +3,7 @@ import type { Pool } from "pg";
 import { z } from "zod";
 
 import type { SignedRequestDomain } from "../../lib/signed-request-statement";
+import { askExpired } from "./ask-expiry";
 import { CreditLedger, CreditLedgerError } from "./credit-ledger";
 import { drawSettlementRef } from "./funding";
 import type { DVMAuthScheme } from "./secp256k1-auth";
@@ -73,10 +74,13 @@ export async function commitBalancePayment(args: {
     const job = jobs.rows[0];
     if (!job || (job.dvm_id !== null && job.dvm_id !== args.dvmId) || job.requester_pubkey !== pubkey) conflict("credit_payment_owner_mismatch");
     if (["completed", "failed", "cancelled"].includes(job.status)) conflict("job_not_active");
-    const asks = await tx.query<{ data: { seq: number; content: { credit?: { amount_micro: number; currency: string } } } }>(
+    const asks = await tx.query<{ data: { seq: number; content: { credit?: { amount_micro: number; currency: string }; expires_at_ms?: number } } }>(
       `SELECT data FROM job_messages WHERE job_id=$1 AND data->>'type'='payment-request'
        AND data->>'from'='provider' AND status='verified' ORDER BY seq DESC LIMIT 1`, [args.jobId]);
     const ask = asks.rows[0]?.data;
+    // Under the job row lock, so idle expiry cannot end the job between this
+    // check and the draw below. Nothing has moved yet: refusing costs nothing.
+    if (ask?.seq === request_seq && askExpired(ask.content.expires_at_ms, Date.now())) conflict("ask_expired");
     if (!ask || ask.seq !== request_seq || !ask.content.credit ||
       ask.content.credit.amount_micro !== amount_micro || ask.content.credit.currency !== currency ||
       Number(job.pending_payment_fiat_micro) !== amount_micro || job.pending_payment_fiat_currency !== currency ||

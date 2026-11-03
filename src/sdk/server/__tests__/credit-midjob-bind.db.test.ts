@@ -495,60 +495,25 @@ describe.skipIf(!RUN)("the mid-job Tx C seam", () => {
     expect(revenue).toHaveLength(0);
   });
 
-  describe("ledger-less, where there is no credit to name", () => {
-    // A ledger-less DVM still needs honest outcome-unknown copy without naming a nonexistent reclaim.
+  it("refuses on a ledger-less DVM before the facilitator settles, and releases the arrival", async () => {
+    // With no ledger there is no row to write, so the payment is never taken.
+    const jobId = "bind-noledger-1";
+    facilitatorSettles("bindtx-noledger");
+    const jm = manager({ ledgerless: true });
+    const job = await seedJob(jobId);
+    let outcome;
+    try {
+      outcome = await payMidJob(jm, job);
+    } finally {
+      jm.shutdown();
+    }
 
-    it("promises no balance and no drain when the row was read", async () => {
-      const jobId = "bind-noledger-1";
-      facilitatorSettles("bindtx-noledger");
-      const jm = manager({ ledgerless: true });
-      const job = await seedJob(jobId);
-      let outcome;
-      try {
-        outcome = await payMidJob(jm, job, { fault: "before", times: 10 });
-        faults.arm("before", 0);
-      } finally {
-        jm.shutdown();
-      }
-
-      expect(outcome.error?.status).toBe(500);
-      expect(outcome.error?.body).toMatchObject({ error: "payment_unapplied" });
-      expect(outcome.error?.body.credit_id).toBeUndefined();
-      const display = String(outcome.error?.body.display);
-      const hint = String(outcome.error?.body.hint);
-
-      expect(hint).toContain("Send a new payment");
-      expect(`${display} ${hint}`).not.toContain("drain");
-      expect(display).not.toContain("prepaid balance with this service,");
-    });
-
-    it("still says unconfirmed when the read-back never reaches the row", async () => {
-      const jobId = "bind-noledger-2";
-      facilitatorSettles("bindtx-noledger-2");
-      const jm = manager({ ledgerless: true });
-      const job = await seedJob(jobId);
-      let outcome;
-      try {
-        outcome = await payMidJob(jm, job, {
-          fault: "after",
-          times: CREDIT_INBOUND_ATTEMPTS,
-          reads: CREDIT_INBOUND_READ_ATTEMPTS,
-        });
-      } finally {
-        jm.shutdown();
-      }
-
-      expect(outcome.error?.status).toBe(500);
-      const display = String(outcome.error?.body.display);
-      const hint = String(outcome.error?.body.hint);
-      expect(display).toContain("unclear whether it was applied to this job");
-      expect(display).not.toContain("still outstanding");
-      expect(hint).toContain("Read this job's status before paying again");
-      expect(`${display} ${hint}`).not.toContain("drain");
-
-      const row = await jobRow(jobId);
-      expect(row?.paidMsats).toBe(ASK_MSATS);
-    });
+    expect(outcome.error).toMatchObject({ status: 402, body: { error: "payment_invalid" } });
+    expect(verifyX402Payment).not.toHaveBeenCalled();
+    expect((await jobRow(jobId))?.paidMsats).toBe(0);
+    // The refusal resolves the arrival's intent: the job is free to end.
+    expect(await jobStore.openPaymentIntentUntil(jobId, Date.now())).toBeUndefined();
+    expect(await jobStore.cancelJob(jobId, "caller stopped")).toBe(true);
   });
 
   it("names the loser when two free-then-paid top-ups race", async () => {

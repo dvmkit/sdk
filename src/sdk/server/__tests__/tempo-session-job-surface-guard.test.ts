@@ -586,7 +586,7 @@ describe("mid-job Tempo session confinement", () => {
           },
         },
       },
-      { mpp: mpp as never, fxFetcher: fx }
+      { mpp: mpp as never, fxFetcher: fx, creditLedger: new MemoryCreditLedger() }
     );
 
     expect(result).toBeNull();
@@ -596,7 +596,7 @@ describe("mid-job Tempo session confinement", () => {
 });
 
 describe("mid-job Tempo instrument preflight", () => {
-  it("skips the ledger leg for a charge against a session-bound credit", async () => {
+  it("lands a charge against a session-bound credit on a fresh credit as balance", async () => {
     const channelId = `0x${"11".repeat(32)}`;
     const mpp = sessionWiredMpp();
     const ledger = new MemoryCreditLedger();
@@ -647,11 +647,14 @@ describe("mid-job Tempo instrument preflight", () => {
       }
     );
 
-    // The money still moves — a mid-job refusal is a skip, never a throw.
+    // The money still moves — never refused, and never without a ledger row:
+    // it lands on a fresh credit of the same caller, not the session-bound one.
     expect(error).toBeUndefined();
-    expect(verified?.paidMsats).toBe(50_000);
     expect(mpp.broadcastCredential).toHaveBeenCalledTimes(1);
-    expect(fund).not.toHaveBeenCalled();
+    expect(fund).toHaveBeenCalledTimes(1);
+    expect(fund.mock.calls[0][0]).toMatchObject({ creditId: "imp:tempo:tempo/charge", callerPubkey: CALLER });
+    expect(verified?.unappliedMicro).toBe(50_000);
+    expect(await ledger.get("imp:tempo:tempo/charge")).toMatchObject({ callerPubkey: CALLER, availableMicro: 50_000 });
 
     const draw = await ledger.getDraw({ creditId: "credit-session", drawId: "draw-1" });
     expect(draw?.amountMicro).toBe(50_000);

@@ -8,6 +8,7 @@
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { ASK_EXPIRY_GRACE_MS } from "../ask-expiry";
 import type { JobRecord } from "../job-store";
 import { PostgresJobStore } from "../postgres-job-store";
 
@@ -83,7 +84,9 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
     }, { awaitingInput: true });
     expect(await store.cancelStaleJob("deadline", now + 1000, "stale", "cancelled")).toBe(false);
     expect(await statusOf("deadline")).toBe("awaiting-input");
-    vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+    vi.spyOn(Date, "now").mockReturnValue(now + 3000 + ASK_EXPIRY_GRACE_MS - 1);
+    expect(await store.cancelStaleJob("deadline", now + 1000, "stale", "cancelled")).toBe(false);
+    vi.spyOn(Date, "now").mockReturnValue(now + 3000 + ASK_EXPIRY_GRACE_MS);
     expect(await store.cancelStaleJob("deadline", now + 1000, "stale", "cancelled")).toBe(true);
     expect((await store.get("deadline"))?.endedBy).toBe("caller");
   });
@@ -111,7 +114,7 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
       type === "payment-request" ? { pendingPaymentDelta: 1000 } : undefined);
     expect(await store.cancelStaleJob("event", now + 1000, "stale", "cancelled")).toBe(false);
     expect(await store.cancelStaleJob("event", now + 1000, "dead", "failed")).toBe(false);
-    vi.spyOn(Date, "now").mockReturnValue(now + 3000);
+    vi.spyOn(Date, "now").mockReturnValue(now + 3000 + ASK_EXPIRY_GRACE_MS);
     expect(await store.cancelStaleJob("event", now + 1000, "stale", "cancelled")).toBe(true);
     expect((await store.get("event"))?.endedBy).toBe("caller");
   });

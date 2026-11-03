@@ -198,7 +198,9 @@ describe("Pattern A reactivation — payment credit", () => {
     // must auto-credit from the leftover pool instead of yielding.
     const overCreditSpy = vi
       .spyOn(jobManager, "processPayment")
-      .mockImplementation(async (job: ServerJob) => {
+      .mockImplementation(async (job: ServerJob, _body, inboundSeq) => {
+        // Tx C records the outcome, which also releases the arrival's intent.
+        await jobStore.verifyAndCredit(job.id, inboundSeq!, null);
         job.paidMsats = 12_000;
         job.pendingPaymentMsats = undefined;
         if (job.status === "awaiting-input") job.status = "processing";

@@ -5,9 +5,11 @@ import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
 import { MemoryKVStore } from "../../store";
 import type { DVMConfig, SDKJobContext } from "../../types";
+import { ASK_EXPIRY_GRACE_MS } from "../ask-expiry";
 import { JobManager } from "../job-manager";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
+import { PAYMENT_INTENT_POLL_MS } from "../payment-arrival";
 
 const START = 1700000000000;
 const managers: { shutdown(): void | Promise<void> }[] = [];
@@ -45,7 +47,7 @@ describe("caller deadlines", () => {
     const job = await start(jm);
     expect(job.status).toBe("processing"); // Event-driven recovery dispatches callbacks.
     expect(job.messages[0].content).toHaveProperty("expires_at_ms", START + 3000);
-    await vi.advanceTimersByTimeAsync(2999);
+    await vi.advanceTimersByTimeAsync(2999 + ASK_EXPIRY_GRACE_MS);
     expect(job.status).toBe("processing");
     expect(await jm.sweepStaleJobs()).toEqual({ swept: 0 });
     await vi.advanceTimersByTimeAsync(1);
@@ -100,7 +102,7 @@ describe("caller deadlines", () => {
     const seq = await recovered.recordInboundPending(replay, "response", content);
     await recovered.markInboundVerified(job.id, seq);
     await recovered.dispatchMessage(replay, "response", content);
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(999 + ASK_EXPIRY_GRACE_MS);
     expect(replay.status).toBe("awaiting-input");
     await vi.advanceTimersByTimeAsync(1);
     expect(replay.status).toBe("cancelled");
@@ -191,6 +193,33 @@ describe("caller deadlines", () => {
     expect((await ledger.getDraw({ creditId: credit.creditId, drawId: "draw" }))?.status).toBe("released");
   });
 
+  it.each(["verified", "refused"] as const)("expires an ask only after a payment that arrived in time is %s", async (outcome) => {
+    const { jm, store } = manager(async (ctx) => {
+      await ctx.requestPayment(1000, "Next block");
+      ctx.complete("done");
+    });
+    const job = await start(jm);
+    await vi.advanceTimersByTimeAsync(2000);
+    const body = { type: "payment" as const, content: { amount_msats: 1000 } };
+    const seq = await jm.recordInboundPending(job, body.type, body.content);
+    // Expiry and the stale sweep both come due while the payment verifies.
+    await vi.advanceTimersByTimeAsync(1000 + ASK_EXPIRY_GRACE_MS);
+    expect(await jm.sweepStaleJobs()).toEqual({ swept: 0 });
+    expect(job.status).toBe("awaiting-input");
+    expect((await store.get(job.id))?.status).toBe("awaiting-input");
+    if (outcome === "verified") {
+      expect((await jm.processPayment(job, body, seq)).error).toBeUndefined();
+      await jm.dispatchMessage(job, body.type, body.content);
+      await vi.advanceTimersByTimeAsync(PAYMENT_INTENT_POLL_MS);
+      expect(job.status).toBe("completed");
+    } else {
+      await store.markInboundFailed(job.id, seq!, "payment_invalid");
+      await vi.advanceTimersByTimeAsync(PAYMENT_INTENT_POLL_MS);
+      expect(job.status).toBe("cancelled");
+      expect((await store.get(job.id))?.endedBy).toBe("caller");
+    }
+  });
+
   it("allows work and progress beyond idleTimeout", async () => {
     const { jm } = manager(async (ctx) => {
       for (let i = 0; i < 6; i++) { await delay(500); ctx.progress(i / 6); }
@@ -227,6 +256,9 @@ describe("caller deadlines", () => {
     // Bypass the manager to exercise the store's last-line expiry guard.
     expect(await store.cancelStaleJob(job.id, Date.now(), "stale", "cancelled")).toBe(false);
     await vi.advanceTimersByTimeAsync(999);
+    // Past the advertised deadline but inside the grace: still answerable.
+    expect(await store.cancelStaleJob(job.id, Date.now(), "stale", "cancelled")).toBe(false);
+    await vi.advanceTimersByTimeAsync(ASK_EXPIRY_GRACE_MS);
     expect(job.status).toBe("awaiting-input");
     expect(ask.content).toHaveProperty("expires_at_ms", fixture.prompt.expires_at_ms);
     await vi.advanceTimersByTimeAsync(1);
@@ -315,7 +347,7 @@ describe("caller deadlines", () => {
     const seq = await jm.recordInboundPending(job, "response", content);
     await jm.markInboundVerified(job.id, seq);
     await jm.dispatchMessage(job, "response", content);
-    await vi.advanceTimersByTimeAsync(1999);
+    await vi.advanceTimersByTimeAsync(1999 + ASK_EXPIRY_GRACE_MS);
     expect(job.status).toBe("awaiting-input");
     await vi.advanceTimersByTimeAsync(1);
     expect(job.status).toBe("cancelled");
@@ -355,7 +387,7 @@ describe("caller deadlines", () => {
     const asks = replay.messages.filter((m) => m.type === "payment-request");
     expect(asks).toHaveLength(2);
     expect(asks[1].content).toMatchObject({ amount_msats: 2000, reason: "Second block", expires_at_ms: START + 7000 });
-    await vi.advanceTimersByTimeAsync(2999);
+    await vi.advanceTimersByTimeAsync(2999 + ASK_EXPIRY_GRACE_MS);
     expect(replay.status).toBe("awaiting-input");
     await vi.advanceTimersByTimeAsync(1);
     expect(replay.status).toBe("cancelled");
@@ -384,7 +416,7 @@ describe("caller deadlines", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(replay.messages.filter((m) => m.type === type)).toEqual([original]);
     expect(await recovered.sweepStaleJobs()).toEqual({ swept: 0 });
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(999 + ASK_EXPIRY_GRACE_MS);
     expect(replay.status).toBe("awaiting-input");
     await vi.advanceTimersByTimeAsync(1);
     expect(replay.status).toBe("cancelled");

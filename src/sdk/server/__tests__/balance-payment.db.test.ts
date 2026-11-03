@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import type { Pool } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
@@ -26,6 +27,9 @@ const signer = createSignedRequestVerifier(z.object({}), { replayStore: null });
 let now = Math.floor(Date.now() / 1000);
 const auth = secp256k1Auth({ now: () => now });
 const tokenHash = createHash("sha256").update("token").digest("hex");
+const fixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/balance-payment-v1.json", import.meta.url), "utf8")) as {
+  ask_expired: { status: number; body: Record<string, unknown> };
+};
 
 describe.skipIf(!RUN)("balance payment atomic persistence", () => {
   let pool: Pool;
@@ -192,6 +196,32 @@ describe.skipIf(!RUN)("balance payment atomic persistence", () => {
     expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.amountMicro).toBe(2_400);
     expect((await ledger.get("credit"))?.availableMicro).toBe(7_600);
     expect((await pool.query("SELECT * FROM credit_balance_payments")).rowCount).toBe(0);
+  });
+
+  describe("after the ask's deadline", () => {
+    const deadline = 1_900_000_000_000;
+    beforeEach(async () => {
+      await pool.query(`UPDATE job_messages SET data=jsonb_set(data,'{content,expires_at_ms}',to_jsonb($1::bigint))
+        WHERE job_id='job' AND data->>'type'='payment-request'`, [deadline]);
+      await pool.query("UPDATE credits SET expiry_ms=$1 WHERE credit_id='credit'", [deadline + 86_400_000]);
+    });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("pays the ask until 30 seconds past expires_at_ms", async () => {
+      vi.useFakeTimers({ toFake: ["Date"], now: deadline + 29_999 });
+      expect(await pay()).toMatchObject({ response: { seq: 2 }, replayed: false });
+      expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.amountMicro).toBe(1_000);
+    });
+
+    it("refuses with ask_expired from 30 seconds past expires_at_ms and moves no money", async () => {
+      vi.useFakeTimers({ toFake: ["Date"], now: deadline + 30_000 });
+      await expect(pay()).rejects.toMatchObject({ status: fixture.ask_expired.status, body: fixture.ask_expired.body });
+      expect((await ledger.get("credit"))?.availableMicro).toBe(10_000);
+      expect((await pool.query("SELECT * FROM credit_draws")).rowCount).toBe(0);
+      expect((await pool.query("SELECT * FROM credit_balance_payments")).rowCount).toBe(0);
+      expect((await store.getMessages("job", 0)).filter((message) => message.type === "payment")).toHaveLength(0);
+      expect((await store.get("job"))?.pendingPaymentMsats).toBe(10_000);
+    });
   });
 
   it("does not place a hold after cancellation wins the job-row lock", async () => {

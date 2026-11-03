@@ -681,13 +681,17 @@ describe("verifyUpfrontPayment", () => {
 });
 
 describe("processIncomingPayment", () => {
+  // Mid-job payments always run their ledger leg; each call gets a fresh ledger.
+  const pay = (...[job, body, opts]: Parameters<typeof processIncomingPayment>) =>
+    processIncomingPayment(job, body, { creditLedger: new MemoryCreditLedger(), ...opts });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
   it("returns null for non-payment messages", async () => {
     const job = makeJob();
-    const result = await processIncomingPayment(
+    const result = await pay(
       job,
       { type: "response", content: { prompt_id: "p1", text: "yes" } },
       {}
@@ -706,7 +710,7 @@ describe("processIncomingPayment", () => {
       });
       const job = makeJob();
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { x402_payment: "encoded-payload" } },
         { x402Config: X402_CONFIG, fxFetcher: stubFx }
@@ -729,7 +733,7 @@ describe("processIncomingPayment", () => {
       mockVerifyX402.mockResolvedValue({ verified: false, amountMsats: 0 });
       const job = makeJob();
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { x402_payment: "bad-payload" } },
         { x402Config: X402_CONFIG, fxFetcher: stubFx }
@@ -740,25 +744,58 @@ describe("processIncomingPayment", () => {
       expect(job.status).toBe("awaiting-input");
     });
 
-    it("does not process x402 when no x402Config provided", async () => {
+    it("refuses x402 when no x402Config is provided", async () => {
       const job = makeJob();
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { x402_payment: "encoded-payload" } },
         {}
       );
 
-      expect(result).toBeNull();
+      expect(result).toMatchObject({ status: 402, body: { error: "payment_invalid" } });
       expect(job.paidMsats).toBe(0);
       expect(mockVerifyX402).not.toHaveBeenCalled();
+    });
+
+    it("refuses a paid payment when no credit ledger is wired, before the facilitator settles", async () => {
+      const job = makeJob();
+
+      const result = await processIncomingPayment(
+        job,
+        { type: "payment", content: { x402_payment: "encoded-payload" } },
+        { x402Config: X402_CONFIG, fxFetcher: stubFx }
+      );
+
+      expect(result).toMatchObject({ status: 402, body: { error: "payment_invalid" } });
+      expect(job.paidMsats).toBe(0);
+      expect(job.status).toBe("awaiting-input");
+      expect(mockVerifyX402).not.toHaveBeenCalled();
+    });
+
+    it("writes the ledger row for an accepted payment", async () => {
+      mockVerifyX402.mockResolvedValue({ verified: true, amountMsats: 1000, amountUsdcMicro: 5_000, txHash: "0xledgered" });
+      const ledger = new MemoryCreditLedger();
+      const job = makeJob({ requesterPubkey: "ab".repeat(32) });
+
+      const result = await processIncomingPayment(
+        job,
+        { type: "payment", content: { x402_payment: "encoded-payload" } },
+        { x402Config: X402_CONFIG, fxFetcher: stubFx, creditLedger: ledger }
+      );
+
+      expect(result).toBeNull();
+      expect(job.creditId).toBe("imp:x402:0xledgered");
+      expect(await ledger.get("imp:x402:0xledgered")).toMatchObject({ callerPubkey: "ab".repeat(32) });
+      expect(await ledger.getDraw({ creditId: "imp:x402:0xledgered", drawId: "0xledgered" }))
+        .toMatchObject({ status: "pending", jobId: job.id });
     });
 
     // The signed authorization must also match this job's pending nonce.
     it("refuses x402 on a non-USD DVM before facilitator verification", async () => {
       const job = makeJob();
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { x402_payment: "encoded-payload" } },
         { x402Config: X402_CONFIG, pricingCurrency: "eur", fxFetcher: stubFx }
@@ -780,7 +817,7 @@ describe("processIncomingPayment", () => {
       });
       const job = makeJob({ pendingX402Nonce: nonce });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         {
           type: "payment",
@@ -810,7 +847,7 @@ describe("processIncomingPayment", () => {
       });
       const job = makeJob({ pendingX402Nonce: boundNonce });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         {
           type: "payment",
@@ -836,7 +873,7 @@ describe("processIncomingPayment", () => {
       const credential = await makeTempoCredential(mpp, 1000);
       const job = makeJob({ pendingMppChallengeIds: [credential.challenge.id] });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -864,7 +901,7 @@ describe("processIncomingPayment", () => {
       const credential = await makeTempoCredential(mpp, 1000);
       const job = makeJob({ pendingMppChallengeIds: ["someone-elses-challenge"] });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -884,7 +921,7 @@ describe("processIncomingPayment", () => {
       const credential = await makeTempoCredential(mpp, 1000);
       const job = makeJob({ pendingMppChallengeIds: undefined });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -900,7 +937,7 @@ describe("processIncomingPayment", () => {
       const credential = await makeTempoCredential(mpp, 5000);
       const job = makeJob({ pendingPaymentMsats: 1000 });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -915,7 +952,7 @@ describe("processIncomingPayment", () => {
       const credential = await makeTempoCredential(mpp, 1000);
       const job = makeJob({ pendingPaymentMsats: undefined });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -932,10 +969,10 @@ describe("processIncomingPayment", () => {
         throw new Error("invalid signature");
       });
       const credential = await makeTempoCredential(mpp, 1000);
-      const job = makeJob();
+      const job = makeJob({ pendingMppChallengeIds: [credential.challenge.id] });
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: credential } },
         { mpp, fxFetcher: stubFx }
@@ -992,7 +1029,7 @@ describe("processIncomingPayment", () => {
         amountUsdcMicro: 1_000,
         txHash: "0xmidjob"
       });
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { x402_payment: "encoded-payload-2" } },
         { x402Config: X402_CONFIG, fxFetcher: stubFx }
@@ -1034,7 +1071,7 @@ describe("processIncomingPayment", () => {
         status: "awaiting-input"
       });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: midjobCred } },
         { mpp, fxFetcher: stubFx }
@@ -1079,7 +1116,7 @@ describe("processIncomingPayment", () => {
         status: "awaiting-input"
       });
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { tempo_credential: midjobCred } },
         { mpp, fxFetcher: stubFx }
@@ -1101,7 +1138,7 @@ describe("processIncomingPayment", () => {
     it("rejects unlocked Cashu tokens with cashu_not_p2pk_locked", async () => {
       const job = makeJob();
 
-      const result = await processIncomingPayment(
+      const result = await pay(
         job,
         { type: "payment", content: { cashu_token: "cashuAeyJ..." } },
         { mints: ["https://mint.example.com"] }

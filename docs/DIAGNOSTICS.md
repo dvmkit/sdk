@@ -12,7 +12,7 @@ Every diagnostic sink uses the same catalogue projection: console loggers, span 
 
 | Field | Allowed values | Meaning |
 | --- | --- | --- |
-| `reason` | `credit_or_draw_missing`, `draw_not_pending`, `draw_job_mismatch`, `rail_mismatch`, `channel_binding_mismatch`, `denomination_unavailable`, `topup_cap_unavailable`, `topup_cap_currency_mismatch`, `unknown` | The existing `credit_topup_skipped` reason. Cap reasons describe an unenforced ceiling; the credit leg may still proceed. |
+| `reason` | `credit_or_draw_missing`, `credit_not_active`, `draw_not_pending`, `draw_job_mismatch`, `rail_mismatch`, `channel_binding_mismatch`, `denomination_unavailable`, `topup_cap_unavailable`, `topup_cap_currency_mismatch`, `unknown` | Why a mid-job payment's ledger leg changed course. On `credit_topup_redirected`, the job's credit could not take the payment, which landed as balance on a fresh credit of the same caller. On `credit_topup_refused` (`denomination_unavailable`), no rate could value the payment, so it was refused before the rail was touched. On `credit_topup_skipped`, the cap reasons describe an unenforced ceiling; the credit leg still proceeds. |
 | `cause` | `no_msats`, `sub_micro`, `unsupported_currency`, `rate_unavailable`, `rate_stale_refused`, `unknown` | The denomination failure behind `denomination_unavailable`. |
 | `job_id_hash` | SHA-256 hex digest of the UTF-8 job ID | Binds top-up warnings to the server-owned job without retaining raw job, credit, or draw IDs. Absent when no job ID is available. |
 | `source_failure` | `network_error`, `http_error`, `invalid_body`, `no_usable_rate`, `missing_currency`, `unknown` | The last source attempt failed at transport, HTTP response, body parsing/shape, or usable-rate collection; `missing_currency` means a successful snapshot omitted an advertised currency with no cached rate. `unknown` means no typed source observation is available. |
@@ -30,10 +30,10 @@ If a one-shot Tempo charge succeeds with a valid transaction hash but its consum
 
 Typed challenge errors do not distinguish expiry, a bad binding, or a missing challenge unless the dependency exposes a dedicated error type. Generic `Error`, `TypeError`, forged exception names, and nested causes do not imply RPC, rate, database, or network unavailability. x402 boolean rejection results distinguish verifier and settlement rejection without interpreting provider prose.
 
-For example, an accepted Cashu top-up whose credit leg cannot find a usable rate emits:
+For example, a Cashu top-up refused because its credit leg cannot find a usable rate emits:
 
 ```json
-{"event":"credit_topup_skipped","level":"warn","rail":"cashu","reason":"denomination_unavailable","cause":"rate_unavailable","currency":"usd","source_failure":"http_error","source_status":429}
+{"event":"credit_topup_refused","level":"warn","rail":"cashu","reason":"denomination_unavailable","cause":"rate_unavailable","currency":"usd","source_failure":"http_error","source_status":429}
 ```
 
 A Tempo adapter exception may instead emit:

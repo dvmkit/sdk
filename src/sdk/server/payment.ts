@@ -51,6 +51,7 @@ import type {
 import { CreditLedgerError, isFundingRail } from "./credit-ledger";
 import {
   drawSettlementRef,
+  fiatAmountMicro,
   type FiatDenomination,
   deferredX402Id,
   DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER,
@@ -68,6 +69,7 @@ import {
 import type { ServerJob } from "./job";
 import type { TopUpCapUnenforcedReason } from "./job-store";
 import { UNCAPPABLE_ASK_TOTAL } from "./job-store";
+import type { ArrivalBalanceReason, BalanceLanding as LedgerBalanceLanding } from "./payment-arrival";
 import type { MintHealthTracker } from "./mint-health-tracker";
 import { challengeMeta, type MppxServer } from "./mpp-setup";
 import {
@@ -193,6 +195,12 @@ export interface PaymentInfo {
    * told or they will re-send. Absent on every ordinary payment.
    */
   unappliedMicro?: number;
+  /**
+   * Set when the ledger leg, not the arrival, turned a mid-job payment into
+   * balance: the job's credit cannot take it, or the job's draw resolved
+   * before the rail committed. It paid no ask, so it must not resume the job.
+   */
+  landedAsBalance?: LedgerBalanceLanding;
   /**
    * The ledger's own record of a mid-job funding accepted against the job's
    * pending draw, fixed inside the rail transaction. Carries the immutable
@@ -1449,27 +1457,8 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         // keyed on the settlement tx hash. A marker collision means this
         // payment already funded — route to the recovery gates.
         let credited: CommittedFunding | undefined;
-        const paymentId = receipt.txHash;
-        if (ledgerCtx && !paymentId) {
-          if (creditEnv?.fund) {
-            // The caller signed an explicit funding commitment, but the rail
-            // returned no settlement reference to key the marker on — the
-            // funding can't be committed idempotently, and silently minting
-            // no credit would leave the caller believing they funded one.
-            // Money already moved at the facilitator, so fail closed like
-            // the amount-mismatch branch below.
-            logCreditRejected("x402_missing_tx_hash_explicit_fund", creditEnv.creditId);
-            return creditRefusal(
-              "payment_invalid",
-              "The payment settled but returned no transaction reference, so the signed funding commitment cannot be recorded. The explicit funding was refused; retry without a fund block or contact the service operator."
-            );
-          }
-          // Implicit N=1: no settlement reference to key the marker on — skip
-          // the ledger leg (legacy semantics) rather than mint an unkeyed
-          // funding. Money is never refused for a rail metadata gap.
-          logCreditRejected("x402_missing_tx_hash", undefined);
-        }
-        if (ledgerCtx && paymentId) {
+        const paymentId = x402FundingId(receipt.txHash, x402Payment);
+        if (ledgerCtx) {
           // The fiat half of the same valuation — one rounding, in USDC.
           // Threaded to the commit below rather than left to `fundAndDraw`'s
           // own `fundedMicroFor`: a gate that accepted `price_micro` while the
@@ -2969,6 +2958,14 @@ export interface VerifyIncomingSnapshot {
    */
   requesterPubkey?: string;
   requesterId?: string;
+  /**
+   * Set when the job's row, read under its lock at arrival, says this payment
+   * cannot pay an ask: the job ended, its ask expired, or none is open. The
+   * payment then lands on credit as balance the caller owns and grows no draw.
+   */
+  landAsBalance?: ArrivalBalanceReason;
+  /** The outstanding ask's own `fiat_amount`, its quote when no pinned envelope or rate exists. */
+  askFiatAmount?: { amount: number; currency: string };
 }
 
 export interface VerifiedIncomingPayment {
@@ -3001,9 +2998,11 @@ export interface VerifiedIncomingPayment {
   /**
    * The ledger funding row a mid-job top-up fixed for this payment, when the
    * job already held a draw. The route issues the signed draw funding receipt
-   * from it; absent when the payment ran ledger-less or opened a fresh credit.
+   * from it; absent when the payment opened a fresh credit.
    */
   drawFunding?: FundingRecord;
+  /** See `PaymentInfo.landedAsBalance`: the payment paid no ask. */
+  landedAsBalance?: LedgerBalanceLanding;
 }
 
 /**
@@ -3079,7 +3078,9 @@ async function verifyIncomingPaymentInScope(
           : undefined;
       // the ledger leg rides the accumulator's own commit
       // transaction, so the proofs and the top-up land together or not at all.
-      const ledgerCtx = await resolveTopUpLedgerContext(opts, snapshot, { rail: "cashu" });
+      const resolved = await resolveTopUpLedgerContext(opts, snapshot, { rail: "cashu" });
+      if (resolved.error) return { error: resolved.error };
+      const ledgerCtx = resolved.ctx;
       const result = await verifyAccumulatorReceipt(
         {
           cashuToken: body.content.cashu_token as string,
@@ -3092,7 +3093,9 @@ async function verifyIncomingPaymentInScope(
           cashuLockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds),
         },
         mints,
-        snapshot.pendingPaymentMsats,
+        // A balance landing has no ask to fall short of: whatever arrived is
+        // the caller's balance, never a short payment refused after receipt.
+        ledgerCtx.askSatisfied ? undefined : snapshot.pendingPaymentMsats,
         ledgerCtx
       );
       if (result.error) {
@@ -3154,6 +3157,18 @@ async function verifyIncomingPaymentInScope(
           snapshot,
         });
       }
+      // Resolved before the facilitator is asked to settle: a refusal here
+      // leaves the authorization unspent and resendable.
+      const resolved = await resolveTopUpLedgerContext(
+        opts,
+        snapshot,
+        await incomingCreditBinding({
+          rail: "x402",
+          x402Payment: body.content.x402_payment as string,
+        })
+      );
+      if (resolved.error) return { error: resolved.error };
+      const ledgerCtx = resolved.ctx;
       const { verifyX402Payment } = await import("../../lib/x402");
       const receipt = await withPaymentStage("verifier_broadcast", () => verifyX402Payment(
         body.content.x402_payment as string,
@@ -3202,46 +3217,29 @@ async function verifyIncomingPaymentInScope(
       // processed-payment marker + fund + growDraw in one transaction — the
       // same shape the upfront path uses, and the first crash-replay protection
       // this leg has ever had (the per-job nonce above is cleared on accept).
-      const ledgerCtx = await resolveTopUpLedgerContext(
-        opts,
-        snapshot,
-        await incomingCreditBinding({
-          rail: "x402",
-          x402Payment: body.content.x402_payment as string,
-        })
-      );
       let credited: CommittedFunding | undefined;
-      const paymentId = receipt.txHash;
-      if (ledgerCtx && !paymentId) {
-        // No settlement reference to key the marker on — skip the ledger leg
-        // (legacy semantics) rather than mint an unkeyed funding, exactly as
-        // the upfront implicit path does. Money is never refused for a rail
-        // metadata gap.
-        logCreditRejected("x402_missing_tx_hash", undefined);
-      }
-      if (ledgerCtx && paymentId) {
-        try {
-          credited = await commitMarkedFunding(ledgerCtx, {
-            rail: "x402",
-            paymentId,
-            paidMsats: midJobFundedMsats(snapshot, receipt.amountMsats),
-            nativeAmount: receipt.amountUsdcMicro,
-            nativeAsset: "usdc",
-          });
-        } catch (err) {
-          const mapped = mapLedgerCommitError(err, undefined, true);
-          if (mapped?.error) {
-            logCredentialRejected("x402", "mid-job", err);
-            return {
-              error: {
-                body: mapped.error.body,
-                status: mapped.error.status,
-                ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
-              },
-            };
-          }
-          throw err;
+      const paymentId = x402FundingId(receipt.txHash, body.content.x402_payment as string);
+      try {
+        credited = await commitMarkedFunding(ledgerCtx, {
+          rail: "x402",
+          paymentId,
+          paidMsats: midJobFundedMsats(snapshot, receipt.amountMsats),
+          nativeAmount: receipt.amountUsdcMicro,
+          nativeAsset: "usdc",
+        });
+      } catch (err) {
+        const mapped = mapLedgerCommitError(err, undefined, true);
+        if (mapped?.error) {
+          logCredentialRejected("x402", "mid-job", err);
+          return {
+            error: {
+              body: mapped.error.body,
+              status: mapped.error.status,
+              ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
+            },
+          };
         }
+        throw err;
       }
       const info = withDrawBasis(
         {
@@ -3331,11 +3329,13 @@ async function verifyIncomingPaymentInScope(
         credential.challenge.method
       );
       const nativeAsset = methodNativeAsset(credential.challenge.method);
-      const ledgerCtx = await resolveTopUpLedgerContext(
+      const resolved = await resolveTopUpLedgerContext(
         opts,
         snapshot,
         await incomingCreditBinding({ rail: "tempo", mppCredential: credential })
       );
+      if (resolved.error) return { error: resolved.error };
+      const ledgerCtx = resolved.ctx;
       const funding: RailFunding & { rail: "tempo" } = {
         rail: "tempo",
         paymentId: mppPaymentId(credential),
@@ -3367,23 +3367,21 @@ async function verifyIncomingPaymentInScope(
       // same durable commit as x402 — marker + fund + growDraw in one
       // transaction, keyed on the credential's challenge id.
       let credited: CommittedFunding | undefined;
-      if (ledgerCtx) {
-        try {
-          credited = await commitMppFunding(ledgerCtx, credential, funding);
-        } catch (err) {
-          const mapped = mapLedgerCommitError(err, undefined, true);
-          if (mapped?.error) {
-            logCredentialRejected("tempo", "mid-job", err);
-            return {
-              error: {
-                body: mapped.error.body,
-                status: mapped.error.status,
-                ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
-              },
-            };
-          }
-          throw err;
+      try {
+        credited = await commitMppFunding(ledgerCtx, credential, funding);
+      } catch (err) {
+        const mapped = mapLedgerCommitError(err, undefined, true);
+        if (mapped?.error) {
+          logCredentialRejected("tempo", "mid-job", err);
+          return {
+            error: {
+              body: mapped.error.body,
+              status: mapped.error.status,
+              ...(mapped.error.replayPaymentId && { replayPaymentId: mapped.error.replayPaymentId }),
+            },
+          };
         }
+        throw err;
       }
       if (credited) {
         await mppServer.completeHostedTempoCharge?.(credential.challenge.id).catch((error: unknown) => {
@@ -3432,6 +3430,18 @@ async function verifyIncomingPaymentInScope(
 }
 
 /**
+ * The funding id an x402 settlement is keyed on: its transaction hash, or the
+ * EIP-3009 authorization when a facilitator reported success without one. An
+ * authorizer's nonce is single-use on chain, so it identifies the transfer as
+ * uniquely, and money that moved is never left without a ledger row.
+ */
+function x402FundingId(txHash: string | undefined, paymentHeader: string): string {
+  if (txHash) return txHash;
+  const { from, nonce } = decodePayment(paymentHeader).payload.authorization;
+  return `eip3009:${from.toLowerCase()}:${nonce.toLowerCase()}`;
+}
+
+/**
  * Rail value a mid-job funding is worth, in msats.
  *
  * The outstanding ask is preferred, and deliberately so (sibling
@@ -3477,18 +3487,18 @@ async function acceptDurableExactIncoming(args: {
   }
   const requiredMsats = args.snapshot.pendingPaymentMsats ?? 0;
   const authorizedUsdcMicro = Number.parseInt(authorization.value, 10);
-  const ledgerCtx = await resolveTopUpLedgerContext(
+  const resolved = await resolveTopUpLedgerContext(
     args.opts,
     args.snapshot,
     await incomingCreditBinding({ rail: "x402", x402Payment: args.paymentHeader })
   );
+  if (resolved.error) return { error: resolved.error };
+  const ledgerCtx = resolved.ctx;
   const paidMsats = midJobFundedMsats(
     args.snapshot,
     x402SettledShare(requiredMsats, Number(args.requiredUsdcMicro), authorizedUsdcMicro)
   );
-  const fundedMicro = ledgerCtx
-    ? fundedMicroFor(ledgerCtx.priceFiat, paidMsats, ledgerCtx.requiredMsats)
-    : 0;
+  const fundedMicro = fundedMicroFor(ledgerCtx.priceFiat, paidMsats, ledgerCtx.requiredMsats);
   const accepted = await args.settlement.accept({
     paymentHeader: args.paymentHeader,
     config: args.config,
@@ -3497,15 +3507,15 @@ async function acceptDurableExactIncoming(args: {
     btcUsdRate: args.btcUsdRate,
     exactVersions: args.exactVersions,
     dvmId: args.opts.dvmId ?? "",
-    effect: ledgerCtx
-      ? exactSettlementEffect(ledgerCtx, {
-          paidMsats,
-          fundedMicro,
-          nativeAmount: authorizedUsdcMicro,
-        })
-      : undefined,
+    effect: exactSettlementEffect(ledgerCtx, {
+      paidMsats,
+      fundedMicro,
+      nativeAmount: authorizedUsdcMicro,
+    }),
     commit: async (receipt, tx) => {
-      if (!ledgerCtx || !receipt.txHash) return undefined;
+      // The settlement store records an intent as settled only with its
+      // transaction reference, so the funding is always keyed.
+      if (!receipt.txHash) return undefined;
       return commitMarkedFunding(
         ledgerCtx,
         {
@@ -3547,7 +3557,7 @@ async function acceptDurableExactIncoming(args: {
   let replayedDrawFound = false;
   let replayedCreditId: string | undefined;
   let replayedDrawId: string | undefined;
-  if (accepted.replayed && ledgerCtx && accepted.receipt.txHash) {
+  if (accepted.replayed && accepted.receipt.txHash) {
     replayedCreditId =
       ledgerCtx.topUp?.creditId ??
       ledgerCtx.creditEnvelope?.creditId ??
@@ -3563,7 +3573,7 @@ async function acceptDurableExactIncoming(args: {
   // A replayed mid-job settlement recovers as a verified result rather than a
   // 409, so the original funding row is what carries its evidence back.
   const replayedDrawFunding =
-    accepted.replayed && ledgerCtx?.topUp && accepted.receipt.txHash
+    accepted.replayed && ledgerCtx.topUp && accepted.receipt.txHash
       ? await ledgerCtx.ledger.getFunding({
           creditId: ledgerCtx.topUp.creditId,
           fundId: accepted.receipt.txHash,
@@ -3577,7 +3587,7 @@ async function acceptDurableExactIncoming(args: {
       receivedProofs: [],
       paymentTxHash:
         replayedDrawFound && replayedCreditId && replayedDrawId
-          ? drawSettlementRef(ledgerCtx?.dvmId ?? "", replayedCreditId, replayedDrawId)
+          ? drawSettlementRef(ledgerCtx.dvmId, replayedCreditId, replayedDrawId)
           : accepted.receipt.txHash,
       nativeAmount: authorizedUsdcMicro,
       nativeAsset: "usdc",
@@ -3621,9 +3631,10 @@ async function acceptDurableExactIncoming(args: {
 function topUpBinding(
   info: PaymentInfo,
   snapshot: VerifyIncomingSnapshot
-): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro" | "drawFunding"> {
+): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro" | "drawFunding" | "landedAsBalance"> {
   const fresh = !snapshot.creditId && info.creditId && info.drawId;
   return {
+    ...(info.landedAsBalance && { landedAsBalance: info.landedAsBalance }),
     ...(fresh && { creditId: info.creditId, drawId: info.drawId }),
     ...(info.funding && { funding: info.funding }),
     ...(info.unappliedMicro !== undefined && { unappliedMicro: info.unappliedMicro }),
@@ -3663,259 +3674,75 @@ export function applyPaymentInfoToJob(job: ServerJob, info: VerifiedIncomingPaym
 }
 
 /**
- * Legacy ledgerless payment path. Mutates the job on acceptance; durable credit hosts use
- * verifyIncomingPayment and apply its result in Tx C.
+ * The job state {@link verifyIncomingPayment} reads, taken from the in-memory
+ * job. Durable hosts pass the same fields read from the job row.
+ */
+export function incomingPaymentSnapshot(job: ServerJob): VerifyIncomingSnapshot {
+  return {
+    pendingPaymentMsats: job.pendingPaymentMsats,
+    pendingMppChallengeIds: job.pendingMppChallengeIds,
+    pendingX402Nonce: job.pendingX402Nonce,
+    pendingX402AmountUsdcMicro: job.pendingX402AmountUsdcMicro,
+    paymentRail: job.paymentRail,
+    creditId: job.creditId,
+    drawId: job.drawId,
+    paymentTxHash: job.paymentTxHash,
+    pendingPaymentFiatMicro: job.pendingPaymentFiatMicro,
+    pendingPaymentFiatCurrency: job.pendingPaymentFiatCurrency,
+    askedTopUpMicro: job.askedTopUpMicro,
+    askedTopUpCurrency: job.askedTopUpCurrency,
+    topUpCapUnenforcedReason: job.topUpCapUnenforcedReason,
+    requesterPubkey: job.requesterPubkey,
+    requesterId: job.requesterId,
+    ...(askFiatAmount(job) && { askFiatAmount: askFiatAmount(job) }),
+  };
+}
+
+function askFiatAmount(job: ServerJob): { amount: number; currency: string } | undefined {
+  const ask = job.messages?.findLast((message) => message.from === "provider" && message.type === "payment-request");
+  const fiat = (ask?.content as { fiat_amount?: { amount?: unknown; currency?: unknown } } | undefined)?.fiat_amount;
+  return typeof fiat?.amount === "number" && typeof fiat.currency === "string"
+    ? { amount: fiat.amount, currency: fiat.currency }
+    : undefined;
+}
+
+/**
+ * What the outstanding ask itself quoted, in `currency`: the exact USDC its
+ * x402 option asked for (USDC micro-units are USD micro-units), else its
+ * `fiat_amount`. Values a payment when neither a pinned envelope nor any rate
+ * can, so money already in hand is not turned away for an fx outage.
+ */
+function askQuote(snapshot: VerifyIncomingSnapshot, currency: string): PriceFiat | undefined {
+  if (currency === "usd" && snapshot.pendingX402AmountUsdcMicro !== undefined) {
+    const micro = Number(snapshot.pendingX402AmountUsdcMicro);
+    if (Number.isSafeInteger(micro) && micro > 0) return { currency, amountMicro: micro };
+  }
+  return snapshot.askFiatAmount?.currency === currency ? fiatAmountMicro(snapshot.askFiatAmount) : undefined;
+}
+
+/** True when a verified payment funded credit without buying any of the job's ask. */
+export function paymentFullyUnapplied(info: VerifiedIncomingPayment): boolean {
+  return info.unappliedMicro !== undefined && info.funding !== undefined &&
+    info.unappliedMicro >= info.funding.amountMicro;
+}
+
+/**
+ * Verify a mid-job payment and apply it to the in-memory job, for hosts that
+ * keep no transactional job store. The ledger leg is the same one durable
+ * hosts run, so `opts.creditLedger` is required: without it the payment is
+ * refused before any rail is touched. Returns null for a non-payment message
+ * or an accepted payment, else the refusal.
  */
 export async function processIncomingPayment(
   job: ServerJob,
   body: { type: MessageType; content: Record<string, unknown> },
   opts: IncomingPaymentOpts
 ): Promise<{ body: Record<string, unknown>; status: number } | null> {
-  return withPaymentDiagnostics(() => processIncomingPaymentInScope(job, body, opts));
-}
-
-async function processIncomingPaymentInScope(
-  job: ServerJob,
-  body: { type: MessageType; content: Record<string, unknown> },
-  opts: IncomingPaymentOpts
-): Promise<{ body: Record<string, unknown>; status: number } | null> {
   if (body.type !== "payment") return null;
-
-  if (body.content.cashu_token) {
-    // route P2PK-locked mid-job cashu through the accumulator when
-    // the receive-side rails are wired (mirrors the upfront `verifyUpfrontPayment`
-    // routing). Unconfigured DVMs still reject with `cashu_not_p2pk_locked` so
-    // bare-token mid-job pays — which retired — surface the same error.
-    if (
-      opts.cashuMode === "p2pk-accumulator" &&
-      (opts.accumulatorDb || opts.disposableCashu) &&
-      opts.dvmId &&
-      opts.lockPubkeys &&
-      opts.lockPubkeys.length > 0
-    ) {
-      const mints = opts.mints ?? [];
-      if (mints.length === 0) {
-        return {
-          body: paymentErrorBody("cashu_unavailable", {
-            message: "No mints configured for cashu receive.",
-          }),
-          status: 402,
-        };
-      }
-      const requestId =
-        typeof body.content.cashu_request_id === "string"
-          ? body.content.cashu_request_id
-          : undefined;
-      const result = await verifyAccumulatorReceipt(
-        {
-          cashuToken: body.content.cashu_token as string,
-          accumulatorDb: opts.accumulatorDb,
-          disposableCashu: opts.disposableCashu,
-          dvmId: opts.dvmId,
-          lockPubkeys: opts.lockPubkeys,
-          requestId,
-          mintHealthTracker: opts.mintHealthTracker,
-          cashuLockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds),
-        },
-        mints,
-        job.pendingPaymentMsats
-      );
-      if (result.error) {
-        return { body: result.error.body, status: result.error.status };
-      }
-      job.paidMsats += result.paidMsats;
-      if (result.paymentMint) job.paymentMint = result.paymentMint;
-      job.paymentRail = "cashu";
-      // Cashu credits track `paymentTxHash` via the request id; `nativeAmount`
-      // is left unset because the platform derives sats from `paidMsats / 1000`
-      // for cashu rows.
-      job.paymentTxHash = result.paymentTxHash;
-      job.cashuFlow = result.cashuFlow;
-      creditPendingPayment(job);
-      return null;
-    }
-    return {
-      body: paymentErrorBody("cashu_not_p2pk_locked", {
-        message: "This DVM requires P2PK-locked Cashu proofs. Initialize an agent wallet first.",
-      }),
-      status: 402,
-    };
-  } else if (body.content.x402_payment && opts.x402Config) {
-    if ((opts.pricingCurrency ?? "usd") !== "usd") {
-      return x402NotOfferedPaymentError(opts.pricingCurrency);
-    }
-    // The exact facilitator requirement is the amount advertised and persisted
-    // with the pending nonce; the fallback covers legacy records. The
-    // original pending msat requirement remains the credit value even if this
-    // later rate changes the receipt's converted msat amount.
-    const rate = await resolveRateOrNull(opts.fxFetcher);
-    if (rate === null) return rateUnavailablePaymentError();
-    try {
-      const requiredMsats = job.pendingPaymentMsats ?? 0;
-      const requiredUsdcMicro =
-        job.pendingX402AmountUsdcMicro !== undefined
-          ? BigInt(job.pendingX402AmountUsdcMicro)
-          : BigInt(msatsToUsdc(requiredMsats, rate));
-      const { verifyX402Payment } = await import("../../lib/x402");
-      const receipt = await withPaymentStage("verifier_broadcast", () => verifyX402Payment(
-        body.content.x402_payment as string,
-        opts.x402Config!,
-        requiredUsdcMicro,
-        opts.resourcePath ?? "/v1/job",
-        rate,
-        opts.x402ExactVersions
-      ));
-      if (receipt.verified) {
-        // Per-job binding: see `verifyIncomingPayment` for the full
-        // rationale. Checked after the facilitator's cryptographic verify so
-        // an unauthenticated client can't probe bound nonces via error-shape
-        // side-channels; gated on `pendingX402Nonce !== undefined` for
-        // backwards-compat with pre-fix DVMs.
-        if (job.pendingX402Nonce !== undefined) {
-          const incomingNonce = decodePayment(body.content.x402_payment as string).payload
-            .authorization.nonce;
-          if (incomingNonce !== job.pendingX402Nonce) {
-            return {
-              body: paymentErrorBody("payment_invalid", {
-                message: "x402 payment not bound to this job",
-              }),
-              status: 402,
-            };
-          }
-        }
-        job.paidMsats += job.pendingPaymentMsats ?? receipt.amountMsats;
-        // accumulate rail-native amount across multi-credit jobs so
-        // the platform's `revenue_events.gross_native` row reflects the sum,
-        // not just the upfront credit. Same-rail credits accumulate; a
-        // cross-rail switch resets — single-row accounting can't represent
-        // mixed-asset gross natively, mirroring the pre-existing
-        // paymentRail-clobber. Cross-rail mid-job isn't exercised by
-        // first-party DVMs today.
-        const sameRail = job.paymentRail === "x402";
-        job.nativeAmount =
-          (sameRail ? (job.nativeAmount ?? 0) : 0) + (receipt.amountUsdcMicro ?? 0);
-        job.nativeAsset = "usdc";
-        job.paymentTxHash = receipt.txHash;
-        job.paymentRail = "x402";
-        // Clear the per-job binding on accept.
-        job.pendingX402Nonce = undefined;
-        job.pendingX402AmountUsdcMicro = undefined;
-        creditPendingPayment(job);
-      } else {
-        return {
-          body: paymentErrorBody("payment_invalid", {
-            message: "x402 signature verification failed",
-          }),
-          status: 402,
-        };
-      }
-    } catch (err) {
-      logCredentialRejected("x402", "mid-job", err);
-      return {
-        body: paymentErrorBody("payment_invalid", { message: "x402 verification error" }),
-        status: 402,
-      };
-    }
-  } else if (body.content.tempo_credential && opts.mpp) {
-    const mppHandle = opts.mpp;
-    // Same reasoning as the x402 branch — resolve before the `try`.
-    const rate = await resolveRateOrNull(opts.fxFetcher);
-    if (rate === null) return rateUnavailablePaymentError();
-    try {
-      const credential = body.content.tempo_credential as MppxCredential;
-      if (isMppSessionCredential(credential)) {
-        // The isolate verifier's copy of the durable path's guard, and the one
-        // with the worse failure behind it: this path carries no ledger context
-        // at all, so an accepted voucher would move the channel's on-chain
-        // state and credit nothing.
-        return {
-          body: paymentErrorBody("payment_invalid", { message: MPP_SESSION_ONLY_ON_CREDIT }),
-          status: 402,
-        };
-      }
-      const expectedMsats = job.pendingPaymentMsats ?? 0;
-      if (expectedMsats <= 0) {
-        // No outstanding payment-request to satisfy. Refuse rather than blanket-
-        // accept — accepting would let an unsolicited credential silently bump
-        // job.paidMsats.
-        return {
-          body: paymentErrorBody("payment_invalid", {
-            message: "MPP credential without pending payment-request",
-          }),
-          status: 402,
-        };
-      }
-      const expectedAmount =
-        job.pendingPaymentFiatCurrency === "usd" && job.pendingPaymentFiatMicro !== undefined
-          ? fiatMicroToMethodAmount(job.pendingPaymentFiatMicro, credential.challenge.method)
-          : msatsToMethodAmount(expectedMsats, credential.challenge.method, rate);
-      // Same defense as upfront: pass the SDK-required amount so mppx rejects
-      // any credential whose bound amount differs. Echo the credential's own
-      // meta back so mppx's rebuild doesn't reject server-issued correlation
-      // values — replay protection here is via `pendingMppChallengeIds`
-      // checked below; the HMAC already proves the meta is
-      // server-issued, so trusting it for the rebuild is sound.
-      const expectedMeta = challengeMeta(credential.challenge);
-      await loggers.tempo.span(
-        "tempo.verify_credential",
-        {
-          method: credential.challenge.method,
-          challenge_id: credential.challenge.id,
-          amount: expectedAmount,
-        },
-        () =>
-          withPaymentStage("verifier_broadcast", () => mppHandle.broadcastCredential(credential, {
-            request: { amount: expectedAmount },
-            ...(opts.hostingPaymentSeq !== undefined && {
-              hostedPaymentIntent: { jobId: opts.jobId, paymentSeq: opts.hostingPaymentSeq },
-            }),
-            ...(expectedMeta && { meta: expectedMeta }),
-          })),
-        { onError: paymentFailureFields }
-      );
-      // Per-job binding: reject credentials whose challenge wasn't
-      // issued for this job. mppx HMAC binds realm/method/amount/expiry — not
-      // the dvmkit job-id — so a sibling job that requested the same fields
-      // would otherwise accept a credential lifted from this one's issuance
-      // within the expiry window. Checked after the cryptographic verify so
-      // an unauthenticated client can't probe for currently-bound challenge
-      // ids via error-shape side-channels.
-      if (!job.pendingMppChallengeIds?.includes(credential.challenge.id)) {
-        return {
-          body: paymentErrorBody("payment_invalid", {
-            message: "MPP credential not bound to this job",
-          }),
-          status: 402,
-        };
-      }
-      job.paidMsats += expectedMsats;
-      // accumulate native amounts across multi-credit mpp jobs (see
-      // x402 branch above for the same-rail/cross-rail rationale).
-      const sameRail = job.paymentRail === "tempo";
-      const creditNative = methodNativeAmountFromDecimal(
-        expectedAmount,
-        credential.challenge.method
-      );
-      job.nativeAmount = (sameRail ? (job.nativeAmount ?? 0) : 0) + creditNative;
-      job.nativeAsset = methodNativeAsset(credential.challenge.method);
-      job.paymentTxHash = credential.challenge.id;
-      job.paymentRail = "tempo";
-      job.pendingMppChallengeIds = undefined;
-      creditPendingPayment(job);
-      await mppHandle.completeHostedTempoCharge?.(credential.challenge.id).catch((error: unknown) => {
-        console.warn("Hosted Tempo charge completion remains unresolved", error);
-      });
-    } catch (err) {
-      logCredentialRejected("tempo", "mid-job", err);
-      return {
-        body: paymentErrorBody("payment_invalid", {
-          message: "MPP credential verification failed",
-        }),
-        status: 402,
-      };
-    }
-  }
-
+  const result = await verifyIncomingPayment(body, { ...opts, jobId: opts.jobId ?? job.id }, incomingPaymentSnapshot(job));
+  if (result.error) return { body: result.error.body, status: result.error.status };
+  // A payment that only landed as balance moved no job counter: it bought nothing.
+  if (result.verified && !paymentFullyUnapplied(result.verified)) applyPaymentInfoToJob(job, result.verified);
   return null;
 }
 
@@ -4491,6 +4318,12 @@ interface LedgerContext {
    */
   askSatisfied?: true;
   /**
+   * Why the job's own credit could not take this payment, which therefore
+   * lands on a fresh credit of the same caller. `jobRail` names the rail the
+   * job's credit holds, when known, so the caller can pay the ask on it.
+   */
+  redirect?: LedgerBalanceLanding;
+  /**
    * True for every mid-job payment, including a free-then-paid job's
    * first one — where there is no {@link topUp} because there is no draw yet.
    *
@@ -4561,42 +4394,54 @@ function resolveLedgerContext(opts: UpfrontPaymentOpts): LedgerContext | undefin
 }
 
 /**
- * Assemble the {@link LedgerContext} for a mid-job `requestPayment` top-up
- * (the credit lifecycle contract), or `undefined` when this payment runs ledger-less.
+ * Where a mid-job payment's ledger leg lands, or the refusal that leaves it
+ * unreceived. A refusal is only ever returned before the rail is touched.
+ */
+type TopUpLedgerResolution =
+  | { ctx: LedgerContext; error?: undefined }
+  | { ctx?: undefined; error: { body: Record<string, unknown>; status: number } };
+
+/**
+ * Assemble the {@link LedgerContext} for a mid-job payment (the credit
+ * lifecycle contract). Every payment that reaches the rail gets a ledger leg:
+ * it either pays the open ask by growing the job's draw, or lands on credit as
+ * balance the caller owns. Nothing is accepted without a ledger row.
  *
- * Every refusal here is a **skip, not an error**. The rail commit and the
- * ledger leg share one transaction, so a `fund` that threw inside it would
- * roll back cashu proofs the caller already sent — and on x402/mpp the money
- * has already moved outside dvmkit, so refusing would take the caller's
- * payment and hand back nothing. Money is never refused over an accounting
- * problem (the posture). Each skip is logged loud instead.
+ * Runs before the rail is touched, so the two refusals here (no ledger wired,
+ * no rate to denominate the money in) cost the caller nothing and leave the
+ * same artifact resendable. Every other mismatch is a landing, not a refusal:
+ * the rail commit and the ledger leg share one transaction, so a `fund` that
+ * threw inside it would roll back Cashu proofs the caller can no longer reclaim
+ * elsewhere, and on x402/Tempo the money has already moved by then.
  *
  * The preflight reads the target credit rather than assuming it, because
- * `fund`'s upsert guards on `caller_pubkey`, `currency`, `rail` and **both
- * channel columns** — all of them are checked here, outside the transaction, so
- * none of them can become a rollback. `binding` is what the arriving artifact
- * would write, read off the artifact itself; the rail alone is not
- * enough, because an x402 exact payment and an x402 channel voucher agree on it
- * and disagree on `x402_channel_id`.
+ * `fund`'s upsert guards on `caller_pubkey`, `status`, `currency`, `rail` and
+ * **both channel columns** — all of them are checked here, outside the
+ * transaction, so none of them can become a rollback. A payment the job's own
+ * credit cannot take lands on a fresh `imp:<rail>:<payment id>` credit owned by
+ * the same caller instead. `binding` is what the arriving artifact would write,
+ * read off the artifact itself; the rail alone is not enough, because an x402
+ * exact payment and an x402 channel voucher agree on it and disagree on
+ * `x402_channel_id`.
  */
 async function resolveTopUpLedgerContext(
   opts: IncomingPaymentOpts,
   snapshot: VerifyIncomingSnapshot,
   binding: IncomingCreditBinding
-): Promise<LedgerContext | undefined> {
+): Promise<TopUpLedgerResolution> {
   const ledger = opts.creditLedger;
   const rail = binding.rail;
   const requiredMsats = snapshot.pendingPaymentMsats ?? 0;
-  if (!ledger) return undefined;
-  // no outstanding ask. A payment still arrives here — the caller
-  // retried after a lost response and the winner's Tx C has since cleared the
-  // ask. It buys nothing, but it is the caller's money, so a job already bound
-  // to a credit funds that credit and grows nothing. Without a binding there is
-  // no credit to name and no ask to price against, so it stays ledger-less.
-  // (Only cashu and x402 reach this: the mpp branch refuses a credential with
-  // no outstanding challenge before it ever asks for a ledger context.)
-  const askSatisfied = requiredMsats <= 0;
-  if (askSatisfied && !(snapshot.creditId && snapshot.drawId)) return undefined;
+  if (!ledger) {
+    return {
+      error: {
+        body: paymentErrorBody("payment_invalid", {
+          message: "Mid-job payments need a credit ledger to record them; none is wired.",
+        }),
+        status: 402,
+      },
+    };
+  }
   const dvmId = opts.dvmId ?? "";
 
   const logTopUp = (event: string, extra?: Record<string, unknown>): void => {
@@ -4615,113 +4460,116 @@ async function resolveTopUpLedgerContext(
       }
     );
   };
-  const logSkip = (reason: string, extra?: Record<string, unknown>): void => {
-    logTopUp("credit_topup_skipped", { reason, ...extra });
+  // The job's own credit could not take this payment; it lands on a fresh
+  // credit of the caller's instead. Logged loud: it is the caller's money on a
+  // credit the job does not name.
+  const logRedirect = (reason: string, extra?: Record<string, unknown>): void => {
+    logTopUp("credit_topup_redirected", { reason, ...extra });
   };
 
-  let topUp: { creditId: string; drawId: string; ledgerSeq?: number } | undefined;
-  let callerId: string;
-  let currency: string;
-  let drawBasis = false;
+  // Balance, not a purchase: the job ended, its ask expired, or no ask is open
+  // (a retry after the winner's Tx C cleared it). It buys nothing, but it is the
+  // caller's money, so it lands on credit they own.
+  const landAsBalance = snapshot.landAsBalance ?? (requiredMsats <= 0 ? "no_open_ask" : undefined);
 
-  if (snapshot.creditId && snapshot.drawId) {
+  let topUp: { creditId: string; drawId: string; ledgerSeq?: number } | undefined;
+  let callerId = snapshot.requesterPubkey ?? snapshot.requesterId ?? "anonymous";
+  let currency = snapshot.pendingPaymentFiatCurrency ?? opts.pricingCurrency ?? "usd";
+  let drawBasis = false;
+  let growsDraw = false;
+  let redirect: LedgerBalanceLanding | undefined;
+
+  // An unsigned payment is final: no caller key can ever drain it. A late one
+  // lands on its own `imp:<rail>:<payment id>` credit rather than the job's,
+  // so each such payment stays a separate, attributable funding.
+  const ownCredit = landAsBalance !== undefined && !snapshot.requesterPubkey;
+  if (snapshot.creditId && snapshot.drawId && !ownCredit) {
     const [credit, draw] = await Promise.all([
       ledger.get(snapshot.creditId).catch(() => undefined),
       ledger
         .getDraw({ creditId: snapshot.creditId, drawId: snapshot.drawId })
         .catch(() => undefined),
     ]);
-    if (!credit || !draw) {
-      logSkip("credit_or_draw_missing");
-      return undefined;
-    }
-    // A resolved draw means the job already reached terminal (a cross-machine
-    // cancel, the stale sweeper). There is nothing left to grow, and reopening
-    // a settled debit would move money after the receipt attested it.
-    if (draw.status !== "pending") {
-      logSkip("draw_not_pending", { status: draw.status });
-      return undefined;
-    }
-    // `growDraw` guards on this too, and a throw there lands inside the rail
-    // transaction — the one outcome this preflight exists to prevent. The draw
-    // is already in hand, so mirror the guard here where a refusal costs
-    // nothing. Unreachable while the job row is the only source of the pair.
-    if (opts.jobId !== undefined && (draw.jobId ?? null) !== opts.jobId) {
-      logSkip("draw_job_mismatch", { draw_job_id: draw.jobId });
-      return undefined;
-    }
-    // `rail` is null on a credit funded before — it has no basis to
-    // conflict with, so a top-up is fine. A *different* rail is refused by
-    // `fund` itself (sats and USDC microunits aren't summable), so catch it here
-    // where a refusal is free.
-    const creditRail = draw.railValue.rail;
-    if (creditRail !== null && creditRail !== rail) {
-      logSkip("rail_mismatch", { credit_rail: creditRail });
-      return undefined;
-    }
-    // The channel half of the same rule. `fund`'s upsert compares
-    // `tempo_channel_id` and `x402_channel_id` on both sides as well as the
-    // rail, and an exact x402 payment agrees with a channel-bound credit's rail
-    // while disagreeing about its channel — so without this rung the refusal
-    // lands inside the rail transaction, with the caller's USDC already
-    // transferred. Rail-independent, exactly as the upsert's `WHERE` is: the
-    // credit's channel columns are on the row whatever `credits.rail` says, so
-    // this also covers the legacy `rail IS NULL` row the rung above skips.
-    //
-    // No settlement-gate rung rides alongside it: a wedged x402
-    // refund is only ever held against a credit's *bound* channel, and every
-    // such credit is turned away right here, so `blockingX402Refund` on this
-    // path could never answer anything. Admitting a mid-job channel voucher —
-    // deliberately out of scope, reusable channels are a `/v1/credit`
-    // instrument — is what would make it reachable, and it must land in the
-    // same change.
+    // The rail rung precedes the instrument rungs (the order `fund` diagnoses
+    // in): a cross-rail top-up also disagrees about both channel columns. `rail`
+    // is null on a credit funded before rails were recorded; it has no basis to
+    // conflict with. The channel rung is rail-independent, exactly as the
+    // upsert's `WHERE` is, so it also covers that legacy row.
+    const creditRail = draw?.railValue.rail ?? null;
     const incomingChannels = incomingChannelColumns(binding);
-    const storedChannels = storedChannelColumns(credit);
-    if (
-      incomingChannels &&
-      (incomingChannels.tempo !== storedChannels.tempo ||
-        incomingChannels.x402 !== storedChannels.x402)
-    ) {
-      logSkip("channel_binding_mismatch", {
-        credit_rail: creditRail,
-        credit_tempo_channel_id: storedChannels.tempo,
-        credit_x402_channel_id: storedChannels.x402,
+    const storedChannels = credit ? storedChannelColumns(credit) : undefined;
+    const redirectReason = !credit || !draw
+      ? "credit_or_draw_missing"
+      : credit.status !== "active"
+        ? "credit_not_active"
+        : opts.jobId !== undefined && (draw.jobId ?? null) !== opts.jobId
+          ? "draw_job_mismatch"
+          : creditRail !== null && creditRail !== rail
+            ? "rail_mismatch"
+            : incomingChannels && storedChannels &&
+                (incomingChannels.tempo !== storedChannels.tempo || incomingChannels.x402 !== storedChannels.x402)
+              ? "channel_binding_mismatch"
+              : undefined;
+    if (redirectReason) {
+      logRedirect(redirectReason, {
+        ...(credit && { credit_status: credit.status }),
+        ...(draw && { draw_job_id: draw.jobId, credit_rail: creditRail }),
+        ...(storedChannels && {
+          credit_tempo_channel_id: storedChannels.tempo,
+          credit_x402_channel_id: storedChannels.x402,
+        }),
         ...(binding.instrument ? { payment_instrument: binding.instrument } : {}),
         ...(binding.channelId ? { payment_channel_id: binding.channelId } : {}),
       });
-      return undefined;
+      if (credit) {
+        callerId = credit.callerPubkey;
+        currency = credit.currency;
+      }
+      redirect = redirectReason === "rail_mismatch" || redirectReason === "channel_binding_mismatch"
+        ? { reason: "rail_mismatch", ...(creditRail !== null && { jobRail: creditRail }) }
+        : { reason: "credit_unavailable" };
+    } else if (credit && draw) {
+      topUp = { creditId: snapshot.creditId, drawId: snapshot.drawId, ledgerSeq: draw.ledgerSeq };
+      callerId = credit.callerPubkey;
+      currency = credit.currency;
+      // A resolved draw means the job already reached terminal (a cancel, the
+      // stale sweeper). Reopening a settled debit would move money after the
+      // receipt attested it, so the payment funds the credit and stops.
+      growsDraw = !landAsBalance && draw.status === "pending";
+      // Inherit the job's revenue basis. An explicit fund-and-draw stamped a
+      // per-draw settlement reference upfront; recomputing it identifies that job
+      // exactly, and keeps the top-up from overwriting the reference with a rail
+      // one `revenue_events` can't tie back to the draw.
+      drawBasis =
+        snapshot.paymentTxHash === drawSettlementRef(dvmId, snapshot.creditId, snapshot.drawId);
     }
-    topUp = { creditId: snapshot.creditId, drawId: snapshot.drawId, ledgerSeq: draw.ledgerSeq };
-    callerId = credit.callerPubkey;
-    currency = credit.currency;
-    // Inherit the job's revenue basis. An explicit fund-and-draw stamped a
-    // per-draw settlement reference upfront; recomputing it identifies that job
-    // exactly, and keeps the top-up from overwriting the reference with a rail
-    // one `revenue_events` can't tie back to the draw.
-    drawBasis =
-      snapshot.paymentTxHash === drawSettlementRef(dvmId, snapshot.creditId, snapshot.drawId);
   } else {
     // Free-then-paid job: the upfront leg placed no draw, so this money opens a
     // fresh implicit credit — the same shape an upfront implicit N=1 payment
     // would have created, just later in the job's life.
-    callerId = snapshot.requesterPubkey ?? snapshot.requesterId ?? "anonymous";
-    currency = snapshot.pendingPaymentFiatCurrency ?? "usd";
+    growsDraw = !landAsBalance;
   }
 
-  // With no ask outstanding there is no pinned envelope to fund against, so
-  // the reference converts into a plain rate and `fundedMicroFor`'s pro-rata
-  // rule applies it to whatever landed.
-  const priceBasisMsats = askSatisfied ? NO_ASK_RATE_REFERENCE_MSATS : requiredMsats;
-  const denomination = askSatisfied
-    ? await msatsToFiatMicro({
+  // Priced against the open ask: its pinned envelope (no fx hop), else a live
+  // rate, else the ask's own quote. With no ask, a reference converts into a
+  // plain rate and `fundedMicroFor`'s pro-rata rule applies it to whatever landed.
+  const priceBasisMsats = requiredMsats > 0 ? requiredMsats : NO_ASK_RATE_REFERENCE_MSATS;
+  let denomination = requiredMsats > 0
+    ? await resolveTopUpFiat(snapshot, currency, priceBasisMsats, opts.fxFetcher)
+    : await msatsToFiatMicro({
         msats: priceBasisMsats,
         currency,
         fxFetcher: opts.fxFetcher ?? createFxFetcher(),
-      })
-    : await resolveTopUpFiat(snapshot, currency, priceBasisMsats, opts.fxFetcher);
+      });
+  const quote = !denomination.ok && requiredMsats > 0 ? askQuote(snapshot, currency) : undefined;
+  if (quote) denomination = { ok: true, price: quote, stale: false };
   if (!denomination.ok) {
-    // Keep the fixed cause, never the provider detail carried by denomination.
-    logSkip("denomination_unavailable", {
+    // No pinned envelope, no rate and no quote on the ask: nothing values this
+    // payment in the credit's currency, so no ledger row can be written. This
+    // runs before the rail is touched; a Cashu token is refused before its
+    // proofs are stored, stays unspent, and can be sent again once rates return.
+    logTopUp("credit_topup_refused", {
+      reason: "denomination_unavailable",
       currency,
       cause: denomination.reason,
       ...(denomination.sourceFailure && {
@@ -4729,16 +4577,16 @@ async function resolveTopUpLedgerContext(
         source_status: denomination.sourceFailure.httpStatus,
       }),
     });
-    return undefined;
+    return { error: rateUnavailablePaymentError() };
   }
   const priceFiat = denomination.price;
   // The top-up is denominated, but off a snapshot the rate provider could no
   // longer confirm. The ledger row is truthful about what was quoted;
   // the rate behind it may have drifted, and this is the only record of that.
   //
-  // Its own event, deliberately not a `credit_topup_skipped` reason: nothing was
-  // skipped, and an operator alarming on that event must not be paged by the
-  // degradation that exists to keep this path working.
+  // Its own event, deliberately not a refusal or redirect: nothing was skipped,
+  // and an operator alarming on those must not be paged by the degradation that
+  // exists to keep this path working.
   if (denomination.stale) {
     logTopUp("credit_topup_stale_rate", {
       currency,
@@ -4755,24 +4603,29 @@ async function resolveTopUpLedgerContext(
     });
   }
 
-  const topUpCapMicro = topUp ? resolveTopUpCap(snapshot, currency, logSkip) : undefined;
+  const topUpCapMicro = topUp && growsDraw
+    ? resolveTopUpCap(snapshot, currency, (reason, extra) => logTopUp("credit_topup_skipped", { reason, ...extra }))
+    : undefined;
 
   return {
-    ledger,
-    processedPayments: opts.processedPayments,
-    enqueueCreditDeposit: opts.enqueueCreditDeposit,
-    priceFiat,
-    requiredMsats: priceBasisMsats,
-    callerId,
-    jobId: opts.jobId,
-    hostingPaymentSeq: opts.hostingPaymentSeq,
-    dvmId,
-    topUp,
-    topUpCapMicro,
-    ...(askSatisfied && { askSatisfied: true as const }),
-    midJob: true,
-    drawBasis,
-    ttlMs: opts.creditTtlMs ?? IMPLICIT_CREDIT_TTL_MS,
+    ctx: {
+      ledger,
+      processedPayments: opts.processedPayments,
+      enqueueCreditDeposit: opts.enqueueCreditDeposit,
+      priceFiat,
+      requiredMsats: priceBasisMsats,
+      callerId,
+      jobId: opts.jobId,
+      hostingPaymentSeq: opts.hostingPaymentSeq,
+      dvmId,
+      topUp,
+      topUpCapMicro,
+      ...(!growsDraw && { askSatisfied: true as const }),
+      ...(redirect && { redirect }),
+      midJob: true,
+      drawBasis,
+      ttlMs: opts.creditTtlMs ?? IMPLICIT_CREDIT_TTL_MS,
+    },
   };
 }
 
@@ -4969,8 +4822,12 @@ function withDrawBasis(
   committed: CommittedFunding | undefined
 ): PaymentInfo {
   if (!committed || !ctx) return info;
+  const landedAsBalance: LedgerBalanceLanding | undefined = committed.drawResolved
+    ? { reason: "job_ended" }
+    : ctx.redirect;
   const base: PaymentInfo = {
     ...info,
+    ...(landedAsBalance && { landedAsBalance }),
     creditId: committed.creditId,
     creditCurrency: ctx.priceFiat.currency,
     funding: committed.deposit,
@@ -5040,6 +4897,8 @@ interface CommittedFunding {
    * find out.
    */
   unappliedMicro?: number;
+  /** Set when the job's draw had resolved by the time the rail committed. */
+  drawResolved?: true;
   /** The `credit_fundings` row a mid-job top-up fixed beside its fund/grow leg. */
   drawFunding?: FundingRecord;
   deposit: CreditFundingReport;
@@ -5273,6 +5132,17 @@ async function fundAndDrawInScope(
       const drawFunding = await completeDrawFunding(credit.availableMicro, await drawLedgerSeq());
       return commitDeposit({ creditId, drawFunding }, credit);
     }
+    // The preflight saw a pending draw, but the job may have ended since: its
+    // payment intent's lease ran out while verification was slow. `fund` above
+    // holds the credit row lock that settle and release also take, so the
+    // draw's state cannot change under this read. A resolved draw is never
+    // reopened; the payment stays on the credit as balance instead of rolling
+    // back money the caller can no longer take elsewhere.
+    const live = await ctx.ledger.getDraw({ creditId, drawId });
+    if (live?.status !== "pending") {
+      const drawFunding = await completeDrawFunding(credit.availableMicro, live?.ledgerSeq);
+      return commitDeposit({ creditId, unappliedMicro: fundedMicro, drawResolved: true, drawFunding }, credit);
+    }
     const grown = await ctx.ledger.growDraw({
       creditId,
       drawId,
@@ -5337,6 +5207,10 @@ async function fundAndDrawInScope(
     basis,
     tx,
   });
+  // A payment that buys nothing (the job ended, its ask expired or is already
+  // paid, or the job's credit cannot take this rail) funds a credit the caller
+  // owns and stops: all of it is balance.
+  if (ctx.midJob && ctx.askSatisfied) return commitDeposit({ creditId, unappliedMicro: fundedMicro }, fundedCredit);
   // Free-then-paid job, short pay: fund the fresh credit and place no draw at
   // all. See `shortMidJob` above — the alternative is a draw nothing resolves.
   if (shortMidJob) return commitDeposit({ creditId }, fundedCredit);

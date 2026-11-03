@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "applies_to": ["DELETE /v1/job/:id", "POST /v1/job/:id/messages"],
+  "status": 409,
+  "headers": {
+    "Retry-After": "2"
+  },
+  "body": {
+    "error": "payment_in_progress",
+    "retryable": true
+  }
+}

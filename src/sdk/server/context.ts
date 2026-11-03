@@ -154,6 +154,46 @@ export interface BuildContextOpts {
    * first payment opens will carry. Defaults to `"usd"`.
    */
   pricingCurrency?: string;
+  /**
+   * The one rail that can pay into the credit this job is bound to, read per
+   * ask. A payment on any other rail lands on a fresh credit as balance and
+   * leaves the ask unpaid, so the ask offers this rail alone. Undefined when
+   * the job holds no credit, the credit takes any rail, or none of the rails
+   * the ask could offer pays into it; the ask then offers every rail.
+   */
+  creditRail?: () => Promise<CreditRail | undefined>;
+}
+
+/** A rail a mid-job ask can offer. */
+export type CreditRail = "cashu" | "x402" | "tempo";
+
+/**
+ * Offer only the rail that can pay into the job's credit. When the ask would
+ * not otherwise offer that rail, nothing is withheld: an ask with no payable
+ * rail strands the job, while a payment on another rail still lands as
+ * balance. Withdrawn x402 and Tempo options take their job bindings with them.
+ */
+function restrictToCreditRail(content: Record<string, unknown>, rail: CreditRail | undefined, job: ServerJob): void {
+  if (!rail) return;
+  const offered: Record<CreditRail, boolean> = {
+    cashu: content.mints !== undefined,
+    x402: content.x402 !== undefined,
+    tempo: content.tempo !== undefined,
+  };
+  if (!offered[rail]) return;
+  if (rail !== "cashu") {
+    delete content.mints;
+    delete content.min_locktime_seconds;
+  }
+  if (rail !== "x402" && offered.x402) {
+    delete content.x402;
+    job.pendingX402Nonce = undefined;
+    job.pendingX402AmountUsdcMicro = undefined;
+  }
+  if (rail !== "tempo" && offered.tempo) {
+    delete content.tempo;
+    job.pendingMppChallengeIds = undefined;
+  }
 }
 
 /**
@@ -829,6 +869,11 @@ export function buildContext(
         // Always assign — `undefined` clears any stale binding from a prior
         // payment-request that included MPP but is now superseded.
         job.pendingMppChallengeIds = mppChallengeIds;
+        restrictToCreditRail(
+          paymentRequestContent,
+          opts.creditRail ? await opts.creditRail().catch(() => undefined) : undefined,
+          job
+        );
       }
 
       // Only recovered history can satisfy replay. A payment arriving after a

@@ -11,6 +11,7 @@ const { processIncomingPayment } = await import("../server/payment");
 const mockAccept = vi.mocked(acceptAccumulatorPayment);
 
 import type { ServerJob } from "../server/job";
+import { MemoryCreditLedger } from "../server/memory-credit-ledger";
 import { StepCache } from "../step-cache";
 
 const MINT = "https://mint.example.com";
@@ -75,6 +76,7 @@ describe("processIncomingPayment — cashu_p2pk mid-job", () => {
         accumulatorDb: {} as never,
         dvmId: "dvm-1",
         lockPubkeys: [LOCK_PUBKEY],
+        creditLedger: new MemoryCreditLedger(),
       }
     );
 
@@ -122,6 +124,7 @@ describe("processIncomingPayment — cashu_p2pk mid-job", () => {
         accumulatorDb: {} as never,
         dvmId: "dvm-1",
         lockPubkeys: [LOCK_PUBKEY],
+        creditLedger: new MemoryCreditLedger(),
       }
     );
 
@@ -188,6 +191,7 @@ describe("processIncomingPayment — cashu_p2pk mid-job", () => {
         accumulatorDb: {} as never,
         dvmId: "dvm-1",
         lockPubkeys: [LOCK_PUBKEY],
+        creditLedger: new MemoryCreditLedger(),
       }
     );
 

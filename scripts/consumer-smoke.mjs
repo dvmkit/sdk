@@ -92,7 +92,7 @@ try {
 
   const shape = declarations.map((entry) => `${entry.export} ${entry.names.length}`).join(", ");
   console.log(
-    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, runnable public examples, persisted drain recovery, Tempo loss classification, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} accepted Cashu cases, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
+    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, runnable public examples, persisted drain recovery, Tempo loss classification, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} rate-outage Cashu refusals, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
   );
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });

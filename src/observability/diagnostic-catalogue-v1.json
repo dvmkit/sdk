@@ -95,6 +95,8 @@
     "credit_resolve_failed",
     "credit_resolve_state_mismatch",
     "credit_topup_over_ask",
+    "credit_topup_redirected",
+    "credit_topup_refused",
     "credit_topup_skipped",
     "credit_topup_stale_rate",
     "credit_topup_unbound",
@@ -1067,6 +1069,7 @@
   ],
   "paymentSkipReasons": [
     "credit_or_draw_missing",
+    "credit_not_active",
     "draw_not_pending",
     "draw_job_mismatch",
     "rail_mismatch",

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { msatsToUsdc } from "../../../lib/currency";
+import { encodePayment } from "../../../lib/x402/spec";
 import type { X402Config } from "../../../lib/x402/types";
 import type { FxFetcher, FxRateSnapshot } from "../../pricing/fx";
 import { fundingCommitment } from "../funding";
@@ -9,12 +10,10 @@ import { verifyUpfrontPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
 
 /**
- * An x402 settle that returns no transaction hash
- * leaves the ledger leg with nothing to key the processed-payment marker on.
- * Implicit N=1 degrades to legacy semantics (money is never refused for a rail
- * metadata gap), but an explicitly signed `fund` block is a commitment the
- * caller expects to be recorded — silently minting no credit would leave them
- * believing a credit exists. That case fails closed instead.
+ * An x402 settle that returns no transaction hash still moved money, so the
+ * ledger leg keys its marker and funding on the EIP-3009 authorization, which
+ * is single-use on chain. Neither an implicit N=1 payment nor an explicitly
+ * signed `fund` block is accepted without a ledger row.
  */
 
 vi.mock("../../../lib/x402", () => ({ verifyX402Payment: vi.fn() }));
@@ -24,7 +23,19 @@ const { verifyX402Payment } = await import("../../../lib/x402");
 const RATE = 100_000;
 const REQUIRED_MSATS = 10_000;
 const PRICE_FIAT = { currency: "usd", amountMicro: 10_000 };
-const X402_HEADER = "base64_header";
+const NONCE = `0x${"12".repeat(32)}`;
+const FROM = "0x2222222222222222222222222222222222222222";
+const X402_HEADER = encodePayment({
+  x402Version: 1,
+  scheme: "exact",
+  network: "eip155:8453",
+  payload: {
+    signature: "0xdeadbeef",
+    authorization: { from: FROM, to: "0x1111111111111111111111111111111111111111", value: "10000",
+      validAfter: "0", validBefore: "9999999999", nonce: NONCE },
+  },
+});
+const AUTHORIZATION_ID = `eip3009:${FROM}:${NONCE}`;
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
@@ -57,15 +68,16 @@ describe("x402 settle without a transaction reference", () => {
     });
   });
 
-  it("refuses an explicitly signed fund block — the funding cannot be recorded idempotently", async () => {
+  it("records an explicitly signed fund block under the authorization", async () => {
     const ledger = new MemoryCreditLedger();
-    const result = await verifyUpfrontPayment({
+    const processedPayments = new MemoryProcessedPaymentStore();
+    const pay = () => verifyUpfrontPayment({
       x402Payment: X402_HEADER,
       x402Config: X402,
       requiredMsats: REQUIRED_MSATS,
       fxFetcher: warmFetcher(),
       creditLedger: ledger,
-      processedPayments: new MemoryProcessedPaymentStore(),
+      processedPayments,
       priceFiat: PRICE_FIAT,
       callerPubkey: "aa".repeat(32),
       creditEnvelope: {
@@ -78,16 +90,17 @@ describe("x402 settle without a transaction reference", () => {
       },
     });
 
-    expect(result.error?.status).toBe(402);
-    expect(result.error?.body).toMatchObject({
-      error: "payment_invalid",
-      message: expect.stringContaining("no transaction reference") as string,
-    });
-    // Nothing was minted: the caller can see the funding did not land.
-    expect(await ledger.get("c1")).toBeUndefined();
+    const result = await pay();
+    expect(result.error).toBeUndefined();
+    expect(await ledger.getFunding({ creditId: "c1", fundId: AUTHORIZATION_ID }))
+      .toMatchObject({ amountMicro: PRICE_FIAT.amountMicro });
+    expect(await ledger.getDraw({ creditId: "c1", drawId: "d1" })).toMatchObject({ status: "pending" });
+    // The authorization keys the marker too: presenting it again funds nothing more.
+    await pay();
+    expect((await ledger.get("c1"))?.balanceMicro).toBe(PRICE_FIAT.amountMicro);
   });
 
-  it("keeps legacy semantics for implicit N=1 — the payment is accepted, no credit minted", async () => {
+  it("keys an implicit N=1 funding on the authorization", async () => {
     const ledger = new MemoryCreditLedger();
     const result = await verifyUpfrontPayment({
       x402Payment: X402_HEADER,
@@ -102,6 +115,8 @@ describe("x402 settle without a transaction reference", () => {
 
     expect(result.error).toBeUndefined();
     expect(result.paidMsats).toBe(REQUIRED_MSATS);
-    expect(result.creditId).toBeUndefined();
+    expect(result.creditId).toBe(`imp:x402:${AUTHORIZATION_ID}`);
+    expect(await ledger.getDraw({ creditId: `imp:x402:${AUTHORIZATION_ID}`, drawId: AUTHORIZATION_ID }))
+      .toMatchObject({ status: "pending", amountMicro: PRICE_FIAT.amountMicro });
   });
 });

@@ -6,6 +6,7 @@ import type { FxFetcher, FxRateSnapshot } from "../../pricing/fx";
 import { MemoryKVStore } from "../../store";
 import { buildContext } from "../context";
 import type { ServerJob } from "../job";
+import { MemoryCreditLedger } from "../memory-credit-ledger";
 import type { MppxServer } from "../mpp-setup";
 import { processIncomingPayment, verifyIncomingPayment, verifyUpfrontPayment } from "../payment";
 
@@ -249,7 +250,7 @@ describe("payment paths across rate refreshes and outages", () => {
     const err = await processIncomingPayment(
       job,
       { type: "payment", content: { x402_payment: "base64_header" } },
-      { x402Config: X402, fxFetcher: warmButDown() }
+      { x402Config: X402, fxFetcher: warmButDown(), creditLedger: new MemoryCreditLedger() }
     );
 
     expect(err).toBeNull();
@@ -280,7 +281,7 @@ describe("payment paths across rate refreshes and outages", () => {
     const err = await processIncomingPayment(
       job,
       { type: "payment", content: { x402_payment: "base64_header" } },
-      { x402Config: X402, fxFetcher: liveFetcher(APPRECIATED_BTC_RATE) }
+      { x402Config: X402, fxFetcher: liveFetcher(APPRECIATED_BTC_RATE), creditLedger: new MemoryCreditLedger() }
     );
 
     expect(err).toBeNull();
@@ -308,7 +309,7 @@ describe("payment paths across rate refreshes and outages", () => {
     });
     const result = await verifyIncomingPayment(
       { type: "payment", content: { x402_payment: "base64_header" } },
-      { x402Config: X402, fxFetcher: liveFetcher(APPRECIATED_BTC_RATE) },
+      { x402Config: X402, fxFetcher: liveFetcher(APPRECIATED_BTC_RATE), creditLedger: new MemoryCreditLedger() },
       {
         pendingPaymentMsats: REQUIRED_MSATS,
         pendingX402AmountUsdcMicro: "1050",

@@ -151,6 +151,7 @@
       "src/sdk/server/admin-content.ts",
       "src/sdk/server/admin-credit.ts",
       "src/sdk/server/app.ts",
+      "src/sdk/server/ask-expiry.ts",
       "src/sdk/server/auth-error.ts",
       "src/sdk/server/btc-rate.ts",
       "src/sdk/server/caller-facing-url.ts",
@@ -185,6 +186,7 @@
       "src/sdk/server/job-manager.ts",
       "src/sdk/server/job-store.ts",
       "src/sdk/server/job.ts",
+      "src/sdk/server/late-payment.ts",
       "src/sdk/server/lightning-rail-health.ts",
       "src/sdk/server/lightning-receive.ts",
       "src/sdk/server/lock-pubkey-store.ts",
@@ -194,6 +196,7 @@
       "src/sdk/server/mpp-secret-state.ts",
       "src/sdk/server/mpp-setup.ts",
       "src/sdk/server/mpp-units.ts",
+      "src/sdk/server/payment-arrival.ts",
       "src/sdk/server/payment-diagnostics.ts",
       "src/sdk/server/payment-mode.ts",
       "src/sdk/server/payment.ts",
@@ -22999,6 +23002,12 @@
         },
         {
           "module": "src/sdk/server/card-refund-sweep.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-arrival.ts"
+        },
+        {
+          "module": "src/sdk/server/late-payment.ts"
         }
       ]
     },
@@ -24384,6 +24393,9 @@
         },
         {
           "module": "src/sdk/server/secp256k1-auth.ts"
+        },
+        {
+          "module": "src/sdk/server/ask-expiry.ts"
         }
       ]
     },
@@ -27181,15 +27193,6 @@
       ],
       "dependencies": [
         {
-          "module": "src/observability/diagnostic-console.ts"
-        },
-        {
-          "module": "src/sdk/server/payment-mode.ts"
-        },
-        {
-          "module": "src/sdk/server/disposable-cashu-store.ts"
-        },
-        {
           "module": "src/lib/cashu/lock-pubkey.ts"
         },
         {
@@ -27208,16 +27211,13 @@
           "module": "src/lib/x402/types.ts"
         },
         {
+          "module": "src/observability/diagnostic-console.ts"
+        },
+        {
           "module": "src/observability/loggers.ts"
         },
         {
           "module": "src/sdk/pricing/index.ts"
-        },
-        {
-          "module": "src/sdk/step-cache.ts"
-        },
-        {
-          "module": "src/sdk/types.ts"
         },
         {
           "module": "src/sdk/server/context.ts"
@@ -27226,13 +27226,16 @@
           "module": "src/sdk/server/credit-ledger.ts"
         },
         {
+          "module": "src/sdk/server/disposable-cashu-store.ts"
+        },
+        {
           "module": "src/sdk/server/funding.ts"
         },
         {
-          "module": "src/sdk/server/job.ts"
+          "module": "src/sdk/server/job-store.ts"
         },
         {
-          "module": "src/sdk/server/job-store.ts"
+          "module": "src/sdk/server/job.ts"
         },
         {
           "module": "src/sdk/server/memory-job-store.ts"
@@ -27242,6 +27245,12 @@
         },
         {
           "module": "src/sdk/server/mpp-setup.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-arrival.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-mode.ts"
         },
         {
           "module": "src/sdk/server/payment.ts"
@@ -27259,7 +27268,13 @@
           "module": "src/sdk/server/revenue-reporter.ts"
         },
         {
+          "module": "src/sdk/server/settled-draw-revenue.ts"
+        },
+        {
           "module": "src/sdk/server/signed-request.ts"
+        },
+        {
+          "module": "src/sdk/server/unsigned-request.ts"
         },
         {
           "module": "src/sdk/server/wallet-accumulator-monitor.ts"
@@ -27271,10 +27286,10 @@
           "module": "src/sdk/server/x402-facilitator-support.ts"
         },
         {
-          "module": "src/sdk/server/unsigned-request.ts"
+          "module": "src/sdk/step-cache.ts"
         },
         {
-          "module": "src/sdk/server/settled-draw-revenue.ts"
+          "module": "src/sdk/types.ts"
         }
       ]
     },
@@ -27552,6 +27567,117 @@
         },
         {
           "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/ask-expiry.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/ask-expiry.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "ASK_EXPIRY_GRACE_MS",
+            "askExpired",
+            "askExpiryAtMs"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager",
+            "supported:./server#PostgresJobStore",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve",
+            "supported:./testing#MemoryJobStore"
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "module": "src/sdk/server/payment-arrival.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "ArrivalBalanceReason",
+            "BalanceLanding",
+            "PAYMENT_INTENT_LEASE_MS",
+            "PAYMENT_INTENT_POLL_MAX_MS",
+            "PAYMENT_INTENT_POLL_MS",
+            "PAYMENT_INTENT_REQUEST_WAIT_MS",
+            "PaymentArrivalStore",
+            "PaymentBalanceReason",
+            "PaymentDisposition",
+            "PaymentIntentOpenError",
+            "RecordedPaymentArrival",
+            "afterPaymentIntents",
+            "decidePaymentDisposition",
+            "isPaymentArrivalStore",
+            "paymentIntentOpen",
+            "paymentIntentRetryDelayMs",
+            "waitForPaymentIntents"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager",
+            "supported:./server#PostgresJobStore",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve",
+            "supported:./testing#MemoryJobStore"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/messages/types.ts"
+        },
+        {
+          "module": "src/sdk/server/ask-expiry.ts"
+        },
+        {
+          "module": "src/sdk/server/job-store.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/late-payment.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "LatePaymentRecorder",
+            "acceptLatePayment"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/cashu/lock-pubkey.ts"
+        },
+        {
+          "module": "src/lib/messages/types.ts"
+        },
+        {
+          "module": "src/sdk/server/job.ts"
+        },
+        {
+          "module": "src/sdk/server/job-manager.ts"
+        },
+        {
+          "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/mint-health-tracker.ts"
         }
       ]
     },
@@ -27883,6 +28009,9 @@
         },
         {
           "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-arrival.ts"
         }
       ]
     },
@@ -29025,6 +29154,9 @@
         },
         {
           "module": "src/sdk/server/stripe-credit.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-arrival.ts"
         }
       ]
     },
@@ -29495,6 +29627,9 @@
         },
         {
           "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/payment-arrival.ts"
         }
       ]
     },

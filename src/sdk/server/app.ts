@@ -186,6 +186,13 @@ import {
   UNSIGNED_LOCK_REFUSAL_HINT,
   verifyUpfrontPayment,
 } from "./payment";
+import {
+  afterPaymentIntents,
+  PAYMENT_INTENT_REQUEST_WAIT_MS,
+  paymentIntentOpen,
+  waitForPaymentIntents,
+} from "./payment-arrival";
+import { acceptLatePayment } from "./late-payment";
 import type { PayoutReporter } from "./payout-reporter";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { MemoryProcessedPaymentStore, PostgresProcessedPaymentStore } from "./processed-payment-store";
@@ -1321,10 +1328,16 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const store = this.jobManager.store;
     if (!(store instanceof PostgresJobStore)) return;
     for (const jobId of status.activeJobIds) {
-      if (await control.dispatchDeadlineReached(jobId) &&
-        await store.cancelJobForHosting(jobId, "Hosting drain deadline reached")) {
-        await this.jobManager.finalizeStoredTerminal(jobId);
+      if (!(await control.dispatchDeadlineReached(jobId))) continue;
+      let cancelled: boolean;
+      try {
+        cancelled = await store.cancelJobForHosting(jobId, "Hosting drain deadline reached");
+      } catch (error) {
+        // A payment being verified holds this job open; a later sweep ends it.
+        if (paymentIntentOpen(error)) continue;
+        throw error;
       }
+      if (cancelled) await this.jobManager.finalizeStoredTerminal(jobId);
     }
   }
 
@@ -4652,6 +4665,24 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return c.json(await this.messageFields(job, visibleJobMessages(job).filter((m) => m.seq > after)));
   }
 
+  /**
+   * A cancel or other ending write held past the request's wait by a payment
+   * still being verified. Nothing changed; the same request succeeds once the
+   * payment is recorded.
+   */
+  private paymentInProgressResponse(c: Context<AppEnv>): Response {
+    c.header("Retry-After", "2");
+    return c.json(
+      {
+        error: "payment_in_progress",
+        message: "A payment for this job is being verified, and the job cannot end until its outcome is recorded.",
+        hint: "Retry this request in a few seconds. The payment will either pay the job's request or be held as balance on your credit.",
+        retryable: true,
+      },
+      409
+    );
+  }
+
   private jobNotActiveResponse(c: Context<AppEnv>): Response {
     return c.json(
       {
@@ -4719,10 +4750,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
     }
 
+    // Money that reaches an ended job is never refused for arriving late: it
+    // lands on credit as balance. Anything else still gets 409.
+    const latePayable = wire?.type === "payment" && !!wire.content && typeof wire.content === "object" &&
+      hasPaymentProof(wire.content);
     if (activeJob) {
       if (!isJobOwner(c, activeJob)) return c.json({ error: "Job not found" }, 404);
       if (isTerminal(activeJob.status)) {
-        return this.jobNotActiveResponse(c);
+        return latePayable ? this.acceptPaymentOnEndedJob(c, id) : this.jobNotActiveResponse(c);
       }
 
       const parsed = await this.requireJsonBody<{
@@ -4756,6 +4791,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
         unappliedCredit = outcome.unappliedCredit;
         drawFundingReceipt = outcome.drawFundingReceipt;
+        // Balance bought nothing, and a job a cancel ended while this payment
+        // verified has no handler left to pay: neither is dispatched.
+        if (outcome.landedAsBalance || isTerminal(activeJob.status)) {
+          return c.json({
+            seq: activeJob.messages[activeJob.messages.length - 1].seq,
+            ...(unappliedCredit && { credit: unappliedCredit }),
+            ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+          }, 201);
+        }
       } else {
         // Non-payment inbound: flip status to verified so cross-machine
         // SSE readers see the row.
@@ -4787,7 +4831,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!record) return c.json({ error: "Job not found" }, 404);
     if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
     if (isTerminal(record.status)) {
-      return this.jobNotActiveResponse(c);
+      return latePayable ? this.acceptPaymentOnEndedJob(c, id, record) : this.jobNotActiveResponse(c);
     }
 
     const parsed = await this.requireJsonBody<{
@@ -4803,12 +4847,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       const summary = record.capability
         ? `Capability "${record.capability}" is no longer registered on this DVM`
         : "Job predates capability dispatch and cannot be resumed";
-      await jm.store.save({
-        ...record,
-        status: "failed",
-        summary,
-        lastActivityAt: Date.now(),
-      });
+      try {
+        await afterPaymentIntents(() => jm.store.save({
+          ...record,
+          status: "failed",
+          summary,
+          lastActivityAt: Date.now(),
+        }), { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+      } catch (error) {
+        const open = paymentIntentOpen(error);
+        if (open) return this.paymentInProgressResponse(c);
+        throw error;
+      }
       const infoUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
       return c.json(
         {
@@ -4877,6 +4927,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       unappliedCredit = outcome.unappliedCredit;
       drawFundingReceipt = outcome.drawFundingReceipt;
+      if (outcome.landedAsBalance) {
+        // It bought nothing, so nothing resumes.
+        this.teardownReactivationScaffold(jm, job);
+        return c.json({
+          seq: job.messages[job.messages.length - 1].seq,
+          ...(unappliedCredit && { credit: unappliedCredit }),
+          ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+        }, 201);
+      }
     } else {
       await jm.markInboundVerified(job.id, inboundSeq);
     }
@@ -4922,6 +4981,28 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     const lastMsg = job.messages[job.messages.length - 1];
     return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
+  }
+
+  /** A paid message for an ended job: recorded, verified and landed as balance. */
+  private async acceptPaymentOnEndedJob(c: Context<AppEnv>, id: string, known?: JobRecord): Promise<Response> {
+    const parsed = await this.requireJsonBody<{ type: MessageType; content: Record<string, unknown> }>(c);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const contentErr = validateMessageContent(body.type, body.content, this.opts.devMode === true);
+    if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
+    const record = known ?? await this.jobManager.store.get(id);
+    if (!record) return c.json({ error: "Job not found" }, 404);
+    // A redacted job keeps no history to record a payment against.
+    if (record.redactedAt !== undefined) return this.jobNotActiveResponse(c);
+    const railRefusal = this.unsignedJobRailRefusal(record, body);
+    if (railRefusal) return railRefusal;
+    const result = await acceptLatePayment({
+      recorder: this.jobManager,
+      record,
+      content: body.content,
+      extra: { lockPubkeys: await this.resolveLockPubkeysForReceive(), mintHealthTracker: this.mintHealthTracker },
+    });
+    return c.json(result.body, result.status as ContentfulStatusCode);
   }
 
   private async persistMessageSnapshot(
@@ -5060,7 +5141,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // means someone else drove the job terminal between our read and the CAS.
       const store = jm.store;
       if (isStreamableJobStore(store)) {
-        const cancelled = await store.cancelJob(id, reason ?? "Job cancelled");
+        // A payment being verified commits first: it pays the ask or lands as balance.
+        let cancelled: boolean;
+        try {
+          cancelled = await afterPaymentIntents(() => store.cancelJob(id, reason ?? "Job cancelled"),
+            { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+        } catch (error) {
+          if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+          throw error;
+        }
         if (!cancelled) return this.jobNotActiveResponse(c);
         // this machine wrote the terminal, so it issues the receipt.
         // The handler's machine will try too when it adopts the status — the
@@ -5082,6 +5171,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     if (!isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
 
+    // A payment being verified commits first: it pays the ask or lands as balance.
+    try {
+      await waitForPaymentIntents(jm.store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+    } catch (error) {
+      if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+      throw error;
+    }
     if (isTerminal(job.status)) {
       return this.jobNotActiveResponse(c);
     }

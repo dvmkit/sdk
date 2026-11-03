@@ -11,6 +11,7 @@ import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
 import type { ServerJob } from "../job";
 import { JobManager } from "../job-manager";
+import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
 import { hasPaymentProof, PAYMENT_PROOF_KEYS } from "../payment";
 
@@ -58,6 +59,7 @@ function manager(opts: {
     store: new MemoryKVStore(),
     jobStore: new MemoryJobStore(),
     fxFetcher: warmFetcher(),
+    creditLedger: new MemoryCreditLedger(),
     dvmId: DVM_ID,
     devMode: opts.devMode,
     mints: opts.mints,

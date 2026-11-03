@@ -37,7 +37,7 @@ import type {
   ZodLike,
 } from "../types";
 import { isZodSchema } from "../types";
-import type { DrawPool } from "./context";
+import type { CreditRail, DrawPool } from "./context";
 import { buildContext } from "./context";
 import {
   CreditLedgerError,
@@ -67,6 +67,7 @@ import type {
   JobStatus,
   JobStore,
   PaymentCreditDelta,
+  VerifyAndCreditOptions,
   VerifyAndCreditResult,
 } from "./job-store";
 import {
@@ -84,9 +85,22 @@ import {
   creditDepositPayload,
   devModeSkipsPaymentVerification,
   hasPaymentProof,
+  incomingPaymentSnapshot,
   paymentErrorBody,
+  paymentFullyUnapplied,
   verifyIncomingPayment,
 } from "./payment";
+import {
+  decidePaymentDisposition,
+  isPaymentArrivalStore,
+  afterPaymentIntents,
+  PAYMENT_INTENT_LEASE_MS,
+  paymentIntentOpen,
+  paymentIntentRetryDelayMs,
+  type BalanceLanding,
+  type PaymentBalanceReason,
+  type PaymentDisposition,
+} from "./payment-arrival";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { drawFundingReceiptFor } from "./funding-receipt";
 import type { ReceiptIssuer } from "./receipt-issuer";
@@ -564,10 +578,16 @@ export type ProcessPaymentOutcome =
       unappliedCredit?: UnappliedCredit;
       /**
        * Signed evidence that this payment funded the job's credit against its
-       * pending draw. Absent when the payment ran ledger-less, opened a fresh
-       * credit, or the DVM has no receipt key.
+       * pending draw. Absent when the payment opened a fresh credit or the DVM
+       * has no receipt key.
        */
       drawFundingReceipt?: DrawFundingReceipt;
+      /**
+       * Set when the payment arrived too late to pay an ask (the job ended or
+       * the ask expired) or with none open. It landed on credit as balance and
+       * bought nothing, so it must not resume or reach the handler.
+       */
+      landedAsBalance?: PaymentBalanceReason;
     };
 
 /**
@@ -650,6 +670,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly paymentAskSeqs = new WeakMap<object, number>();
   private readonly reactivationAskSeqs = new WeakMap<ServerJob, number>();
   private readonly pendingPaymentMessages = new WeakMap<ServerJob, Map<number | object, Message>>();
+  /** How many times idle expiry has found a payment holding each job open. */
+  private readonly idleIntentWaits = new WeakMap<ServerJob, number>();
+  /** What each recorded payment arrival is for, decided under the job row lock. */
+  private readonly paymentDispositions = new WeakMap<ServerJob, Map<number | object, PaymentDisposition>>();
 
   // Every local input resume holds this queue through its durable wait update.
   // A prompt response and a payment NOTIFY must not mistake each other for a
@@ -1454,7 +1478,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async persistTerminalSnapshot(job: ServerJob): Promise<void> {
-    const deadline = performance.now() + TERMINAL_PERSIST_RETRY_MS;
+    let deadline = performance.now() + TERMINAL_PERSIST_RETRY_MS;
+    let intentWaits = 0;
     await job.messageAppenderTail;
     while (!this.terminalFailures.has(job)) {
       try {
@@ -1462,7 +1487,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         await this.flushOutgoing(job);
         await this.persistSnapshot(job, true);
         return;
-      } catch {
+      } catch (error) {
+        // A payment intent holds the job open; that is no store fault, so the
+        // wait does not spend the retry budget that turns a completion into a
+        // failure. The intent's lease bounds it.
+        const open = paymentIntentOpen(error);
+        if (open) {
+          const waitMs = paymentIntentRetryDelayMs(open.retryAtMs, intentWaits++);
+          deadline += waitMs;
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+          continue;
+        }
         if (performance.now() >= deadline) break;
         await new Promise(resolve => setTimeout(resolve, Math.min(500, deadline - performance.now())));
       }
@@ -1485,7 +1520,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     this.outgoingQueues.delete(job);
     const store = this.jobStore;
     if (isStreamableJobStore(store) && store.failJob) {
-      await store.failJob(job.id, reason);
+      const failJob = store.failJob.bind(store);
+      await afterPaymentIntents(() => failJob(job.id, reason));
       const saved = await store.get(job.id);
       if (!saved || !isTerminal(saved.status)) throw new JobSnapshotPersistenceError("failure not committed");
       job.status = saved.status;
@@ -1964,7 +2000,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return;
     }
     if (current && isStreamableJobStore(this.jobStore)) {
-      const claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled");
+      let claimed: boolean;
+      try {
+        claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled");
+      } catch (error) {
+        // A payment that arrived before expiry is still being verified; expire
+        // after it resolves, which may also have paid the ask.
+        const open = paymentIntentOpen(error);
+        if (!open) throw error;
+        const attempt = this.idleIntentWaits.get(job) ?? 0;
+        this.idleIntentWaits.set(job, attempt + 1);
+        this.startIdleTimer(job, Date.now() + paymentIntentRetryDelayMs(open.retryAtMs, attempt));
+        return;
+      }
+      this.idleIntentWaits.delete(job);
       if (claimed) await this.finalizeStoredTerminal(job.id);
       await this.adoptDurableTerminal(job);
       if (!claimed && !isTerminal(job.status)) this.startIdleTimer(job, Date.now() + 1);
@@ -2103,12 +2152,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           });
           continue;
         }
-        const claimed = await this.jobStore.cancelStaleJob(
-          record.id,
-          expectedActivityBefore,
-          reason,
-          terminalStatus
-        );
+        let claimed: boolean;
+        try {
+          claimed = await this.jobStore.cancelStaleJob(
+            record.id,
+            expectedActivityBefore,
+            reason,
+            terminalStatus
+          );
+        } catch (error) {
+          // A payment being verified holds this job open; a later tick reaps it.
+          if (paymentIntentOpen(error)) continue;
+          throw error;
+        }
         if (claimed) {
           swept++;
           // the reaper bypasses `handleJobTerminal`, so issue the
@@ -2877,7 +2933,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   ): Promise<number | null> {
     const timestamp = Math.floor(Date.now() / 1000);
     let txSeq: number | null = null;
-    if (isStreamableJobStore(this.jobStore)) {
+    let disposition: PaymentDisposition | undefined;
+    if (msgType === "payment" && isStreamableJobStore(this.jobStore) && isPaymentArrivalStore(this.jobStore)) {
+      // The arrival, its disposition and the intent that holds the job open
+      // through verification commit under the job row lock, before any rail
+      // is touched.
+      ({ seq: txSeq, disposition } = await this.jobStore.recordPaymentArrival(
+        job.id,
+        { from: "requester", type: "payment", timestamp, content: msgContent },
+        { arrivedAtMs: Date.now(), leaseMs: PAYMENT_INTENT_LEASE_MS }
+      ));
+    } else if (isStreamableJobStore(this.jobStore)) {
       txSeq = await this.jobStore.recordInbound(job.id, {
         from: "requester",
         type: msgType,
@@ -2900,6 +2966,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         this.pendingPaymentMessages.set(job, pending);
       }
       pending.set(txSeq ?? msgContent, message);
+      if (disposition) {
+        let dispositions = this.paymentDispositions.get(job);
+        if (!dispositions) this.paymentDispositions.set(job, dispositions = new Map());
+        dispositions.set(txSeq ?? msgContent, disposition);
+      }
       holdJobHistory(job, message.seq);
     } else {
       job.messages.push(message);
@@ -3042,13 +3113,29 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const pending = this.pendingPaymentMessages.get(job);
     const key = inboundSeq ?? body.content;
     const message = pending?.get(key);
+    // A store without arrival support, or a caller that never recorded the
+    // arrival, decides from the in-memory job instead of the locked row.
+    const disposition = this.paymentDispositions.get(job)?.get(key) ?? decidePaymentDisposition({
+      status: job.status,
+      pendingPaymentMsats: job.pendingPaymentMsats,
+      ask: job.messages?.findLast((m) => m.from === "provider" && m.type === "payment-request"),
+      arrivedAtMs: Date.now(),
+    });
     let accepted: Message | undefined;
     try {
-      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, extra);
-      if (!outcome.error && message && pending?.get(key) === message) {
+      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, disposition, extra);
+      // A balance landing paid no ask; it stays out of history here as it does in the store.
+      if (!outcome.error && !outcome.landedAsBalance && message && pending?.get(key) === message) {
         accepted = message;
       }
       return outcome;
+    } catch (error) {
+      // An unexpected failure must not hold the job for the intent's whole
+      // lease. Only a still-pending arrival changes, so a recorded outcome stands.
+      if (inboundSeq !== null && isStreamableJobStore(this.jobStore)) {
+        await this.jobStore.markInboundFailed(job.id, inboundSeq, "verify_error").catch(() => undefined);
+      }
+      throw error;
     } finally {
       pending?.delete(key);
       if (message) releaseJobHistory(job, message.seq, accepted);
@@ -3059,12 +3146,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job: ServerJob,
     body: { type: MessageType; content: Record<string, unknown> },
     inboundSeq: number | null,
+    disposition: PaymentDisposition,
     extra?: {
       lockPubkeys?: LockPubkey[];
       mintHealthTracker?: MintHealthTracker;
     }
   ): Promise<ProcessPaymentOutcome> {
     if (body.type !== "payment") return {};
+    const landAsBalance = disposition.disposition === "balance" ? disposition.reason : undefined;
 
     const devAuto =
       this.opts.devMode === true &&
@@ -3072,14 +3161,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       !hasPaymentProof(body.content);
     if (devAuto || devModeSkipsPaymentVerification(this.opts)) {
       const hadPendingPayment = job.pendingPaymentMsats !== undefined;
-      const delta = job.pendingPaymentMsats ?? 0;
+      // An unverified dev payment that arrived too late to pay the ask buys nothing.
+      const delta = landAsBalance ? 0 : job.pendingPaymentMsats ?? 0;
       if (inboundSeq !== null && isStreamableJobStore(this.jobStore)) {
         const credit: PaymentCreditDelta | null = delta
           ? { paidMsatsDelta: delta, clearPending: true }
           : null;
         // No ledger leg ran here, so there is no committed money to strand —
         // the retry is for the transient store error alone.
-        const { counters } = await this.creditInbound(job.id, inboundSeq, credit);
+        const { counters } = await this.creditInbound(job.id, inboundSeq, credit,
+          landAsBalance ? { landedAsBalance: true } : undefined);
         job.paidMsats = counters.paidMsats;
         job.pendingPaymentMsats = counters.pendingPaymentMsats;
         if (
@@ -3102,7 +3193,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         if (hadPendingPayment) job.reactivationPaymentApplied = true;
         if (job.status === "awaiting-input" && job.pendingPrompts.size === 0) job.status = "processing";
       }
-      return {};
+      return landAsBalance ? { landedAsBalance: landAsBalance } : {};
     }
 
     const verifyResult = await verifyIncomingPayment(
@@ -3132,23 +3223,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         hostingPaymentSeq: inboundSeq ?? undefined,
         creditTtlMs: this.opts.creditTtlMs,
       },
-      {
-        pendingPaymentMsats: job.pendingPaymentMsats,
-        pendingMppChallengeIds: job.pendingMppChallengeIds,
-        pendingX402Nonce: job.pendingX402Nonce,
-        pendingX402AmountUsdcMicro: job.pendingX402AmountUsdcMicro,
-        paymentRail: job.paymentRail,
-        creditId: job.creditId,
-        drawId: job.drawId,
-        paymentTxHash: job.paymentTxHash,
-        pendingPaymentFiatMicro: job.pendingPaymentFiatMicro,
-        pendingPaymentFiatCurrency: job.pendingPaymentFiatCurrency,
-        askedTopUpMicro: job.askedTopUpMicro,
-        askedTopUpCurrency: job.askedTopUpCurrency,
-        topUpCapUnenforcedReason: job.topUpCapUnenforcedReason,
-        requesterPubkey: job.requesterPubkey,
-        requesterId: job.requesterId,
-      }
+      { ...incomingPaymentSnapshot(job), ...(landAsBalance && { landAsBalance }) }
     );
 
     if (verifyResult.error) {
@@ -3191,10 +3266,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // silently pre-satisfy the *next* ask's auto-credit gate, giving away a
     // stage of work the caller never paid for. The inbound row is still CAS'd
     // verified, which is what stops it being retried.
-    const fullyUnapplied =
-      info.unappliedMicro !== undefined &&
-      info.funding !== undefined &&
-      info.unappliedMicro >= info.funding.amountMicro;
+    // The arrival decided the payment was balance, or the ledger leg found the
+    // job's credit could not take it. Either way it paid no ask.
+    let landing: BalanceLanding | undefined = landAsBalance ? { reason: landAsBalance } : info.landedAsBalance;
+    let fullyUnapplied = landing !== undefined || paymentFullyUnapplied(info);
     const hadPendingPayment = job.pendingPaymentMsats !== undefined;
     if (inboundSeq !== null && isStreamableJobStore(this.jobStore)) {
       let result: VerifyAndCreditResult;
@@ -3217,7 +3292,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
                 clearPendingX402Binding: info.paymentRail === "x402",
                 creditId: info.creditId,
                 drawId: info.drawId,
-              }
+              },
+          landing ? { landedAsBalance: true } : undefined
         );
       } catch (err) {
         const unapplied = await this.reportUnappliedPayment(job, inboundSeq, info, err);
@@ -3229,6 +3305,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         };
       }
       const { counters } = result;
+      if (result.creditRefused && !fullyUnapplied) {
+        // The job ended while this payment verified, after its intent's lease
+        // ran out. It paid no ask: a draw it placed for the job is released, so
+        // the money is the caller's balance instead of a hold no job owns.
+        landing = { reason: result.creditRefused };
+        fullyUnapplied = true;
+        await this.releaseOrphanedDraw(job, info);
+        unappliedCredit = this.unappliedCredit(info.funding, info.funding?.creditId, landing.reason);
+      }
       job.paidMsats = counters.paidMsats;
       job.pendingPaymentMsats = counters.pendingPaymentMsats;
       if (
@@ -3249,7 +3334,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // surface builders implement). Silence there means "didn't say", not
       // "holds nothing" — so fall back to the set-if-null mirror
       // rather than wiping a live binding and calling every top-up unapplied.
-      if (result.creditId !== undefined || result.drawId !== undefined) {
+      if (result.creditRefused) {
+        // The ended row took no binding; keep the snapshot's.
+      } else if (result.creditId !== undefined || result.drawId !== undefined) {
         job.creditId = result.creditId;
         job.drawId = result.drawId;
         if (info.creditId && result.creditId !== info.creditId) {
@@ -3307,7 +3394,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         job.status = "processing";
       }
     } else {
-      applyPaymentInfoToJob(job, info);
+      // A payment that bought nothing moves no job counter here either.
+      if (!fullyUnapplied) applyPaymentInfoToJob(job, info);
       if (
         !fullyUnapplied &&
         hadPendingPayment &&
@@ -3326,8 +3414,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // The credit the money landed on, not `info.creditId` — that one is set
       // only when the top-up minted a *fresh* credit, and this shape is the
       // opposite case (a job already bound to one).
-      unappliedCredit = this.unappliedCredit(info.funding, info.funding?.creditId, "over_ask", {
+      unappliedCredit = this.unappliedCredit(info.funding, info.funding?.creditId, landing?.reason ?? "over_ask", {
         creditedMicro: info.unappliedMicro,
+        jobRail: landing?.jobRail,
       });
       diagnosticConsole.warn(
         {
@@ -3349,6 +3438,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     return {
       ...(unappliedCredit && { unappliedCredit }),
       ...(drawFundingReceipt && { drawFundingReceipt }),
+      ...(landing && { landedAsBalance: landing.reason }),
     };
   }
 
@@ -3472,7 +3562,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async creditInbound(
     jobId: string,
     seq: number,
-    credit: PaymentCreditDelta | null
+    credit: PaymentCreditDelta | null,
+    opts?: VerifyAndCreditOptions
   ): Promise<VerifyAndCreditResult> {
     const store = this.jobStore;
     if (!isStreamableJobStore(store)) {
@@ -3481,7 +3572,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= CREDIT_INBOUND_ATTEMPTS; attempt++) {
       try {
-        return await store.verifyAndCredit(jobId, seq, credit);
+        return await store.verifyAndCredit(jobId, seq, credit, opts);
       } catch (err) {
         lastErr = err;
         if (attempt === CREDIT_INBOUND_ATTEMPTS) break;
@@ -3649,14 +3740,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
      * clipped over-ask payment did buy part of the job, so reporting the whole
      * deposit would overstate what the caller can reclaim.
      */
-    opts?: { creditedMicro?: number }
+    opts?: { creditedMicro?: number; jobRail?: string }
   ): UnappliedCredit | undefined {
     if (!funding || !creditId || funding.creditId !== creditId) return undefined;
     return {
       credit_id: creditId,
       credited_micro: opts?.creditedMicro ?? funding.amountMicro,
       credit_currency: funding.currency,
-      ...unappliedCopy(reason, creditId),
+      ...unappliedCopy(reason, creditId, opts?.jobRail),
     };
   }
 
@@ -3736,6 +3827,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         return jobStore.getCounters(job.id);
       } : undefined,
       drawPool: this.opts.creditLedger ? () => this.resolveDrawPool(job) : undefined,
+      creditRail: this.opts.creditLedger ? () => this.payableCreditRail(job) : undefined,
       pricingCurrency: this.pricingCurrency,
       claimForProcessing: isStreamableJobStore(jobStore)
         ? (resume) => {
@@ -3850,6 +3942,24 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     return { basis: "draw", amountMicro: draw.amountMicro, currency: creditCurrency };
   }
 
+  /**
+   * The one rail a mid-job payment can pay into this job's credit on, if any.
+   * Mirrors the top-up preflight: the credit must be active and bound to no
+   * channel, and its rail must be one a mid-job ask offers. Any read failure
+   * answers undefined, so the ask offers every rail rather than none.
+   */
+  private async payableCreditRail(job: ServerJob): Promise<CreditRail | undefined> {
+    const ledger = this.opts.creditLedger;
+    if (!ledger || !job.creditId || !job.drawId) return undefined;
+    const [credit, draw] = await Promise.all([
+      ledger.get(job.creditId).catch(() => undefined),
+      ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }).catch(() => undefined),
+    ]);
+    if (!credit || !draw || credit.status !== "active" || credit.tempoChannelId || credit.x402ChannelId) return undefined;
+    const rail = draw.railValue.rail;
+    return rail === "cashu" || rail === "x402" || rail === "tempo" ? rail : undefined;
+  }
+
   /** Internal: structured warn for the one path that can't price a drawn job's pool. */
   private warnDrawPool(job: ServerJob, reason: string, error?: string): void {
     diagnosticConsole.warn(
@@ -3960,6 +4070,28 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /** Build the common settle/release args, adding the hosted release outbox when wired. */
+  /**
+   * Release the draw a payment placed for a job that ended before the payment
+   * was recorded. The job row never bound it; if this release fails, the
+   * terminal-draw reconciler releases it as an unbound hold.
+   */
+  private async releaseOrphanedDraw(job: ServerJob, info: VerifiedIncomingPayment): Promise<void> {
+    const ledger = this.opts.creditLedger;
+    if (!ledger || !info.creditId || !info.drawId) return;
+    try {
+      await ledger.release(this.drawResolutionArgs(info.creditId, info.drawId));
+    } catch (err) {
+      diagnosticConsole.warn({
+        level: "warn",
+        event: "credit_draw_reconcile_failed",
+        jobId: job.id,
+        creditId: info.creditId,
+        drawId: info.drawId,
+        code: err instanceof CreditLedgerError ? err.code : undefined,
+      });
+    }
+  }
+
   private drawResolutionArgs(creditId: string, drawId: string) {
     const enqueue = this.opts.enqueueCreditDrawRelease;
     const dvmId = this.opts.dvmId;
@@ -4698,7 +4830,7 @@ function errText(err: unknown): string {
 }
 
 /** Why a verified mid-job payment isn't charged to the job. */
-type UnappliedReason = "unapplied" | "unbound" | "unconfirmed" | "over_ask";
+type UnappliedReason = "unapplied" | "unbound" | "unconfirmed" | "over_ask" | PaymentBalanceReason;
 
 /**
  * The caller-facing words for a deposit the job row never took.
@@ -4739,8 +4871,12 @@ type UnappliedReason = "unapplied" | "unbound" | "unconfirmed" | "over_ask";
  */
 function unappliedCopy(
   reason: UnappliedReason,
-  creditId: string | undefined
+  creditId: string | undefined,
+  jobRail?: string
 ): Pick<UnappliedCredit, "display" | "hint"> {
+  const payOn = jobRail
+    ? `pay it with ${jobRail}, the method this job's credit holds`
+    : "pay it with a method its payment request offers";
   if (!creditId) {
     const noLedger = `This service holds no prepaid balance, so anything this job doesn't charge for can only be recovered from the provider directly.`;
     return {
@@ -4763,6 +4899,26 @@ function unappliedCopy(
         display:
           "The payment was received, but this job had already been paid for what it asked — so none of it was charged to this job.",
         hint: `Don't re-send it: this job's payment request is already satisfied. ${noLedger}`,
+      },
+      job_ended: {
+        display: "The payment arrived after this job ended, so none of it was charged to this job.",
+        hint: `Don't re-send it: the job is finished. ${noLedger}`,
+      },
+      ask_expired: {
+        display: "The payment arrived after this job's payment request expired, so none of it was charged to this job.",
+        hint: `Don't re-send it: the expired request can no longer be paid. ${noLedger}`,
+      },
+      no_open_ask: {
+        display: "The payment arrived while this job had no payment request open, so none of it was charged to this job.",
+        hint: `Don't re-send it. ${noLedger}`,
+      },
+      rail_mismatch: {
+        display: "The payment used a different method from the one this job's credit holds, so it wasn't applied to this job. The job's payment request is still outstanding.",
+        hint: `To satisfy the request, ${payOn}. ${noLedger}`,
+      },
+      credit_unavailable: {
+        display: "The payment wasn't applied to this job because the job's credit could not take it. The job's payment request is still outstanding.",
+        hint: `Read this job's status before paying again. ${noLedger}`,
       },
     }[reason];
   }
@@ -4787,6 +4943,31 @@ function unappliedCopy(
       display:
         "The payment was received, but this job had already been paid for what it asked — so the amount is prepaid balance with this service rather than a charge against this job.",
       hint: `The balance is on credit ${creditId} and nothing is holding it. Don't re-send this payment: this job's payment request is already satisfied. Spend the balance on a later request, or reclaim it now with op "drain" at POST /v1/credit.`,
+    },
+    job_ended: {
+      display:
+        "The payment arrived after this job ended, so it was not charged to the job. The amount is prepaid balance with this service.",
+      hint: `The balance is on credit ${creditId} and nothing is holding it. Don't re-send this payment. A signed caller can spend the balance on a later request, or reclaim it with op "drain" at POST /v1/credit; an unsigned payment is final.`,
+    },
+    ask_expired: {
+      display:
+        "The payment arrived after this job's payment request expired, so it was not charged to the job. The amount is prepaid balance with this service.",
+      hint: `The balance is on credit ${creditId} and nothing is holding it. Don't re-send this payment: the expired request can no longer be paid. A signed caller can spend the balance on a later request, or reclaim it with op "drain" at POST /v1/credit; an unsigned payment is final.`,
+    },
+    no_open_ask: {
+      display:
+        "The payment arrived while this job had no payment request open, so it was not charged to the job. The amount is prepaid balance with this service.",
+      hint: `The balance is on credit ${creditId} and nothing is holding it. Don't re-send this payment. A signed caller can spend the balance on a later request, or reclaim it with op "drain" at POST /v1/credit; an unsigned payment is final.`,
+    },
+    rail_mismatch: {
+      display:
+        "The payment used a different method from the one this job's credit holds, so it wasn't applied to this job. The amount is prepaid balance with this service, and the job's payment request is still outstanding.",
+      hint: `The balance is on credit ${creditId} and nothing is holding it. To satisfy the request, ${payOn}. A signed caller can spend the balance on a later request, or reclaim the balance with op "drain" at POST /v1/credit; an unsigned payment is final.`,
+    },
+    credit_unavailable: {
+      display:
+        "The payment wasn't applied to this job because the job's credit could not take it. The amount is prepaid balance with this service, and the job's payment request is still outstanding.",
+      hint: `The balance is on credit ${creditId} and nothing is holding it. Read this job's status before paying again. A signed caller can reclaim the balance with op "drain" at POST /v1/credit; an unsigned payment is final.`,
     },
   }[reason];
 }

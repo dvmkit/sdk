@@ -4,6 +4,7 @@ import { configureDVM } from "../../configure";
 import { MemoryKVStore } from "../../store";
 import type { SDKJobContext } from "../../types";
 import { createDVMServer } from "../app";
+import { ASK_EXPIRY_GRACE_MS } from "../ask-expiry";
 import { JobManager } from "../job-manager";
 import { fromJobRecord } from "../job";
 import type { JobRecord } from "../job-store";
@@ -119,7 +120,7 @@ describe("SDK terminal attribution and timing", () => {
     const rec = record(awaiting ? "awaiting-input" : "processing");
     if (path === "idle-awaiting") {
       rec.messages = [{ seq: 1, from: "provider", type: "prompt", timestamp: 1,
-        content: { id: "q", text: "Continue?", expires_at_ms: 1500 } }];
+        content: { id: "q", text: "Continue?", expires_at_ms: 1500 - ASK_EXPIRY_GRACE_MS } }];
       rec.seq = 1;
     }
     await store.save(rec);

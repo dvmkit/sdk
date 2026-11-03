@@ -78,5 +78,11 @@
     "body": {
       "error": "credit_payment_conflict"
     }
+  },
+  "ask_expired": {
+    "status": 409,
+    "body": {
+      "error": "ask_expired"
+    }
   }
 }

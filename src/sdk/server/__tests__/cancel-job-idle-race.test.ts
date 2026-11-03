@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
 import { MemoryKVStore } from "../../store";
+import { ASK_EXPIRY_GRACE_MS } from "../ask-expiry";
 import { JobManager } from "../job-manager";
 import type { JobRecord } from "../job-store";
 import { MemoryJobStore } from "../memory-job-store";
@@ -126,7 +127,7 @@ describe("JobManager.cancelJobIdle cross-machine race", () => {
   it("still cancels normally when the store has not moved on", async () => {
     const store = new MemoryJobStore();
     await store.save(seedRecord({ messages: [{ seq: 1, from: "provider", type: "prompt", timestamp: 1,
-      content: { id: "q1", text: "Continue?", expires_at_ms: Date.now() - 1 } }], seq: 1 }));
+      content: { id: "q1", text: "Continue?", expires_at_ms: Date.now() - ASK_EXPIRY_GRACE_MS - 1 } }], seq: 1 }));
     const jm = buildManager(store);
 
     try {

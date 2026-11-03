@@ -10,6 +10,7 @@ import type {
 import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
 import { StepCache } from "../step-cache";
 import type { FundingMethod, SDKJobContext } from "../types";
+import { askExpiryAtMs } from "./ask-expiry";
 import type { CreditSnapshot } from "./credit-ledger";
 import type { AppendOutgoingOptions, JobRecord, TopUpCapUnenforcedReason } from "./job-store";
 
@@ -542,7 +543,11 @@ export function isYieldMessage(msg: Message): boolean {
 
 type WaitingJob = Pick<JobRecord, "status" | "messages" | "pendingPaymentMsats" | "lastActivityAt" | "awaitingInputAtMs">;
 
-/** Recover outstanding asks from verified history; text and unrelated responses never extend a turn. */
+/**
+ * Recover outstanding asks from verified history; text and unrelated responses never extend a turn.
+ * A stamped ask expires `ASK_EXPIRY_GRACE_MS` after its advertised `expires_at_ms`, and every
+ * expiry path (idle timer, stale sweep, store cancellation CAS) reads that instant from here.
+ */
 export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): number | undefined {
   if (isTerminal(job.status)) return undefined;
   const prompts = new Map<string, Message & { type: "prompt" }>();
@@ -554,7 +559,7 @@ export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): numbe
   }
   const asks = [...prompts.values(), ...(payment && (job.pendingPaymentMsats ?? 0) > 0 ? [payment] : [])];
   const deadlines = asks.map((ask) => ask.content.expires_at_ms).filter((stamp): stamp is number => Number.isSafeInteger(stamp));
-  if (deadlines.length > 0) return Math.min(...deadlines);
+  if (deadlines.length > 0) return askExpiryAtMs(Math.min(...deadlines));
   // Legacy snapshots did not carry millisecond emission timestamps.
   if (job.status === "awaiting-input" && legacyTimeoutMs !== undefined && (asks.length > 0 || job.messages.length === 0)) {
     return (job.awaitingInputAtMs ?? job.lastActivityAt) + legacyTimeoutMs;

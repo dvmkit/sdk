@@ -41,6 +41,7 @@ describe.skipIf(!RUN)("isolated SDK Postgres boundary", () => {
       "job_content_holds",
       "job_messages",
       "job_outgoing_appends",
+      "job_payment_intents",
       "jobs",
       "receipt_counter",
       "request_id_claims",
