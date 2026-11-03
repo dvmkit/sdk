@@ -357,12 +357,12 @@ export function pieceSettlementSuite(
     }
 
     it.each([
-      { ending: "completes", action: "complete", charged: 800_000, released: 0 },
-      { ending: "the provider fails during the $0.20 piece", action: "fail-piece-2", charged: 100_000, released: 200_000 },
-      { ending: "the caller declines the $0.50 ask", action: "ask-3", charged: 300_000, released: 0 },
-      { ending: "the caller cancels during the $0.20 piece", action: "cancel-piece-2", charged: 300_000, released: 0 },
-      { ending: "the $0.20 piece finishes at $0.05, then the job completes", action: "lowered", charged: 650_000, released: 150_000 },
-    ])("worked example: $ending", async ({ action, charged, released }) => {
+      { ending: "completes", action: "complete", charged: 800_000, released: 0, finished: 3 },
+      { ending: "the provider fails during the $0.20 piece", action: "fail-piece-2", charged: 100_000, released: 200_000, finished: 1 },
+      { ending: "the caller declines the $0.50 ask", action: "ask-3", charged: 300_000, released: 0, finished: 2 },
+      { ending: "the caller cancels during the $0.20 piece", action: "cancel-piece-2", charged: 300_000, released: 0, finished: 1 },
+      { ending: "the $0.20 piece finishes at $0.05, then the job completes", action: "lowered", charged: 650_000, released: 150_000, finished: 3 },
+    ])("worked example: $ending", async ({ action, charged, released, finished }) => {
       const h = await host();
       const job = await h.submit(action);
       await h.awaitAsks(job, 1);
@@ -385,6 +385,10 @@ export function pieceSettlementSuite(
         expect((await h.request(`/v1/job/${job.job_id}`, { method: "DELETE", token: job.job_token })).status).toBe(200);
       }
       expectSettlement(await h.settled(job), charged, released);
+      expect(h.terminals.length).toBeGreaterThan(0);
+      for (const report of h.terminals) {
+        expect(report).toMatchObject({ heldMicro: charged + released, finishedPieceCount: finished });
+      }
     });
 
     it("a provider failure during piece 2 charges piece 1, as ask 2 said declining would", async () => {
@@ -460,7 +464,7 @@ export function pieceSettlementSuite(
       for (const report of h.terminals) {
         expect(Object.keys(report).sort()).toEqual(Object.keys(fixture.terminal_report).sort());
         expect(report).toMatchObject({
-          jobId: job.job_id, outcome: "cancelled", endedBy: "caller", chargedMicro: UPFRONT + ASK_2, currency: "usd", stoppedPiece: true,
+          jobId: job.job_id, outcome: "cancelled", endedBy: "caller", chargedMicro: UPFRONT + ASK_2, heldMicro: 300_000, finishedPieceCount: 1, currency: "usd", stoppedPiece: true,
         });
       }
     });
@@ -471,6 +475,10 @@ export function pieceSettlementSuite(
       await h.control.reached("work");
       expect((await h.request(`/v1/job/${job.job_id}`, { method: "DELETE", token: job.job_token })).status).toBe(200);
       expectSettlement(await h.settled(job), UPFRONT, 0);
+      expect(h.terminals.length).toBeGreaterThan(0);
+      for (const report of h.terminals) {
+        expect(report).toMatchObject({ heldMicro: 100_000, finishedPieceCount: 0, stoppedPiece: true });
+      }
     });
 
     it.each([
@@ -667,6 +675,11 @@ export function pieceSettlementSuite(
         expect(outcome.ledger).toEqual({ held, charged: end === "cancel" ? charged : 0, released: end === "cancel" ? released : held });
         expect(outcome.row.settlement).toEqual({ whole: end === "cancel" ? "settle" : "release", stoppedPiece: end === "cancel" });
         expect(outcome.receipt.settlement).toMatchObject({ pieces: [] });
+        expect(h.terminals.length).toBeGreaterThan(0);
+        for (const report of h.terminals) {
+          expect(report).toMatchObject({ heldMicro: held });
+          expect(report).not.toHaveProperty("finishedPieceCount");
+        }
       }
     });
 

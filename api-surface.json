@@ -103,7 +103,9 @@
       "fixture": "protocol-fixtures/piece-settlement-v1.json",
       "optionalFields": [
         "payment-request.content.charged_if_declined_micro",
-        "receipt.settlement"
+        "receipt.settlement",
+        "terminal_report.heldMicro",
+        "terminal_report.finishedPieceCount"
       ],
       "unit": "integer micro-units of the job credit's currency",
       "behavior": "each payment buys the next piece of work and a piece finishes at the next payment-request or completion; every ending charges finished pieces, a caller cancel also charges the running piece, and failure, decline and expiry release it; decline answers 201 or 409 no_open_ask; receipt credit.amount is the charged amount"

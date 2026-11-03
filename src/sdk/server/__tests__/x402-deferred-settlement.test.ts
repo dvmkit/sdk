@@ -192,7 +192,8 @@ afterEach(() => {
 describe("unsigned x402 settled after the job", () => {
   it("verifies before the job, settles once when it succeeds, and funds the draw only then", async () => {
     const r = rig();
-    const { jobs, completed } = manager(r, (ctx) => ctx.complete("done"));
+    const terminal = vi.fn(async (_info: unknown) => undefined);
+    const { jobs, completed } = manager(r, (ctx) => ctx.complete("done"), RUNTIME_SECONDS, r.settler, { onJobTerminal: terminal });
     const header = authorization(60);
 
     const payment = await admit(r, header, "job-ok");
@@ -212,6 +213,7 @@ describe("unsigned x402 settled after the job", () => {
     expect(completed).toHaveBeenCalledTimes(1);
     expect(completed.mock.calls[0]?.[0]).toMatchObject({ jobId: "job-ok", paidMsats: PRICE_MSATS });
     expect((await r.store.get(DVM_ID, intentId!))?.status).toBe("complete");
+    expect(terminal).toHaveBeenCalledWith(expect.objectContaining({ heldMicro: PRICE_MICRO, finishedPieceCount: 1 }));
 
     // A retried terminal (lost receipt, cross-machine re-read) must not pay twice.
     expect(await r.settler.settle(intentId!)).toBe("settled");
@@ -265,7 +267,7 @@ describe("unsigned x402 settled after the job", () => {
     // The platform hears of the cancelled job, with nothing paid and nothing charged.
     await vi.waitFor(() => expect(terminal).toHaveBeenCalledTimes(1));
     expect(terminal.mock.calls[0]?.[0]).toMatchObject({
-      jobId: "job-cancelled", outcome: "cancelled", endedBy: "caller", paid: false, chargedMicro: 0, currency: null, stoppedPiece: false,
+      jobId: "job-cancelled", outcome: "cancelled", endedBy: "caller", paid: false, chargedMicro: 0, heldMicro: 0, finishedPieceCount: 0, currency: null, stoppedPiece: false,
     });
     jobs.shutdown();
   });
@@ -405,7 +407,7 @@ describe("unsigned x402 settled after the job", () => {
       });
       expect(stored?.receipt).not.toHaveProperty("credit");
       expect(terminal).toHaveBeenCalledTimes(1);
-      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ jobId: "job-unpaid", outcome: "completed", paid: false });
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ jobId: "job-unpaid", outcome: "completed", paid: false, heldMicro: 0, finishedPieceCount: 0 });
       expect(completed).not.toHaveBeenCalled();
       jobs.shutdown();
     });
