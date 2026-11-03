@@ -187,6 +187,73 @@ export function describeCreditLedgerConformance(
         .toEqual(["pi_partial"]);
     });
 
+    it.each(["whole", "partial"] as const)("releases a %s settlement on a terminalized x402 credit", async (mode) => {
+      const ledger = await makeLedger();
+      const channel = channelId("d");
+      const creditId = "contract-closed-x402";
+      const draw = { creditId, drawId: "held" };
+      await fund(ledger, creditId, {
+        amountMicro: 2_000,
+        basis: {
+          rail: "x402",
+          paidMsats: 0,
+          nativeAmount: 2_000,
+          nativeAsset: "usdc",
+          x402Channel: { channelId: channel, maxClaimableAmount: "2000" },
+        },
+      });
+      await ledger.draw({ ...draw, amountMicro: 1_000 });
+      await ledger.terminalizeX402Credit({
+        channelId: channel,
+        channelBalanceNative: 0n,
+        totalClaimedNative: 0n,
+      });
+
+      const settle = () => mode === "whole"
+        ? ledger.settle(draw)
+        : resolveDraw(ledger)({ ...draw, settleMicro: 600 });
+      expect(await settle()).toMatchObject({ status: "released", amountMicro: 1_000, replayed: false });
+      expect(await settle()).toMatchObject({ status: "released", amountMicro: 1_000, replayed: true });
+      expect(await ledger.getDraw(draw)).toMatchObject({ status: "released", amountMicro: 1_000 });
+      expect(await ledger.get(creditId)).toMatchObject({
+        status: "unbacked",
+        balanceMicro: 2_000,
+        availableMicro: 0,
+        nativeAvailable: 0,
+      });
+      expect(await ledger.earnedNativeForX402Channel(channel)).toBe(0);
+    });
+
+    it("replays a settled x402 draw after terminalization and refuses a different figure", async () => {
+      const ledger = await makeLedger();
+      const channel = channelId("e");
+      const creditId = "contract-settled-closed-x402";
+      const draw = { creditId, drawId: "settled" };
+      await fund(ledger, creditId, {
+        amountMicro: 2_000,
+        basis: {
+          rail: "x402",
+          paidMsats: 0,
+          nativeAmount: 2_000,
+          nativeAsset: "usdc",
+          x402Channel: { channelId: channel, maxClaimableAmount: "2000" },
+        },
+      });
+      await ledger.draw({ ...draw, amountMicro: 1_000 });
+      await ledger.settle(draw);
+      await ledger.terminalizeX402Credit({
+        channelId: channel,
+        channelBalanceNative: 1_000n,
+        totalClaimedNative: 1_000n,
+      });
+
+      await expect(ledger.settle(draw)).resolves.toMatchObject({ status: "settled", replayed: true });
+      await expect(resolveDraw(ledger)({ ...draw, settleMicro: 1_000 }))
+        .resolves.toMatchObject({ status: "settled", replayed: true, amountMicro: 1_000 });
+      await expect(resolveDraw(ledger)({ ...draw, settleMicro: 600 }))
+        .rejects.toMatchObject({ code: "invalid_draw_state" });
+    });
+
     it("earns an x402 channel only the settled part of a draw", async () => {
       const ledger = await makeLedger();
       const channel = channelId("c");

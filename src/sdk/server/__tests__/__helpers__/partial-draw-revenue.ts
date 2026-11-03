@@ -61,6 +61,35 @@ export function describePartialDrawRevenue(
     expect(costs).toEqual([]);
   });
 
+  it.each(["whole", "partial"] as const)("books nothing for a %s settlement after the x402 channel closes", async (mode) => {
+    const { jobStore, ledger } = await make();
+    const channelId = `0x${"de".repeat(32)}`;
+    const credit = await fundAndDraw(ledger, {
+      rail: "x402",
+      paidMsats: 0,
+      nativeAmount: 1_000_000,
+      nativeAsset: "usdc",
+      x402Channel: { channelId, maxClaimableAmount: "1000000" },
+    });
+    await ledger.terminalizeX402Credit({
+      channelId,
+      channelBalanceNative: 0n,
+      totalClaimedNative: 0n,
+    });
+    if (mode === "whole") await ledger.settle(credit);
+    else await resolve(ledger, credit, 60_000);
+
+    const { reports, costs } = await failJob(jobStore, ledger, credit, {
+      paidMsats: 50_000,
+      paymentRail: "x402",
+      nativeAmount: 100_000,
+      nativeAsset: "usdc",
+    });
+
+    expect(reports).toEqual([]);
+    expect(costs).toEqual([expect.objectContaining({ outcome: "failed", cost: { amountMicro: 1_000, currency: "usd" } })]);
+  });
+
   it("books the settled part of a Cashu credit draw at the funding lot's rate", async () => {
     const { jobStore, ledger } = await make();
     const credit = await fundAndDraw(ledger, {

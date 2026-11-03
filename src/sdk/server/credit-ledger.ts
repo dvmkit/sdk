@@ -3709,6 +3709,8 @@ export class CreditLedger {
         `draw ${args.drawId} not found on credit ${args.creditId}`
       );
     }
+    // A terminalized channel cannot pay a pending hold. Keep settled draws replayable.
+    const request = credit.status === "unbacked" && draw.status !== "settled" ? 0 : args.request;
     const plan = planDrawResolution(
       {
         drawId: args.drawId,
@@ -3716,7 +3718,7 @@ export class CreditLedger {
         amountMicro: toSafeInt(draw.amount_micro),
         heldMicro: draw.held_micro === null || draw.held_micro === undefined ? null : toSafeInt(draw.held_micro),
       },
-      args.request
+      request
     );
     let balanceMicro = toSafeInt(credit.balance_micro);
     if (!plan.replay) {
