@@ -71,7 +71,8 @@
       "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it",
       "paymentIntentMetadata": {
         "dvmkit_dvm_id": "server canonicalDvmId, falling back to dvmId; omitted without identity; sent on creation including declined confirmations; credential metadata cannot override it",
-        "chargeContext": "StripeCreditRail.charge accepts optional canonicalDvmId supplied by the server; existing mpp_* metadata and idempotency keys are preserved"
+        "chargeContext": "StripeCreditRail.charge accepts optional canonicalDvmId supplied by the server; existing mpp_* metadata and idempotency keys are preserved",
+        "legacyReplay": "HTTP 400 idempotency_error permits one retry without the new metadata under the same key to recover a pre-upgrade charge; existing PaymentIntents keep their original metadata"
       }
     },
     "cardCreditRefund": {

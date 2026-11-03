@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Card-credit PaymentIntents now include server-owned Stripe metadata `dvmkit_dvm_id` from the server's canonical identity (falling back to its DVM id), including declined confirmations. Environment-created and explicit rails share this behavior; standalone servers without identity omit the field. `StripeCreditRail.charge` accepts optional server-side `canonicalDvmId`. MPP challenge and idempotency formats are unchanged; no storage migration is required. See `protocol-fixtures/credit-fund-stripe-v1.json`.
+- Card-credit PaymentIntents now include server-owned Stripe metadata `dvmkit_dvm_id` from the server's canonical identity (falling back to its DVM id), including declined confirmations. Environment-created and explicit rails share this behavior; standalone servers without identity omit the field. `StripeCreditRail.charge` accepts optional server-side `canonicalDvmId`. A Stripe parameter mismatch triggers one retry without the new metadata under the same idempotency key, preserving recovery of pre-upgrade charges; existing PaymentIntents keep their original metadata. MPP challenge and idempotency formats are unchanged; no storage migration is required. See `protocol-fixtures/credit-fund-stripe-v1.json`.
 
 ### Terminal result durability
 

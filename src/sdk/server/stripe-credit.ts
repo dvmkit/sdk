@@ -350,24 +350,36 @@ function fetchClient(args: {
         form.delete("metadata[dvmkit_dvm_id]");
         if (args.canonicalDvmId) form.set("metadata[dvmkit_dvm_id]", args.canonicalDvmId);
         args.attempt.called = true;
-        const response = await args.fetchImpl(`${args.apiBase}/v1/payment_intents`, {
-          method: "POST",
-          headers: {
-            Authorization: `Basic ${Buffer.from(`${args.secretKey}:`).toString("base64")}`,
-            "Content-Type": "application/x-www-form-urlencoded",
-            ...(options.idempotencyKey && { "Idempotency-Key": options.idempotencyKey }),
-            ...(options.apiVersion && { "Stripe-Version": options.apiVersion }),
-            ...(options.stripeAccount && { "Stripe-Account": options.stripeAccount }),
-          },
-          body: form,
-        });
-        const body = (await response.json().catch(() => ({}))) as {
-          id?: unknown;
-          status?: unknown;
-          amount?: unknown;
-          currency?: unknown;
-          error?: { type?: unknown; code?: unknown; decline_code?: unknown; payment_intent?: { id?: unknown } };
+        const send = async (requestBody: URLSearchParams) => {
+          const response = await args.fetchImpl(`${args.apiBase}/v1/payment_intents`, {
+            method: "POST",
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${args.secretKey}:`).toString("base64")}`,
+              "Content-Type": "application/x-www-form-urlencoded",
+              ...(options.idempotencyKey && { "Idempotency-Key": options.idempotencyKey }),
+              ...(options.apiVersion && { "Stripe-Version": options.apiVersion }),
+              ...(options.stripeAccount && { "Stripe-Account": options.stripeAccount }),
+            },
+            body: requestBody,
+          });
+          const body = (await response.json().catch(() => ({}))) as {
+            id?: unknown;
+            status?: unknown;
+            amount?: unknown;
+            currency?: unknown;
+            error?: { type?: unknown; code?: unknown; decline_code?: unknown; payment_intent?: { id?: unknown } };
+          };
+          return { response, body };
         };
+        let { response, body } = await send(form);
+        if (response.status === 400 && body.error?.type === "idempotency_error" &&
+          options.idempotencyKey && args.canonicalDvmId) {
+          // A pre-upgrade charge has no identity metadata. Retry its original parameters
+          // once under the same key so a lost response or booking can still be recovered.
+          const legacyForm = new URLSearchParams(form);
+          legacyForm.delete("metadata[dvmkit_dvm_id]");
+          ({ response, body } = await send(legacyForm));
+        }
         if (!response.ok) {
           const enumField = (value: unknown) =>
             typeof value === "string" && /^[a-z0-9_]{1,64}$/.test(value) ? value : undefined;

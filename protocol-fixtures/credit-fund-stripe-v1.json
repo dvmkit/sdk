@@ -5,7 +5,8 @@
     "source": "Server canonicalDvmId, falling back to server dvmId; never credential metadata. Host resolves DVMKIT_CANONICAL_DVM_ID with DVMKIT_DVM_ID as fallback.",
     "configured": { "dvmkit_dvm_id": "00000000-0000-4000-8000-000000000001" },
     "unconfigured": "dvmkit_dvm_id is omitted; standalone charging remains available",
-    "behavior": "Sent on PaymentIntent creation, including declined confirmations; existing mpp_* metadata is preserved"
+    "behavior": "Sent on PaymentIntent creation, including declined confirmations; existing mpp_* metadata is preserved",
+    "legacy_replay": "HTTP 400 idempotency_error with identity metadata triggers one retry removing only dvmkit_dvm_id, under the same idempotency key; pre-upgrade PaymentIntents keep their original metadata"
   },
   "menu": {
     "credit": {
