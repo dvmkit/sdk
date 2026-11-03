@@ -85,6 +85,7 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
   let facilitatorCalls: string[];
   let settleAnswer: () => Promise<Response>;
   let sawSettle: ReturnType<typeof gate>;
+  let unholdSettle: (() => void) | undefined;
 
   beforeEach(async () => {
     await recreateSchema(SCHEMA);
@@ -116,6 +117,9 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
 
   afterEach(async () => {
     finish?.resolve();
+    // A failed test must not leave the facilitator answer pending, or shutdown waits on it.
+    unholdSettle?.();
+    unholdSettle = undefined;
     await servers.closeAll();
     for (const shutdown of shutdowns.splice(0)) await shutdown();
     await Promise.all([poolA?.end(), poolB?.end()]);
@@ -184,9 +188,14 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
   }
 
   /** Every route that can carry the job's output, as the raw text a caller would receive. */
-  async function everythingReadable(url: string, job: AcceptedJob): Promise<string> {
+  async function readEverything(url: string, job: AcceptedJob): Promise<{ job: string; all: string }> {
     const responses = await Promise.all([read(url, job), readMessages(url, job), readMessages(url, job, true)]);
-    return (await Promise.all(responses.map((response) => response.text()))).join("\n");
+    const bodies = await Promise.all(responses.map((response) => response.text()));
+    return { job: bodies[0]!, all: bodies.join("\n") };
+  }
+
+  async function everythingReadable(url: string, job: AcceptedJob): Promise<string> {
+    return (await readEverything(url, job)).all;
   }
 
   it("advertises the longer window, settles only after success, and rejects replay across servers", async () => {
@@ -258,6 +267,7 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     const url = await start(poolA, { artifact: true });
     let release!: () => void;
     const settleHeld = new Promise<void>((resolve) => { release = resolve; });
+    unholdSettle = () => release();
     settleAnswer = async () => {
       await settleHeld;
       return Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
@@ -280,10 +290,11 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     await vi.waitFor(async () => expect((await jobs.get(job.job_id))?.status).toBe("completed"), { timeout: 5000 });
 
     // Handler done, authorization sent, facilitator has not answered.
-    const settling = await everythingReadable(url, job);
-    expect(settling).not.toContain("paid-for output");
-    expect(settling).not.toContain("done");
-    expect(await (await read(url, job)).json()).toMatchObject({
+    // Each read waits a bounded time for the in-flight settlement before answering.
+    const settling = await readEverything(url, job);
+    expect(settling.all).not.toContain("paid-for output");
+    expect(settling.all).not.toContain("done");
+    expect(JSON.parse(settling.job)).toMatchObject({
       status: "processing",
       content_available: false,
       content_withheld: "payment_pending",
@@ -296,7 +307,7 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     expect(await settled.json()).toMatchObject({ status: "completed", summary: "done", has_artifacts: true, artifact_count: 1 });
     expect(await (await readMessages(url, job)).text()).toContain("paid-for output");
     expect(await (await readMessages(url, job, true)).text()).toContain("paid-for output");
-  });
+  }, 30_000);
 
   it("never exposes the output or claims payment when the settlement is refused", async () => {
     const url = await start(poolA, { artifact: true });
