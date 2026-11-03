@@ -162,6 +162,14 @@ describe("public signature gate", () => {
     expect(check(root, "--write").stderr).toContain("without a breaking-change section");
   });
 
+  it("allows promoting an experimental export to stable without marking the release breaking", () => {
+    const root = fixture();
+    const path = join(root, "src/sdk/server/index.ts");
+    writeFileSync(path, readFileSync(path, "utf8").replace("experimental", "stable"));
+    expect(check(root, "--write").status).toBe(0);
+    expect(check(root).status).toBe(0);
+  });
+
   it("ignores comments, formatting, private fields and bundled local alias names", () => {
     const root = fixture();
     const text = declaration.replaceAll("Input", "RenamedInput").replaceAll("Result", "RenamedResult").replace("private cache;", "private differentCache;").replace("value: string", "/* prose */ value : string");

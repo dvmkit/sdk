@@ -30,7 +30,11 @@ if (baselineTag) {
     if (!publicEntryPoints.includes(previous.export)) continue;
     const current = actual.find((entry) => entry.export === previous.export);
     for (const [name, signature] of Object.entries(previous.signatures)) {
-      if (JSON.stringify(current?.signatures?.[name]) !== JSON.stringify(signature)) changes.push(`${previous.export}:${name}`);
+      const next = current?.signatures?.[name];
+      const before = /** @type {{signature: string, stability: string}} */ (signature);
+      if (!next || next.signature !== before.signature || (before.stability === "stable" && next.stability !== "stable")) {
+        changes.push(`${previous.export}:${name}`);
+      }
     }
   }
   if (changes.length && !hasBreakingMarker(readFileSync(join(root, "CHANGELOG.md"), "utf8"), manifest.version, baseline.version)) {
