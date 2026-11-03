@@ -151,7 +151,6 @@ async function resolve(
   draw: { creditId: string; drawId: string },
   settleMicro: number
 ) {
-  if (!ledger.resolveDraw) throw new Error("ledger does not implement resolveDraw");
   return ledger.resolveDraw({ ...draw, settleMicro });
 }
 

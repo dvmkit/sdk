@@ -481,6 +481,13 @@ describe("router.proxy dimensions", () => {
     ).toEqual({});
   });
 
+  it.each(["no_open_ask", "ask_already_open", "decline_unavailable", "ask_expired"])(
+    "keeps the %s refusal as an error code rather than unknown_error",
+    (code) => {
+      expect(projectDiagnosticFields({ "error.code": code })).toEqual({ "error.code": code });
+    }
+  );
+
   it("keeps hosting_identity_revoke_failed as an error code", () => {
     expect(
       projectDiagnosticFields({

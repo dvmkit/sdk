@@ -705,9 +705,7 @@ export function describeCreditLedgerConformance(
   });
 }
 
-/** Both shipping ledgers implement the optional verb; a missing one fails the case. */
-function resolveDraw(ledger: CreditLedgerLike): NonNullable<CreditLedgerLike["resolveDraw"]> {
-  if (!ledger.resolveDraw) throw new Error("ledger does not implement resolveDraw");
+function resolveDraw(ledger: CreditLedgerLike): CreditLedgerLike["resolveDraw"] {
   return ledger.resolveDraw.bind(ledger);
 }
 

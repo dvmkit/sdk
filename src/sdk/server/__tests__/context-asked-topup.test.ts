@@ -84,7 +84,9 @@ describe("buildContext.requestPayment — cumulative ask total", () => {
     expect(job.askedTopUpCurrency).toBe("usd");
 
     // Second stage of the same job: the ceiling is the sum, not the latest ask.
-    job.pendingPayment = null;
+    // Pay the open ask, as a landed payment does, so the next one can be made.
+    job.pendingPayment!.resolve({ amount_msats: 0 } as never);
+    await tick();
     void ctx.requestPayment(usd(0.4), "surcharge");
     await tick();
     expect(job.askedTopUpMicro).toBe(1_000_000);
@@ -100,7 +102,9 @@ describe("buildContext.requestPayment — cumulative ask total", () => {
 
     void ctx.requestPayment(usd(0.6), "base");
     await tick();
-    job.pendingPayment = null;
+    // Pay the open ask, as a landed payment does, so the next one can be made.
+    job.pendingPayment!.resolve({ amount_msats: 0 } as never);
+    await tick();
     void ctx.requestPayment({ amount: 0.4, currency: "eur" }, "surcharge");
     await tick();
 
@@ -211,7 +215,9 @@ describe("buildContext.requestPayment — cumulative ask total", () => {
 
     // Sticky: a later ask the rate is back for does not restore the ceiling,
     // because the ask it is missing is still missing.
-    job.pendingPayment = null;
+    // Pay the open ask, as a landed payment does, so the next one can be made.
+    job.pendingPayment!.resolve({ amount_msats: 0 } as never);
+    await tick();
     const back = buildContext(job, {
       store: new MemoryKVStore(),
       env: {},
@@ -395,28 +401,5 @@ describe("buildContext.requestPayment — cumulative ask total", () => {
     void ctx.requestPayment(usd(0.4), "surcharge");
     await tick();
     expect(job.askedTopUpMicro).toBe(1_000_000);
-  });
-
-  it("does not accumulate an ask the upfront pool auto-credits", async () => {
-    // No payment-request is emitted, so Tx A never runs and the durable total
-    // stays put; an in-memory accumulate here would drift the two apart in the
-    // direction that lets a top-up over-grow the draw.
-    const job = blankJob();
-    const ctx = buildContext(job, {
-      store: new MemoryKVStore(),
-      env: {},
-      fxFetcher: fx,
-      drawPool: () =>
-        Promise.resolve({
-          basis: "draw" as const,
-          amountMicro: 1_000_000,
-          currency: "usd"
-        })
-    });
-
-    await ctx.requestPayment(usd(0.6), "base");
-
-    expect(job.askedTopUpMicro).toBeUndefined();
-    expect(job.messages).toHaveLength(0);
   });
 });

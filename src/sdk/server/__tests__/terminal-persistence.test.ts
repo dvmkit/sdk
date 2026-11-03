@@ -192,7 +192,8 @@ describe("terminal result durability", () => {
     const record = (await store.get(job.id))!;
     expect(record.status).toBe("cancelled");
     expect(record.receipt).toMatchObject({ outcome: "cancelled", reason: "caller stopped" });
-    expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("released");
+    // A caller's cancel charges the piece it stops; this job is one piece.
+    expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("settled");
   });
 
   it("keeps the failure decision and retries its durable write when storage returns", async () => {

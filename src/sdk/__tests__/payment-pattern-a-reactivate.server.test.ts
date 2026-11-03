@@ -5,7 +5,6 @@ import { describe, expect, it, vi } from "vitest";
 import { servedApps } from "../../test-support/served-app";
 import { configureDVM } from "../configure";
 import { createDVMServer } from "../server/app";
-import type { ServerJob } from "../server/job";
 import { MemoryJobStore } from "../server/memory-job-store";
 import { MemoryKVStore } from "../store";
 
@@ -155,83 +154,8 @@ describe("Pattern A reactivation — payment credit", () => {
     processPaymentSpy.mockRestore();
   });
 
-  // Over-credit models an upfront pool that covers both asks. Replay must consume
-  // the first ask before deciding whether the second requires another payment.
-  it("auto-credits upfront-pool requestPayment after Pattern A reactivation", async () => {
-    const jobStore = new MemoryJobStore();
-
-    const descriptor = configureDVM({
-      name: "UpfrontPoolReplay",
-      capability: "test",
-      tag: "test",
-      async onJob(ctx) {
-        await ctx.requestPayment(7_000, "base");
-        await ctx.requestPayment(5_000, "surcharge");
-        ctx.complete(`paid:${String(ctx.paidMsats)}`);
-      },
-    });
-
-    const { app, jobManager } = await createDVMServer(descriptor, {
-      env: {},
-      store: new MemoryKVStore(),
-      jobStore,
-      devMode: true,
-    });
-    const baseUrl = await servers.serve(app);
-
-    const res = await postJson(
-      `${baseUrl}/v1/job`,
-      JSON.stringify({ capability: "test", input: "" })
-    );
-    const { job_id, job_token } = await res.json();
-    await tick();
-
-    let record = await jobStore.get(job_id);
-    expect(record?.status).toBe("awaiting-input");
-    expect(record?.pendingPaymentMsats).toBe(7_000);
-    expect(record?.paidMsats).toBe(0);
-
-    jobManager.activeJobs.delete(job_id);
-
-    // Stub `processPayment` to over-credit by 5_000 — the upfront pool
-    // semantics. After reactivation, replay's second `requestPayment(5_000)`
-    // must auto-credit from the leftover pool instead of yielding.
-    const overCreditSpy = vi
-      .spyOn(jobManager, "processPayment")
-      .mockImplementation(async (job: ServerJob, _body, inboundSeq) => {
-        // Tx C records the outcome, which also releases the arrival's intent.
-        await jobStore.verifyAndCredit(job.id, inboundSeq!, null);
-        job.paidMsats = 12_000;
-        job.pendingPaymentMsats = undefined;
-        if (job.status === "awaiting-input") job.status = "processing";
-        return {};
-      });
-
-    const msgRes = await postJson(
-      `${baseUrl}/v1/job/${job_id}/messages`,
-      JSON.stringify({
-        type: "payment",
-        content: { cashu_token: "fake-token", amount_msats: 12_000 },
-      }),
-      job_token
-    );
-    expect(msgRes.status).toBe(201);
-    await tick();
-
-    record = await jobStore.get(job_id);
-    expect(record?.paidMsats).toBe(12_000);
-    expect(record?.status).toBe("completed");
-    // `paid:12000` proves the handler reached `ctx.complete` after replay
-    // and auto-credit — not a stall on the second `requestPayment`.
-    expect(record?.summary).toBe("paid:12000");
-    overCreditSpy.mockRestore();
-  });
-
-  // the per-ctx `creditedToHandlerMsats` counter (context.ts:69)
-  // must re-derive correctly on every reactivation. The ctx is fresh on
-  // resume; the same call sequence walked twice (once before suspension,
-  // once during replay) must produce identical consumption bookkeeping
-  // with no double-counting.
+  // Each reactivation builds a fresh ctx and walks the same call sequence again:
+  // every paid ask resolves from its payment in the log, with no double-counting.
   it("re-derives the per-ctx counter on reactivation (invariant)", async () => {
     const jobStore = new MemoryJobStore();
     const observed: { paidMsats: number; pendingAt: string }[] = [];
@@ -273,8 +197,7 @@ describe("Pattern A reactivation — payment credit", () => {
 
     // Pattern A reactivation: pay 3_000. Replay re-walks both
     // requestPayment calls; the first resolves positionally from the
-    // payment in the log, the second yields fresh (per-ctx counter
-    // correctly says "3_000 consumed, paidMsats covers exactly that").
+    // payment in the log, the second yields fresh.
     await postJson(
       `${baseUrl}/v1/job/${job_id}/messages`,
       JSON.stringify({
@@ -292,8 +215,8 @@ describe("Pattern A reactivation — payment credit", () => {
 
     jobManager.activeJobs.delete(job_id);
 
-    // Second Pattern A reactivation: pay 2_000. Fresh ctx re-walks all
-    // three steps; per-ctx counter advances by 3_000 + 2_000 = 5_000.
+    // Second Pattern A reactivation: pay 2_000. A fresh ctx re-walks both asks, each
+    // resolved by its own payment.
     await postJson(
       `${baseUrl}/v1/job/${job_id}/messages`,
       JSON.stringify({
@@ -473,10 +396,10 @@ describe("Pattern A reactivation — payment credit", () => {
 // returns before re-emitting the payment-request — so the skip was never
 // consumed and swallowed the next provider message: the artifact. The paid job
 // then completed with no payload.
-describe("Pattern A reactivation — replay skip accounting under auto-credit", () => {
+describe("Pattern A reactivation — replay skip accounting", () => {
   const servers = servedApps();
 
-  it("dead-worker replay reproduces the artifact (skip excludes the auto-credited payment-request)", async () => {
+  it("dead-worker replay reproduces the artifact (skip excludes the replayed payment-requests)", async () => {
     const jobStore = new MemoryJobStore();
     const BASE = 8_000;
     const SURCHARGE = 2_000;
@@ -488,8 +411,8 @@ describe("Pattern A reactivation — replay skip accounting under auto-credit", 
       tag: "test",
       async onJob(ctx) {
         invocations++;
-        await ctx.requestPayment(BASE, "base"); // auto-credits from upfront pool
-        await ctx.requestPayment(SURCHARGE, "size"); // yielded originally; auto-credits on replay
+        await ctx.requestPayment(BASE, "base"); // paid on the original run
+        await ctx.requestPayment(SURCHARGE, "size"); // yielded originally; paid cross-machine
         ctx.artifact({ data: "# scraped markdown", mime_type: "text/markdown" });
         ctx.complete("scraped");
       },
@@ -504,10 +427,10 @@ describe("Pattern A reactivation — replay skip accounting under auto-credit", 
     });
     const baseUrl = await servers.serve(app);
 
-    // Seed a suspended-at-surcharge snapshot directly — the original worker is
-    // gone, so no live handler races the reactivation. History carries exactly
-    // one provider message: the surcharge payment-request. Base was already
-    // auto-credited on the original run, so `paidMsats` covers it.
+    // Seed a suspended-at-surcharge job directly — the original worker is gone,
+    // so no live handler races the reactivation. Its durable history holds the
+    // base ask, its payment and the surcharge ask; only payment-requests, which
+    // replay never re-emits, are provider messages.
     const job_id = "scrape-dead-worker-1";
     await jobStore.save({
       id: job_id,
@@ -517,28 +440,30 @@ describe("Pattern A reactivation — replay skip accounting under auto-credit", 
       params: {},
       requesterId: "dev-anonymous",
       requesterTokenHash: SEEDED_JOB_TOKEN_HASH,
-      status: "awaiting-input",
-      messages: [
-        {
-          seq: 1,
-          from: "provider",
-          timestamp: Math.floor(Date.now() / 1000),
-          type: "payment-request",
-          content: { amount_msats: SURCHARGE, reason: "size" },
-        },
-      ],
-      seq: 1,
-      paidMsats: BASE,
-      pendingPaymentMsats: SURCHARGE,
+      status: "processing",
+      messages: [],
+      seq: 0,
+      paidMsats: 0,
       receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),
       lastActivityAt: Date.now(),
     });
+    const ask = (amount_msats: number, reason: string) => jobStore.appendOutgoing(job_id, {
+      from: "provider", type: "payment-request", timestamp: Math.floor(Date.now() / 1000),
+      content: { amount_msats, reason },
+    }, { awaitingInput: true, pendingPaymentDelta: amount_msats });
+    await ask(BASE, "base");
+    const paidSeq = await jobStore.recordInbound(job_id, {
+      from: "requester", type: "payment", timestamp: Math.floor(Date.now() / 1000),
+      content: { cashu_token: "base-token", amount_msats: BASE },
+    });
+    await jobStore.verifyAndCredit(job_id, paidSeq, { paidMsatsDelta: BASE, clearPending: true });
+    await ask(SURCHARGE, "size");
 
-    // Pay the surcharge cross-machine. Tx C credits +SURCHARGE (pool now covers
-    // both requestPayment calls), then the reactivation replays the handler.
+    // Pay the surcharge cross-machine. Tx C credits +SURCHARGE, then the
+    // reactivation replays the handler: each ask resolves from its payment.
     const msgRes = await postJson(
       `${baseUrl}/v1/job/${job_id}/messages`,
       JSON.stringify({

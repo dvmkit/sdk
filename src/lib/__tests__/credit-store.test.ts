@@ -1740,6 +1740,52 @@ describe("applyReceiptCredit", () => {
     expect(loadCredit(ENDPOINT, PUBKEY)?.lastPriceMicro).toBeUndefined();
   });
 
+  it("checks a cancelled job's charge against what the caller paid, not only completions", () => {
+    seeded();
+    // A cancel charges the pieces of work it stopped; the balance must still follow.
+    const clean = applyReceiptCredit({
+      endpoint: ENDPOINT,
+      callerPubkey: PUBKEY,
+      jobId: "job-2",
+      outcome: "cancelled",
+      credit: { credit_id: "credit-1", draw_id: "draw-2", amount: 30_000, balance_after: 170_000, ledger_seq: 2 },
+      settlement: { charged: 30_000 },
+    });
+    expect(clean.mismatch).toBeUndefined();
+    expect(clean.credit?.remainingMicro).toBe(170_000);
+
+    const overcharged = applyReceiptCredit({
+      endpoint: ENDPOINT,
+      callerPubkey: PUBKEY,
+      jobId: "job-3",
+      outcome: "failed",
+      credit: { credit_id: "credit-1", draw_id: "draw-3", amount: 250_000, balance_after: 0, ledger_seq: 3 },
+      settlement: { charged: 250_000 },
+    });
+    // 250_000 charged against 170_000 the caller had: more than its payments could cover.
+    expect(overcharged.mismatch).toMatchObject({
+      expectedMicro: 170_000 - 250_000,
+      reportedMicro: 0,
+      drawId: "draw-3",
+      jobId: "job-3",
+      priorJobId: "job-2",
+    });
+  });
+
+  it("does not check a release, whose receipt charged nothing", () => {
+    seeded();
+    const result = applyReceiptCredit({
+      endpoint: ENDPOINT,
+      callerPubkey: PUBKEY,
+      jobId: "job-2",
+      outcome: "failed",
+      credit: { credit_id: "credit-1", draw_id: "draw-2", amount: 0, balance_after: 200_000, ledger_seq: 2 },
+      settlement: { charged: 0 },
+    });
+    expect(result.mismatch).toBeUndefined();
+    expect(loadCredit(ENDPOINT, PUBKEY)?.remainingMicro).toBe(200_000);
+  });
+
   describe("a receipt older than the stored sequence", () => {
     const receipt = (
       seq: number,

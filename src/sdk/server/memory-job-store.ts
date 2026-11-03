@@ -2,9 +2,11 @@ import { callerDeadline, hasCallerDeadline } from "./job";
 import { applyContentHoldMutation, ContentHoldError, type ContentHoldHistory, type ContentHoldMutation } from "./content-retention";
 import type { Message } from "../../lib/messages/types";
 import type { JobReceipt } from "../../lib/receipt";
-import { isTerminal } from "./job";
+import { hasOpenAsk, isTerminal } from "./job";
+import { JobEndedError } from "./job-store";
 import type {
   AppendOutgoingOptions,
+  DeclineOutcome,
   JobCounters,
   JobRecord,
   JobRetentionCursor,
@@ -18,6 +20,7 @@ import type {
   VerifyAndCreditResult,
 } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
+import { appendPiece, endPieces, finishRunningPiece, type PieceEnding, terminalEnding } from "./pieces";
 import {
   decidePaymentDisposition,
   PaymentIntentOpenError,
@@ -159,9 +162,21 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     // store, whose `save` statement simply doesn't list those columns. Without
     // this, a snapshot taken before the receipt was signed would clear it.
     const snapshot = structuredClone(record);
+    delete snapshot.pieceEnding;
     if (existing) {
       snapshot.createdAt = existing.createdAt;
       snapshot.upfrontPayment = structuredClone(existing.upfrontPayment);
+      // Store-owned after insert, like the Postgres columns.
+      snapshot.pieces = structuredClone(existing.pieces);
+      snapshot.settlement = structuredClone(existing.settlement);
+    }
+    if (isTerminal(record.status) && (!existing || !isTerminal(existing.status))) {
+      // A row inserted already terminal takes the settlement the SDK froze on the snapshot.
+      const ended = !existing && record.settlement
+        ? { pieces: snapshot.pieces, settlement: snapshot.settlement }
+        : endPieces(snapshot.pieces, terminalEnding(record));
+      snapshot.pieces = ended.pieces;
+      snapshot.settlement = ended.settlement;
     }
     if (existing && isTerminal(existing.status)) snapshot.lastActivityAt = existing.lastActivityAt;
     if (existing?.receipt) snapshot.receipt = existing.receipt;
@@ -288,6 +303,12 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     }
     const prior = opts?.appendId ? this.outgoingAppends.get(jobId)?.get(opts.appendId) : undefined;
     if (prior !== undefined) return Promise.resolve(prior);
+    if ((message.type === "payment-request" || message.type === "prompt") && isTerminal(record.status)) {
+      return Promise.reject(new JobEndedError(jobId));
+    }
+    if (message.type === "payment-request" && record.pieces) {
+      record.pieces = finishRunningPiece(record.pieces, opts?.finishedChargeMicro);
+    }
     const seq = this.allocateSeq(jobId);
     const fullMessage = { ...message, seq } as Message;
     if (opts?.awaitingInput && !isTerminal(record.status)) {
@@ -427,6 +448,9 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
       // one here; an existing binding stands, since the top-up grew that draw.
       record.creditId ??= credit.creditId;
       record.drawId ??= credit.drawId;
+      if (record.pieces && credit.piece && credit.piece.amountMicro > 0 && record.drawId === credit.piece.drawId) {
+        record.pieces = appendPiece(record.pieces, credit.piece.amountMicro, seq);
+      }
       if (credit.paymentMint) record.paymentMint = credit.paymentMint;
       if (credit.paymentRail) record.paymentRail = credit.paymentRail;
       if (credit.paymentTxHash) record.paymentTxHash = credit.paymentTxHash;
@@ -506,21 +530,27 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return Promise.resolve();
   }
 
-  cancelStaleJob(
+  async cancelStaleJob(
     jobId: string,
     expectedActivityBefore: number,
     reason: string,
     terminalStatus: "failed" | "cancelled"
   ): Promise<boolean> {
-    return this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore);
+    return (await this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore, { kind: "release" })) === "ended";
   }
 
-  cancelJob(jobId: string, reason: string): Promise<boolean> {
-    return this.terminateJob(jobId, reason, "cancelled", null);
+  /** A caller's cancel stops the piece in progress and charges it. */
+  async cancelJob(jobId: string, reason: string): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "cancelled", null, { kind: "stop" })) === "ended";
   }
 
-  failJob(jobId: string, reason: string): Promise<boolean> {
-    return this.terminateJob(jobId, reason, "failed", null);
+  async failJob(jobId: string, reason: string): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "failed", null, { kind: "release" })) === "ended";
+  }
+
+  async declineJob(jobId: string, reason: string): Promise<DeclineOutcome> {
+    const outcome = await this.terminateJob(jobId, reason, "cancelled", null, { kind: "release" }, true);
+    return outcome === "ended" ? "declined" : outcome;
   }
 
 
@@ -619,16 +649,18 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     jobId: string,
     reason: string,
     terminalStatus: "failed" | "cancelled",
-    expectedActivityBefore: number | null
-  ): Promise<boolean> {
+    expectedActivityBefore: number | null,
+    ending: PieceEnding,
+    requireOpenAsk = false
+  ): Promise<"ended" | "not_active" | "no_open_ask"> {
     const record = this.data.get(jobId);
-    if (!record) return Promise.resolve(false);
+    if (!record) return Promise.resolve("not_active");
     const eligible =
       (record.status === "processing" ||
         record.status === "working" ||
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
-    if (!eligible) return Promise.resolve(false);
+    if (!eligible) return Promise.resolve("not_active");
     const until = this.openIntentUntil(jobId, Date.now());
     if (until !== undefined) return Promise.reject(new PaymentIntentOpenError(jobId, until));
     const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
@@ -636,8 +668,9 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     if (expectedActivityBefore !== null) {
       const deadline = callerDeadline({ ...record, messages: terminalMessages });
       const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
-      if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve(false);
+      if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve("not_active");
     }
+    if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) return Promise.resolve("no_open_ask");
     const seq = this.allocateSeq(jobId);
     const cancelMsg: Message = {
       seq,
@@ -651,6 +684,9 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     // snapshot sees the cancel via the live stream before terminal cleanup.
     this.messagesFor(jobId).push({ message: cancelMsg, status: "verified" });
     record.endedBy = terminalStatus === "cancelled" ? "caller" : "provider";
+    const ended = endPieces(record.pieces, ending);
+    record.pieces = ended.pieces;
+    record.settlement = ended.settlement;
     applyTiming(record, structuredClone(record), Date.now(), terminalStatus);
     record.status = terminalStatus;
     record.summary = record.summary ?? reason;
@@ -659,7 +695,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     record.lastActivityAt = Date.now();
     this.notify(jobId);
     this.deleteResolvedMessages(jobId);
-    return Promise.resolve(true);
+    return Promise.resolve("ended");
   }
 
   /** The latest lease among this job's unresolved, unexpired payment intents. */
@@ -771,6 +807,7 @@ function snapshotCounters(record: JobRecord): JobCounters {
     paidMsats: record.paidMsats,
     pendingPaymentMsats: record.pendingPaymentMsats,
     summary: record.summary,
+    ...(record.pieces && { pieces: structuredClone(record.pieces) }),
   };
 }
 

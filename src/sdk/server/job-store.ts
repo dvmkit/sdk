@@ -6,6 +6,7 @@ import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
 import type { FundingMethod } from "../types";
 import type { CreditSnapshot } from "./credit-ledger";
+import type { JobPiece, JobSettlement, PieceEnding } from "./pieces";
 
 export type JobStatus =
   | "processing"
@@ -205,6 +206,23 @@ export interface JobRecord {
   /** Price the job was charged at (msats). Used to detect overpayment for change/melt gating. */
   requiredMsats?: number;
   /**
+   * The pieces of work the job's payments bought, in order. Written from the snapshot only when
+   * the row is first inserted; afterwards the store alone changes it, in the transactions that
+   * write an ask, credit a payment or make the job terminal. Undefined on a job accepted before
+   * piece accounting, which settles as one piece.
+   */
+  pieces?: JobPiece[];
+  /**
+   * The settlement frozen by the transaction that made the job terminal. Store-owned like
+   * {@link pieces}; every later resolution of the job's draw settles exactly this.
+   */
+  settlement?: JobSettlement;
+  /**
+   * How a terminal snapshot ends the running piece. Read by the store's first terminal write
+   * and never persisted; absent means the piece in progress is released.
+   */
+  pieceEnding?: PieceEnding;
+  /**
    * The DVM-signed proof of this job's outcome. Written once at the
    * terminal transition via `saveReceipt` and never rewritten — `save` leaves
    * the column alone so a stale in-memory snapshot can't clear it. Absent on
@@ -232,6 +250,8 @@ export interface JobCounters {
   status: JobStatus;
   paidMsats: number;
   pendingPaymentMsats?: number;
+  /** The job's pieces, so a handler resuming on another machine knows what its payment bought. */
+  pieces?: JobPiece[];
   /**
    * `jobs.summary`. Set to the cancel/fail reason by `cancelJob` /
    * `cancelStaleJob`, and to the completion summary by a handler's
@@ -269,6 +289,11 @@ export interface PaymentCreditDelta {
   creditId?: string;
   /** The draw opened alongside {@link creditId}. Same set-if-null rule. */
   drawId?: string;
+  /**
+   * The piece this payment bought: what it added to the job's draw. Appended only while the
+   * job is live and its row is bound to `drawId`; a payment that grew another draw bought none.
+   */
+  piece?: { amountMicro: number; drawId: string };
 }
 
 /** Atomic side effects applied with an outgoing provider message. */
@@ -289,7 +314,27 @@ export interface AppendOutgoingOptions {
    */
   pendingPaymentFiatMicro?: number;
   pendingPaymentFiatCurrency?: string;
+  /**
+   * A payment-request finishes the running piece in the same transaction; this lowers that
+   * piece's charge when it is below the price.
+   */
+  finishedChargeMicro?: number;
 }
+
+/**
+ * Thrown by `appendOutgoing` for an ask (`prompt` or `payment-request`) on a job that is
+ * already terminal. Nothing was written: no message, no counter and no piece changed.
+ */
+export class JobEndedError extends Error {
+  readonly code = "job_ended";
+  constructor(readonly jobId: string) {
+    super(`job ${jobId} has ended; it takes no further asks`);
+    this.name = "JobEndedError";
+  }
+}
+
+/** What a store did with a caller's decline: ended the job, or why it refused. */
+export type DeclineOutcome = "declined" | "not_active" | "no_open_ask";
 
 /**
  * Why a job's cumulative ask total can't bound its draw growth.
@@ -712,6 +757,13 @@ export interface StreamableJobStore extends JobStore {
 
   /** Atomically fail a nonterminal job with its final reason and durable message history. */
   failJob?(jobId: string, reason: string): Promise<boolean>;
+
+  /**
+   * End a job at the caller's decline of its open ask or prompt: `cancelled`, ended by the
+   * caller, with the piece in progress released. Same transaction shape as {@link cancelJob};
+   * refuses with `no_open_ask` when nothing is open for the caller to decline.
+   */
+  declineJob?(jobId: string, reason: string): Promise<DeclineOutcome>;
 
   /**
    * Bump `last_activity_at` to `now` (Unix ms) for the given jobs that are

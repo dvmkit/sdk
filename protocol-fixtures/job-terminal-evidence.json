@@ -39,6 +39,9 @@
     "acceptedAtMs": 1000,
     "terminalAtMs": 1700,
     "callerWaitMs": 300,
-    "receiptSeq": 7
+    "receiptSeq": 7,
+    "chargedMicro": 0,
+    "currency": null,
+    "stoppedPiece": false
   }
 }

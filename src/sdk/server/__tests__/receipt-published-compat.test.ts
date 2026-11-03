@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isSignedJobReceipt, verifyReceipt } from "sdk-receipt-compat/internal";
 import fixture from "../../../../protocol-fixtures/job-terminal-evidence.json";
+import pieces from "../../../../protocol-fixtures/piece-settlement-v1.json";
 import { signReceipt } from "../../../lib/receipt";
 import type { UnsignedJobReceipt } from "../../../lib/receipt";
 
@@ -18,6 +19,14 @@ describe("published receipt verifier compatibility", () => {
     expect(verifyReceipt(changedTiming as PublishedReceipt)).toBe(false);
     const changedAttribution = { ...receipt, ended_by: "caller" as const };
     expect(verifyReceipt(changedAttribution as PublishedReceipt)).toBe(false);
+  });
+  it("reads a receipt that settled by the piece through the pinned verifier", () => {
+    // Deployed callers predate `settlement`; the signature still covers it.
+    const receipt = pieces.receipt as unknown as PublishedReceipt;
+    expect(isSignedJobReceipt(receipt)).toBe(true);
+    expect(verifyReceipt(receipt)).toBe(true);
+    const recharged = { ...pieces.receipt, settlement: { ...pieces.receipt.settlement, charged: 100_000 } };
+    expect(verifyReceipt(recharged as unknown as PublishedReceipt)).toBe(false);
   });
   it("verifies the portable new-shape fixture", () => {
     expect(isSignedJobReceipt(fixture.receipt)).toBe(true);

@@ -73,6 +73,12 @@ async function drain(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0));
 }
 
+/** The amount the job's latest payment-request asks for; every ask suspends for new money. */
+function askedMsats(job: ServerJob): number | undefined {
+  const ask = job.messages.findLast((m) => m.type === "payment-request");
+  return (ask?.content as { amount_msats?: number } | undefined)?.amount_msats;
+}
+
 describe("buildContext.requestPayment — multi-currency", () => {
   it("EUR amount converts via fx.rates.eur against a multi-currency fetcher", async () => {
     const job = fundedJob();
@@ -81,9 +87,10 @@ describe("buildContext.requestPayment — multi-currency", () => {
       env: {},
       fxFetcher: multiFx,
     });
-    const result = await ctx.requestPayment({ amount: 1, currency: "eur" }, "test");
+    void ctx.requestPayment({ amount: 1, currency: "eur" }, "test");
+    await drain();
     // 1 EUR × 1e8 / 73_000 = 1369.86... sats → ceil 1370 → × 1000 msats
-    expect(result.amount_msats).toBe(1370 * 1000);
+    expect(askedMsats(job)).toBe(1370 * 1000);
   });
 
   it("USD amount still converts via fx.rates.usd against a multi-currency fetcher", async () => {
@@ -93,9 +100,10 @@ describe("buildContext.requestPayment — multi-currency", () => {
       env: {},
       fxFetcher: multiFx,
     });
-    const result = await ctx.requestPayment({ amount: 0.005, currency: "usd" }, "test");
+    void ctx.requestPayment({ amount: 0.005, currency: "usd" }, "test");
+    await drain();
     // $0.005 × 1e8 / 100_000 = 5 sats → × 1000 msats
-    expect(result.amount_msats).toBe(5 * 1000);
+    expect(askedMsats(job)).toBe(5 * 1000);
   });
 
   it("rejects EUR against a USD-only fetcher with UnsupportedCurrencyError whose set names usd", async () => {

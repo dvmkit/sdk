@@ -33,12 +33,17 @@ async function ask(creditRail: CreditRail | undefined) {
   void ctx.requestPayment(1_000, "next step").catch(() => undefined);
   for (let n = 0; n < 50 && !job.messages.length; n++) await new Promise((resolve) => setTimeout(resolve, 1));
   const content = job.messages.find((message) => message.type === "payment-request")?.content as unknown as Record<string, unknown>;
-  return { offers: { cashu: "mints" in content, x402: "x402" in content }, nonce: job.pendingX402Nonce };
+  return { offers: { cashu: "mints" in content, x402: "x402" in content }, nonce: job.pendingX402Nonce, content };
 }
 
 describe("a mid-job ask on a job bound to a credit", () => {
-  it("offers only Cashu when the job's credit holds Cashu, and drops the x402 binding", async () => {
-    expect(await ask("cashu")).toEqual({ offers: { cashu: true, x402: false }, nonce: undefined });
+  it("offers only Cashu when the job's credit holds Cashu, and binds x402 to a nonce it never shows", async () => {
+    const { offers, nonce, content } = await ask("cashu");
+    expect(offers).toEqual({ cashu: true, x402: false });
+    // A cleared binding switched the job check off, so a stray x402 payment settled; an
+    // unadvertised nonce makes the verifier refuse it before it reaches the facilitator.
+    expect(nonce).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(JSON.stringify(content)).not.toContain(nonce!.slice(2));
   });
 
   it("offers only x402 when the job's credit holds x402", async () => {

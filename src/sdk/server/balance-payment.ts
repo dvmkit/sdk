@@ -6,6 +6,7 @@ import type { SignedRequestDomain } from "../../lib/signed-request-statement";
 import { askExpired } from "./ask-expiry";
 import { CreditLedger, CreditLedgerError } from "./credit-ledger";
 import { drawSettlementRef } from "./funding";
+import { appendPiece } from "./pieces";
 import type { DVMAuthScheme } from "./secp256k1-auth";
 
 export const BALANCE_PAYMENT_SCHEMA = z.object({
@@ -114,9 +115,12 @@ export async function commitBalancePayment(args: {
       pending_payment_fiat_micro=NULL, pending_payment_fiat_currency=NULL,
       pending_mpp_challenge_ids=NULL, pending_x402_nonce=NULL, pending_x402_amount_usdc_micro=NULL,
       credit_id=$3, draw_id=$4, payment_rail=$5, payment_mint=$6, payment_tx_hash=$7,
-      native_amount=$8, native_asset=$9, last_activity_at=$10 WHERE id=$1`,
+      native_amount=$8, native_asset=$9, last_activity_at=$10,
+      -- The paid ask buys the next piece; a job with no piece list settles as one piece.
+      pieces = CASE WHEN pieces IS NULL THEN NULL ELSE pieces || $11::jsonb END WHERE id=$1`,
     [args.jobId, grown.addedRailValue.drawMsats, credit_id, draw_id, basis.rail, basis.mint,
-      drawSettlementRef(args.dvmId, credit_id, draw_id), basis.drawNative, nativeAsset, Date.now()]);
+      drawSettlementRef(args.dvmId, credit_id, draw_id), basis.drawNative, nativeAsset, Date.now(),
+      JSON.stringify(appendPiece([], amount_micro, seq))]);
     await tx.query("UPDATE job_messages SET status='verified' WHERE job_id=$1 AND seq=$2", [args.jobId, seq]);
     const response = { seq };
     await tx.query("INSERT INTO credit_balance_payments(payment_id,fingerprint,response,job_id,request_seq) VALUES($1,$2,$3,$4,$5)",

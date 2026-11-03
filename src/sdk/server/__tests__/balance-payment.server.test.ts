@@ -246,8 +246,10 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     expect((await ledger.get("rollout-credit"))?.availableMicro).toBe(10_000);
   }, 20_000);
 
-  it("releases the full balance hold on provider failure and caller cancellation", async () => {
-    for (const outcome of ["fail", "wait"] as const) {
+  it("releases the balance-paid piece on provider failure and charges it on caller cancellation", async () => {
+    // The balance payment bought the piece the job was working on: a failure releases it,
+    // a caller's cancel stops it and charges it.
+    for (const [outcome, status, available] of [["fail", "released", 10_000], ["wait", "settled", 9_000]] as const) {
       const url = await server(outcome);
       const job = await pending(url);
       const creditId = `${outcome}-credit`;
@@ -256,8 +258,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
       if (outcome === "wait") {
         await fetch(`${url}/v1/job/${job.job_id}`, { method: "DELETE", headers: { "X-Job-Token": job.job_token } });
       }
-      await expect.poll(async () => (await ledger.getDraw({ creditId, drawId: `draw-${creditId}` }))?.status).toBe("released");
-      expect((await ledger.get(creditId))?.availableMicro).toBe(10_000);
+      await expect.poll(async () => (await ledger.getDraw({ creditId, drawId: `draw-${creditId}` }))?.status).toBe(status);
+      expect((await ledger.get(creditId))?.availableMicro).toBe(available);
     }
   }, 20_000);
 });

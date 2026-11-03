@@ -4,6 +4,7 @@ import type {
   ApprovalContent,
   ArtifactContent,
   CancelContent,
+  DeclineContent,
   MessageType,
   MppxChallenge,
   PaymentContent,
@@ -25,6 +26,7 @@ export type {
   ApprovalContent,
   ArtifactContent,
   CancelContent,
+  DeclineContent,
   PaymentContent,
   ProgressContent,
   ResponseContent,
@@ -105,6 +107,23 @@ export interface SDKPaymentRequestOpts {
    * everywhere on the job surface.
    */
   mpp?: { challenges: MppxChallenge[] };
+  /**
+   * Charge the piece of work this ask finishes less than its price: integer micro-units of
+   * the job's credit currency, at most that piece's price, or the call rejects with a
+   * `RangeError`. The difference goes back to the caller when the job ends. Use it for
+   * metered work: ask at the cap, then report what the piece actually used.
+   */
+  finishedChargeMicro?: number;
+}
+
+/** Options for {@link SDKJobContext.complete}. */
+export interface CompleteOpts {
+  /**
+   * Charge the last piece of work less than its price, as
+   * {@link SDKPaymentRequestOpts.finishedChargeMicro} does for the piece an ask finishes.
+   * Throws a `RangeError` above that piece's price.
+   */
+  finishedChargeMicro?: number;
 }
 
 /**
@@ -169,9 +188,16 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
   /** Ask the client a question. Resolves when the client responds. */
   prompt(id: string, text: string, opts?: PromptOpts): Promise<ResponseContent>;
   /**
-   * Request payment; resolves when the ask is satisfied by the upfront pool or a payment.
-   * Numbers are millisatoshis. Fiat envelopes use major units in the supplied
-   * supported currency; the ledger pin is converted into the job's denomination.
+   * Ask the caller to pay for the next piece of work; resolves when a payment for this ask
+   * lands. Every ask is new money: the upfront payment bought the first piece and is never
+   * spent on an ask. Sending the ask finishes the piece in progress, so deliver that piece's
+   * output (artifacts, partial results) before asking. However the job ends, the caller is
+   * charged for finished pieces; a failure, decline or expiry releases the piece in progress,
+   * and a caller's cancel charges it too.
+   *
+   * One payment request may be open at a time: a second call while one is open rejects with
+   * code `ask_already_open`. Numbers are millisatoshis. Fiat envelopes use major units in the
+   * supplied supported currency; the ledger pin is converted into the job's denomination.
    * x402 is offered only for USD; other configured rails can use supported FX currencies.
    */
   requestPayment(
@@ -189,11 +215,16 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
    * single-call operations (Whisper transcribe, diariser polling, …).
    */
   progress(percentComplete: number, phase?: string, hint?: string): void;
-  /** Complete the job with a human-readable summary. The summary is a one-liner for relaying to humans; artifacts emitted with `ctx.artifact()` carry the actual payload. */
-  complete(summary: string): void;
   /**
-   * Fail the job with an error message. No debit happens either way — the
-   * terminal funnel releases the credit draw ({@link RAIL_REFUNDABLE}).
+   * Complete the job with a human-readable summary. The summary is a one-liner for relaying
+   * to humans; artifacts emitted with `ctx.artifact()` carry the actual payload. Completing
+   * finishes the piece in progress, so the caller is charged for every paid piece. An open
+   * payment request is withdrawn; a payment that arrives later lands on credit as balance.
+   */
+  complete(summary: string, opts?: CompleteOpts): void;
+  /**
+   * Fail the job with an error message. The caller is charged for the pieces of work already
+   * finished; the piece in progress is released back to their credit.
    * `{ refund: true }` annotates the failure as caller-fault; it
    * moves no money on any rail and never has.
    */

@@ -24,31 +24,23 @@ import { deferredX402IntentId, pinAskFiat, resolveFxSnapshot } from "./funding";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import { instrumentKVStore } from "./instrumented-kv";
 import type { ServerJob } from "./job";
-import { isTerminal, JobCancelledError, providerMessage } from "./job";
+import { AskAlreadyOpenError, isTerminal, JobCancelledError, providerMessage } from "./job";
 import type { JobCounters } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
 import type { MppxServer } from "./mpp-setup";
 import { fiatMicroToMethodAmount, msatsToMethodAmount } from "./mpp-units";
+import { chargedIfDeclinedMicro, checkFinishedCharge, finishRunningPiece, runningPiece } from "./pieces";
 import type { CanonicalEnvelope } from "./signed-request";
 import type { X402FacilitatorHealthLike } from "./x402-facilitator-support";
 
 /**
- * What unit `ctx.requestPayment`'s upfront-pool auto-credit may compare a job's
- * remaining pool in.
+ * The job's draw as `ctx.requestPayment` reads it, for the denomination a mid-job ask is pinned
+ * in.
  *
- * Three answers, deliberately distinct — the two that mean "no fiat pool" and
- * "I could not read the fiat pool" are not the same money. `rail` says
- * `job.paidMsats` is the rail's own traffic and the msat comparison is exact;
- * `draw` carries the fiat figure an explicit fund-and-draw actually spent;
- * `unpriced` says the job is draw-funded — so `paidMsats` is a slice of the
- * credit's rail value at a ratio pinned whenever the credit was funded — but
- * the pool behind it could not be read or denominated.
- *
- * `creditCurrency` on the two non-fiat arms is the credit's denomination, not a
- * pool figure. The gate can't spend it, but the mid-job ask still
- * has to be *pinned* in it — including on the `rail` arm, which is where an
- * implicit N=1 credit (the ordinary per-job payment) lands. Its absence there
- * means exactly "this job is bound to no credit", the free-then-paid shape.
+ * `rail` is a job whose counters are its rail's own traffic, `draw` a job bound to a credit
+ * whose draw read in its currency, and `unpriced` a job that drew but whose draw could not be
+ * read. `creditCurrency` on the two non-draw arms is the credit's denomination; its absence on
+ * `rail` means the job is bound to no credit yet, the free-then-paid shape.
  */
 export type DrawPool =
   | { basis: "rail"; creditCurrency?: string }
@@ -132,19 +124,12 @@ export interface BuildContextOpts {
    */
   onSuperseded?: () => void;
   /**
-   * The job's draw, read as a fiat pool — the unit
-   * `ctx.requestPayment`'s upfront-pool auto-credit compares in when the job's
-   * `paidMsats` is draw-derived rather than rail traffic. Omitted entirely by a
-   * `JobManager` with no credit ledger, which is the `rail` answer.
+   * The job's draw, read for the currency a mid-job ask is pinned in. Omitted by a
+   * `JobManager` with no credit ledger, which is the `rail` answer. Never rejects: a ledger
+   * it cannot read for a job that drew resolves `unpriced`.
    *
-   * Never rejects, and never answers `rail` on a guess: a ledger it cannot read
-   * for a job that demonstrably drew resolves `unpriced`, which the gate
-   * declines to auto-credit from rather than fall back to a figure it knows is
-   * denominated wrong.
-   *
-   * A function rather than a value because the draw grows: a mid-job top-up
-   * commits on whichever machine took the payment, so the pool must
-   * be re-read per ask, never captured when the context is built.
+   * A function rather than a value because a mid-job top-up commits on whichever machine
+   * took the payment, so it is re-read per ask.
    */
   drawPool?: () => Promise<DrawPool>;
   /**
@@ -171,7 +156,10 @@ export type CreditRail = "cashu" | "x402" | "tempo";
  * Offer only the rail that can pay into the job's credit. When the ask would
  * not otherwise offer that rail, nothing is withheld: an ask with no payable
  * rail strands the job, while a payment on another rail still lands as
- * balance. Withdrawn x402 and Tempo options take their job bindings with them.
+ * balance. A withdrawn Tempo option takes its job binding with it. A withdrawn
+ * x402 option leaves the job bound to a fresh nonce nobody was shown, so an x402
+ * payment sent anyway is refused before it settles rather than settled and
+ * landed as balance.
  */
 function restrictToCreditRail(content: Record<string, unknown>, rail: CreditRail | undefined, job: ServerJob): void {
   if (!rail) return;
@@ -187,7 +175,7 @@ function restrictToCreditRail(content: Record<string, unknown>, rail: CreditRail
   }
   if (rail !== "x402" && offered.x402) {
     delete content.x402;
-    job.pendingX402Nonce = undefined;
+    job.pendingX402Nonce = `0x${randomBytes(32).toString("hex")}`;
     job.pendingX402AmountUsdcMicro = undefined;
   }
   if (rail !== "tempo" && offered.tempo) {
@@ -264,25 +252,21 @@ export function buildContext(
     }
   };
 
-  // Per-context running counters of what the handler has consumed via
-  // successful `requestPayment` calls. Subtracted from the job's pool to find
-  // its remaining balance — when the pool covers the next request, auto-credit
-  // instead of yielding. Both reset per ctx, which is rebuilt on
-  // every reactivation, so replay re-derives consumption from the same call
-  // sequence.
-  //
-  // Two units, kept in lockstep. The msat counter runs against
-  // `job.paidMsats`, which is exact whenever that figure is the rail's own
-  // traffic. The fiat counter runs against the job's DRAW, which is what an
-  // explicit fund-and-draw actually spent — see the gate below for why the
-  // msat view can't answer for it.
-  let creditedToHandlerMsats = 0;
-  let creditedToHandlerMicro = 0;
-  // Sticky: set the first time an ask resolves a fiat pool. `job.paidMsats` is
-  // then a draw-derived figure for the rest of this context, so the msat
-  // comparisons stop being apples-to-apples even on a later ask whose own pool
-  // read failed. Governs the cross-machine resume gate below.
-  let poolBasis = false;
+  let askInFlight = false;
+
+  // `ctx.complete` with a payment request open withdraws it: the handler stops waiting, and a
+  // payment that arrives once the job has ended lands on credit as balance.
+  const withdrawAsk = (): void => {
+    const pending = job.pendingPayment;
+    job.pendingPayment = null;
+    job.pendingPaymentMsats = undefined;
+    job.pendingPaymentFiatMicro = undefined;
+    job.pendingPaymentFiatCurrency = undefined;
+    job.pendingMppChallengeIds = undefined;
+    job.pendingX402Nonce = undefined;
+    job.pendingX402AmountUsdcMicro = undefined;
+    pending?.reject(new JobCancelledError("The job completed; its open payment request was withdrawn"));
+  };
 
   // Per-context running total of what the handler has declared through
   // `ctx.cost()`, in MAJOR units of `declaredCostCurrency`.
@@ -372,7 +356,7 @@ export function buildContext(
     job.costCurrency = currency;
   };
 
-  return {
+  const ctx: SDKJobContext<unknown, unknown> = {
     jobId: job.id,
     tags: job.tags,
     input: opts.parsedInput ?? (job.input as unknown),
@@ -394,6 +378,8 @@ export function buildContext(
     sendMessage: (type, content) => {
       if (terminated("sendMessage")) return;
       if (type === "payment-request" && typeof content.amount_msats === "number") job.pendingPaymentMsats = content.amount_msats;
+      // Any payment-request finishes the piece in progress, in its Tx A and here.
+      if (type === "payment-request" && job.pieces) job.pieces = finishRunningPiece(job.pieces);
       providerMessage(job, type, content);
       if ((type === "prompt" || type === "payment-request") && opts.onYield) {
         void opts.onYield().catch((err: unknown) => {
@@ -461,6 +447,7 @@ export function buildContext(
           "ctx.requestPayment is unavailable: this job was paid by an x402 authorization that settles only when it succeeds"
         );
       }
+      const finishedChargeMicro = payOpts?.finishedChargeMicro;
       let amountMsats: number;
       let fiatAmount: { amount: number; currency: Currency } | undefined;
       // Hoisted so the pin below converts on the SAME snapshot that sized the
@@ -486,15 +473,13 @@ export function buildContext(
         fiatAmount = { amount: amount.amount, currency };
       }
 
-      // The job's pool, in the unit it was actually paid in. Read
-      // per ask, never captured per context: a mid-job top-up grows the draw on
-      // whichever machine took the payment, and `reactivateJob` builds the
-      // context before that growth is even committed.
+      // Read per ask, never captured per context: a mid-job top-up grows the draw on whichever
+      // machine took the payment, and `reactivateJob` builds the context before that growth is
+      // even committed.
       const pool: DrawPool = opts.drawPool
         ? await opts.drawPool().catch((): DrawPool => ({ basis: "unpriced" }))
         : { basis: "rail" };
       const poolCurrency = pool.basis === "draw" ? pool.currency : undefined;
-      poolBasis ||= pool.basis !== "rail";
 
       // The denomination this job's asks are pinned in, and the ceiling on its
       // draw growth is summed in. Three rungs, most durable first:
@@ -507,9 +492,9 @@ export function buildContext(
       // and of an operator changing `DVMConfig.currency` mid-flight. The
       // accumulator's switch arm poisons the total to a permanent `-1`, so
       // "usually agrees" is not good enough here.
-      // 2. The currency of the credit this job is actually bound to — the fiat
-      // pool's when there is one, otherwise the credit's own, which the
-      // `rail` arm now carries for the implicit N=1 case.
+      // 2. The currency of the credit this job is actually bound to — the draw's
+      // when it read, otherwise the credit's own, which the `rail` arm carries
+      // for the implicit N=1 case.
       // 3. The DVM's declared currency, which is what a credit opened by this
       // job's first payment will be denominated in.
       const askCurrency =
@@ -527,37 +512,21 @@ export function buildContext(
       // drop the exactness a fiat-form ask already has.
       //
       // A fiat-form ask already in `askCurrency` is exact and pins verbatim. Any
-      // other form needs the fx hop — took that branch out of
-      // `resolvePriceFiat` when it removed numeric *prices*, but
-      // `ctx.requestPayment(50_000, …)` is still a supported ask. It returns
-      // `undefined` rather than throwing when the rate provider is down
-      // the top-up then degrades to ledger-less, which the accept
-      // path warns about.
+      // other form needs the fx hop; `ctx.requestPayment(50_000, …)` is still a
+      // supported ask. It returns `undefined` rather than throwing when the rate
+      // provider is down, and the job's ask total records why it lost its ceiling.
       //
-      // Denominated in `askCurrency` — the credit's, on every job shape rather
-      // than only the ones whose fiat pool happened to read. That is
-      // what makes the figure the gate spends the same figure `growDraw` adds
-      // back and caps against: `resolveTopUpFiat` takes the pin verbatim when it
-      // already speaks the credit's currency, so the ceiling and the funded
-      // amount are one pinned integer and a rate move between the ask and the
-      // payment is structurally incapable of clipping a payment the caller owes.
+      // Denominated in `askCurrency`, so the figure `growDraw` adds and caps
+      // against is one pinned integer and a rate move between the ask and the
+      // payment cannot clip a payment the caller owes. An ask naming some other
+      // currency converts rather than being refused; the wire's `fiat_amount`
+      // keeps the builder's currency verbatim.
       //
-      // An ask naming some other currency converts rather than being refused —
-      // it is still the builder's ask, and the wire's `fiat_amount` below keeps
-      // their currency verbatim. Only the ledger pin moves.
-      //
-      // Memoised: computed at most once per ask, and only when something below
-      // actually needs it. Fails soft on a rate outage — the ask
-      // still goes out, and the job's ask total records why it lost its ceiling.
-      //
-      // the fetch degrades onto the fetcher's last-known snapshot
+      // The fetch degrades onto the fetcher's last-known snapshot
       // (`resolveFxSnapshot`) rather than reading one blip at the rate provider
       // as "no rate". This leg is free on a fiat-form ask — `fxSnapshot` already
-      // holds the snapshot that sized the msats — so bare msats is the only
-      // shape where pinning opens a failure door at all, and losing the pin
-      // there costs the receipt its whole `credit` block. When it *is* lost, say
-      // which failure did it: an unnamed cause here is what made the same skip
-      // at the verify-time leg undiagnosable after the fact.
+      // holds the snapshot that sized the msats. When the pin is lost, say which
+      // failure did it.
       let pinned: PriceFiat | undefined;
       let pinnedDone = false;
       const pinAsk = async (): Promise<PriceFiat | undefined> => {
@@ -581,12 +550,9 @@ export function buildContext(
         // The pin is the figure that goes on the ledger and that `growDraw` caps
         // against, so "priced off a rate nothing could re-confirm" is exactly as
         // material here as at the verify-time leg — which reports it as
-        // `credit_topup_stale_rate`. Without this the ask half of the ladder is
-        // invisible, and an operator reading correct-looking ledger rows has no
-        // way to know how old the rate behind them was. Two rungs degrade: the
-        // whole snapshot came from `lastKnown()`, or the source stopped carrying
-        // this one currency and it was carried forward. An ask that
-        // pins verbatim reads no rate at all, so neither applies to it.
+        // `credit_topup_stale_rate`. Two rungs degrade: the whole snapshot came
+        // from `lastKnown()`, or the source stopped carrying this one currency and
+        // it was carried forward. An ask that pins verbatim reads no rate at all.
         const pinReadsRate = fiatAmount?.currency !== askCurrency;
         const carriedForward = pinReadsRate && (fx.carried_forward?.includes(askCurrency) ?? false);
         if (pinReadsRate && (staleSnapshot || carriedForward)) {
@@ -622,87 +588,6 @@ export function buildContext(
         return pinned;
       };
 
-      // Auto-credit from the upfront pool. `verifyUpfrontPayment` may
-      // have credited the job above the worst-case ceiling at /v1/job time
-      // (dynamic-priced DVMs that quote `upfront = base + worst-case surcharge`
-      // and emit per-stage `requestPayment` calls — scrape, narrate, cast all
-      // do this). Without this short-circuit the handler suspends on a
-      // payment-request the agent has no reason to satisfy (it already paid
-      // upfront), and the job idle-times-out at 120s.
-      //
-      // measured in the same unit as what the job actually drew. Under
-      // an explicit fund-and-draw `job.paidMsats` is `withDrawBasis`'s pro-rata
-      // slice of the credit's rail value — an msat figure derived from a *fiat*
-      // draw at the credit's pinned ratio — while `amountMsats` converts at the
-      // rate live right now. Those drift both ways: a fallen rate makes the pool
-      // look too small and suspends the handler on work the caller already paid
-      // for; a risen rate makes it look too large and gives away asks the draw
-      // never covered. Under implicit N=1 no draw pool resolves, `paidMsats` is
-      // the rail's own traffic, and the msat comparison stays exact.
-      //
-      // A job that drew but whose pool can't be read or priced auto-credits from
-      // NEITHER: `paidMsats` is known to be a slice of the credit's rail value
-      // at a ratio pinned whenever the credit was funded — days ago, on a credit
-      // that backs N jobs — so spending against it is spending a figure we know
-      // is denominated wrong. Yielding instead costs at worst an ask the caller
-      // can see, log, and decline; auto-crediting on that figure gives work away
-      // silently and unrecoverably. Yielding is not refusing — the
-      // handler suspends on a payment-request exactly as it does for any charge
-      // the pool genuinely doesn't cover.
-      //
-      // The same doctrine covers a pin that reads fine but in the WRONG unit
-      // `askCurrency`'s top rung is the job's own denomination, so
-      // it no longer derives from this pool the way it did when `pinAsk` always
-      // denominated in `poolCurrency` — a job whose first ask resolved its
-      // currency elsewhere (that ask's pool read flapped, or the operator has
-      // since flipped `DVMConfig.currency`) can now be pinned in one currency
-      // while bound to a credit in another. Comparing across that is the mixed-
-      // unit gate exists to prevent, and it is silently wrong in both
-      // directions, so a disagreement yields exactly as an unpriceable pool does.
-      const askMicro =
-        pool.basis === "draw" && askCurrency === pool.currency
-          ? (await pinAsk())?.amountMicro
-          : undefined;
-      let covered: boolean;
-      if (pool.basis === "rail") {
-        covered = job.paidMsats - creditedToHandlerMsats >= amountMsats;
-      } else if (pool.basis === "draw" && askMicro !== undefined) {
-        covered = pool.amountMicro - creditedToHandlerMicro >= askMicro;
-      } else {
-        covered = false;
-        log.warn("requestPayment pool unpriceable — yielding rather than guessing", {
-          amountMsats,
-          reason,
-          poolBasis: pool.basis,
-          askCurrency,
-          // `draw` here means the pool read fine and either the ASK wouldn't pin
-          // an fx outage on a bare-msats ask, or a sub-micro amount — or it
-          // pinned in a currency this pool isn't denominated in.
-          ...(pool.basis === "draw" && { poolCurrency: pool.currency }),
-        });
-      }
-      if (covered) {
-        creditedToHandlerMsats += amountMsats;
-        creditedToHandlerMicro += askMicro ?? 0;
-        log.info("requestPayment auto-credited from upfront pool", {
-          amountMsats,
-          reason,
-          ...(pool.basis === "draw" && askMicro !== undefined
-            ? {
-                amountMicro: askMicro,
-                poolCurrency: pool.currency,
-                poolRemainingMicro: pool.amountMicro - creditedToHandlerMicro,
-              }
-            : { poolRemaining: job.paidMsats - creditedToHandlerMsats }),
-        });
-        if (job.replayHighSeq !== null) {
-          job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
-          opts.onCallerResume?.();
-        }
-        advanceReplayPaymentIndex(job);
-        return { amount_msats: amountMsats };
-      }
-
       const replayedPaymentRequest = job.replayHighSeq !== null &&
         job.replayPaymentIndex >= job.messages.filter((m) => m.from === "requester" && m.type === "payment").length
         ? job.messages.findLast((m) => m.from === "provider" && m.type === "payment-request" && m.seq <= job.replayHighSeq! &&
@@ -710,6 +595,11 @@ export function buildContext(
         : undefined;
       const originalAsk = replayedPaymentRequest?.type === "payment-request" ? replayedPaymentRequest.content : undefined;
       if (originalAsk) amountMsats = originalAsk.amount_msats;
+      // Every ask is new money. A replay re-walks asks the job already made: their pieces were
+      // finished when they were first written, so only an ask about to be written is checked.
+      const replayingPaidAsk = job.replayHighSeq !== null && job.replayPaymentIndex <
+        job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!).length;
+      if (!originalAsk && !replayingPaidAsk) checkFinishedCharge(runningPiece(job.pieces), finishedChargeMicro);
       const pendingFiat = originalAsk
         ? (originalAsk.credit ? { amountMicro: originalAsk.credit.amount_micro, currency: originalAsk.credit.currency } : undefined)
         : await pinAsk();
@@ -721,7 +611,8 @@ export function buildContext(
       let paymentRequestContent: Record<string, unknown>;
       if (originalAsk) {
         paymentRequestContent = { ...originalAsk };
-        job.pendingX402Nonce = originalAsk.x402?.nonce;
+        // An ask that withheld x402 carries no nonce; keep the unadvertised one its row holds.
+        job.pendingX402Nonce = originalAsk.x402 ? originalAsk.x402.nonce : job.pendingX402Nonce;
         job.pendingX402AmountUsdcMicro = originalAsk.x402?.required_usdc_micro;
         job.pendingMppChallengeIds = originalAsk.tempo?.challenges.map((challenge) => challenge.id);
       } else {
@@ -734,6 +625,11 @@ export function buildContext(
           ...(payOpts?.mints && { mints: payOpts.mints }),
           ...(payOpts?.minLocktimeSeconds && { min_locktime_seconds: payOpts.minLocktimeSeconds }),
           ...(!payOpts?.mints && opts.mints && { mints: opts.mints }),
+          // What declining this ask costs: the pieces finished so far, this ask finishing the
+          // one in progress. Absent on a job accepted before piece accounting.
+          ...(job.pieces && {
+            charged_if_declined_micro: chargedIfDeclinedMicro(finishRunningPiece(job.pieces, finishedChargeMicro)),
+          }),
         };
 
         // x402 payment option
@@ -885,25 +781,26 @@ export function buildContext(
       // `payment` message. This keeps the `replayProviderSkip` invariant
       // simple: replay never re-emits a payment-request, so the skip budget
       // (seeded in `runReactivation`) counts only the provider messages the
-      // replay *does* re-emit. Emitting-then-suppressing here
-      // would consume a skip slot that the auto-credit short-circuit above
-      // silently steals — the stale skip then swallowed the artifact.
+      // replay *does* re-emit.
       if (job.replayHighSeq !== null) {
         const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!);
         if (job.replayPaymentIndex < payments.length) {
           const payment = payments[job.replayPaymentIndex];
           job.replayPaymentIndex++;
-          // The caller must have credited the job before replay.
-          // Tx C sets this one-way runtime marker after it clears the current
-          // ask. Do not use `job.status`: a cached prompt earlier in the same
-          // replay can set it back to `processing` even when this payment was
+          // The caller must have credited the job before replay. A payment that bought a
+          // piece did, and so did one the handler already resumed past: the job's history
+          // holds provider output after it. Otherwise Tx C sets this one-way runtime marker
+          // after it clears the current ask. Do not use `job.status`: a cached prompt earlier
+          // in the same replay can set it back to `processing` even when this payment was
           // left pending. Do not compare `paidMsats` to this ask: an explicit
           // draw makes `paidMsats` a draw-derived rail slice while the ask is
           // live-rate msats.
           const balance = (payment.content as PaymentContent).credit;
           const accepted = balance
             ? await opts.acceptedBalancePayment?.(payment.seq, pendingFiat?.amountMicro, pendingFiat?.currency)
-            : job.reactivationPaymentApplied === true;
+            : job.pieces?.some((piece) => piece.paidSeq === payment.seq) === true ||
+              job.messages.some((m) => m.from === "provider" && m.seq > payment.seq) ||
+              job.reactivationPaymentApplied === true;
           if (!accepted) throw new Error("[internal_error] payment replay reached without credit");
           job.pendingPaymentMsats = undefined;
           job.pendingPaymentFiatMicro = undefined;
@@ -913,8 +810,6 @@ export function buildContext(
           job.pendingX402AmountUsdcMicro = undefined;
           job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
           opts.onCallerResume?.();
-          creditedToHandlerMsats += amountMsats;
-          creditedToHandlerMicro += pendingFiat?.amountMicro ?? 0;
           return payment.content as PaymentContent;
         }
         // A persisted unpaid ask may have concurrently replaying siblings.
@@ -964,23 +859,22 @@ export function buildContext(
       }
       // An unanswered replay keeps the original message and payment bindings.
       job.status = "awaiting-input";
-      if (!originalAsk) providerMessage(job, "payment-request", paymentRequestContent);
+      if (!originalAsk) {
+        // Sending the ask finishes the piece in progress; its Tx A does the same durably.
+        if (job.pieces) job.pieces = finishRunningPiece(job.pieces, finishedChargeMicro);
+        job.finishingChargeMicro = finishedChargeMicro;
+        providerMessage(job, "payment-request", paymentRequestContent);
+      }
 
-      // Register resolver synchronously. Wrap `resolve` so the upfront-pool
-      // counter advances when the agent's payment satisfies this yield —
-      // mirrors the auto-credit + replay branches above so subsequent calls
-      // see the consumption regardless of how the prior one settled.
-      //
-      // also subscribe to NOTIFY so a cross-machine Tx C wakes
+      // Register the resolver synchronously, and subscribe to NOTIFY so a cross-machine Tx C wakes
       // this resolver. When the inbound lands on a different process,
       // `job.pendingPayment` never resolves locally — the notify-driven
       // counter re-read is the only signal the handler gets. First firing
       // wins (in-process dispatch and notify-driven wake both call the
       // shared `doResolve`).
       //
-      // The job's rail-msat total at the instant it suspended. Under
-      // a fiat pool this is what the resume gate measures against: see the
-      // gate itself for why the running msat counter can no longer answer.
+      // The job's rail-msat total at the instant it suspended, which the cross-machine resume
+      // gate measures this ask's payment against.
       const paidMsatsAtYield = job.paidMsats;
       const p = new Promise<PaymentContent>((resolve, reject) => {
         let resolved = false;
@@ -1006,21 +900,6 @@ export function buildContext(
           opts.onCallerResume?.();
           resolved = true;
           cleanup();
-          creditedToHandlerMsats += amountMsats;
-          // The payment that satisfied this ask funded the credit and grew the
-          // draw by the same pinned figure, so the pool the next ask
-          // reads is larger by exactly what this line consumes — the two cancel
-          // and `pool − consumed` is invariant across paid asks. That is what
-          // lets a reactivation replay re-walk the whole sequence against the
-          // grown draw and reach the same decisions.
-          //
-          // The cancellation is exact whenever the pin and the growth are the
-          // same number, and they are on both sides of it: no pin means no
-          // `growDraw` at all (the top-up degrades to ledger-less), and a pin in
-          // a currency the credit doesn't speak is refused by the mid-job
-          // preflight, which leaves this line over-consuming — the direction
-          // that yields, never the one that gives work away.
-          creditedToHandlerMicro += pendingFiat?.amountMicro ?? 0;
           resolve(pc);
         };
         const doReject = (err: Error): void => {
@@ -1039,25 +918,14 @@ export function buildContext(
             try {
               const counters = await getCounters();
               if (!counters || resolved) return;
-              // Did the caller satisfy THIS ask? Under a fiat pool the running
-              // msat counter can't answer: it tracks asks priced at
-              // live rates against a `paidMsats` seeded from a pinned draw, so
-              // it reads too low in one rate direction — a fully-paid job never
-              // resumes — and too high in the other, where this check fires on
-              // stale headroom before any payment lands and the handler does the
-              // work for free. The rail-msat delta since the yield is exact on
-              // every accept path and needs no unit conversion: cashu earmarks
-              // the money it just received, x402/mpp credit the ask exactly,
-              // dev mode credits the ask, and a payment whose ledger leg was
-              // skipped still credits its raw rail value. It is also implied by
-              // the expression below whenever `creditedToHandlerMsats <=
-              // paidMsats`, which is every non-pool job — so implicit N=1 keeps
-              // the original comparison and its original behaviour.
-              // Balance authorization pays the pinned fiat ask, so its stored
-              // rail conversion need not reach this ask's current msat value.
-              const satisfied = counters.balancePaymentSatisfied === true || (poolBasis
-                ? counters.paidMsats - paidMsatsAtYield >= amountMsats
-                : counters.paidMsats - creditedToHandlerMsats >= amountMsats);
+              // Did the caller pay THIS ask? Every ask is new money, so only what was
+              // credited since the yield counts, never the upfront payment. The rail-msat
+              // delta is exact on every accept path: cashu earmarks the money it just
+              // received, x402 and Tempo credit the ask exactly and dev mode credits the
+              // ask. A balance authorization pays the pinned fiat ask, so its stored rail
+              // conversion need not reach this ask's current msat value.
+              const satisfied = counters.balancePaymentSatisfied === true ||
+                counters.paidMsats - paidMsatsAtYield >= amountMsats;
               if (satisfied) {
                 // Single-execution claim: win the
                 // `awaiting-input → processing` CAS before resuming, so a
@@ -1068,6 +936,8 @@ export function buildContext(
                   // local resume operation as the durable claim.
                   job.paidMsats = counters.paidMsats;
                   job.pendingPaymentMsats = counters.pendingPaymentMsats;
+                  // The piece this payment bought, so the next ask finishes it.
+                  if (counters.pieces) job.pieces = counters.pieces;
                   await doResolve({ amount_msats: amountMsats } as PaymentContent);
                 };
                 if (opts.claimForProcessing) {
@@ -1102,7 +972,7 @@ export function buildContext(
               }
               unsubscribeNotify = u;
               // Run an immediate check in case Tx C committed between the
-              // upfront-pool check above and the subscribe call.
+              // ask and the subscribe call.
               void check();
             })
             .catch((err: unknown) => {
@@ -1117,6 +987,7 @@ export function buildContext(
       }
       return p;
     },
+
     working: (estimateSeconds, hint) => {
       if (terminated("working")) return;
       const content: Record<string, unknown> = {};
@@ -1136,8 +1007,20 @@ export function buildContext(
       if (hint) content.hint = hint;
       providerMessage(job, "progress", content);
     },
-    complete: (summary) => {
+    complete: (summary, completeOpts) => {
       if (terminated("complete")) return;
+      // Completing finishes the piece in progress, at a lower charge when one is given.
+      const running = runningPiece(job.pieces);
+      checkFinishedCharge(running, completeOpts?.finishedChargeMicro);
+      if (job.pendingPayment || job.pendingPaymentMsats !== undefined) withdrawAsk();
+      // Finish the piece this handler was working on, and only it: a payment that bought
+      // another piece paid an ask this completion withdrew. A job accepted before piece
+      // accounting is one piece, finished whole.
+      job.pieceEnding = job.pieces === undefined
+        ? { kind: "finish" }
+        : running
+          ? { kind: "finish", paidSeq: running.paidSeq, chargeMicro: completeOpts?.finishedChargeMicro }
+          : { kind: "release" };
       job.status = "completed";
       job.summary = summary;
       providerMessage(job, "complete", { summary });
@@ -1194,6 +1077,20 @@ export function buildContext(
     env: opts.env,
     log,
   };
+
+  // One open ask at a time, counted from the call rather than the emission: a second call
+  // while the first is still pricing its ask would otherwise overwrite it.
+  const ask = ctx.requestPayment;
+  ctx.requestPayment = (amount, reason, payOpts) => {
+    if (!isTerminal(job.status) && (askInFlight || job.pendingPayment)) {
+      return Promise.reject(new AskAlreadyOpenError(job.id));
+    }
+    askInFlight = true;
+    return ask(amount, reason, payOpts).finally(() => {
+      askInFlight = false;
+    });
+  };
+  return ctx;
 }
 
 /**
@@ -1226,19 +1123,4 @@ function warnPinLost(
     cause: reason,
     ...(detail !== undefined && { detail }),
   });
-}
-
-/**
- * when the upfront-pool branch of `requestPayment` short-circuits
- * instead of yielding, consuming the satisfaction without advancing the
- * positional payment index would let a later yield re-claim a payment this
- * call already accounted for. No-op outside replay; no-op when the index has
- * already drained past every requester `payment` message.
- */
-function advanceReplayPaymentIndex(job: ServerJob): void {
-  if (job.replayHighSeq === null) return;
-  const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!);
-  if (job.replayPaymentIndex < payments.length) {
-    job.replayPaymentIndex++;
-  }
 }

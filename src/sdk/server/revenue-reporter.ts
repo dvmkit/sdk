@@ -119,6 +119,16 @@ export interface JobTerminalReportPayload {
   terminalAtMs: number;
   callerWaitMs: number;
   receiptSeq: number | null;
+  /**
+   * What the job's credit draw charged, in integer micro-units of {@link currency}: its
+   * finished pieces, and on a caller's cancel the piece it stopped. `0` without a draw.
+   * Absent on reports queued before piece charging.
+   */
+  chargedMicro?: number;
+  /** Currency of {@link chargedMicro}; `null` when the job held no draw. */
+  currency?: string | null;
+  /** A caller's cancel stopped a piece of work in progress and charged it. */
+  stoppedPiece?: boolean;
 }
 
 /**

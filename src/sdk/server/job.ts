@@ -13,6 +13,7 @@ import type { FundingMethod, SDKJobContext } from "../types";
 import { askExpiryAtMs } from "./ask-expiry";
 import type { CreditSnapshot } from "./credit-ledger";
 import type { AppendOutgoingOptions, JobRecord, TopUpCapUnenforcedReason } from "./job-store";
+import type { JobPiece, JobSettlement, PieceEnding } from "./pieces";
 
 export interface PromptResolver {
   resolve: (value: ResponseContent) => void;
@@ -176,6 +177,17 @@ export interface ServerJob {
   topUpCapUnenforcedReason?: TopUpCapUnenforcedReason;
   /** Price the job was charged at (msats). Used to detect overpayment for change/melt gating. */
   requiredMsats?: number;
+  /** This machine's view of `JobRecord.pieces`; the store's row is the authority. */
+  pieces?: JobPiece[];
+  /** Mirror of `JobRecord.settlement` once the job is terminal. */
+  settlement?: JobSettlement;
+  /** See `JobRecord.pieceEnding`. */
+  pieceEnding?: PieceEnding;
+  /**
+   * The lowered charge for the piece the next payment-request finishes, handed from
+   * `ctx.requestPayment` to that request's Tx A. Runtime-only.
+   */
+  finishingChargeMicro?: number;
   /**
    * The signed receipt for this job's terminal outcome. Mirror of
    * `JobRecord.receipt`, set once the terminal funnel has signed and persisted
@@ -293,6 +305,9 @@ export function toJobRecord(job: ServerJob): JobRecord {
     askedTopUpCurrency: job.askedTopUpCurrency,
     topUpCapUnenforcedReason: job.topUpCapUnenforcedReason,
     requiredMsats: job.requiredMsats,
+    pieces: job.pieces,
+    settlement: job.settlement,
+    pieceEnding: job.pieceEnding,
     receipt: job.receipt,
     stepCache: job.stepCache.serialize(),
     state: job.state,
@@ -354,6 +369,8 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     askedTopUpCurrency: record.askedTopUpCurrency,
     topUpCapUnenforcedReason: record.topUpCapUnenforcedReason,
     requiredMsats: record.requiredMsats,
+    pieces: record.pieces ? structuredClone(record.pieces) : undefined,
+    settlement: record.settlement,
     receipt: record.receipt,
     listeners: new Set(),
     abort: new AbortController(),
@@ -392,6 +409,19 @@ export class JobCancelledError extends Error {
   }
 }
 
+/**
+ * Thrown by `ctx.requestPayment` while an earlier payment request on the job is still open.
+ * A job has one open ask at a time, so a payment always says which piece of work it buys.
+ */
+export class AskAlreadyOpenError extends Error {
+  readonly code = "ask_already_open";
+  readonly status = 409;
+  constructor(jobId: string) {
+    super(`job ${jobId} already has an open payment request; wait for it to be paid before asking again`);
+    this.name = "AskAlreadyOpenError";
+  }
+}
+
 export function providerMessage(
   job: ServerJob,
   type: MessageType,
@@ -425,8 +455,10 @@ export function providerMessage(
       awaitingInput: job.status === "awaiting-input",
       pendingPaymentDelta,
       pendingMppChallengeIds,
+      // An ask that withheld x402 still binds the job to an unadvertised nonce, so a stray x402
+      // payment is refused before it settles; that nonce is on the job, not in the content.
       pendingX402Nonce:
-        typeof paymentRequest.x402?.nonce === "string" ? paymentRequest.x402.nonce : undefined,
+        typeof paymentRequest.x402?.nonce === "string" ? paymentRequest.x402.nonce : job.pendingX402Nonce,
       pendingX402AmountUsdcMicro:
         typeof paymentRequest.x402?.required_usdc_micro === "string"
           ? paymentRequest.x402.required_usdc_micro
@@ -437,7 +469,9 @@ export function providerMessage(
       // `pendingPaymentMsats` comment above describes).
       pendingPaymentFiatMicro: job.pendingPaymentFiatMicro,
       pendingPaymentFiatCurrency: job.pendingPaymentFiatCurrency,
+      finishedChargeMicro: job.finishingChargeMicro,
     });
+    job.finishingChargeMicro = undefined;
     return;
   }
   job.messageAppender?.(msg, type === "prompt" ? { awaitingInput: job.status === "awaiting-input" } : undefined);
@@ -565,6 +599,19 @@ export function callerDeadline(job: WaitingJob, legacyTimeoutMs?: number): numbe
     return (job.awaitingInputAtMs ?? job.lastActivityAt) + legacyTimeoutMs;
   }
   return undefined;
+}
+
+/** True while a prompt is unanswered or a payment-request is unpaid: what a caller can decline. */
+export function hasOpenAsk(job: Pick<JobRecord, "status" | "messages" | "pendingPaymentMsats">): boolean {
+  if (isTerminal(job.status)) return false;
+  const prompts = new Set<string>();
+  let paymentAsked = false;
+  for (const message of job.messages) {
+    if (message.from === "provider" && message.type === "prompt") prompts.add(message.content.id);
+    if (message.from === "provider" && message.type === "payment-request") paymentAsked = true;
+    if (message.from === "requester" && message.type === "response") prompts.delete(message.content.prompt_id);
+  }
+  return prompts.size > 0 || (paymentAsked && (job.pendingPaymentMsats ?? 0) > 0);
 }
 
 /** Distinguish completed stamped waits from legacy rows without deadline evidence. */

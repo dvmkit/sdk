@@ -4104,10 +4104,10 @@ export interface CreditLedgerLike {
   }): Promise<DrawResolution>;
   /**
    * Settle part of a pending draw and release the rest in one terminal step. See
-   * {@link CreditLedger.resolveDraw}. Optional so existing custom ledgers keep compiling;
-   * without it a draw can only settle or release whole.
+   * {@link CreditLedger.resolveDraw}. Required: a job's draw settles by the piece, which
+   * needs a partial settle on most endings.
    */
-  resolveDraw?(args: {
+  resolveDraw(args: {
     creditId: string;
     drawId: string;
     /** Micro-units of the draw's currency to charge, from zero (a release) to the whole hold. */

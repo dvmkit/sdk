@@ -340,13 +340,15 @@ describe("explicit credit draws", () => {
     const receipt = body.receipt;
     expect(receipt?.outcome).toBe("failed");
 
+    // A released draw charged nothing; the settlement block keeps the hold it released.
     expect(receipt?.credit).toEqual({
       credit_id: "c1",
       draw_id: "d1",
-      amount: PRICE_MICRO,
+      amount: 0,
       balance_after: 1_000_000,
       ledger_seq: 1,
     });
+    expect(receipt?.settlement).toMatchObject({ held: PRICE_MICRO, charged: 0, released: PRICE_MICRO });
     const draw = await ledger.getDraw({ creditId: "c1", drawId: "d1" });
     expect(draw?.status).toBe("released");
     const snap = await ledger.get("c1");
@@ -405,7 +407,7 @@ describe("explicit credit draws", () => {
     expect(body.receipt?.credit).toEqual({
       credit_id: "tempo-loss",
       draw_id: "lost-draw",
-      amount: PRICE_MICRO,
+      amount: 0,
       balance_after: 0,
       ledger_seq: 1,
     });

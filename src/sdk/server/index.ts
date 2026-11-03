@@ -123,8 +123,9 @@ export { JobManager } from "./job-manager";
 export type { HostingControlCommand, HostingControlConfig, HostingControlStatus,
   HostingClosureCommand, HostingClosureEvidence } from "./hosting-control";
 export { signHostingControl, signHostingClosure } from "./hosting-control";
-export type { JobRecord, JobStatus, JobStore, StreamableJobStore } from "./job-store";
-export { isStreamableJobStore } from "./job-store";
+export type { DeclineOutcome, JobRecord, JobStatus, JobStore, StreamableJobStore } from "./job-store";
+export { isStreamableJobStore, JobEndedError } from "./job-store";
+export type { JobPiece, JobSettlement, PieceEnding, PieceState } from "./pieces";
 export type { LightningReceiveConfig } from "./lightning-receive";
 export {
   DEFAULT_INVOICE_TTL_SECONDS,

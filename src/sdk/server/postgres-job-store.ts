@@ -11,8 +11,10 @@ import type { JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
+import { JobEndedError } from "./job-store";
 import type {
   AppendOutgoingOptions,
+  DeclineOutcome,
   JobCounters,
   JobRecord,
   JobRetentionCursor,
@@ -26,6 +28,8 @@ import type {
   VerifyAndCreditOptions,
   VerifyAndCreditResult,
 } from "./job-store";
+import { hasOpenAsk } from "./job";
+import { appendPiece, endPieces, finishRunningPiece, type PieceEnding, storedPieces, terminalEnding } from "./pieces";
 import {
   decidePaymentDisposition,
   PaymentIntentOpenError,
@@ -307,6 +311,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       );
       CREATE INDEX IF NOT EXISTS job_payment_intents_open
         ON job_payment_intents (job_id) WHERE resolved_at_ms IS NULL;
+
+      -- Charging by the piece. pieces is the ordered list of work the job's payments bought;
+      -- settlement is the figure the terminal transition froze for the draw. NULL pieces is a
+      -- job accepted before this column existed, which settles as one piece.
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pieces JSONB;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS settlement JSONB;
     `);
   }
 
@@ -545,8 +555,9 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         last_activity_at, next_seq, requester_token_hash, requester_token,
         request_fingerprint, requester_pubkey, request_id, credit_id, draw_id,
         pending_payment_fiat_micro, pending_payment_fiat_currency, auth_request_path,
-        funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52)
+        funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment,
+        pieces
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53)
       ON CONFLICT (id) DO UPDATE SET
         terminal_at_ms = COALESCE(jobs.terminal_at_ms, EXCLUDED.terminal_at_ms),
         ended_by = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.ended_by ELSE EXCLUDED.ended_by END,
@@ -687,6 +698,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         now,
         record.timingKnown ?? true,
         record.upfrontPayment ? JSON.stringify(record.upfrontPayment) : null,
+        // INSERT-only: after insert the transactional paths own the piece list.
+        record.pieces ? JSON.stringify(record.pieces) : null,
       ]
     );
     let rowCount: number | null;
@@ -696,10 +709,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       // Lock an existing row before speculative insertion touches its unique
       // indexes. Otherwise a concurrent indexed UPDATE can become the deadlock
       // victim, and retrying only this save cannot recover that other writer.
-      const existing = await tx.query<{ dvm_id: string | null; status: JobStatus }>(
-        "SELECT dvm_id, status FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
+      const existing = await tx.query<{ dvm_id: string | null; status: JobStatus; pieces: unknown }>(
+        "SELECT dvm_id, status, pieces FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
       );
-      if (existing.rows[0] && !isTerminalStatus(existing.rows[0].status) && isTerminalStatus(record.status)) {
+      const prior = existing.rows[0];
+      const ending = isTerminalStatus(record.status) && (!prior || !isTerminalStatus(prior.status));
+      if (prior && ending) {
         await this.assertNoOpenPaymentIntent(tx, record.id);
       }
       if (this.hostingCleanupFence) {
@@ -713,6 +728,18 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         }
       }
       ({ rowCount } = await write(tx));
+      if (rowCount && ending) {
+        // The first terminal write ends the running piece and freezes the settlement, from the
+        // row's own piece list rather than the snapshot's.
+        // A row inserted already terminal takes the settlement the SDK froze on the snapshot.
+        const ended = prior
+          ? endPieces(storedPieces(prior.pieces), terminalEnding(record))
+          : record.settlement
+            ? { pieces: record.pieces, settlement: record.settlement }
+            : endPieces(record.pieces, terminalEnding(record));
+        await tx.query("UPDATE jobs SET pieces = $2, settlement = $3 WHERE id = $1",
+          [record.id, ended.pieces ? JSON.stringify(ended.pieces) : null, JSON.stringify(ended.settlement)]);
+      }
       await tx.query("COMMIT");
     } catch (error) {
       await tx.query("ROLLBACK").catch(() => undefined);
@@ -1004,19 +1031,24 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
           return prior.rows[0].seq;
         }
       }
-      const { rows } = await client.query<{ seq: number }>(
+      const { rows } = await client.query<{ seq: number; status: JobStatus; pieces: unknown }>(
         `UPDATE jobs SET next_seq = next_seq + 1, last_activity_at = CASE WHEN status IN ('completed','failed','cancelled') THEN last_activity_at ELSE $2 END,
            awaiting_input_at_ms = CASE WHEN $3::boolean AND status NOT IN ('completed', 'failed', 'cancelled')
              THEN COALESCE(awaiting_input_at_ms, $2) ELSE awaiting_input_at_ms END,
            status = CASE WHEN $3::boolean AND status NOT IN ('completed', 'failed', 'cancelled')
              THEN 'awaiting-input' ELSE status END
            WHERE id = $1 AND redacted_at IS NULL
-           RETURNING (next_seq - 1) AS seq`,
+           RETURNING (next_seq - 1) AS seq, status, pieces`,
         [jobId, Date.now(), opts?.awaitingInput ?? false]
       );
       if (rows.length === 0) {
         await client.query("ROLLBACK");
         throw new Error(`appendOutgoing: job ${jobId} not found`);
+      }
+      const ask = message.type === "payment-request" || message.type === "prompt";
+      if (ask && isTerminalStatus(rows[0].status)) {
+        await client.query("ROLLBACK");
+        throw new JobEndedError(jobId);
       }
       const seq = rows[0].seq;
       const fullMessage = { ...message, seq } as Message;
@@ -1082,6 +1114,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
             opts.pendingPaymentFiatCurrency ?? null,
           ]
         );
+      }
+      const pieces = storedPieces(rows[0].pieces);
+      if (message.type === "payment-request" && pieces) {
+        // Sending the next ask finishes the piece in progress.
+        await client.query("UPDATE jobs SET pieces = $2 WHERE id = $1",
+          [jobId, JSON.stringify(finishRunningPiece(pieces, opts?.finishedChargeMicro))]);
       }
       if (opts?.appendId) {
         await client.query("INSERT INTO job_outgoing_appends (job_id, append_id, seq) VALUES ($1,$2,$3)",
@@ -1273,6 +1311,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
           pending_payment_msats: string | number | null;
           credit_id: string | null;
           draw_id: string | null;
+          pieces: unknown;
         }>(
           `UPDATE jobs SET
              paid_msats = paid_msats + $2,
@@ -1309,7 +1348,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
              pending_x402_amount_usdc_micro = CASE WHEN $11::boolean THEN NULL ELSE pending_x402_amount_usdc_micro END,
              last_activity_at = $12
            WHERE id = $1 AND status NOT IN ('completed','failed','cancelled')
-           RETURNING status, paid_msats, pending_payment_msats, credit_id, draw_id`,
+           RETURNING status, paid_msats, pending_payment_msats, credit_id, draw_id, pieces`,
           params
         );
         if (rows.length === 0) {
@@ -1326,6 +1365,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
           await client.query("COMMIT");
           return { counters: ended, alreadyVerified: false, ...endedBinding, creditRefused: "job_ended" };
         }
+        let pieces = storedPieces(rows[0].pieces);
+        // Only growth of the draw this row is bound to buys a piece: a concurrent top-up that
+        // lost the bind grew a draw this job does not own.
+        if (pieces && credit.piece && credit.piece.amountMicro > 0 && rows[0].draw_id === credit.piece.drawId) {
+          pieces = appendPiece(pieces, credit.piece.amountMicro, seq);
+          await client.query("UPDATE jobs SET pieces = $2 WHERE id = $1", [jobId, JSON.stringify(pieces)]);
+        }
         counters = {
           status: rows[0].status,
           paidMsats: Number(rows[0].paid_msats),
@@ -1333,6 +1379,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
             rows[0].pending_payment_msats == null
               ? undefined
               : Number(rows[0].pending_payment_msats),
+          ...(pieces && { pieces }),
         };
         // `RETURNING` is post-COALESCE, so this is the binding the
         // row actually kept — not the one we asked it to take.
@@ -1372,7 +1419,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const { rows } = await this.pool.query<
       CountersRow & { credit_id: string | null; draw_id: string | null }
     >(
-      `SELECT j.status, j.paid_msats, j.pending_payment_msats, j.summary, j.credit_id, j.draw_id
+      `SELECT j.status, j.paid_msats, j.pending_payment_msats, j.summary, j.pieces, j.credit_id, j.draw_id
          FROM jobs j
          JOIN job_messages m ON m.job_id = j.id AND m.seq = $2
         WHERE j.id = $1 AND m.status IN ('verified', 'balance')`,
@@ -1444,30 +1491,37 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     );
   }
 
-  cancelStaleJob(
+  async cancelStaleJob(
     jobId: string,
     expectedActivityBefore: number,
     reason: string,
     terminalStatus: "failed" | "cancelled"
   ): Promise<boolean> {
-    return this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore, null);
+    return (await this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore, null,
+      { kind: "release" })) === "ended";
   }
 
-  cancelJob(jobId: string, reason: string): Promise<boolean> {
-    return this.terminateJob(jobId, reason, "cancelled", null, "caller");
+  /** A caller's cancel stops the piece in progress and charges it. */
+  async cancelJob(jobId: string, reason: string): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "cancelled", null, "caller", { kind: "stop" })) === "ended";
   }
 
-  failJob(jobId: string, reason: string): Promise<boolean> {
-    return this.terminateJob(jobId, reason, "failed", null, "provider");
+  async failJob(jobId: string, reason: string): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "failed", null, "provider", { kind: "release" })) === "ended";
   }
 
-  cancelJobForHosting(jobId: string, reason: string): Promise<boolean> {
-    return this.terminateJob(jobId, reason, "cancelled", null, "provider");
+  async declineJob(jobId: string, reason: string): Promise<DeclineOutcome> {
+    const outcome = await this.terminateJob(jobId, reason, "cancelled", null, "caller", { kind: "release" }, true);
+    return outcome === "ended" ? "declined" : outcome;
+  }
+
+  async cancelJobForHosting(jobId: string, reason: string): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "cancelled", null, "provider", { kind: "release" })) === "ended";
   }
 
   async getCounters(jobId: string): Promise<JobCounters | undefined> {
     const { rows } = await this.pool.query<CountersRow>(
-      `SELECT status, paid_msats, pending_payment_msats, summary,
+      `SELECT status, paid_msats, pending_payment_msats, summary, pieces,
         EXISTS (SELECT 1 FROM credit_balance_payments p WHERE p.job_id=jobs.id
           AND p.request_seq=(SELECT MAX(m.seq) FROM job_messages m WHERE m.job_id=jobs.id
             AND m.data->>'type'='payment-request' AND m.data->>'from'='provider'
@@ -1664,8 +1718,10 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     reason: string,
     terminalStatus: "failed" | "cancelled",
     expectedActivityBefore: number | null,
-    endedBy: "caller" | "provider" | null
-  ): Promise<boolean> {
+    endedBy: "caller" | "provider" | null,
+    ending: PieceEnding,
+    requireOpenAsk = false
+  ): Promise<"ended" | "not_active" | "no_open_ask"> {
     const staleOnly = expectedActivityBefore !== null;
     const client = await this.pool.connect();
     try {
@@ -1680,7 +1736,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       );
       if (rows.length === 0) {
         await client.query("ROLLBACK");
-        return false;
+        return "not_active";
       }
       await this.assertNoOpenPaymentIntent(client, jobId);
       const record = rowToRecord(rows[0]);
@@ -1692,9 +1748,14 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
         if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) {
           await client.query("ROLLBACK");
-          return false;
+          return "not_active";
         }
       }
+      if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
+        await client.query("ROLLBACK");
+        return "no_open_ask";
+      }
+      const ended = endPieces(record.pieces, ending);
       const nextSeq = rows[0].next_seq;
       const now = Date.now();
       const cancelMsg: Message = {
@@ -1727,10 +1788,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
            messages = $3::jsonb,
            seq = $4,
            next_seq = $4 + 1,
-           last_activity_at = $5
+           last_activity_at = $5,
+           pieces = $8::jsonb,
+           settlement = $9::jsonb
          WHERE id = $1`,
         [jobId, reason, JSON.stringify([...terminalMessages, cancelMsg]), nextSeq, now, terminalStatus,
-          staleOnly ? (terminalStatus === "cancelled" ? "caller" : "provider") : endedBy]
+          staleOnly ? (terminalStatus === "cancelled" ? "caller" : "provider") : endedBy,
+          ended.pieces ? JSON.stringify(ended.pieces) : null, JSON.stringify(ended.settlement)]
       );
       await client.query("SELECT pg_notify('job_messages', $1)", [jobId]);
       await client.query("COMMIT");
@@ -1747,7 +1811,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     // Best-effort: the snapshot's `messages` array is already the source of
     // truth at terminal, so a transient cleanup failure is recoverable.
     await this.deleteResolvedMessages(jobId).catch(() => undefined);
-    return true;
+    return "ended";
   }
 
   private async deleteResolvedMessages(jobId: string): Promise<void> {
@@ -1767,7 +1831,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     jobId: string
   ): Promise<JobCounters | undefined> {
     const { rows } = await client.query<CountersRow>(
-      "SELECT status, paid_msats, pending_payment_msats, summary FROM jobs WHERE id = $1",
+      "SELECT status, paid_msats, pending_payment_msats, summary, pieces FROM jobs WHERE id = $1",
       [jobId]
     );
     if (rows.length === 0) return undefined;
@@ -1812,6 +1876,7 @@ interface CountersRow {
   pending_payment_msats: string | number | null;
   summary: string | null;
   balance_payment_satisfied?: boolean;
+  pieces?: unknown;
 }
 
 function rowToCounters(row: CountersRow): JobCounters {
@@ -1822,6 +1887,7 @@ function rowToCounters(row: CountersRow): JobCounters {
     pendingPaymentMsats:
       row.pending_payment_msats == null ? undefined : Number(row.pending_payment_msats),
     summary: row.summary ?? undefined,
+    ...(storedPieces(row.pieces) && { pieces: storedPieces(row.pieces) }),
   };
 }
 
@@ -1886,6 +1952,8 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     topUpCapUnenforcedReason: (row.topup_cap_unenforced_reason ??
       undefined) as JobRecord["topUpCapUnenforcedReason"],
     requiredMsats: row.required_msats == null ? undefined : Number(row.required_msats),
+    pieces: storedPieces(row.pieces),
+    settlement: (row.settlement ?? undefined) as JobRecord["settlement"],
     receipt: (row.receipt ?? undefined) as JobRecord["receipt"],
     stepCache: row.step_cache as JobRecord["stepCache"],
     state: row.state,

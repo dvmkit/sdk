@@ -175,6 +175,12 @@ export interface PaymentInfo {
   drawId?: string;
   /** The draw's fiat amount, 1e-6 of {@link creditCurrency}. */
   drawAmountMicro?: number;
+  /**
+   * What this payment added to the draw named by {@link drawId}, 1e-6 of {@link creditCurrency}:
+   * the whole draw when it placed one, the growth on a mid-job top-up. A paid ask buys a
+   * piece of exactly this size.
+   */
+  drawAddedMicro?: number;
   /** Currency the credit — and therefore the draw — is denominated in. */
   creditCurrency?: string;
   /**
@@ -3003,6 +3009,8 @@ export interface VerifiedIncomingPayment {
   drawFunding?: FundingRecord;
   /** See `PaymentInfo.landedAsBalance`: the payment paid no ask. */
   landedAsBalance?: LedgerBalanceLanding;
+  /** The piece this payment buys: what it added to a draw, and which draw. */
+  piece?: { amountMicro: number; drawId: string };
 }
 
 /**
@@ -3169,6 +3177,32 @@ async function verifyIncomingPaymentInScope(
       );
       if (resolved.error) return { error: resolved.error };
       const ledgerCtx = resolved.ctx;
+      // Per-job binding: a payment-request that included an x402
+      // envelope stamped a fresh server-issued `bytes32` nonce on the wire,
+      // captured into `pendingX402Nonce`; an ask that withheld x402 bound an
+      // unadvertised one. The facilitator's EIP-3009 check proves the
+      // authorization is well-signed but doesn't bind it to *this* job — a
+      // payload with the right `(payTo, value)` lifted from a sibling job's
+      // payment-request could otherwise satisfy this one. Checked before the
+      // facilitator settles, so a refused payment moves no money: the route is
+      // owner-authenticated, so the refusal reveals nothing to a stranger.
+      // Gated on `pendingX402Nonce !== undefined` for jobs whose ask predates
+      // the binding. Compare as raw hex strings — no bigint coercion, no
+      // asymmetric `0x` stripping.
+      if (snapshot.pendingX402Nonce !== undefined) {
+        const incomingNonce = decodePayment(body.content.x402_payment as string).payload
+          .authorization.nonce;
+        if (incomingNonce !== snapshot.pendingX402Nonce) {
+          return {
+            error: {
+              body: paymentErrorBody("payment_invalid", {
+                message: "x402 payment not bound to this job",
+              }),
+              status: 402,
+            },
+          };
+        }
+      }
       const { verifyX402Payment } = await import("../../lib/x402");
       const receipt = await withPaymentStage("verifier_broadcast", () => verifyX402Payment(
         body.content.x402_payment as string,
@@ -3187,31 +3221,6 @@ async function verifyIncomingPaymentInScope(
             status: 402,
           },
         };
-      }
-      // Per-job binding: a payment-request that included an x402
-      // envelope stamped a fresh server-issued `bytes32` nonce on the wire,
-      // captured into `pendingX402Nonce`. The facilitator's EIP-3009 check
-      // proves the authorization is well-signed but doesn't bind it to *this*
-      // job — a payload with the right `(payTo, value)` lifted from a sibling
-      // job's payment-request could otherwise satisfy this one before its
-      // `transferWithAuthorization` settles. Checked after the cryptographic
-      // verify so error-shape side-channels can't reveal bound nonces; gated
-      // on `pendingX402Nonce !== undefined` for backwards-compat with pre-fix
-      // DVMs. Compare as raw hex strings — no bigint coercion, no asymmetric
-      // `0x` stripping.
-      if (snapshot.pendingX402Nonce !== undefined) {
-        const incomingNonce = decodePayment(body.content.x402_payment as string).payload
-          .authorization.nonce;
-        if (incomingNonce !== snapshot.pendingX402Nonce) {
-          return {
-            error: {
-              body: paymentErrorBody("payment_invalid", {
-                message: "x402 payment not bound to this job",
-              }),
-              status: 402,
-            },
-          };
-        }
       }
       // the money moved outside dvmkit, so the durable commit is the
       // processed-payment marker + fund + growDraw in one transaction — the
@@ -3631,9 +3640,12 @@ async function acceptDurableExactIncoming(args: {
 function topUpBinding(
   info: PaymentInfo,
   snapshot: VerifyIncomingSnapshot
-): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro" | "drawFunding" | "landedAsBalance"> {
+): Pick<VerifiedIncomingPayment, "creditId" | "drawId" | "funding" | "unappliedMicro" | "drawFunding" | "landedAsBalance" | "piece"> {
   const fresh = !snapshot.creditId && info.creditId && info.drawId;
   return {
+    ...(info.drawId && info.drawAddedMicro !== undefined && !info.landedAsBalance && {
+      piece: { amountMicro: info.drawAddedMicro, drawId: info.drawId },
+    }),
     ...(info.landedAsBalance && { landedAsBalance: info.landedAsBalance }),
     ...(fresh && { creditId: info.creditId, drawId: info.drawId }),
     ...(info.funding && { funding: info.funding }),
@@ -4848,6 +4860,7 @@ function withDrawBasis(
     ...base,
     drawId,
     drawAmountMicro: draw.amountMicro,
+    drawAddedMicro: committed.added?.amountMicro ?? draw.amountMicro,
     ...(!ctx.midJob && !ctx.fundOnly && { upfrontPayment: upfrontPaymentFromDraw(draw) }),
   };
   if (!ctx.drawBasis) return withDraw;

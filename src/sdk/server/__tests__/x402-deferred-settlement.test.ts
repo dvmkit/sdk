@@ -236,6 +236,40 @@ describe("unsigned x402 settled after the job", () => {
     jobs.shutdown();
   });
 
+  it("never settles when the caller cancels: a cancel charges an unsigned x402 job nothing", async () => {
+    const r = rig();
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    const terminal = vi.fn(async (_info: unknown) => undefined);
+    const { jobs, completed } = manager(r, async (ctx) => {
+      started();
+      await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+    }, RUNTIME_SECONDS, r.settler, { onJobTerminal: terminal });
+    const fund = vi.spyOn(r.ledger, "fund");
+
+    const payment = await admit(r, authorization(60), "job-cancelled");
+    const job = jobs.createJob({ input: "https://example.com" }, "anonymous", payment, PRICE_MSATS, "scrape", undefined, { jobId: "job-cancelled" });
+    await jobs.persistJob(job);
+    jobs.runHandler(job, jobs.buildAndAttachContext(job, undefined));
+    await running;
+    // Unlike a ledger-backed job, the stopped piece is not charged: the authorization settles only on completion.
+    await jobs.dispatchMessage(job, "cancel", { reason: "changed my mind" });
+
+    expect(job.status).toBe("cancelled");
+    expect(r.facilitatorCalls("/settle")).toBe(0);
+    expect(fund).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    const intent = await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!);
+    expect(intent?.status).toBe("released");
+    expect((await jobs.store.get("job-cancelled"))?.settlement).toEqual({ chargedMicro: 0, stoppedPiece: false });
+    // The platform hears of the cancelled job, with nothing paid and nothing charged.
+    await vi.waitFor(() => expect(terminal).toHaveBeenCalledTimes(1));
+    expect(terminal.mock.calls[0]?.[0]).toMatchObject({
+      jobId: "job-cancelled", outcome: "cancelled", endedBy: "caller", paid: false, chargedMicro: 0, currency: null, stoppedPiece: false,
+    });
+    jobs.shutdown();
+  });
+
   it("never settles a job that outlives its runtime bound", async () => {
     const r = rig();
     let aborted = false;

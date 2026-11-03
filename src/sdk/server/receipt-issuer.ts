@@ -6,6 +6,7 @@ import type {
   FundingReceipt,
   JobReceipt,
   ReceiptCredit,
+  ReceiptSettlement,
   ReceiptOutcome,
   UnsignedJobReceipt,
 } from "../../lib/receipt";
@@ -51,15 +52,17 @@ export class ReceiptIssuer {
    * seq is store-allocated; issuedAt is epoch seconds. Free jobs also consume a
    * sequence and attest their outcome. Timing/attribution comes from the committed
    * terminal row; legacy rows omit unknown historical fields. credit is present
-   * only for a resolved ledger draw. `unpaid` attests a completed job whose
-   * admitted payment was never collected, so `paid` reports none.
+   * only for a resolved ledger draw, with `settlement` saying how it settled by the piece.
+   * `unpaid` attests a completed job whose admitted payment was never collected, so `paid`
+   * reports none.
    */
   issue(
     record: JobRecord,
     seq: number,
     issuedAt?: number,
     credit?: ReceiptCredit,
-    unpaid = false
+    unpaid = false,
+    settlement?: ReceiptSettlement
   ): JobReceipt {
     const unsigned: UnsignedJobReceipt = {
       v: 1,
@@ -93,6 +96,7 @@ export class ReceiptIssuer {
       result_hash: resultHashFor(record),
       receipt_pubkey: this.pubkey,
       ...(credit && { credit }),
+      ...(credit && settlement && { settlement }),
     };
     return signReceipt(unsigned, this.secret);
   }
