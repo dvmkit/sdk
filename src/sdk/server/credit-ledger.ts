@@ -2870,7 +2870,7 @@ export class CreditLedger {
     const { rows } = await (args.tx ?? this.pool).query<{ card_refund: CardRefundPlan | null }>(
       `UPDATE credit_drains SET card_refund = $3
         WHERE credit_id = $1 AND drain_id = $2 AND method = 'stripe' AND status = 'pending'
-          AND ($4::boolean IS FALSE OR card_refund IS NULL)
+          AND ($4::boolean IS FALSE OR card_refund IS NULL OR card_refund = 'null'::jsonb)
           AND COALESCE((card_recovery->>'revision')::integer, 0) = $5
         RETURNING card_refund`,
       [args.creditId, args.drainId, JSON.stringify(args.plan), args.onlyIfUnset === true, args.revision ?? 0]
@@ -2908,7 +2908,7 @@ export class CreditLedger {
         WHERE credit_id=$1 AND drain_id=$2 AND method='stripe' AND status=$7
           AND COALESCE((card_recovery->>'revision')::integer, 0)=$8 RETURNING *`,
       [args.creditId, args.drainId, args.status, JSON.stringify(args.recovery),
-        args.plan !== undefined, JSON.stringify(args.plan ?? null), args.expectedStatus, args.expectedRevision]);
+        args.plan !== undefined, args.plan ? JSON.stringify(args.plan) : null, args.expectedStatus, args.expectedRevision]);
     if (!rows[0]) throw new CreditLedgerError("drain_decision_conflict", "The card drain changed before this decision committed.");
     return this.rejoin(q, rows[0]);
   }

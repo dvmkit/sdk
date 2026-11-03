@@ -447,6 +447,21 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     } finally { await single.end(); }
   });
 
+  it.each([
+    ["sql-null", null], ["json-null", "null"],
+  ])("plans and completes a refund whose saved plan is %s", async (suffix, storedPlan) => {
+    const account = fakeStripeAccount();
+    const creditId = `empty-plan-${suffix}`;
+    const pi = `pi_empty_${suffix}`;
+    await cardCredit(account, { creditId, pi, cents: 200, expiryMs: Date.now() + HOUR_MS });
+    const { drain: requested } = await ledger.requestDrain({ creditId, drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    await db.query("UPDATE credit_drains SET card_refund=$3::jsonb WHERE credit_id=$1 AND drain_id=$2", [creditId, "d", storedPlan]);
+    const result = await runStripeDrain({ ledger, stripe: stripeApi(account), drainReport: {} }, requested);
+    expect(result).toMatchObject({ completed: true, drain: { status: "sent", sentRef: { refunded_cents: 164 } } });
+    expect([...account.refunds.values()].map((refund) => [refund.payment_intent, refund.amount])).toEqual([[pi, 164]]);
+    expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 0 });
+  });
+
   it("lets expiry refund remaining released holds after a blocked drain is written off", async () => {
     const account = fakeStripeAccount();
     const now = Date.now();
@@ -514,7 +529,9 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     const recipe = readFileSync(new URL("../../../../recipes/postgres/financial-export-v1.sql", import.meta.url), "utf8");
     const client = await db.connect();
     try {
-      const results = await client.query(recipe) as unknown as import("pg").QueryResult[];
+      const begin = recipe.indexOf("BEGIN TRANSACTION");
+      await client.query(recipe.slice(0, begin));
+      const results = await client.query(recipe.slice(begin)) as unknown as import("pg").QueryResult[];
       const exported = results.find((result) => result.rows?.[0]?.jsonb_build_object)?.rows[0].jsonb_build_object;
       expect(exported.drains).toContainEqual(expect.objectContaining({ credit_id: "export-close", status: "written_off",
         card_recovery: { revision: 0, blockedAt: expect.any(Number), blockedReason: "charges_exhausted", refundedGrossMicro: 0,
