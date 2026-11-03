@@ -4,6 +4,8 @@ import { join, resolve } from "node:path";
 
 import ts from "typescript";
 
+import { inspectDeclaration, publicEntryPoints, readStability } from "./api-surface.mjs";
+
 const root = resolve(import.meta.dirname, "..");
 const outputPath = join(root, "docs", "API.md");
 const mode = process.argv[2];
@@ -12,7 +14,6 @@ if (mode !== "--check" && mode !== "--write") {
 }
 
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-const publicEntryPoints = [".", "./server", "./testing"];
 const sections = publicEntryPoints.map((entryPoint) => inspectEntry(entryPoint));
 const generated = render(sections);
 
@@ -37,25 +38,13 @@ if (mode === "--write") {
 function inspectEntry(entryPoint) {
   const target = manifest.exports?.[entryPoint];
   if (!target?.types) fail(`package.json is missing declarations for ${entryPoint}`);
-  const declarationPath = join(root, target.types);
-  const program = ts.createProgram({
-    rootNames: [declarationPath],
-    options: {
-      module: ts.ModuleKind.ESNext,
-      moduleResolution: ts.ModuleResolutionKind.Bundler,
-      skipLibCheck: true,
-      target: ts.ScriptTarget.ES2024,
-    },
+  const { checker, symbols: exported } = inspectDeclaration(root, target.types);
+  const levels = readStability(root, entryPoint);
+  const symbols = exported.map((symbol) => {
+    const stability = levels.get(symbol.getName());
+    if (!stability) fail(`${entryPoint}:${symbol.getName()} is missing stability`);
+    return { ...describeSymbol(symbol, checker), stability };
   });
-  const checker = program.getTypeChecker();
-  const source = program.getSourceFile(declarationPath);
-  const moduleSymbol = source && checker.getSymbolAtLocation(source);
-  if (!moduleSymbol) fail(`could not inspect ${target.types}`);
-
-  const symbols = checker
-    .getExportsOfModule(moduleSymbol)
-    .map((exported) => describeSymbol(exported, checker))
-    .sort((left, right) => left.name.localeCompare(right.name));
   return { entryPoint, declaration: target.types, symbols };
 }
 
@@ -99,7 +88,7 @@ function cleanDocumentation(raw) {
   return firstSentence.replace(/\|/gu, "\\|");
 }
 
-/** @param {{ entryPoint: string, declaration: string, symbols: { name: string, kind: string, documentation: string }[] }[]} sections */
+/** @param {{ entryPoint: string, declaration: string, symbols: { name: string, kind: string, documentation: string, stability: string }[] }[]} sections */
 function render(sections) {
   const count = sections.reduce((sum, section) => sum + section.symbols.length, 0);
   const lines = [
@@ -109,15 +98,17 @@ function render(sections) {
     "",
     `This reference is generated from the built TypeScript declarations and covers ${count} names across the three supported public entry points. Run \`npm run build && npm run docs:api\` to refresh it; \`npm run check:api\` rejects stale output.`,
     "",
+    "Stability levels follow the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning).",
+    "",
   ];
 
   for (const section of sections) {
     const specifier = `@dvmkit/sdk${section.entryPoint === "." ? "" : section.entryPoint.slice(1)}`;
     lines.push(`## \`${specifier}\``, "");
     lines.push(`${entryPointGuidance(section.entryPoint)} Generated from \`${section.declaration}\`.`, "");
-    lines.push("| Name | Kind | Guidance |", "| --- | --- | --- |");
+    lines.push("| Name | Kind | Stability | Guidance |", "| --- | --- | --- | --- |");
     for (const symbol of section.symbols) {
-      lines.push(`| \`${symbol.name}\` | ${symbol.kind} | ${symbol.documentation} |`);
+      lines.push(`| \`${symbol.name}\` | ${symbol.kind} | ${symbol.stability} | ${symbol.documentation} |`);
     }
     lines.push("");
   }

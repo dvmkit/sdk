@@ -1,8 +1,14 @@
+/** @stability stable */
 export type { UpfrontPayment } from "../lib/upfront-payment";
+/** @stability stable */
 export { configureDVM, isConfiguredDVMDescriptor } from "./configure";
+/** @stability stable */
 export { envFlag } from "./env";
+/** @stability stable */
 export type { ProgressHeartbeatOpts } from "./heartbeat";
+/** @stability stable */
 export { withProgressHeartbeat } from "./heartbeat";
+/** @stability stable */
 export type {
   CreateFxFetcherOpts,
   Currency,
@@ -13,6 +19,7 @@ export type {
   PlatformFxSource,
   Upfront,
 } from "./pricing/index";
+/** @stability stable */
 export {
   buildUpfront,
   createFxFetcher,
@@ -31,7 +38,9 @@ export {
   UnsupportedCurrencyError,
   validateCurrency,
 } from "./pricing/index";
+/** @stability stable */
 export type { JobRecord, JobStatus, JobStore } from "./server/job-store";
+/** @stability stable */
 export type {
   ApprovalContent,
   ArtifactContent,
@@ -65,6 +74,7 @@ export type {
   CompleteOpts,
   ZodLike,
 } from "./types";
+/** @stability stable */
 export {
   DEFAULT_CREDIT_MAX,
   DEFAULT_CREDIT_MIN,
@@ -75,16 +85,19 @@ export {
 // Signing primitives — re-exported from the server entry so builders can
 // `import { createSignedRequestVerifier } from "@dvmkit/sdk"` without reaching
 // into the `/server` sub-path.
+/** @stability stable */
 export type {
   SignedRequestAudience,
   SignedRequestDomain,
   SignedRequestStatementHeader,
 } from "../lib/signed-request-statement";
+/** @stability stable */
 export {
   SIGNED_REQUEST_AUTH_ID,
   SIGNED_REQUEST_STATEMENT_VERSION,
   signedRequestStatementHeader,
 } from "../lib/signed-request-statement";
+/** @stability stable */
 export type {
   CanonicalEnvelope,
   CreateSignedRequestVerifierOpts,
@@ -93,12 +106,16 @@ export type {
   SignedRequestSignOpts,
   SignedRequestVerifier,
 } from "./server/signed-request";
+/** @stability stable */
 export { createSignedRequestVerifier, SignedRequestError } from "./server/signed-request";
 // SSRF guard — re-exported from the server entry so builders touching URLs in
 // their handlers can `import { assertSafeUrl } from "@dvmkit/sdk"` without
 // reaching into the `/server` sub-path.
+/** @stability stable */
 export type { PinnedFetch, SSRFGuardOpts, SSRFReason, SSRFResolver } from "./server/ssrf";
+/** @stability stable */
 export { assertSafeUrl, createPinnedFetch, SSRFError } from "./server/ssrf";
 // Re-export the SDK's own bundled zod so a builder's `input:` schema and the SDK's
 // schema handling validate against one zod instance (no dual-zod version skew).
+/** @stability stable */
 export { z } from "zod";

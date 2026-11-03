@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a single compatibility policy, per-entry-point stability levels, and a public signature gate requiring breaking-change release notes. Root and testing exports are stable; server exports are experimental. The post-trigger deprecation window spans two minor-version increments.
+
 - Terminal reports now include `heldMicro`, the original draw hold including paid mid-job pieces, and `finishedPieceCount`, which excludes a piece stopped by cancellation. Both fields are optional for compatibility with older reports; historical jobs without piece accounting omit the count. See `protocol-fixtures/piece-settlement-v1.json`.
 
 - Terminally refused card refunds now enter `refund_blocked` and stop consuming sweep retry slots. Signed admin routes `close-card-drain` and `replan-card-drain` require a decision id and reason; closing records the unpaid remainder as `written_off`, while replanning retains successful refunds and immediately retries only the remainder. Unknown or processing refunds refuse recovery. Postgres adds nullable `credit_drains.card_recovery`; the financial export retains structured refund/write-off amounts without operator free text. Custom card ledgers must implement serialized recovery and honor the supplied query connection. Clients must handle the two new drain states; see `protocol-fixtures/credit-drain-stripe-v1.json`.

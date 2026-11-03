@@ -2,11 +2,11 @@
 
 Build Digital Vending Machines: pay-per-use HTTPS services that AI agents can find, pay, and call with no account or API key.
 
-Pre-1.0 alpha: breaking changes are announced in the [release notes](./CHANGELOG.md); pin the version you install.
+Pre-1.0 alpha: pin the version you install; see the [release notes](./CHANGELOG.md) for breaking changes and the [compatibility policy](docs/PROTOCOL-NOTES.md#compatibility-and-versioning).
 
 ## Requirements
 
-Node.js 22.18 or later for the TypeScript quickstart.
+Node.js 22.18 or later for the TypeScript quickstart; see [runtime support](docs/PROTOCOL-NOTES.md#compatibility-and-versioning).
 
 ## Install
 
@@ -83,9 +83,7 @@ The files above are copied verbatim from [`examples/quickstart`](./examples/quic
 | `@dvmkit/sdk/server` | Node hosting, Postgres stores, signed-request auth, and payment infrastructure |
 | `@dvmkit/sdk/testing` | Deterministic handler contexts and in-memory stores |
 
-`@dvmkit/sdk/internal` also exists for the dvmkit platform; it has no stability promise and can change in any release.
-
-The generated [API reference](./docs/API.md) lists the supported declarations. Deep imports from `dist/` are unsupported.
+The generated [API reference](./docs/API.md) lists the supported declarations.
 
 ## Next steps
 
