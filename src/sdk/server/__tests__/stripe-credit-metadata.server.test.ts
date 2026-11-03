@@ -32,6 +32,7 @@ describe("host card-credit identity wiring", () => {
         ...(configuration === "environment" ? {
           DVMKIT_STRIPE_SECRET_KEY: "sk_test_fake",
           DVMKIT_STRIPE_NETWORK_ID: "profile_test",
+          DVMKIT_STRIPE_MIN_USD: "0.50",
         } : {}),
       },
       fx: rateFx,
