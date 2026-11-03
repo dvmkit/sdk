@@ -110,7 +110,7 @@ describe("card-credit PaymentIntent identity metadata", () => {
     } else {
       // Stop after the real rail charges, as a crash before ledger booking would.
       const legacyRail = createStripeCreditRail({
-        secretKey: "sk_test_fake", networkId: "profile_test", hmacSecret: HMAC, fetch: stripe.fetchImpl,
+        secretKey: "sk_test_fake", networkId: "profile_test", minUsd: "0.50", hmacSecret: HMAC, fetch: stripe.fetchImpl,
       });
       expect(await legacyRail.charge(credential, { amountMicro: 600_000, resourcePath: "/v1/credit" }))
         .toMatchObject({ ok: true, paymentIntentId: "pi_test_1" });
@@ -147,6 +147,7 @@ describe("card-credit PaymentIntent identity metadata", () => {
         stripeCredit: createStripeCreditRail({
           secretKey: "sk_test_fake",
           networkId: "profile_test",
+          minUsd: "0.50",
           hmacSecret: HMAC,
           fetch: fetchImpl,
         }),

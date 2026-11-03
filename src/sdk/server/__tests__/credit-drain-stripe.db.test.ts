@@ -229,6 +229,7 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
         stripeCredit: createStripeCreditRail({
           secretKey: "sk_test_fake",
           networkId: "profile_test",
+          minUsd: "0.50",
           hmacSecret: HMAC,
           apiBase: "https://stripe.invalid",
           fetch: account.fetchImpl,

@@ -144,12 +144,47 @@ describe("card-funded credit charge", () => {
     expect(await ledger.get(derivedFundCreditId(CALLER, "mismatch"))).toBeUndefined();
   });
 
-  it("refuses a top-up below $0.50 with a hint, before charging", async () => {
-    const { app, stripe } = await cardServer();
+  it("refuses a top-up below the card minimum with a hint, before charging", async () => {
+    const { app, stripe } = await cardServer({ minUsd: "0.50" });
     const response = await fund(app, { fundId: "small", amountMicro: 300_000 });
     const body = await expectExchange(response, fundFixture.refusals.below_minimum);
     expect(body.hint).toEqual(expect.stringContaining("$0.50"));
     expect(stripe!.calls).toHaveLength(0);
+  });
+
+  it("defaults the card minimum to $5, so a $1 top-up is refused before charging", async () => {
+    const { app, stripe } = await cardServer({ minUsd: null });
+    const info = await (await app.request("/v1/info")).json();
+    expect(info.credit.stripe.min_micro).toBe(5_000_000);
+    const response = await fund(app, { fundId: "one-dollar", amountMicro: 1_000_000 });
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: "below_rail_minimum", rail: "stripe", min_micro: 5_000_000 });
+    expect(body.hint).toEqual(expect.stringContaining("$5.00"));
+    expect(stripe!.calls).toHaveLength(0);
+  });
+
+  it("accepts a $1 top-up once the builder sets a $1 card minimum", async () => {
+    const { app, ledger } = await cardServer({ minUsd: "1" });
+    const info = await (await app.request("/v1/info")).json();
+    expect(info.credit.stripe.min_micro).toBe(1_000_000);
+    const credential = await credentialFor(app, "one-dollar", 1_000_000);
+    const response = await fund(app, { fundId: "one-dollar", amountMicro: 1_000_000, credential });
+    expect(response.status).toBe(200);
+    expect((await ledger.get(derivedFundCreditId(CALLER, "one-dollar")))?.balanceMicro).toBe(1_000_000);
+  });
+
+  it("still offers card when the credit maximum is under $5, with the maximum as the minimum", async () => {
+    const { app } = await cardServer({ minUsd: null, credit: { min: "$0.10", max: "$3.00" } });
+    const info = await (await app.request("/v1/info")).json();
+    expect(info.credit.funding).toContain("stripe");
+    expect(info.credit.stripe.min_micro).toBe(3_000_000);
+  });
+
+  it("refuses to boot when the builder's card minimum is above the credit maximum", async () => {
+    await expect(
+      cardServer({ minUsd: "6", credit: { min: "$0.10", max: "$5.00" } })
+    ).rejects.toThrow(/DVMKIT_STRIPE_MIN_USD.*\$0\.50 to \$5/);
   });
 
   it("refuses a declined card with a relayable hint and books nothing", async () => {

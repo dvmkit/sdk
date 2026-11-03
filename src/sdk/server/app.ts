@@ -79,6 +79,7 @@ import type {
   FundingMethod,
   KVStore,
   PaymentMethod,
+  PriceValue,
   QuoteContext,
   QuoteResult,
   ZodLike,
@@ -1110,6 +1111,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
     this.pricingCurrency = (descriptor.currency as string | undefined) ?? "usd";
     this.opts = opts;
+    assertCardMinimumWithinCreditMax(opts.stripeCredit, descriptor.credit);
     this.publicOrigin = resolvePublicOrigin(opts.env.DVMKIT_PUBLIC_URL);
     this.authAudience = this.resolveAuthAudience();
     this.x402BatchSettlement = opts.x402BatchSettlement;
@@ -2336,6 +2338,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       x402Schemes: this.creditX402Schemes(),
       lightningFundingMinSats: this.opts.lightningReceive?.fundingMinSats,
       stripeNetworkId: this.opts.stripeCredit?.networkId,
+      stripeMinMicro: this.opts.stripeCredit?.minMicro,
       // Configured, not advertised: `advertisedMints()` is health
       // filtered, and a rail that comes and goes with a mint's uptime is worse
       // product than one that is honestly absent.
@@ -5864,6 +5867,25 @@ function assertRateText(value: unknown, field: string, refuse: (detail: string) 
     refuse(
       `${field} must be a string of 1 to ${MAX_RATE_TEXT_LENGTH} characters with no leading or ` +
         `trailing whitespace (got ${JSON.stringify(value)})`
+    );
+  }
+}
+
+/**
+ * A card minimum the builder set above the credit maximum leaves no top-up a card can make, so
+ * boot refuses it. The unset default is not checked: the menu lowers it to the maximum instead.
+ */
+function assertCardMinimumWithinCreditMax(
+  rail: { minMicro?: number } | undefined,
+  credit: { max: PriceValue } | undefined
+): void {
+  if (rail?.minMicro === undefined || !credit) return;
+  const maxMicro = Math.round(parseUsdPrice(credit.max, "credit bound") * 1_000_000);
+  if (rail.minMicro > maxMicro) {
+    const usd = (micro: number) => "$" + micro / 1_000_000;
+    throw new Error(
+      "DVMKIT_STRIPE_MIN_USD (or the createStripeCreditRail minUsd option) is " + usd(rail.minMicro) +
+        ", above the credit maximum of " + usd(maxMicro) + ". Allowed range: $0.50 to " + usd(maxMicro) + "."
     );
   }
 }

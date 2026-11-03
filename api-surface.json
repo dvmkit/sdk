@@ -77,6 +77,7 @@
       ],
       "unit": "integer USD micro-units on the wire; integer cents on the MPP challenge",
       "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it",
+      "callerTerms": "CreditTerms.stripe optionally carries network_id (string), min_micro (positive safe integer USD micro-units), and currency (usd); parseCreditTerms and parseCreditMenu preserve only those fields and reject terms with a malformed stripe block",
       "paymentIntentMetadata": {
         "dvmkit_dvm_id": "server canonicalDvmId, falling back to dvmId; omitted without identity; sent on creation including declined confirmations; credential metadata cannot override it",
         "chargeContext": "StripeCreditRail.charge accepts optional canonicalDvmId supplied by the server; existing mpp_* metadata and idempotency keys are preserved",

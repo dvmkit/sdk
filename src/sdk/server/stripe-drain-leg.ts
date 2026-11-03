@@ -521,8 +521,12 @@ async function reconcileForDecision(deps: StripeDrainLegDeps, drain: CreditDrain
     }
     if (succeeded[0]) { entry.refundId = succeeded[0].id; setStatus(entry, "succeeded"); }
     else {
-      if (entry.status === "pending" || entry.status === "requires_action" ||
-        entry.status === "planned" && !["charge_not_refundable", "charge_dispute_lost", "charge_disputed"].includes(entry.lastError ?? "")) {
+      const currentRefund = matched.find((refund) => entry.refundId ? refund.id === entry.refundId :
+        refund.metadata.dvmkit_attempt === String(entry.attempt));
+      const definitivelyUnpaid = currentRefund?.status === "failed" || currentRefund?.status === "canceled";
+      // A previous attempt's failure cannot resolve a newer submission with a lost answer.
+      if (!definitivelyUnpaid && (entry.status === "pending" || entry.status === "requires_action" ||
+        entry.status === "planned" && !["charge_not_refundable", "charge_dispute_lost", "charge_disputed"].includes(entry.lastError ?? ""))) {
         throw new CreditLedgerError("card_refund_uncertain", "A refund submission has no definitive outcome. Recover its Stripe evidence before deciding.");
       }
       entry.refundId = null; entry.status = "rejected";

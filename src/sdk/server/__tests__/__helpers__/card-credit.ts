@@ -125,6 +125,9 @@ export async function cardServer(
     deposits?: CreditDepositPayload[];
     fx?: FxFetcher;
     serverOpts?: Partial<SDKServerOpts>;
+    /** The rail's card minimum. Tests default to $0.50 so small top-ups stay valid; `null` is the SDK default. */
+    minUsd?: string | null;
+    credit?: { min: string; max: string };
   } = {}
 ) {
   const stripe = opts.stripe === undefined ? fakeStripe() : opts.stripe;
@@ -135,7 +138,7 @@ export async function cardServer(
     input: jobInput,
     auth: secp256k1Auth(),
     price: "$0.10",
-    credit: { min: "$0.10", max: "$5.00" },
+    credit: opts.credit ?? { min: "$0.10", max: "$5.00" },
     onJob(ctx) {
       ctx.complete("done");
     },
@@ -155,6 +158,7 @@ export async function cardServer(
       stripeCredit: createStripeCreditRail({
         secretKey: "sk_test_fake",
         networkId: "profile_test",
+        ...(opts.minUsd !== null && { minUsd: opts.minUsd ?? "0.50" }),
         hmacSecret: HMAC,
         apiBase: "https://stripe.invalid",
         fetch: stripe.fetchImpl,
