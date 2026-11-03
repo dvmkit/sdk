@@ -375,6 +375,75 @@ async function waitForLockWaiters(pool: pg.Pool, applicationNames: string[]): Pr
     await expect(storeA.get(CHANNEL_ID)).resolves.toMatchObject({ spent: 4n, units: 1 });
   });
 
+  async function fundSession(creditId: string): Promise<void> {
+    await ledger.fund({
+      creditId,
+      callerPubkey: "ab".repeat(32),
+      currency: "usd",
+      amountMicro: 10,
+      expiryMs: Date.now() + 60_000,
+      basis: {
+        rail: "tempo",
+        paidMsats: 0,
+        nativeAmount: 10,
+        nativeAsset: "pathUSD",
+        tempoSession: { channelId: CHANNEL_ID, cumulativeAmount: "10" },
+      },
+    });
+  }
+
+  async function closeChannel(state: Partial<typeof BASE>): Promise<void> {
+    await storeA.update(CHANNEL_ID, (current) => ({
+      op: "set",
+      value: { ...(current as typeof BASE), ...state },
+      result: undefined,
+    }));
+  }
+
+  it("consumes only the settled part of a session-backed draw", async () => {
+    await fundSession("tempo-part");
+    await ledger.draw({ creditId: "tempo-part", drawId: "job", amountMicro: 4 });
+
+    await expect(ledger.resolveDraw({ creditId: "tempo-part", drawId: "job", settleMicro: 3 }))
+      .resolves.toMatchObject({ status: "settled", amountMicro: 3, availableMicro: 7, partialSettle: { releasedNative: 1 } });
+    await expect(storeA.get(CHANNEL_ID)).resolves.toMatchObject({ spent: 3n, units: 1 });
+
+    await expect(ledger.resolveDraw({ creditId: "tempo-part", drawId: "job", settleMicro: 3 }))
+      .resolves.toMatchObject({ replayed: true });
+    await expect(storeA.get(CHANNEL_ID)).resolves.toMatchObject({ spent: 3n, units: 1 });
+    await expect(ledger.get("tempo-part")).resolves.toMatchObject({ balanceMicro: 7, availableMicro: 7, nativeAvailable: 7 });
+  });
+
+  it("part-settles a hold whose channel began closing once the close covers it, consuming nothing", async () => {
+    await fundSession("tempo-part-covered");
+    await ledger.draw({ creditId: "tempo-part-covered", drawId: "job", amountMicro: 4 });
+    await closeChannel({ closeRequestedAt: 123n, settledOnChain: 10n });
+
+    await expect(ledger.resolveDraw({ creditId: "tempo-part-covered", drawId: "job", settleMicro: 1 }))
+      .resolves.toMatchObject({ status: "settled", amountMicro: 1, availableMicro: 9 });
+    await expect(storeA.get(CHANNEL_ID)).resolves.toMatchObject({ spent: 0n, units: 0 });
+    await expect(ledger.get("tempo-part-covered")).resolves.toMatchObject({ balanceMicro: 9 });
+  });
+
+  it("holds a part-settle until the close covers it, and releases the whole hold if it never does", async () => {
+    await fundSession("tempo-part-uncovered");
+    await ledger.draw({ creditId: "tempo-part-uncovered", drawId: "job", amountMicro: 4 });
+    await closeChannel({ closeRequestedAt: 123n, settledOnChain: 6n });
+
+    await expect(ledger.resolveDraw({ creditId: "tempo-part-uncovered", drawId: "job", settleMicro: 1 }))
+      .rejects.toMatchObject({ code: "tempo_settlement_pending" });
+    await expect(ledger.getDraw({ creditId: "tempo-part-uncovered", drawId: "job" }))
+      .resolves.toMatchObject({ status: "pending", amountMicro: 4 });
+
+    // Finalized short of the accepted voucher: nothing proves the settled part was collected.
+    await closeChannel({ finalized: true });
+    await expect(ledger.resolveDraw({ creditId: "tempo-part-uncovered", drawId: "job", settleMicro: 1 }))
+      .resolves.toMatchObject({ status: "released", amountMicro: 4, availableMicro: 10, replayed: false });
+    await expect(ledger.resolveDraw({ creditId: "tempo-part-uncovered", drawId: "job", settleMicro: 1 }))
+      .resolves.toMatchObject({ status: "released", replayed: true });
+    await expect(storeA.get(CHANNEL_ID)).resolves.toMatchObject({ spent: 0n, units: 0 });
+  });
+
   it("settles a covered draw during close without advancing channel consumption", async () => {
     await ledger.fund({
       creditId: "tempo-closing",

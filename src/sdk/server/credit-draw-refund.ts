@@ -26,6 +26,15 @@ export interface CreditDrawRefundResult {
   replayed: boolean;
 }
 
+/**
+ * A refund returns settled spending only. A partial settle rewrites its draw down to the settled
+ * part, so that part is what both refusals measure; the released rest is already on the credit.
+ */
+export const DRAW_NOT_SETTLED_REFUSAL =
+  "Only a settled draw, or the settled part of a partly settled draw, can be refunded.";
+export const REFUND_EXCEEDS_SETTLED_REFUSAL =
+  "The refund exceeds the draw's remaining unrefunded settled charge.";
+
 /** Omission is a stable remainder intent, distinct from an explicit equal amount. */
 export function refundRequest(args: CreditDrawRefundArgs): string {
   const id = (value: unknown): value is string => typeof value === "string" && value.length > 0;

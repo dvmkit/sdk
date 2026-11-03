@@ -174,7 +174,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `DrainConflictReason` | type | Structured drain_conflict reasons select caller instructions without matching prose. |
 | `DrawRailValue` | interface | A draw’s rail value and funding identity. |
 | `DrawRecord` | interface | Exported declaration from the built public entry point. |
-| `DrawResolution` | interface | Result of `settle` / `release` — the draw's recorded tuple plus a fresh available-balance read. |
+| `DrawResolution` | interface | Result of `settle`, `release` or `resolveDraw`: the draw's recorded tuple plus a fresh available-balance read. |
 | `DrawResult` | interface | Exported declaration from the built public entry point. |
 | `drawSettlementRef` | function | Settlement reference stamped on the revenue event of an **explicit** draw; one funding backs N draws, so the funding's own rail reference cannot key them: `revenue_events` carries a global `UNIQUE (rail, tx_hash)` that deliberately drops cross-job reuse of a settlement reference, and reusing it would silently discard every draw but the first. |
 | `DrawStatus` | type | Draw lifecycle: two-phase hold → terminal settle/release. |

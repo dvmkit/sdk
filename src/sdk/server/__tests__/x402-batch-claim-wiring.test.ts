@@ -92,58 +92,84 @@ function claimedAmounts(facilitator: FacilitatorClient): string[] {
     .flatMap((raw) => (raw.claims ?? []).map((c) => (c as { totalClaimed: string }).totalClaimed));
 }
 
-describe("the DVM's claim job reads the DVM's own credit ledger", () => {
-  it("claims the settled draws recorded by the host's ledger, not the deposit", async () => {
-    const ledger = new MemoryCreditLedger();
-    await ledger.fund({
-      creditId: "c1",
-      callerPubkey: CALLER,
-      currency: "usd",
-      amountMicro: 1_000,
-      expiryMs: Date.now() + 3_600_000,
-      basis: {
-        rail: "x402",
-        paidMsats: 1_000,
-        nativeAmount: 1_000,
-        nativeAsset: "usdc",
-        x402Channel: { channelId: CHANNEL_ID, maxClaimableAmount: "1000" },
+/** A DVM whose claim job runs every 20 ms against `ledger` and `storage`. */
+async function claimingDvm(ledger: MemoryCreditLedger, storage: InMemoryChannelStorage, facilitator: FacilitatorClient) {
+  const dvm = configureDVM({
+    name: "x402-claim-wiring",
+    capability: "do",
+    input: schema,
+    price: "$0.10",
+    onJob(ctx) {
+      ctx.complete("done");
+    },
+    auth: secp256k1Auth(),
+  });
+  return createDVMServer(dvm, {
+    env: {},
+    store: new MemoryKVStore(),
+    jobStore: new MemoryJobStore(),
+    fxFetcher: stubFx,
+    creditLedger: ledger,
+    x402: {
+      network: NETWORK,
+      payTo: PAY_TO,
+      batchSettlement: {
+        storage,
+        facilitatorClient: facilitator,
+        // Fast enough to observe inside the test; the ceiling it applies is
+        // the same one the shipped 300s cadence gets.
+        autoSettlement: { claimIntervalSecs: 0.02, settleIntervalSecs: 3_600 },
       },
+    },
+  });
+}
+
+async function channelCredit(): Promise<MemoryCreditLedger> {
+  const ledger = new MemoryCreditLedger();
+  await ledger.fund({
+    creditId: "c1",
+    callerPubkey: CALLER,
+    currency: "usd",
+    amountMicro: 1_000,
+    expiryMs: Date.now() + 3_600_000,
+    basis: {
+      rail: "x402",
+      paidMsats: 1_000,
+      nativeAmount: 1_000,
+      nativeAsset: "usdc",
+      x402Channel: { channelId: CHANNEL_ID, maxClaimableAmount: "1000" },
+    },
+  });
+  return ledger;
+}
+
+describe("the DVM's claim job reads the DVM's own credit ledger", () => {
+  it("claims only the settled part of a partly settled draw", async () => {
+    const ledger = await channelCredit();
+    await ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: 1_000 });
+    await ledger.resolveDraw({ creditId: "c1", drawId: "d1", settleMicro: 600 });
+
+    const storage = new InMemoryChannelStorage();
+    await storage.updateChannel(CHANNEL_ID, () => fundedChannel());
+    const facilitator = claimingFacilitator();
+    const { shutdown } = await claimingDvm(ledger, storage, facilitator);
+
+    await vi.waitFor(() => {
+      expect(claimedAmounts(facilitator)).toEqual(["600"]);
     });
+    expect(await storage.get(CHANNEL_ID)).toMatchObject({ chargedCumulativeAmount: "1000", totalClaimed: "600" });
+    await shutdown();
+  });
+
+  it("claims the settled draws recorded by the host's ledger, not the deposit", async () => {
+    const ledger = await channelCredit();
     await ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: 400 });
     await ledger.settle({ creditId: "c1", drawId: "d1" });
 
     const storage = new InMemoryChannelStorage();
     await storage.updateChannel(CHANNEL_ID, () => fundedChannel());
     const facilitator = claimingFacilitator();
-
-    const dvm = configureDVM({
-      name: "x402-claim-wiring",
-      capability: "do",
-      input: schema,
-      price: "$0.10",
-      onJob(ctx) {
-        ctx.complete("done");
-      },
-      auth: secp256k1Auth(),
-    });
-    const { shutdown } = await createDVMServer(dvm, {
-      env: {},
-      store: new MemoryKVStore(),
-      jobStore: new MemoryJobStore(),
-      fxFetcher: stubFx,
-      creditLedger: ledger,
-      x402: {
-        network: NETWORK,
-        payTo: PAY_TO,
-        batchSettlement: {
-          storage,
-          facilitatorClient: facilitator,
-          // Fast enough to observe inside the test; the ceiling it applies is
-          // the same one the shipped 300s cadence gets.
-          autoSettlement: { claimIntervalSecs: 0.02, settleIntervalSecs: 3_600 },
-        },
-      },
-    });
+    const { shutdown } = await claimingDvm(ledger, storage, facilitator);
 
     await vi.waitFor(() => {
       expect(claimedAmounts(facilitator)).toEqual(["400"]);

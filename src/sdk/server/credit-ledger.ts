@@ -18,7 +18,15 @@ import {
   netOwedSats,
   type NonChannelBitcoinRail,
 } from "./credit-lots";
-import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
+import {
+  DRAW_NOT_SETTLED_REFUSAL,
+  REFUND_EXCEEDS_SETTLED_REFUSAL,
+  refundAssetDelta,
+  refundRequest,
+  type CreditDrawRefundArgs,
+  type CreditDrawRefundResult,
+} from "./credit-draw-refund";
+import { assertSettleMicro, type DrawSettleRequest, planDrawResolution, settledShare } from "./credit-draw-resolution";
 import { withSdkInitLock } from "./init-lock";
 import { parseStoreValue } from "./store-json";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
@@ -273,8 +281,8 @@ export class CreditLedger {
     // by nothing, and the preflight refuses to cap a job it has no ask total
     // for anyway.
     // what `allocateDrawValue` stamped on this draw when the payment
-    // landed, kept only where the settle's FIFO re-price later moved
-    // `draw_msats` off it. NULL is the whole of history and every row that was
+    // landed, kept only where the settle's FIFO re-price, or a partial settle,
+    // later moved `draw_msats` off it. NULL is the whole of history and every row that was
     // never re-priced — there `draw_msats` *is* the allocation, so a backfill
     // would write the column it already reads. It exists because the job row's
     // `paid_msats` can carry legs the draw never absorbed (a cross-rail
@@ -558,6 +566,12 @@ export class CreditLedger {
       `CREATE INDEX IF NOT EXISTS idx_credit_expiry_releases_open
          ON credit_expiry_releases(credit_id) WHERE reversed_at IS NULL;`
     );
+    // A partial settle rewrites the draw down to its settled part. These keep the hold it
+    // replaced and what went back to the credit; NULL on every draw resolved whole.
+    await this.pool.query(`ALTER TABLE credit_draws
+      ADD COLUMN IF NOT EXISTS held_micro BIGINT,
+      ADD COLUMN IF NOT EXISTS released_micro BIGINT,
+      ADD COLUMN IF NOT EXISTS released_native BIGINT`);
   }
 
   /**
@@ -1073,12 +1087,14 @@ export class CreditLedger {
       const existing = await this.readDraw(client, args.creditId, args.drawId);
       if (existing) {
         const recordedJobId = existing.job_id ?? null;
-        if (toSafeInt(existing.amount_micro) !== args.amountMicro || recordedJobId !== jobId) {
+        // A partial settle rewrote amount_micro; the placement being replayed was the hold.
+        const holdMicro = toSafeInt(existing.held_micro ?? existing.amount_micro);
+        if (holdMicro !== args.amountMicro || recordedJobId !== jobId) {
           throw new CreditLedgerError(
             "draw_conflict",
             `draw ${args.drawId} on credit ${args.creditId} was recorded with different parameters`,
             {
-              expectedAmountMicro: toSafeInt(existing.amount_micro),
+              expectedAmountMicro: holdMicro,
               expectedJobId: recordedJobId,
             }
           );
@@ -1471,7 +1487,7 @@ export class CreditLedger {
         throw new CreditLedgerError("draw_not_found", "No draw with proven ownership matches this DVM.");
       }
       if (draw.status !== "settled") {
-        throw new CreditLedgerError("draw_not_completed", "Only a settled completed draw can be refunded.");
+        throw new CreditLedgerError("draw_not_completed", DRAW_NOT_SETTLED_REFUSAL);
       }
       const nowMs = args.nowMs ?? Date.now();
       // A partial drain retaining pending holds did not close the credit. A later positive
@@ -1504,7 +1520,7 @@ export class CreditLedger {
       const originalMicro = toSafeInt(draw.amount_micro);
       const amountMicro = args.amountMicro ?? originalMicro - before;
       if (amountMicro <= 0 || amountMicro > originalMicro - before) {
-        throw new CreditLedgerError("refund_exceeds_draw", "The refund exceeds the draw's remaining unrefunded charge.");
+        throw new CreditLedgerError("refund_exceeds_draw", REFUND_EXCEEDS_SETTLED_REFUSAL);
       }
       const after = before + amountMicro;
       if (!isFundingRail(credit.rail)) {
@@ -1569,7 +1585,8 @@ export class CreditLedger {
    * receipt chain countersigns. Idempotent: settling a settled draw returns
    * the original tuple. A released draw cannot be settled
    * (`invalid_draw_state`) — release-then-settle would debit money the caller
-   * was already told is theirs again.
+   * was already told is theirs again. Neither can a partly settled one: it
+   * already charged a different figure.
    *
    * Deliberately **no expiry check** here (nor on `release`): a job accepted
    * pre-expiry routinely reaches its terminal post-expiry, and refusing would
@@ -1581,13 +1598,64 @@ export class CreditLedger {
     releaseOutbox?: CreditDrawReleaseOutbox;
     nowMs?: number;
   }): Promise<DrawResolution> {
-    if (!this.tempoSessionStore) return this.resolveDraw({ ...args, to: "settled" });
+    return this.resolveTerminal(args, "hold");
+  }
+
+  /**
+   * Release a pending draw: the hold evaporates, the balance is untouched —
+   * this is how "no debit on job failure" is mechanically real (the credit lifecycle contract).
+   * Idempotent: releasing a released draw returns the original tuple. A
+   * settled draw cannot be released (`invalid_draw_state`) — un-settling
+   * booked revenue is a reconciliation problem, not a ledger verb.
+   */
+  async release(args: {
+    creditId: string;
+    drawId: string;
+    releaseOutbox?: CreditDrawReleaseOutbox;
+    nowMs?: number;
+  }): Promise<DrawResolution> {
+    return this.resolveTerminal(args, 0);
+  }
+
+  /**
+   * Settle `settleMicro` of a pending draw and release the rest, in one terminal step under
+   * the credit lock. Zero is `release`; the whole hold is `settle`. Between them the draw row
+   * is rewritten down to the settled part (amount, balance-after, rail value), the hold and
+   * the released remainder are kept beside it, and only the settled part debits the balance,
+   * depletes funding lots (oldest first) and consumes a Tempo channel. Everything that charges
+   * money off a settled draw then charges the settled part alone.
+   *
+   * `settleMicro` is micro-units of the draw's currency: a safe integer from zero to the hold.
+   * A replay with the recorded figure changes nothing; a different figure is
+   * `invalid_draw_state`. A frozen card credit still resolves, like `settle` and `release`.
+   */
+  async resolveDraw(args: {
+    creditId: string;
+    drawId: string;
+    settleMicro: number;
+    releaseOutbox?: CreditDrawReleaseOutbox;
+    nowMs?: number;
+  }): Promise<DrawResolution> {
+    assertSettleMicro(args.settleMicro);
+    return this.resolveTerminal(args, args.settleMicro);
+  }
+
+  /**
+   * A settle on a Tempo session credit runs under the channel row, ahead of the credit lock,
+   * so the channel consumes exactly what the ledger settles. A release consumes nothing and
+   * takes the credit lock alone.
+   */
+  private async resolveTerminal(
+    args: { creditId: string; drawId: string; releaseOutbox?: CreditDrawReleaseOutbox; nowMs?: number },
+    request: DrawSettleRequest
+  ): Promise<DrawResolution> {
+    if (request === 0 || !this.tempoSessionStore) return this.resolveUnderCreditLock({ ...args, request });
     const { rows } = await this.pool.query<{ tempo_channel_id: string | null }>(
       `SELECT tempo_channel_id FROM credits WHERE credit_id = $1`,
       [args.creditId]
     );
     const channelId = rows[0]?.tempo_channel_id;
-    if (!channelId) return this.resolveDraw({ ...args, to: "settled" });
+    if (!channelId) return this.resolveUnderCreditLock({ ...args, request });
 
     return this.tempoSessionStore.withTerminalConsumption(channelId, async (tx, lifecycle) => {
       const credit = await this.lockCreditRow(tx, args.creditId);
@@ -1598,22 +1666,18 @@ export class CreditLedger {
           `draw ${args.drawId} not found on credit ${args.creditId}`
         );
       }
-      const drawNative = draw.draw_native === null ? null : BigInt(draw.draw_native);
-      if (drawNative === null) {
+      if (draw.draw_native === null) {
         throw new CreditLedgerError(
           "invalid_basis",
           `Tempo session draw ${args.drawId} has no native value to consume`
         );
       }
       if (draw.status === "settled") {
-        const value = await this.resolveDrawLocked(tx, credit, { ...args, to: "settled" });
-        return { value, amount: drawNative, consume: false };
+        const value = await this.resolveDrawLocked(tx, credit, { ...args, request });
+        return { value, amount: 0n, consume: false };
       }
       if (credit.status === "unbacked") {
-        const value = await this.resolveDrawLocked(tx, credit, {
-          ...args,
-          to: "released",
-        });
+        const value = await this.resolveDrawLocked(tx, credit, { ...args, request: 0 });
         return { value, amount: 0n, consume: false };
       }
       const closing = lifecycle.finalized || lifecycle.closeRequestedAt !== 0n;
@@ -1630,35 +1694,18 @@ export class CreditLedger {
             `Tempo channel settlement has not yet covered draw ${args.drawId}`
           );
         }
-        const value = await this.resolveDrawLocked(tx, credit, {
-          ...args,
-          to: "released",
-        });
+        const value = await this.resolveDrawLocked(tx, credit, { ...args, request: 0 });
         return { value, amount: 0n, consume: false };
       }
-      const value = await this.resolveDrawLocked(tx, credit, { ...args, to: "settled" });
+      const value = await this.resolveDrawLocked(tx, credit, { ...args, request });
+      // The resolved row carries the settled part's native value, so a partial settle
+      // consumes that part of the voucher and leaves the released rest unspent.
       return {
         value,
-        amount: drawNative,
+        amount: BigInt(value.railValue.drawNative ?? 0),
         consume: !closing && !value.replayed,
       };
     });
-  }
-
-  /**
-   * Release a pending draw: the hold evaporates, the balance is untouched —
-   * this is how "no debit on job failure" is mechanically real (the credit lifecycle contract).
-   * Idempotent: releasing a released draw returns the original tuple. A
-   * settled draw cannot be released (`invalid_draw_state`) — un-settling
-   * booked revenue is a reconciliation problem, not a ledger verb.
-   */
-  async release(args: {
-    creditId: string;
-    drawId: string;
-    releaseOutbox?: CreditDrawReleaseOutbox;
-    nowMs?: number;
-  }): Promise<DrawResolution> {
-    return this.resolveDraw({ ...args, to: "released" });
   }
 
   /**
@@ -3631,18 +3678,13 @@ export class CreditLedger {
     }
   }
 
-  private async resolveDraw(args: {
+  private async resolveUnderCreditLock(args: {
     creditId: string;
     drawId: string;
-    to: "settled" | "released";
+    request: DrawSettleRequest;
     releaseOutbox?: CreditDrawReleaseOutbox;
-    tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<DrawResolution> {
-    if (args.tx) {
-      const credit = await this.lockCreditRow(args.tx, args.creditId);
-      return this.resolveDrawLocked(args.tx, credit, args);
-    }
     return this.withCreditLock(args.creditId, (client, credit) =>
       this.resolveDrawLocked(client, credit, args)
     );
@@ -3654,7 +3696,7 @@ export class CreditLedger {
     args: {
       creditId: string;
       drawId: string;
-      to: "settled" | "released";
+      request: DrawSettleRequest;
       releaseOutbox?: CreditDrawReleaseOutbox;
       nowMs?: number;
     }
@@ -3667,43 +3709,67 @@ export class CreditLedger {
         `draw ${args.drawId} not found on credit ${args.creditId}`
       );
     }
+    const plan = planDrawResolution(
+      {
+        drawId: args.drawId,
+        status: draw.status,
+        amountMicro: toSafeInt(draw.amount_micro),
+        heldMicro: draw.held_micro === null || draw.held_micro === undefined ? null : toSafeInt(draw.held_micro),
+      },
+      args.request
+    );
     let balanceMicro = toSafeInt(credit.balance_micro);
-    let replayed = false;
-    if (draw.status === args.to) {
-      replayed = true;
-    } else if (draw.status !== "pending") {
-      throw new CreditLedgerError(
-        "invalid_draw_state",
-        `cannot ${args.to === "settled" ? "settle" : "release"} draw ${args.drawId}: status is ${draw.status}`,
-        { currentStatus: draw.status }
-      );
-    } else {
+    if (!plan.replay) {
       await client.query(
         `UPDATE credit_draws SET status = $3, resolved_at = $4
            WHERE credit_id = $1 AND draw_id = $2`,
-        [args.creditId, args.drawId, args.to, nowMs]
+        [args.creditId, args.drawId, plan.status, nowMs]
       );
-      if (args.to === "settled") {
-        const amountMicro = toSafeInt(draw.amount_micro);
-        balanceMicro -= amountMicro;
+      if (plan.status === "settled") {
+        const holdMicro = toSafeInt(draw.amount_micro);
+        const settleMicro = plan.settleMicro;
+        balanceMicro -= settleMicro;
         // FIFO lot depletion determines a non-channel Bitcoin draw’s settled sats value,
         // replacing its pooled hold forecast. Preserve that forecast as allocated_msats so
         // revenue adjusts only the draw component of a job’s paid_msats. Channels and
-        // basisless lots keep the pooled allocation; zero is a real superseded forecast, not
-        // absence.
+        // basisless lots keep the pooled allocation, scaled to the settled part; zero is a
+        // real superseded forecast, not absence.
         const forecastMsats = toSafeInt(draw.draw_msats);
-        let settledMsats = forecastMsats;
+        const holdNative = draw.draw_native === null ? null : toSafeInt(draw.draw_native);
+        const settledNative = holdNative === null ? null : settledShare(holdNative, settleMicro, holdMicro);
+        let settledMsats = settledShare(forecastMsats, settleMicro, holdMicro);
         if (isNonChannelBitcoinRail(credit.rail)) {
-          const depletion = depleteLots(await this.openLots(client, args.creditId), amountMicro);
-          const inKindMsats = inKindDrawMsats(depletion, amountMicro);
-          settledMsats = inKindMsats ?? forecastMsats;
+          const depletion = depleteLots(await this.openLots(client, args.creditId), settleMicro);
+          const inKindMsats = inKindDrawMsats(depletion, settleMicro);
+          settledMsats = inKindMsats ?? settledMsats;
           await client.query(`UPDATE credit_draws SET settled_sats = $3
             WHERE credit_id = $1 AND draw_id = $2`,
             [args.creditId, args.drawId, inKindMsats === null ? null : inKindMsats / 1000]);
           await this.applyLotDebits(client, depletion.debits, -1);
         }
+        if (plan.partial) {
+          // The row now reads as if the settled part had been the whole hold: the released
+          // remainder is back in available balance at this draw's sequence.
+          const releasedMicro = holdMicro - settleMicro;
+          const releasedNative = holdNative === null ? null : holdNative - (settledNative ?? 0);
+          const balanceAfterMicro = toSafeInt(toSafeInt(draw.balance_after_micro) + releasedMicro);
+          await client.query(
+            `UPDATE credit_draws
+                SET amount_micro = $3, balance_after_micro = $4, draw_native = $5,
+                    held_micro = $6, released_micro = $7, released_native = $8
+              WHERE credit_id = $1 AND draw_id = $2`,
+            [args.creditId, args.drawId, settleMicro, balanceAfterMicro, settledNative,
+              holdMicro, releasedMicro, releasedNative]
+          );
+          draw.amount_micro = String(settleMicro);
+          draw.balance_after_micro = String(balanceAfterMicro);
+          draw.draw_native = settledNative === null ? null : String(settledNative);
+          draw.held_micro = String(holdMicro);
+          draw.released_micro = String(releasedMicro);
+          draw.released_native = releasedNative === null ? null : String(releasedNative);
+        }
         if (settledMsats !== forecastMsats) {
-          // Write allocated_msats only when repricing changes the value. NULL continues to
+          // Write allocated_msats only when settling changes the value. NULL continues to
           // mean draw_msats is the original allocation.
           await client.query(
             `UPDATE credit_draws SET draw_msats = $3, allocated_msats = $4
@@ -3719,7 +3785,9 @@ export class CreditLedger {
         // Bitcoin credit whose earlier draws consumed a cheaper lot than the
         // pooled forecast predicted. `draw_native` is untouched by the
         // re-price: neither Cashu nor Lightning reports a native amount, so
-        // both remainders are NULL on every rail that carries lots.
+        // both remainders are NULL on every rail that carries lots. A partial
+        // settle's released rail value stays in both remainders with its
+        // released micro.
         await client.query(
           `UPDATE credits
                SET balance_micro    = $2,
@@ -3727,7 +3795,7 @@ export class CreditLedger {
                    native_remaining = CASE WHEN native_remaining IS NULL THEN NULL
                                            ELSE GREATEST(native_remaining - $4, 0) END
              WHERE credit_id = $1`,
-          [args.creditId, balanceMicro, settledMsats, Number(draw.draw_native ?? 0)]
+          [args.creditId, balanceMicro, settledMsats, settledNative ?? 0]
         );
       }
     }
@@ -3737,12 +3805,14 @@ export class CreditLedger {
         : balanceMicro - (await this.pendingSums(client, args.creditId)).micro;
     const resolution: DrawResolution = {
       ...drawResultFromRow(draw, credit),
-      status: args.to,
-      replayed,
+      status: plan.status,
+      replayed: plan.replay,
       availableMicro,
-      resolvedAt: draw.status === "pending" ? nowMs : Number(draw.resolved_at ?? nowMs),
+      resolvedAt: plan.replay ? Number(draw.resolved_at ?? nowMs) : nowMs,
     };
-    if (!replayed && args.to === "released" && resolution.amountMicro > 0 && args.releaseOutbox) {
+    // A whole release reports its hold. The remainder a partial settle releases is not
+    // reported: the release report is keyed by draw, and this draw is also settled revenue.
+    if (!plan.replay && plan.status === "released" && resolution.amountMicro > 0 && args.releaseOutbox) {
       await args.releaseOutbox.enqueue(client, {
         dvmId: args.releaseOutbox.dvmId,
         creditId: resolution.creditId,
@@ -4027,6 +4097,19 @@ export interface CreditLedgerLike {
   release(args: {
     creditId: string;
     drawId: string;
+    releaseOutbox?: CreditDrawReleaseOutbox;
+    nowMs?: number;
+  }): Promise<DrawResolution>;
+  /**
+   * Settle part of a pending draw and release the rest in one terminal step. See
+   * {@link CreditLedger.resolveDraw}. Optional so existing custom ledgers keep compiling;
+   * without it a draw can only settle or release whole.
+   */
+  resolveDraw?(args: {
+    creditId: string;
+    drawId: string;
+    /** Micro-units of the draw's currency to charge, from zero (a release) to the whole hold. */
+    settleMicro: number;
     releaseOutbox?: CreditDrawReleaseOutbox;
     nowMs?: number;
   }): Promise<DrawResolution>;
@@ -4657,6 +4740,19 @@ export interface DrawResult {
   railValue: DrawRailValue;
   /** When the draw reached its terminal state; `null` while pending. */
   resolvedAt: number | null;
+  /**
+   * Present only on a draw settled for less than its hold. `amountMicro`, `balanceAfterMicro`
+   * and `railValue` then describe the settled part as if it had been the hold; this keeps the
+   * hold it replaced and what went back to the credit.
+   */
+  partialSettle?: {
+    /** The hold the draw carried when it was resolved, including mid-job growth. */
+    heldMicro: number;
+    /** `heldMicro` less the settled `amountMicro`, now available to the caller again. */
+    releasedMicro: number;
+    /** Rail-native value released with it; `null` when the rail reports none. */
+    releasedNative: number | null;
+  };
 }
 
 /**
@@ -4707,7 +4803,7 @@ export interface GrownDrawResult extends DrawResult {
   cappedMicro: number;
 }
 
-/** Result of `settle` / `release` — the draw's recorded tuple plus a fresh available-balance read. */
+/** Result of `settle`, `release` or `resolveDraw`: the draw's recorded tuple plus a fresh available-balance read. */
 export interface DrawResolution extends DrawResult {
   /** Available balance after this resolution, read under the same lock. */
   availableMicro: number;
@@ -5117,6 +5213,8 @@ export interface CreditLedgerErrorDetails {
   expiryMs?: number;
   /** On `invalid_draw_state`: the draw's actual status. */
   currentStatus?: DrawStatus;
+  /** On `invalid_draw_state` from a resolution: what the draw already settled, 0 when released. */
+  settledMicro?: number;
   /** On `draw_conflict`: the amount the draw was originally recorded with. */
   expectedAmountMicro?: number;
   /** On `draw_conflict`: the job the draw was originally recorded for. */
@@ -5333,6 +5431,10 @@ interface DrawRow {
   allocated_msats: string | null;
   settled_sats: string | null;
   refund_dvm_id: string | null;
+  /** Set together, and only, by a partial settle. */
+  held_micro?: string | null;
+  released_micro?: string | null;
+  released_native?: string | null;
 }
 
 interface FundingRow {
@@ -5548,6 +5650,14 @@ function drawResultFromRow(
     replayed: false,
     railValue: railValueFromRow(row, basis),
     resolvedAt: row.resolved_at === null ? null : toSafeInt(row.resolved_at),
+    ...(typeof row.held_micro === "string" && {
+      partialSettle: {
+        heldMicro: toSafeInt(row.held_micro),
+        releasedMicro: toSafeInt(row.released_micro ?? 0),
+        releasedNative:
+          typeof row.released_native === "string" ? toSafeInt(row.released_native) : null,
+      },
+    }),
   };
 }
 

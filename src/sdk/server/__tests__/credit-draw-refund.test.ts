@@ -31,6 +31,17 @@ describe("development completed draw refund parity", () => {
     await expect(ledger.refundDraw({ jobId: "job-d", refundId: "excess", outbox, nowMs })).rejects.toMatchObject({ code: "refund_exceeds_draw" });
   });
 
+  it("refunds no more than the settled part of a partly settled draw", async () => {
+    const ledger = new MemoryCreditLedger();
+    await fund(ledger);
+    await ledger.draw({ creditId: "c", drawId: "d", amountMicro: 1_000, jobId: "job-d", nowMs });
+    await ledger.resolveDraw({ creditId: "c", drawId: "d", settleMicro: 600, nowMs });
+    await expect(ledger.refundDraw({ jobId: "job-d", refundId: "over", amountMicro: 601, outbox, nowMs }))
+      .rejects.toMatchObject({ code: "refund_exceeds_draw" });
+    expect(await ledger.refundDraw({ jobId: "job-d", refundId: "rest", outbox, nowMs }))
+      .toMatchObject({ amountMicro: 600, balanceAfterMicro: 1_000 });
+  });
+
   it("refuses a drained credit and allows one topped up after an old drain and fully spent again", async () => {
     const ledger = new MemoryCreditLedger();
     await fund(ledger); await complete(ledger, "d", 500);

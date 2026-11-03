@@ -92,6 +92,7 @@ import { drawFundingReceiptFor } from "./funding-receipt";
 import type { ReceiptIssuer } from "./receipt-issuer";
 import { isReceiptableStatus } from "./receipt-issuer";
 import { stripProtocolEnvelope } from "./request-envelope";
+import { settledDrawRevenue } from "./settled-draw-revenue";
 import type {
   CreditDepositEnqueue,
   CreditDepositPayload,
@@ -4358,20 +4359,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * Report a completed paid job's revenue under its durable job identity.
+   * Report a paid job's revenue under its durable job identity.
    * Fire-and-forget — the `RevenueReporter` owns persistence and retry.
    *
    * For a **credit-backed** job the revenue event is the *settled draw* (spec
-   * §10), and since the behavior was introduced the sats figure corrects the job's mirror of that
-   * draw against the draw itself: `withDrawBasis` stamps the job when the
-   * payment lands, but a Bitcoin credit's settle re-prices the draw against
-   * the funding lots it consumed. The correction is a delta, because a job's
-   * counter can carry legs no draw ever absorbed — except where the draw's
-   * forecast was zero and the counter therefore never held a component to
-   * correct. The event is dated at settlement rather than at report time. A
-   * released draw — the failed/cancelled path — is deliberately unreachable
-   * here, which is what makes "no debit on job failure" true in the books as
-   * well as the ledger.
+   * §10), and the amounts correct the job's mirror of that draw against the
+   * draw itself (`settledDrawRevenue`): a Bitcoin credit's settle re-prices the
+   * draw against the funding lots it consumed, and a partial settle charges
+   * only part of the hold. The event is dated at settlement rather than at
+   * report time. A settled draw books whatever the job's outcome, so a failed
+   * or cancelled job charged for part of its work books that part; a released
+   * draw books nothing, which is what makes "no debit on job failure" true in
+   * the books as well as the ledger. Without a draw, only a completed job books.
    *
    * For everything else (free-then-paid jobs, isolate-shaped flows, a DVM
    * whose price couldn't be fiat-denominated) nothing changes: the pre-credits
@@ -4404,7 +4403,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const onJobCompleted = this.opts.onJobCompleted;
     const onRevenueSkippedNoRail = this.opts.onRevenueSkippedNoRail;
     if (!onJobCompleted && !onRevenueSkippedNoRail) return false;
-    if (job.status !== "completed") return false;
+    // A draw that settled is revenue however its job ended: a job that did not complete can
+    // still have been charged for the part it finished. Without a draw only completion earns.
+    const drawBacked = !!(job.creditId && job.drawId && this.opts.creditLedger);
+    if (job.status !== "completed" && !(drawBacked && isTerminal(job.status))) return false;
 
     let credit: Record<string, unknown> = {};
     // `null` = a legacy row written before recorded a rail.
@@ -4420,9 +4422,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let creditRail: string | null | undefined;
     let drawAmountMicro: number | undefined;
     let bookedMsats = job.paidMsats;
+    let bookedNative = job.nativeAmount;
     if (job.creditId && job.drawId && this.opts.creditLedger) {
       const args = { creditId: job.creditId, drawId: job.drawId };
       const draw = await this.opts.creditLedger.getDraw(args).catch(() => undefined);
+      // An unsettled draw on a job that did not complete was released: nothing was earned.
+      if (draw?.status !== "settled" && job.status !== "completed") return false;
       if (draw?.status !== "settled") {
         // `attachReceipt` above settles every completed job's draw, so getting
         // here means that resolution failed (already logged loud as
@@ -4442,50 +4447,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
-      // the settled draw is the authority on what the *draw* was
-      // worth. On the Bitcoin rails the settle re-prices it off the funding
-      // lots it actually consumed, so the pooled slice `allocateDrawValue`
-      // stamped when the hold was placed — which could not yet know which
-      // deposit the draw would take — is a forecast the ledger has since
-      // corrected. Booking the forecast leaves a residue between sats revenue
-      // and sats received on a credit topped up at a second rate. The job row
-      // and its receipt keep it deliberately: they attest what the caller's
-      // payment was worth when it landed, which is the question they were
-      // asked.
-      //
-      // Applied as a **delta**, not a substitution. `job.paidMsats` is a sum
-      // of legs, and only the legs that reached the ledger are inside the
-      // draw's allocation: the "degrades rather than refusing money" paths
-      // (`credit-midjob-topup.test.ts`) take a mid-job payment that writes no
-      // ledger row at all — a cross-rail top-up, an exact top-up on a
-      // channel-bound credit, a top-up on a draw that already settled — and
-      // `withDrawBasis` leaves those legs the rail's own msats. Replacing the
-      // whole figure would book those sats nowhere; correcting this draw's
-      // component leaves them where they are.
-      //
-      // A **zero forecast** is the one shape where the counter holds a figure
-      // the ledger never allocated, so there is nothing to subtract:
-      // `withDrawBasis` and `recordedDrawPayment` (`app.ts:4314`) both overlay
-      // only a positive allocation, leaving the leg at the rail's own msats —
-      // the ask. Not a hypothetical on an upgraded host: a legacy multi-rate
-      // credit whose pooled `msats_remaining` has clamped to 0 (legacy
-      // settles decremented it by the blend while the lots shed the cheaper
-      // FIFO figure) forecasts 0 on every draw while the lots still price the
-      // settle, so booking the counter would preserve an unbacked ask value
-      // straight through the upgrade. The settled figure replaces the total
-      // there, which does give up the delta's one virtue on that one credit —
-      // a no-ledger-row top-up gets absorbed with the ask — against an
-      // alternative that books a price no deposit backs on every job it runs.
-      //
-      // A credit with no sats basis at all allocates nothing and re-prices
-      // nothing (`isInKindDepletion` is false on basisless lots): both figures
-      // are 0 and the counter stands. And on a draw the settle never re-priced
-      // the delta is a no-op, `allocatedMsats` reading back as `drawMsats`.
-      if (draw.allocatedMsats > 0) {
-        bookedMsats = Math.max(0, job.paidMsats - draw.allocatedMsats + draw.railValue.drawMsats);
-      } else if (draw.railValue.drawMsats > 0) {
-        bookedMsats = draw.railValue.drawMsats;
-      }
+      // The settled draw, not the job's counters, says what the draw earned: a Bitcoin
+      // settle re-prices it off the lots it consumed and a partial settle charges only part.
+      ({ paidMsats: bookedMsats, nativeAmount: bookedNative } = settledDrawRevenue(job, draw));
       credit = {
         creditId: draw.creditId,
         drawId: draw.drawId,
@@ -4577,7 +4541,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         paymentMint: job.paymentMint,
         rail: job.paymentRail,
         paymentTxHash: job.paymentTxHash,
-        nativeAmount: job.nativeAmount,
+        nativeAmount: bookedNative,
         nativeAsset: job.nativeAsset,
         cashuFlow: job.cashuFlow,
         // Absent unless the handler declared one, and absent is a fact: the

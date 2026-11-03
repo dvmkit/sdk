@@ -469,6 +469,72 @@ describe.skipIf(!RUN)("credit ledger (Postgres)", () => {
     await expectLedgerError(ledger.settle({ creditId, drawId: "nope" }), "draw_not_found");
   });
 
+  it("stores a partial settle as the settled draw, keeping the hold and the released rest beside it", async () => {
+    const snap = await fundCredit(ledger, {
+      callerPubkey: CALLER,
+      currency: "usd",
+      amountMicro: 10_000,
+      expiryMs: FUTURE_MS,
+      basis: { rail: "x402", paidMsats: 20_000, nativeAmount: 10_000, nativeAsset: "usdc", fundingRef: "0xfund" },
+    });
+    const creditId = snap.creditId;
+    const placed = await ledger.draw({ creditId, drawId: "d1", amountMicro: 1_000, jobId: "j1" });
+    expect(placed).toMatchObject({ balanceAfterMicro: 9_000, railValue: { drawMsats: 2_000, drawNative: 1_000 } });
+
+    await ledger.resolveDraw({ creditId, drawId: "d1", settleMicro: 600 });
+
+    const { rows } = await poolA.query(
+      `SELECT status, amount_micro, balance_after_micro, draw_msats, allocated_msats, draw_native,
+              held_micro, released_micro, released_native
+         FROM credit_draws WHERE credit_id = $1 AND draw_id = 'd1'`,
+      [creditId]
+    );
+    expect(rows[0]).toEqual({
+      status: "settled",
+      amount_micro: "600",
+      balance_after_micro: "9400",
+      draw_msats: "1200",
+      allocated_msats: "2000",
+      draw_native: "600",
+      held_micro: "1000",
+      released_micro: "400",
+      released_native: "400",
+    });
+    const credit = await poolA.query(
+      `SELECT balance_micro, msats_remaining, native_remaining FROM credits WHERE credit_id = $1`,
+      [creditId]
+    );
+    expect(credit.rows[0]).toEqual({ balance_micro: "9400", msats_remaining: "18800", native_remaining: "9400" });
+  });
+
+  it("lets one of two machines resolve a draw; the other replays its figure or is refused", async () => {
+    const creditId = await fund(10_000);
+    await ledger.draw({ creditId, drawId: "same", amountMicro: 1_000 });
+    await ledger.draw({ creditId, drawId: "different", amountMicro: 1_000 });
+
+    const same = await Promise.all([
+      ledger.resolveDraw({ creditId, drawId: "same", settleMicro: 600 }),
+      ledgerB.resolveDraw({ creditId, drawId: "same", settleMicro: 600 }),
+    ]);
+    expect(same.map((r) => r.replayed).sort()).toEqual([false, true]);
+
+    const different = await Promise.allSettled([
+      ledger.resolveDraw({ creditId, drawId: "different", settleMicro: 600 }),
+      ledgerB.resolveDraw({ creditId, drawId: "different", settleMicro: 700 }),
+    ]);
+    const won = different.filter((r) => r.status === "fulfilled");
+    const lost = different.filter((r) => r.status === "rejected");
+    expect(won).toHaveLength(1);
+    expect(lost).toHaveLength(1);
+    expect((lost[0] as PromiseRejectedResult).reason).toMatchObject({ code: "invalid_draw_state" });
+    const winner = (won[0] as PromiseFulfilledResult<{ amountMicro: number }>).value.amountMicro;
+
+    expect(await ledger.get(creditId)).toMatchObject({
+      balanceMicro: 10_000 - 600 - winner,
+      availableMicro: 10_000 - 600 - winner,
+    });
+  });
+
   it("settle and release succeed after expiry — a pre-expiry hold must not leak", async () => {
     const creditId = await fund(100_000);
     await ledger.draw({ creditId, drawId: "d1", amountMicro: 30_000 });

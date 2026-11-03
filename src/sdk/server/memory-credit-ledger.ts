@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 
-import { refundAssetDelta, refundRequest, type CreditDrawRefundArgs, type CreditDrawRefundResult } from "./credit-draw-refund";
+import {
+  DRAW_NOT_SETTLED_REFUSAL,
+  REFUND_EXCEEDS_SETTLED_REFUSAL,
+  refundAssetDelta,
+  refundRequest,
+  type CreditDrawRefundArgs,
+  type CreditDrawRefundResult,
+} from "./credit-draw-refund";
 import type {
   CreditFundingEvidence,
   BitcoinDepositLiability,
@@ -49,6 +56,7 @@ import {
   isFundingRail,
   x402SettlementPending,
 } from "./credit-ledger";
+import { assertSettleMicro, type DrawSettleRequest, planDrawResolution, settledShare } from "./credit-draw-resolution";
 import {
   depleteLots,
   DRAIN_DELIVERY_RESERVE_SATS,
@@ -138,7 +146,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         throw new CreditLedgerError("draw_not_found", "No unique job-bound draw matches this selector.");
       }
       const { credit, draw } = matches[0];
-      if (draw.status !== "settled") throw new CreditLedgerError("draw_not_completed", "Only a settled completed draw can be refunded.");
+      if (draw.status !== "settled") throw new CreditLedgerError("draw_not_completed", DRAW_NOT_SETTLED_REFUSAL);
       const nowMs = args.nowMs ?? Date.now();
       const lastDrain = [...credit.drains.values()].filter(drain => drain.status !== "released")
         .sort((a, b) => b.ledgerSeq - a.ledgerSeq)[0];
@@ -163,7 +171,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         (refund.result.creditId === credit.creditId && refund.result.drawId === draw.drawId ? refund.result.amountMicro : 0), 0);
       const amountMicro = args.amountMicro ?? draw.amountMicro - before;
       if (amountMicro <= 0 || amountMicro > draw.amountMicro - before) {
-        throw new CreditLedgerError("refund_exceeds_draw", "The refund exceeds the draw's remaining unrefunded charge.");
+        throw new CreditLedgerError("refund_exceeds_draw", REFUND_EXCEEDS_SETTLED_REFUSAL);
       }
       if (!isFundingRail(credit.rail)) throw new CreditLedgerError("credit_refund_basis_unavailable", "The original funding rail is not recorded on this older credit.");
       const bitcoin = isNonChannelBitcoinRail(credit.rail);
@@ -233,21 +241,32 @@ export class MemoryCreditLedger implements CreditLedgerLike {
   }
 
   settle(args: Parameters<CreditLedgerLike["settle"]>[0]): Promise<DrawResolution> {
-    return run(() => {
-      const credit = this.requireCredit(args.creditId);
-      const draw = credit.draws.get(args.drawId);
-      const to =
-        draw?.status === "settled"
-          ? "settled"
-          : credit.status === "unbacked"
-            ? "released"
-            : "settled";
-      return this.resolve({ ...args, to });
-    });
+    return run(() => this.resolveTerminal(args, "hold"));
   }
 
   release(args: Parameters<CreditLedgerLike["release"]>[0]): Promise<DrawResolution> {
-    return run(() => this.resolve({ ...args, to: "released" }));
+    return run(() => this.resolve({ ...args, request: 0 }));
+  }
+
+  /** See {@link CreditLedger.resolveDraw}. */
+  resolveDraw(
+    args: Parameters<NonNullable<CreditLedgerLike["resolveDraw"]>>[0]
+  ): Promise<DrawResolution> {
+    return run(() => {
+      assertSettleMicro(args.settleMicro);
+      return this.resolveTerminal(args, args.settleMicro);
+    });
+  }
+
+  /** A settle on an unbacked credit releases instead: its backing is gone. */
+  private resolveTerminal(
+    args: { creditId: string; drawId: string; nowMs?: number },
+    request: DrawSettleRequest
+  ): DrawResolution {
+    const credit = this.requireCredit(args.creditId);
+    const draw = credit.draws.get(args.drawId);
+    const unbacked = request !== 0 && draw?.status !== "settled" && credit.status === "unbacked";
+    return this.resolve({ ...args, request: unbacked ? 0 : request });
   }
 
   recordFunding(args: Parameters<CreditLedgerLike["recordFunding"]>[0]): Promise<FundingRecord> {
@@ -779,11 +798,13 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     const credit = this.requireCredit(args.creditId);
     const existing = credit.draws.get(args.drawId);
     if (existing) {
-      if (existing.amountMicro !== args.amountMicro || existing.jobId !== jobId) {
+      // A partial settle rewrote amountMicro; the placement being replayed was the hold.
+      const holdMicro = existing.heldMicro ?? existing.amountMicro;
+      if (holdMicro !== args.amountMicro || existing.jobId !== jobId) {
         throw new CreditLedgerError(
           "draw_conflict",
           `draw ${args.drawId} on credit ${args.creditId} was recorded with different parameters`,
-          { expectedAmountMicro: existing.amountMicro, expectedJobId: existing.jobId }
+          { expectedAmountMicro: holdMicro, expectedJobId: existing.jobId }
         );
       }
       return { ...drawResult(existing, credit), replayed: true };
@@ -1626,7 +1647,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
   private resolve(args: {
     creditId: string;
     drawId: string;
-    to: "settled" | "released";
+    request: DrawSettleRequest;
     nowMs?: number;
   }): DrawResolution {
     const nowMs = args.nowMs ?? Date.now();
@@ -1638,45 +1659,55 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         `draw ${args.drawId} not found on credit ${args.creditId}`
       );
     }
-    let replayed = false;
-    if (draw.status === args.to) {
-      replayed = true;
-    } else if (draw.status !== "pending") {
-      throw new CreditLedgerError(
-        "invalid_draw_state",
-        `cannot ${args.to === "settled" ? "settle" : "release"} draw ${args.drawId}: status is ${draw.status}`,
-        { currentStatus: draw.status }
-      );
-    } else {
-      draw.status = args.to;
+    const plan = planDrawResolution(
+      { drawId: draw.drawId, status: draw.status, amountMicro: draw.amountMicro, heldMicro: draw.heldMicro ?? null },
+      args.request
+    );
+    if (!plan.replay) {
+      draw.status = plan.status;
       draw.resolvedAt = nowMs;
-      if (args.to === "settled") {
-        credit.balanceMicro -= draw.amountMicro;
+      if (plan.status === "settled") {
+        const holdMicro = draw.amountMicro;
+        const settleMicro = plan.settleMicro;
+        const forecastMsats = draw.drawMsats;
+        const holdNative = draw.drawNative;
+        const settledNative = holdNative === null ? null : settledShare(holdNative, settleMicro, holdMicro);
+        let settledMsats = settledShare(forecastMsats, settleMicro, holdMicro);
+        credit.balanceMicro -= settleMicro;
         // FIFO depletion replaces the pooled hold forecast at settlement. Use the shared
         // inKindDrawMsats arithmetic so memory and SQL book the same sats value.
         if (isNonChannelBitcoinRail(credit.rail)) {
-          const depletion = depleteLots(openLots(credit), draw.amountMicro);
-          const settledMsats = inKindDrawMsats(depletion, draw.amountMicro);
-          draw.settledSats = settledMsats === null ? null : settledMsats / 1000;
-          if (settledMsats !== null && settledMsats !== draw.drawMsats) {
-            // Keep the superseded forecast: the job's `paidMsats` counter was
-            // built from it, so booking revenue swaps this draw's component
-            // out rather than replacing the whole total.
-            draw.allocatedMsats = draw.drawMsats;
-            draw.drawMsats = settledMsats;
-          }
+          const depletion = depleteLots(openLots(credit), settleMicro);
+          const inKindMsats = inKindDrawMsats(depletion, settleMicro);
+          draw.settledSats = inKindMsats === null ? null : inKindMsats / 1000;
+          settledMsats = inKindMsats ?? settledMsats;
           applyLotDebits(credit, depletion.debits, -1);
         }
-        credit.msatsRemaining = Math.max(0, credit.msatsRemaining - draw.drawMsats);
+        if (plan.partial) {
+          draw.heldMicro = holdMicro;
+          draw.releasedMicro = holdMicro - settleMicro;
+          draw.releasedNative = holdNative === null ? null : holdNative - (settledNative ?? 0);
+          draw.amountMicro = settleMicro;
+          draw.balanceAfterMicro += holdMicro - settleMicro;
+          draw.drawNative = settledNative;
+        }
+        if (settledMsats !== forecastMsats) {
+          // Keep the superseded forecast: the job's `paidMsats` counter was
+          // built from it, so booking revenue swaps this draw's component
+          // out rather than replacing the whole total.
+          draw.allocatedMsats = forecastMsats;
+          draw.drawMsats = settledMsats;
+        }
+        credit.msatsRemaining = Math.max(0, credit.msatsRemaining - settledMsats);
         if (credit.nativeRemaining !== null) {
-          credit.nativeRemaining = Math.max(0, credit.nativeRemaining - (draw.drawNative ?? 0));
+          credit.nativeRemaining = Math.max(0, credit.nativeRemaining - (settledNative ?? 0));
         }
       }
     }
     return {
       ...drawResult(draw, credit),
-      status: args.to,
-      replayed,
+      status: plan.status,
+      replayed: plan.replay,
       availableMicro:
         credit.status === "unbacked" ? 0 : credit.balanceMicro - pendingSums(credit).micro,
       resolvedAt: draw.resolvedAt ?? nowMs,
@@ -1798,6 +1829,10 @@ interface MemoryDraw {
    */
   allocatedMsats?: number;
   settledSats?: number | null;
+  /** Set together, and only, by a partial settle. */
+  heldMicro?: number;
+  releasedMicro?: number;
+  releasedNative?: number | null;
 }
 
 function applyBasis(credit: MemoryCredit, basis: CreditFundingBasis): void {
@@ -1904,6 +1939,13 @@ function drawResult(
     replayed: false,
     railValue: railValue(draw, credit),
     resolvedAt: draw.resolvedAt,
+    ...(draw.heldMicro !== undefined && {
+      partialSettle: {
+        heldMicro: draw.heldMicro,
+        releasedMicro: draw.releasedMicro ?? 0,
+        releasedNative: draw.releasedNative ?? null,
+      },
+    }),
   };
 }
 
