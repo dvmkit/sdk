@@ -4405,22 +4405,58 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return buildSubmitResponse(c, snapshot, jobToken, fields);
   }
 
-  private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt }): Promise<Record<string, unknown>> {
+  /**
+   * What a deferred-x402 job may show before its payment settles. The intent
+   * is the durable, cross-machine record of settlement, so every read path
+   * agrees without a flag on the job row. Output is held from admission
+   * because a caller could otherwise read it and then cancel the nonce or drain
+   * the wallet. A job that ended without completing keeps only its
+   * cancellation message, so the caller still learns why.
+   */
+  private async outputGate(job: { status: JobStatus; creditId?: string }): Promise<OutputGate | undefined> {
+    const intentId = deferredX402IntentId(job.creditId);
+    if (!intentId) return undefined;
+    const intent = await this.x402ExactSettlement?.get(this.opts.dvmId ?? "", intentId);
+    if (intent?.status === "complete") return undefined;
+    if (job.status === "failed" || job.status === "cancelled") return { terminalOnly: true };
+    return {
+      reason:
+        intent?.status === "released" || intent?.status === "rejected"
+          ? "payment_unsettled"
+          : "payment_pending",
+    };
+  }
+
+  private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt; creditId?: string }): Promise<Record<string, unknown>> {
     const store = this.jobManager.store;
     const responseStatus = job.status;
     const evidence = isTerminal(job.status) && this.jobManager.receiptsEnabled && !job.receipt
       ? { receipt_pending: true } : {};
+    const gate = await this.outputGate(job);
+    const withheld = gate && "reason" in gate
+      ? { content_available: false, content_withheld: gate.reason } : {};
     if (isContentHoldStore(store)) {
       const snapshot = await store.getContentSnapshot(job.id);
-      if (snapshot) return { ...evidence, ...contentMetadata({ ...snapshot.job, status: responseStatus }, this.descriptor.jobRetentionDays, snapshot.history.holds) };
+      if (snapshot) return { ...evidence, ...contentMetadata({ ...snapshot.job, status: responseStatus }, this.descriptor.jobRetentionDays, snapshot.history.holds), ...withheld };
     }
     // Unsupported custom stores cannot vouch for durable availability or holds.
-    return isContentHoldStore(store) ? { ...evidence, ...contentMetadata(job, this.descriptor.jobRetentionDays) } : evidence;
+    return isContentHoldStore(store) ? { ...evidence, ...contentMetadata(job, this.descriptor.jobRetentionDays), ...withheld } : { ...evidence, ...withheld };
   }
 
-  private async messageFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number }, messages: Message[]): Promise<Record<string, unknown>> {
+  /** The messages a caller may read now: none while withheld, only the cancellation once a job ended unpaid. */
+  private async releasableMessages(
+    job: { status: JobStatus; creditId?: string },
+    messages: Message[]
+  ): Promise<Message[]> {
+    const gate = await this.outputGate(job);
+    if (!gate) return messages;
+    return "terminalOnly" in gate ? messages.filter((m) => m.type === "cancel") : [];
+  }
+
+  private async messageFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; creditId?: string }, messages: Message[]): Promise<Record<string, unknown>> {
     const fields = await this.contentFields(job);
-    return { messages: fields.content_available === false ? [] : messages, ...fields };
+    const releasable = await this.releasableMessages(job, messages);
+    return { messages: fields.content_available === false ? [] : releasable, ...fields };
   }
 
   private async handleGetJob(c: Context<AppEnv>): Promise<Response> {
@@ -4435,8 +4471,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Live progress such as ctx.working() need not have a persisted status.
     // Terminal outcomes always come from the durable snapshot.
     if ("listeners" in job && !isTerminal(snapshot.status) && !isTerminal(job.status)) snapshot.status = job.status;
-    const res: Record<string, unknown> = { job_id: snapshot.id, status: snapshot.status };
-    Object.assign(res, terminalResponseFields(snapshot), await this.contentFields(snapshot));
+    const content = await this.contentFields(snapshot);
+    const status = withheldStatus(snapshot.status, content);
+    const res: Record<string, unknown> = { job_id: snapshot.id, status };
+    Object.assign(res, terminalResponseFields({ ...snapshot, status }), content);
     Object.assign(res, await this.drawFundingFields(snapshot));
     removeUnavailableContent(res);
     return this.withDeferredSettlement(c.json(res), snapshot.creditId);
@@ -4480,6 +4518,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (accept.includes("text/event-stream")) {
         // Every host uses store-allocated cursors, including the active worker.
         if (isStreamableJobStore(store) && !terminal) {
+          // A stream would deliver messages as they are written; withheld
+          // output must not leave before its payment settles.
+          if ((await this.contentFields(record)).content_available === false) {
+            return streamSSE(c, async () => undefined);
+          }
           return streamSSE(c, async (stream) => {
             let unsubFn: (() => void) | undefined;
 
@@ -4554,9 +4597,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
 
         const fields = await this.contentFields(record);
+        const releasable = await this.releasableMessages(record, filtered);
         return streamSSE(c, async (stream) => {
           if (fields.content_available === false) return;
-          for (const msg of filtered) {
+          for (const msg of releasable) {
             await stream.writeSSE({ data: JSON.stringify(msg), event: "message" });
           }
         });
@@ -4569,9 +4613,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     if (accept.includes("text/event-stream")) {
       const fields = await this.contentFields(job);
+      const gated = await this.releasableMessages(job, visibleJobMessages(job));
       return streamSSE(c, async (stream) => {
         if (fields.content_available === false) return;
-        const existing = visibleJobMessages(job).filter((m) => m.seq > after);
+        const existing = gated.filter((m) => m.seq > after);
         let yielded = false;
         for (const msg of existing) {
           await stream.writeSSE({ data: JSON.stringify(msg), event: "message" });
@@ -5099,13 +5144,14 @@ function buildSubmitResponse(
   jobToken: string | undefined,
   contentFields: Record<string, unknown>
 ): Response {
+  const status = withheldStatus(job.status, contentFields);
   const res: Record<string, unknown> = { job_id: job.id };
   if (jobToken) res.job_token = jobToken;
-  if (job.status === "awaiting-input") res.status = "awaiting-input";
-  else if (job.status === "completed") res.status = "completed";
-  Object.assign(res, terminalResponseFields(job), contentFields);
+  if (status === "awaiting-input") res.status = "awaiting-input";
+  else if (status === "completed") res.status = "completed";
+  Object.assign(res, terminalResponseFields({ ...job, status }), contentFields);
   removeUnavailableContent(res);
-  return c.json(res, job.status === "completed" ? 200 : 202, jobIdentityHeaders(job.id));
+  return c.json(res, status === "completed" ? 200 : 202, jobIdentityHeaders(job.id));
 }
 
 function requestRecoveryStore(store: JobStore): RequestRecoveryJobStore | undefined {
@@ -5190,7 +5236,8 @@ function buildRequestResultResponse(
   job: JobRecord,
   contentFields: Record<string, unknown>
 ): Response {
-  const status = job.status === "working" ? "processing" : job.status;
+  const shown = withheldStatus(job.status, contentFields);
+  const status = shown === "working" ? "processing" : shown;
   const res: Record<string, unknown> = {
     request_id: requestId,
     job_id: job.id,
@@ -5198,9 +5245,9 @@ function buildRequestResultResponse(
   };
   if (job.requesterToken) res.job_token = job.requesterToken;
   if (job.paymentTransactionHash) res.transaction_hash = job.paymentTransactionHash;
-  Object.assign(res, terminalResponseFields(job), contentFields);
+  Object.assign(res, terminalResponseFields({ ...job, status: shown }), contentFields);
   removeUnavailableContent(res);
-  return c.json(res, isTerminal(job.status) ? 200 : 202, jobIdentityHeaders(job.id));
+  return c.json(res, isTerminal(shown) ? 200 : 202, jobIdentityHeaders(job.id));
 }
 
 /**
@@ -5257,6 +5304,21 @@ async function awaitTerminalWork(work: () => Promise<void>): Promise<void> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Why a deferred-x402 job's output is not readable yet; see `outputGate`. */
+type OutputGate = { reason: "payment_pending" | "payment_unsettled" } | { terminalOnly: true };
+
+/**
+ * The status a caller sees. The durable row says `completed` as soon as the
+ * handler finishes, but until the payment settles the job is not done, and
+ * once it is known unpaid the job has failed for the caller.
+ */
+function withheldStatus(status: JobStatus, fields: Record<string, unknown>): JobStatus {
+  if (status !== "completed") return status;
+  if (fields.content_withheld === "payment_pending") return "processing";
+  if (fields.content_withheld === "payment_unsettled") return "failed";
+  return status;
 }
 
 interface TerminalFieldSource {

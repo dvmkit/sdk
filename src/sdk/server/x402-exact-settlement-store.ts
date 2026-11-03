@@ -85,6 +85,16 @@ export interface X402ExactSettlementAttempt {
   createdAt: number;
 }
 
+/** Admission limits {@link X402ExactSettlementStore.claim} enforces atomically with the insert. */
+export interface X402ExactClaimOptions {
+  /**
+   * Refuse (throwing `X402ExactPayerLimitError`) when this payer already has
+   * this many intents that may still settle. A store that ignores the option
+   * does not enforce the limit.
+   */
+  maxOutstandingPerPayer?: number;
+}
+
 /** Persistence contract for exact x402 settlement recovery. */
 export interface X402ExactSettlementStore {
   prepare(
@@ -96,7 +106,8 @@ export interface X402ExactSettlementStore {
    * insert it, so exactly one sees `inserted: true`.
    */
   claim(
-    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">,
+    opts?: X402ExactClaimOptions
   ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }>;
   get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined>;
   markSubmitting(args: {
@@ -192,6 +203,10 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
         `CREATE INDEX IF NOT EXISTS idx_x402_exact_settlement_queue
            ON x402_exact_settlement_intents (dvm_id, status, updated_at)`
       );
+      await this.pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_x402_exact_settlement_payer
+           ON x402_exact_settlement_intents (dvm_id, authorizer, status)`
+      );
     });
   }
 
@@ -202,14 +217,39 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
   }
 
   async claim(
-    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">,
+    opts?: X402ExactClaimOptions
   ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }> {
     const now = Date.now();
     const existing = await this.get(intent.dvmId, intent.id);
     if (existing && !sameIntentBinding(existing, intent)) {
       throw new X402ExactIntentConflictError(intent.id);
     }
+    const limit = existing ? undefined : opts?.maxOutstandingPerPayer;
     const write = async (q: Pick<Pool, "query">): Promise<boolean> => {
+      if (limit !== undefined) {
+        // The lock makes the count and the insert one decision per payer, so
+        // parallel admissions on different machines cannot each see room.
+        await q.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+          `x402-payer:${intent.dvmId}:${intent.from}`,
+        ]);
+        // A presentation of an authorization already on file is a replay, not a
+        // second outstanding payment; leave it to the insert's conflict handling.
+        const present = await q.query(
+          `SELECT 1 FROM x402_exact_settlement_intents WHERE dvm_id = $1 AND intent_id = $2`,
+          [intent.dvmId, intent.id]
+        );
+        if (present.rowCount) return false;
+        const { rows } = await q.query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM x402_exact_settlement_intents
+            WHERE dvm_id = $1 AND authorizer = $2
+              AND (status IN ('submitting', 'ambiguous')
+                   OR (status = 'prepared' AND CASE WHEN valid_before ~ '^[0-9]+$'
+                        THEN valid_before::numeric > $3 ELSE false END))`,
+          [intent.dvmId, intent.from, Math.floor(now / 1000)]
+        );
+        if (Number(rows[0]?.n ?? 0) >= limit) throw new X402ExactPayerLimitError(intent.from);
+      }
       const authFingerprint = intent.effect?.jobAdmission?.authFingerprint;
       if (authFingerprint) {
       await q.query(
@@ -266,6 +306,18 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
         fundId: effect?.fundOnly?.fundId,
         callerPubkey: effect?.jobId ? undefined : effect?.callerId,
       }, write);
+    } else if (limit !== undefined) {
+      const tx = await this.pool.connect();
+      try {
+        await tx.query("BEGIN");
+        inserted = await write(tx);
+        await tx.query("COMMIT");
+      } catch (error) {
+        await tx.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        tx.release();
+      }
     } else {
       inserted = await write(this.pool);
     }
@@ -520,12 +572,28 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
   }
 
   async claim(
-    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">
+    intent: Omit<X402ExactSettlementIntent, "status" | "createdAt" | "updatedAt" | "resolvedAt">,
+    opts?: X402ExactClaimOptions
   ): Promise<{ intent: X402ExactSettlementIntent; inserted: boolean }> {
     const key = intentKey(intent.dvmId, intent.id);
     const existing = this.intents.get(key);
     if (existing && !sameIntentBinding(existing, intent)) {
       throw new X402ExactIntentConflictError(intent.id);
+    }
+    if (!existing && opts?.maxOutstandingPerPayer !== undefined) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      let outstanding = 0;
+      for (const held of this.intents.values()) {
+        if (held.dvmId !== intent.dvmId || held.from !== intent.from) continue;
+        if (
+          held.status === "submitting" ||
+          held.status === "ambiguous" ||
+          (held.status === "prepared" && Number(held.validBefore) > nowSeconds)
+        ) {
+          outstanding++;
+        }
+      }
+      if (outstanding >= opts.maxOutstandingPerPayer) throw new X402ExactPayerLimitError(intent.from);
     }
     const authFingerprint = intent.effect?.jobAdmission?.authFingerprint;
     if (authFingerprint) {
@@ -739,6 +807,14 @@ export class X402ExactIntentConflictError extends Error {
   constructor(readonly intentId: string) {
     super(`x402 exact intent ${intentId} conflicts with its durable authorization or effect`);
     this.name = "X402ExactIntentConflictError";
+  }
+}
+
+/** Raised when a payer already has the most outstanding authorizations a DVM admits. */
+export class X402ExactPayerLimitError extends Error {
+  constructor(readonly payer: string) {
+    super(`x402 payer ${payer} has too many outstanding authorizations`);
+    this.name = "X402ExactPayerLimitError";
   }
 }
 

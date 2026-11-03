@@ -53,6 +53,7 @@ import {
   drawSettlementRef,
   type FiatDenomination,
   deferredX402Id,
+  DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER,
   deferredX402Window,
   fundedMicroFor,
   fundingCommitment,
@@ -2324,6 +2325,7 @@ export type PaymentErrorCode =
   | "x402_not_offered"
   | "payment_method_requires_signature"
   | "payment_authorization_too_short"
+  | "x402_payer_busy"
   | "x402_settlement_ambiguous"
   | "cashu_unavailable"
   | "cashu_not_p2pk_locked"
@@ -2400,6 +2402,12 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     display:
       "The payment authorization expires before this job could finish, so it was not accepted. Nothing was charged.",
     hint: "Sign a new authorization that stays valid for at least the maxTimeoutSeconds in the payment requirements, and send it again.",
+    retryable: true,
+  },
+  x402_payer_busy: {
+    display:
+      "This wallet already has a payment authorization in use for a running job, so this one was not accepted. Nothing was charged.",
+    hint: "Wait for the running job to finish, or pay from another wallet, then send the request again.",
     retryable: true,
   },
   x402_not_offered: {
@@ -5692,8 +5700,17 @@ async function acceptDeferredExactUpfront(args: {
     effect: exactSettlementEffect(ctx, { paidMsats, fundedMicro, nativeAmount: authorizedUsdcMicro }),
     minValidSeconds: window.minValidSeconds,
     maxTimeoutSeconds: window.advertisedTimeoutSeconds,
+    maxOutstandingPerPayer: DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER,
   });
   if (prepared.outcome === "rejected") return invalid();
+  if (prepared.outcome === "payer_limit") {
+    return refuse(
+      paymentErrorBody("x402_payer_busy", {
+        message: "This wallet already has an x402 authorization in use for a running job.",
+      }),
+      429
+    );
+  }
   if (prepared.outcome === "authorization_too_short") {
     return refuse(
       paymentErrorBody("payment_authorization_too_short", {

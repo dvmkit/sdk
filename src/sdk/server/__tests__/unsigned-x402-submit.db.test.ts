@@ -37,7 +37,10 @@ const input = z.object({
   text: z.string(),
 });
 
-function authorization(validForSeconds: number): string {
+function authorization(
+  validForSeconds: number,
+  who: { from?: string; nonce?: string } = {}
+): string {
   return encodePayment({
     x402Version: 1,
     scheme: "exact",
@@ -45,12 +48,12 @@ function authorization(validForSeconds: number): string {
     payload: {
       signature: `0x${"ab".repeat(65)}`,
       authorization: {
-        from: "0x2222222222222222222222222222222222222222",
+        from: who.from ?? "0x2222222222222222222222222222222222222222",
         to: X402.payTo,
         value: String(PRICE_MICRO),
         validAfter: "0",
         validBefore: String(Math.floor(Date.now() / 1000) + validForSeconds),
-        nonce: `0x${"33".repeat(32)}`,
+        nonce: who.nonce ?? `0x${"33".repeat(32)}`,
       },
     },
   });
@@ -80,6 +83,8 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
   let finish: ReturnType<typeof gate>;
   let handled: number;
   let facilitatorCalls: string[];
+  let settleAnswer: () => Promise<Response>;
+  let sawSettle: ReturnType<typeof gate>;
 
   beforeEach(async () => {
     await recreateSchema(SCHEMA);
@@ -93,6 +98,8 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     finish = gate();
     handled = 0;
     facilitatorCalls = [];
+    settleAnswer = async () => Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
+    sawSettle = gate();
     const fetch = globalThis.fetch;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = typeof request === "string" ? request : request instanceof URL ? request.href : request.url;
@@ -100,7 +107,8 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
       facilitatorCalls.push(new URL(url).pathname);
       if (url === `${X402.facilitator}/verify`) return Response.json({ isValid: true });
       if (url === `${X402.facilitator}/settle`) {
-        return Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
+        sawSettle.resolve();
+        return settleAnswer();
       }
       throw new Error(`Unexpected facilitator request: ${url}`);
     });
@@ -114,7 +122,10 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     await dropSchemas(SCHEMA);
   });
 
-  async function start(pool = poolA, opts: { fail?: boolean; unbounded?: boolean } = {}): Promise<string> {
+  async function start(
+    pool = poolA,
+    opts: { fail?: boolean; unbounded?: boolean; artifact?: boolean } = {}
+  ): Promise<string> {
     const descriptor = configureDVM({
       name: "unsigned-x402-test",
       auth: secp256k1Auth({ allowUnsignedPaid: true }),
@@ -125,6 +136,7 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
           ...(opts.unbounded ? {} : { maxRuntimeSeconds: RUNTIME_SECONDS }),
           async onJob(ctx) {
             handled++;
+            if (opts.artifact) ctx.artifact({ name: "report", data: "paid-for output" });
             await finish.promise;
             if (opts.fail) ctx.fail("blocked");
             else ctx.complete("done");
@@ -163,6 +175,18 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
 
   function read(url: string, job: AcceptedJob): Promise<Response> {
     return fetch(`${url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
+  }
+
+  function readMessages(url: string, job: AcceptedJob, sse = false): Promise<Response> {
+    return fetch(`${url}/v1/job/${job.job_id}/messages`, {
+      headers: { "X-Job-Token": job.job_token, ...(sse ? { Accept: "text/event-stream" } : {}) },
+    });
+  }
+
+  /** Every route that can carry the job's output, as the raw text a caller would receive. */
+  async function everythingReadable(url: string, job: AcceptedJob): Promise<string> {
+    const responses = await Promise.all([read(url, job), readMessages(url, job), readMessages(url, job, true)]);
+    return (await Promise.all(responses.map((response) => response.text()))).join("\n");
   }
 
   it("advertises the longer window, settles only after success, and rejects replay across servers", async () => {
@@ -228,6 +252,126 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     expect(handled).toBe(1);
     expect(facilitatorCalls).toEqual(["/verify", "/settle"]);
     expect((await poolA.query("SELECT id FROM jobs")).rowCount).toBe(1);
+  });
+
+  it("holds every read of the output until the settlement lands, then releases it", async () => {
+    const url = await start(poolA, { artifact: true });
+    let release!: () => void;
+    const settleHeld = new Promise<void>((resolve) => { release = resolve; });
+    settleAnswer = async () => {
+      await settleHeld;
+      return Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
+    };
+    const accepted = await submit(url, authorization(RUNTIME_SECONDS + 60));
+    const job = await accepted.json() as AcceptedJob;
+    await vi.waitFor(() => expect(handled).toBe(1));
+    // The artifact exists in the store but the job is still running.
+    await vi.waitFor(async () => {
+      const rows = await poolA.query("SELECT 1 FROM job_messages WHERE job_id = $1 AND data->>'type' = 'artifact'", [job.job_id]);
+      expect(rows.rowCount).toBe(1);
+    }, { timeout: 5000 });
+
+    const midRun = await everythingReadable(url, job);
+    expect(midRun).not.toContain("paid-for output");
+    expect(await (await read(url, job)).json()).toMatchObject({ status: "processing", content_available: false });
+
+    finish.resolve();
+    await sawSettle.promise;
+    await vi.waitFor(async () => expect((await jobs.get(job.job_id))?.status).toBe("completed"), { timeout: 5000 });
+
+    // Handler done, authorization sent, facilitator has not answered.
+    const settling = await everythingReadable(url, job);
+    expect(settling).not.toContain("paid-for output");
+    expect(settling).not.toContain("done");
+    expect(await (await read(url, job)).json()).toMatchObject({
+      status: "processing",
+      content_available: false,
+      content_withheld: "payment_pending",
+    });
+
+    release();
+    const intentId = deferredX402IntentId(job.upfront_payment.credit_id)!;
+    await vi.waitFor(async () => expect((await settlements.get(DVM_ID, intentId))?.status).toBe("complete"), { timeout: 5000 });
+    const settled = await read(url, job);
+    expect(await settled.json()).toMatchObject({ status: "completed", summary: "done", has_artifacts: true, artifact_count: 1 });
+    expect(await (await readMessages(url, job)).text()).toContain("paid-for output");
+    expect(await (await readMessages(url, job, true)).text()).toContain("paid-for output");
+  });
+
+  it("never exposes the output or claims payment when the settlement is refused", async () => {
+    const url = await start(poolA, { artifact: true });
+    settleAnswer = async () =>
+      Response.json({ success: false, errorReason: "invalid_exact_evm_nonce_already_used", network: X402.network });
+    const accepted = await submit(url, authorization(RUNTIME_SECONDS + 60));
+    const job = await accepted.json() as AcceptedJob;
+    const intentId = deferredX402IntentId(job.upfront_payment.credit_id)!;
+    finish.resolve();
+    await vi.waitFor(async () => expect((await settlements.get(DVM_ID, intentId))?.status).toBe("rejected"), { timeout: 5000 });
+
+    const everything = await everythingReadable(url, job);
+
+    expect(everything).not.toContain("paid-for output");
+    expect(everything).not.toContain("done");
+    const unpaid = await read(url, job);
+    expect(await unpaid.json()).toMatchObject({ status: "failed", content_available: false, content_withheld: "payment_unsettled" });
+    expect(unpaid.headers.get("PAYMENT-RESPONSE")).toBeNull();
+    expect((await poolA.query("SELECT credit_id FROM credits")).rowCount).toBe(0);
+  });
+
+  it("keeps the output held while the settlement outcome is unknown, and settles on a later read", async () => {
+    const url = await start(poolA, { artifact: true });
+    settleAnswer = async () => Response.json({ success: false, errorReason: "facilitator_status_503", network: X402.network });
+    const accepted = await submit(url, authorization(RUNTIME_SECONDS + 60));
+    const job = await accepted.json() as AcceptedJob;
+    const intentId = deferredX402IntentId(job.upfront_payment.credit_id)!;
+    finish.resolve();
+    await vi.waitFor(async () => expect((await settlements.get(DVM_ID, intentId))?.status).toBe("ambiguous"), { timeout: 5000 });
+
+    expect(await everythingReadable(url, job)).not.toContain("paid-for output");
+
+    settleAnswer = async () => Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
+    await vi.waitFor(async () => {
+      expect(await (await read(url, job)).json()).toMatchObject({ status: "completed", summary: "done" });
+    }, { timeout: 5000 });
+    expect((await settlements.get(DVM_ID, intentId))?.status).toBe("complete");
+    expect(await (await readMessages(url, job)).text()).toContain("paid-for output");
+  });
+
+  it("does not let a cancelled job hand its artifacts to a caller who never paid", async () => {
+    const url = await start(poolA, { artifact: true });
+    const accepted = await submit(url, authorization(RUNTIME_SECONDS + 60));
+    const job = await accepted.json() as AcceptedJob;
+    const intentId = deferredX402IntentId(job.upfront_payment.credit_id)!;
+    await vi.waitFor(async () => {
+      const rows = await poolA.query("SELECT 1 FROM job_messages WHERE job_id = $1 AND data->>'type' = 'artifact'", [job.job_id]);
+      expect(rows.rowCount).toBe(1);
+    }, { timeout: 5000 });
+
+    const cancelled = await fetch(`${url}/v1/job/${job.job_id}`, { method: "DELETE", headers: { "X-Job-Token": job.job_token } });
+    expect(cancelled.status).toBeLessThan(300);
+    await vi.waitFor(async () => expect((await settlements.get(DVM_ID, intentId))?.status).toBe("released"), { timeout: 5000 });
+
+    const everything = await everythingReadable(url, job);
+    expect(everything).not.toContain("paid-for output");
+    expect(facilitatorCalls).toEqual(["/verify"]);
+  });
+
+  it("refuses a second authorization from a payer whose first job is still running", async () => {
+    const url = await start();
+    const first = await submit(url, authorization(RUNTIME_SECONDS + 60, { nonce: `0x${"41".repeat(32)}` }));
+    expect(first.status).toBe(202);
+
+    const second = await submit(url, authorization(RUNTIME_SECONDS + 60, { nonce: `0x${"42".repeat(32)}` }));
+    const otherPayer = await submit(url, authorization(RUNTIME_SECONDS + 60, {
+      nonce: `0x${"43".repeat(32)}`,
+      from: "0x5555555555555555555555555555555555555555",
+    }));
+
+    expect(second.status).toBe(429);
+    expect(await second.json()).toMatchObject({ error: "x402_payer_busy" });
+    expect(otherPayer.status).toBe(202);
+    expect(handled).toBe(2);
+    expect((await poolA.query("SELECT id FROM jobs")).rowCount).toBe(2);
   });
 
   it("releases a failed job's authorization without settling or creating credit", async () => {

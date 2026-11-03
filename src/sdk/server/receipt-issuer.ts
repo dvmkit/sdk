@@ -51,9 +51,16 @@ export class ReceiptIssuer {
    * seq is store-allocated; issuedAt is epoch seconds. Free jobs also consume a
    * sequence and attest their outcome. Timing/attribution comes from the committed
    * terminal row; legacy rows omit unknown historical fields. credit is present
-   * only for a resolved ledger draw.
+   * only for a resolved ledger draw. `unpaid` attests a completed job whose
+   * admitted payment was never collected, so `paid` reports none.
    */
-  issue(record: JobRecord, seq: number, issuedAt?: number, credit?: ReceiptCredit): JobReceipt {
+  issue(
+    record: JobRecord,
+    seq: number,
+    issuedAt?: number,
+    credit?: ReceiptCredit,
+    unpaid = false
+  ): JobReceipt {
     const unsigned: UnsignedJobReceipt = {
       v: 1,
       job_id: record.id,
@@ -73,14 +80,16 @@ export class ReceiptIssuer {
       seq,
       issued_at: issuedAt ?? Math.floor(Date.now() / 1000),
       requester_pubkey: record.requesterPubkey ?? null,
-      paid: {
-        msats: record.paidMsats,
-        rail: record.paymentRail ?? null,
-        native_amount: record.nativeAmount ?? null,
-        native_asset: record.nativeAsset ?? null,
-        tx_hash: record.paymentTxHash ?? null,
-        mint: record.paymentMint ?? null,
-      },
+      paid: unpaid
+        ? { msats: 0, rail: null, native_amount: null, native_asset: null, tx_hash: null, mint: null }
+        : {
+            msats: record.paidMsats,
+            rail: record.paymentRail ?? null,
+            native_amount: record.nativeAmount ?? null,
+            native_asset: record.nativeAsset ?? null,
+            tx_hash: record.paymentTxHash ?? null,
+            mint: record.paymentMint ?? null,
+          },
       result_hash: resultHashFor(record),
       receipt_pubkey: this.pubkey,
       ...(credit && { credit }),

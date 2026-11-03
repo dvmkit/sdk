@@ -3940,7 +3940,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // `ensureReceipt` re-attempts on the read paths. Without that retry the
       // stranded number would read as a permanent suppression gap.
       const seq = await store.claimReceiptSeq(record.id);
-      const receipt = issuer.issue(record, seq, undefined, credit);
+      const receipt = issuer.issue(record, seq, undefined, credit, await this.deferredUnpaid(record));
       const saved = await store.saveReceipt(record.id, receipt);
       if (!saved) return undefined;
       await this.observePaidCompletion(record);
@@ -4065,6 +4065,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
+   * A completed deferred-x402 job whose authorization was never collected: its
+   * output stays withheld and nothing it reports or signs may claim payment.
+   * `settle` is idempotent once the intent is resolved, so this re-reads the
+   * recorded outcome; it rejects while the outcome is still unknown.
+   */
+  private async deferredUnpaid(record: JobRecord): Promise<boolean> {
+    const intentId = deferredX402IntentId(record.creditId);
+    if (!intentId || !this.settlesDraw(record.status) || !this.opts.deferredX402) return false;
+    return (await this.opts.deferredX402.settle(intentId)) === "unpaid";
+  }
+
+  /**
    * Sign a locally-held terminal job's receipt and mirror it onto the
    * in-memory job, so the read paths served out of `activeJobs` during the
    * cleanup window hand back the same bytes as a cross-machine re-read.
@@ -4186,14 +4198,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Resolve money and persist receipt evidence before exposing the terminal event.
       const receipt = await this.issueReceipt(record);
       if (this.opts.receiptIssuer && !receipt) return;
-      if (record.creditId && record.drawId && this.opts.creditLedger) {
+      // An unpaid deferred job never gets a ledger draw to wait on.
+      const unpaid = await this.deferredUnpaid(record);
+      if (!unpaid && record.creditId && record.drawId && this.opts.creditLedger) {
         const draw = await this.opts.creditLedger.getDraw({creditId: record.creditId, drawId: record.drawId});
         if (!draw || draw.status === "pending") return;
       }
       await callback({
         dvmId, jobId: record.id, capability: record.capability, outcome: record.status,
         endedBy: record.status === "completed" ? null : record.endedBy ?? "provider",
-        paid: record.paidMsats > 0 || (record.nativeAmount ?? 0) > 0 || !!record.drawId,
+        paid: !unpaid && (record.paidMsats > 0 || (record.nativeAmount ?? 0) > 0 || !!record.drawId),
         acceptedAtMs: record.createdAt,
         terminalAtMs: record.terminalAtMs,
         callerWaitMs: record.callerWaitMs ?? 0,

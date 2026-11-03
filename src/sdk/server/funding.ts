@@ -316,6 +316,13 @@ export const DEFERRED_X402_SETTLE_MARGIN_SECONDS = 15;
 /** Extra validity advertised so ordinary signing and network delay cannot trip the guard. */
 export const DEFERRED_X402_SIGNING_ALLOWANCE_SECONDS = 15;
 
+/**
+ * Authorizations from one payer that may be outstanding at once. The facilitator's
+ * `/verify` reserves no balance, so without a cap one balance could admit
+ * any number of jobs of which only the first settle would be paid.
+ */
+export const DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER = 1;
+
 /** Authorization lifetime a deferred-settlement capability needs and advertises. */
 export function deferredX402Window(maxRuntimeSeconds: number): {
   minValidSeconds: number;
