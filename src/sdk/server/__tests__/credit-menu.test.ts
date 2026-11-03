@@ -166,24 +166,37 @@ describe("credit menu assembly", () => {
     expect(menu?.x402).toBeUndefined();
   });
 
-  it("raises the advertised card floor to Stripe's $0.50 above a lower credit minimum", async () => {
-    const menu = await buildCreditMenu(
-      args({ funding: ["cashu", "stripe"], stripeNetworkId: "profile_test" })
+  const card = (overrides: Partial<Parameters<typeof buildCreditMenu>[0]> = {}) =>
+    buildCreditMenu(
+      args({ funding: ["cashu", "stripe"], stripeNetworkId: "profile_test", ...overrides })
     );
+
+  it("advertises a $5 card minimum by default and leaves the credit minimum for other rails", async () => {
+    const menu = await card();
     expect(menu?.funding).toEqual(["cashu", "stripe"]);
     expect(menu?.min_micro).toBe(100_000);
-    expect(menu?.stripe).toEqual({ network_id: "profile_test", min_micro: 500_000, currency: "usd" });
+    expect(menu?.stripe).toEqual({ network_id: "profile_test", min_micro: 5_000_000, currency: "usd" });
   });
 
-  it("keeps a credit minimum above $0.50 as the card floor", async () => {
-    const menu = await buildCreditMenu(
-      args({
-        config: { ...CONFIG, min: "$1.25" },
-        funding: ["stripe"],
-        stripeNetworkId: "profile_test",
-      })
-    );
+  it("takes the builder's card minimum, and never goes under Stripe's $0.50", async () => {
+    expect((await card({ stripeMinMicro: 1_000_000 }))?.stripe?.min_micro).toBe(1_000_000);
+    expect((await card({ stripeMinMicro: 100_000 }))?.stripe?.min_micro).toBe(500_000);
+    expect((await card({ stripeMinMicro: 1_000_000 }))?.min_micro).toBe(100_000);
+  });
+
+  it("keeps a credit minimum above the card setting as the card floor", async () => {
+    const menu = await card({
+      config: { ...CONFIG, min: "$1.25" },
+      stripeMinMicro: 1_000_000,
+    });
     expect(menu?.stripe?.min_micro).toBe(1_250_000);
+  });
+
+  it("keeps card on a credit whose maximum is under the default, with the maximum as its minimum", async () => {
+    const menu = await card({ config: { ...CONFIG, max: "$3.00" } });
+    expect(menu?.funding).toEqual(["cashu", "stripe"]);
+    expect(menu?.stripe?.min_micro).toBe(3_000_000);
+    expect(menu?.max_micro).toBe(3_000_000);
   });
 
   it("omits card funding when the rail isn't configured or the menu isn't USD", async () => {

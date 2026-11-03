@@ -347,6 +347,7 @@ describe("the charge journal", () => {
         stripeCredit: createStripeCreditRail({
           secretKey: "sk_test_fake",
           networkId: "profile_test",
+          minUsd: "0.50",
           hmacSecret: HMAC,
           apiBase: "https://stripe.invalid",
           fetch: account.fetchImpl,
@@ -391,6 +392,7 @@ describe("a charge the journal cannot record", () => {
         stripeCredit: createStripeCreditRail({
           secretKey: "sk_test_fake",
           networkId: "profile_test",
+          minUsd: "0.50",
           hmacSecret: HMAC,
           apiBase: "https://stripe.invalid",
           fetch: account.fetchImpl,
