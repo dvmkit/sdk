@@ -69,6 +69,38 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.25.0](https://github.com/dvmkit/sdk/compare/v0.24.0...v0.25.0) (2026-11-03)
+
+### Breaking API changes
+
+Card top-ups now default to $5 instead of $0.50. Set `DVMKIT_STRIPE_MIN_USD` or `createStripeCreditRail({ minUsd: ... })` to choose a card-only minimum. Explicit settings must be at least $0.50 and no greater than `credit.max`; invalid settings fail boot. The effective minimum respects `credit.min` and Stripe's $0.50 floor, and the default is capped at `credit.max` so menus below $5 can still offer cards. Other rails and `credit.min` are unchanged. `CreditTerms.stripe` now preserves validated card terms when parsing a credit menu; no public export is removed or renamed.
+
+### Migrations
+
+To retain the previous card floor, set `DVMKIT_STRIPE_MIN_USD=0.50` before upgrading, or pass `minUsd: 0.50` to `createStripeCreditRail`. Otherwise existing card-enabled DVMs advertise the new $5 default, capped by their credit maximum. No database or wire-format migration is required.
+
+### Compatibility requirements
+
+Node.js 22 or newer. No dependency floor changes from 0.24.0.
+
+### dvmctl and platform prerequisites
+
+None. This release introduces no new minimum CLI version or platform capability requirement for the supported builder APIs.
+
+
+### ⚠ BREAKING CHANGES
+
+* **stripe:** default the card top-up minimum to $5 and let builders set it
+
+### Features
+
+* **stripe:** default the card top-up minimum to $5 and let builders set it ([d5ae56b](https://github.com/dvmkit/sdk/commit/d5ae56b54da732e3a1fc217df62977f9060108c5))
+
+
+### Bug Fixes
+
+* **credit:** preserve card terms in caller parsing ([f4e6507](https://github.com/dvmkit/sdk/commit/f4e650720e9893fd6029724b753756e2385b09e3))
+
 ## [0.24.0](https://github.com/dvmkit/sdk/compare/v0.23.0...v0.24.0) (2026-11-03)
 
 
