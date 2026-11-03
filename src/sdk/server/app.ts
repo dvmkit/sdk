@@ -2286,6 +2286,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       accumulatorDb: this.opts.cashuMode === "p2pk-accumulator" ? this.opts.db : undefined,
       disposableCashu: this.opts.disposableCashu,
       dvmId: this.opts.dvmId,
+      canonicalDvmId: this.opts.canonicalDvmId,
       lockPubkeys,
       cashuLockWindowSeconds: signedCashuLockWindowSeconds(this.descriptor.cashu),
       requestId: c.req.header("X-Cashu-Request-Id"),

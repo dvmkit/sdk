@@ -64,6 +64,7 @@ export function fakeStripe(mode: FakeStripeMode = "succeed", idPrefix = "pi_test
   let responseLost = false;
   const calls: StripeCall[] = [];
   const intents = new Map<string, string>();
+  const intentParams = new Map<string, string>();
   const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
     const headers = new Headers(init?.headers);
     const idempotencyKey = headers.get("Idempotency-Key");
@@ -96,7 +97,14 @@ export function fakeStripe(mode: FakeStripeMode = "succeed", idPrefix = "pi_test
     }
     const key = idempotencyKey ?? `anon-${calls.length}`;
     const replayed = intents.has(key);
-    if (!replayed) intents.set(key, `${idPrefix}${intents.size + 1}`);
+    const fingerprint = JSON.stringify([...body].sort(([a], [b]) => a.localeCompare(b)));
+    if (replayed && intentParams.get(key) !== fingerprint) {
+      return Response.json({ error: { type: "idempotency_error" } }, { status: 400 });
+    }
+    if (!replayed) {
+      intents.set(key, `${idPrefix}${intents.size + 1}`);
+      intentParams.set(key, fingerprint);
+    }
     if (mode === "lose-first-response" && !responseLost) {
       responseLost = true;
       throw new TypeError(`fetch failed: socket hang up (${LEAKY_SPT})`);

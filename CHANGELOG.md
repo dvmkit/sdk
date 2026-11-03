@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Card-credit PaymentIntents now include server-owned Stripe metadata `dvmkit_dvm_id` from the server's canonical identity (falling back to its DVM id), including declined confirmations. Environment-created and explicit rails share this behavior; standalone servers without identity omit the field. `StripeCreditRail.charge` accepts optional server-side `canonicalDvmId`. A Stripe parameter mismatch triggers one retry without the new metadata under the same idempotency key, preserving recovery of pre-upgrade charges; existing PaymentIntents keep their original metadata. MPP challenge and idempotency formats are unchanged; no storage migration is required. See `protocol-fixtures/credit-fund-stripe-v1.json`.
+
 ### Terminal result durability
 
 - Retry failed outgoing appends and terminal snapshots for up to 30 seconds before settling a completed credit draw. Exhausted completion retries fail the job with `terminal_persistence_failed` and release its draw when storage is reachable; refusal receipts retain their own reason after failed step writes.

@@ -11,7 +11,7 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
   ".": ["configureDVM", "isConfiguredDVMDescriptor"],
-  "./server": ["readPendingImplicitDraws", "createDVMHost", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
+  "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
   "./testing": ["createTestContext"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
@@ -293,6 +293,7 @@ function typecheckConsumer(consumer, resolution) {
     [
       `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
       `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
+      `import { createStripeCreditRail, type StripeCreditRail } from "${manifest.name}/server";`,
       `import { type UpfrontPayment as ServerUpfrontPayment, readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, type CreditFundingEvidence, type FundingRecord, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { MemoryJobStore } from "${manifest.name}/testing";`,
@@ -305,6 +306,8 @@ function typecheckConsumer(consumer, resolution) {
       "export const serverUpfront: ServerUpfrontPayment = acceptedUpfront;",
       "export const missingSignature: SignedRequestFailure = 'signature_required';",
       "export const serverMissingSignature: ServerSignedRequestFailure = missingSignature;",
+      "export const cardRail: StripeCreditRail = createStripeCreditRail({ secretKey: 'sk_test_fake', networkId: 'profile_test', hmacSecret: '44'.repeat(32) });",
+      "export const cardChargeContext: Parameters<StripeCreditRail['charge']>[1] = { amountMicro: 600000, resourcePath: '/v1/credit', canonicalDvmId: '00000000-0000-4000-8000-000000000001' };",
       "export const historyStore: StreamableJobStore = new MemoryJobStore();",
       "export const verifiedSnapshotHistory = historyStore.getMessages('example-job', 0, { includeHeld: true });",
       "export const credentials: WalletCredentialConfig = { tempo: { method: 'tempo', network: 'moderato' } };",

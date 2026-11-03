@@ -330,6 +330,8 @@ export interface UpfrontPaymentOpts {
   disposableCashu?: DisposableCashuCommit;
   /** DVM identifier — required for the `p2pk-accumulator` path. */
   dvmId?: string;
+  /** Server-resolved canonical identity for card-credit PaymentIntent metadata. Defaults to `dvmId`. */
+  canonicalDvmId?: string;
   /**
    * Active NUT-11 P2PK lock pubkeys — required for the `p2pk-accumulator`
    * path. Includes the current pubkey followed by retired pubkeys still
@@ -775,7 +777,7 @@ async function verifyCardFundingInScope(
   if (refusal) return refusal;
 
   const charged = await withPaymentStage("verifier_broadcast", () =>
-    rail.charge(credential, { amountMicro, resourcePath })
+    rail.charge(credential, { amountMicro, resourcePath, canonicalDvmId: opts.canonicalDvmId ?? opts.dvmId })
   );
   if (!charged.ok) {
     logCreditRejected(`stripe_${charged.reason}`, fundOnly.creditId, cardLogFields(charged));
