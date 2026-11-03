@@ -62,6 +62,26 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.23.0](https://github.com/dvmkit/sdk/compare/v0.22.0...v0.23.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **credit:** a caller's cancel charges the paid pieces including the one in progress, and an ask is never covered by the upfront payment. CreditLedgerLike.resolveDraw is required. StreamableJobStore.appendOutgoing refuses an ask on a terminal job with JobEndedError and finishes the running piece on a payment-request; verifyAndCredit appends PaymentCreditDelta.piece; terminal writes freeze JobRecord.settlement, which the built-in stores own after insert. Postgres initialization adds jobs.pieces and jobs.settlement. A second open ask rejects with ask_already_open, and receipt credit.amount is the charged amount.
+* **payment:** StreamableJobStore.verifyAndCredit takes landing options and may report creditRefused; job_messages gains the balance row status; custom job stores must implement payment intents.
+
+### Features
+
+* **credit:** charge mid-job work by the piece ([#100](https://github.com/dvmkit/sdk/issues/100)) ([9dd3d63](https://github.com/dvmkit/sdk/commit/9dd3d63eed096fd0872059139f7111379af222e1))
+* **credit:** settle part of a credit draw ([#95](https://github.com/dvmkit/sdk/issues/95)) ([d468aac](https://github.com/dvmkit/sdk/commit/d468aacbc2eff035d7712769a1c937618478c139))
+
+
+### Bug Fixes
+
+* **credit:** release a draw held on a closed x402 channel in both ledgers ([#97](https://github.com/dvmkit/sdk/issues/97)) ([221c338](https://github.com/dvmkit/sdk/commit/221c338f80171410da9428f5be903c0031e5de65))
+* **payment:** decide what a mid-job payment pays for when it arrives ([#99](https://github.com/dvmkit/sdk/issues/99)) ([f16cb02](https://github.com/dvmkit/sdk/commit/f16cb02780221977a84aafcb17e906454a6d3be2))
+* **x402:** withhold an unsigned job's output until its payment settles ([1a0e693](https://github.com/dvmkit/sdk/commit/1a0e69341ecfb1ab33cc1141b043fa686c43a509))
+
 ## [0.22.0](https://github.com/dvmkit/sdk/compare/v0.21.2...v0.22.0) (2026-11-02)
 
 
