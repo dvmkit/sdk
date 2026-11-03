@@ -163,6 +163,8 @@ export interface CreditTerms {
    * without an entry have no floor beyond `min_micro`.
    */
   lightning_min_micro?: number;
+  /** Card funding profile and minimum in USD micro-units. */
+  stripe?: { network_id: string; min_micro: number; currency: "usd" };
 }
 
 /** Prepaid-credit funding menu on a quote or 402. Snake_case: wire shape. */
@@ -204,6 +206,8 @@ export function parseCreditTerms(raw: unknown): CreditTerms | undefined {
   if (credit.tempo !== undefined && !tempo) return undefined;
   const x402 = credit.x402 === undefined ? undefined : parseCreditX402Terms(credit.x402);
   if (credit.x402 !== undefined && !x402) return undefined;
+  const stripe = credit.stripe === undefined ? undefined : parseCreditStripeTerms(credit.stripe);
+  if (credit.stripe !== undefined && !stripe) return undefined;
 
   return {
     ...(credit.balance_payment === true && { balance_payment: true }),
@@ -215,6 +219,7 @@ export function parseCreditTerms(raw: unknown): CreditTerms | undefined {
     funding: [...credit.funding] as string[],
     ...(tempo && { tempo }),
     ...(x402 && { x402 }),
+    ...(stripe && { stripe }),
     ...(typeof credit.lightning_min_micro === "number" && {
       lightning_min_micro: credit.lightning_min_micro,
     }),
@@ -235,6 +240,20 @@ export function parseCreditMenu(raw: unknown): CreditMenu | undefined {
     }),
     ...(typeof credit.expiry_ms === "number" && { expiry_ms: credit.expiry_ms }),
   };
+}
+
+function parseCreditStripeTerms(raw: unknown): CreditTerms["stripe"] | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const block = raw as Record<string, unknown>;
+  if (
+    typeof block.network_id !== "string" ||
+    typeof block.min_micro !== "number" ||
+    !Number.isSafeInteger(block.min_micro) ||
+    block.min_micro <= 0 ||
+    block.currency !== "usd"
+  )
+    return undefined;
+  return { network_id: block.network_id, min_micro: block.min_micro, currency: "usd" };
 }
 
 function parseCreditTempoTerms(raw: unknown): CreditTerms["tempo"] | undefined {
