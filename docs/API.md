@@ -291,7 +291,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `StalePendingDrawCursor` | interface | Keyset cursor into CreditLedgerLike.listStalePendingDraws, holding the sort key of the last row a caller examined; offset paging would not do: the scan skips holds it can't resolve (their job row exists), so those rows stay `pending` and reappear at the head of every subsequent page. |
 | `StreamableJobStore` | interface | JobStore extension for cross-machine message streaming + the transactional model (Tx A / Tx B / Tx C). |
 | `stripCreditEnvelope` | function | Remove undeclared credit keys before schema parsing. |
-| `STRIPE_CREDIT_MIN_MICRO` | value | Smallest card top-up, in USD micro-units. |
+| `STRIPE_CREDIT_MIN_MICRO` | value | Stripe's own floor on a USD charge, in USD micro-units. |
 | `StripeChargeFacts` | interface | What a refund needs to know about the charge behind one funding PaymentIntent. |
 | `StripeChargeOutcome` | type | What one charge attempt established. |
 | `StripeCreditConfig` | interface | The env vars that opt a DVM into card-funded credit. |

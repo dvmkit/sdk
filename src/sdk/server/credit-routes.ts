@@ -2398,12 +2398,12 @@ async function checkSizing(
       extra: { min_micro: menu.min_micro, max_micro: menu.max_micro, currency: menu.currency },
     });
   }
-  // The card processor's own floor, above a lower credit minimum.
+  // The card minimum (builder-set or the default), above a lower credit minimum.
   if (args.rail === "stripe" && menu.stripe && args.amountMicro < menu.stripe.min_micro) {
     return jsonPaymentError("below_rail_minimum", 400, {
       message: `Top-up of ${args.amountMicro} micro-${menu.currency.toUpperCase()} is below the ${menu.stripe.min_micro} micro-${menu.currency.toUpperCase()} card minimum.`,
-      display: "Card top-ups start at $0.50. Nothing was charged.",
-      hint: `Ask for a top-up of at least ${menu.stripe.min_micro} micro-USD ($0.50) and sign the fund request again with that amount.`,
+      display: `Card top-ups start at ${formatUsd(menu.stripe.min_micro)}. Nothing was charged.`,
+      hint: `Ask for a top-up of at least ${menu.stripe.min_micro} micro-USD (${formatUsd(menu.stripe.min_micro)}) and sign the fund request again with that amount.`,
       extra: {
         rail: "stripe",
         min_micro: menu.stripe.min_micro,
@@ -2952,4 +2952,11 @@ function pickPrimary(credits: CreditSnapshot[], currency: string): CreditSnapsho
     }
   }
   return best;
+}
+
+/** Dollars from USD micro-units: two decimals, more only when the amount needs them. */
+function formatUsd(micro: number): string {
+  const text = (micro / 1_000_000).toFixed(6).replace(/0+$/, "");
+  const [whole, frac = ""] = text.split(".");
+  return `$${whole}.${frac.padEnd(2, "0")}`;
 }

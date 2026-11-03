@@ -39,6 +39,7 @@ describe("host card-credit identity wiring", () => {
         stripeCredit: createStripeCreditRail({
           secretKey: "sk_test_fake",
           networkId: "profile_test",
+          minUsd: "0.50",
           hmacSecret: HMAC,
           fetch: stripe.fetchImpl,
         }),

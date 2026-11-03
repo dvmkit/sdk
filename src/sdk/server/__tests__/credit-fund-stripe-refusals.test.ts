@@ -175,7 +175,7 @@ describe("card challenges across a binding-key rotation", () => {
   const ROTATED = "55".repeat(32);
 
   async function credentialUnder(secret: string): Promise<string> {
-    const issuer = createStripeCreditRail({ secretKey: "sk_test_fake", networkId: "profile_test", hmacSecret: secret });
+    const issuer = createStripeCreditRail({ secretKey: "sk_test_fake", networkId: "profile_test", minUsd: "0.50", hmacSecret: secret });
     const challenge: Challenge.Challenge = await issuer.issueChallenge({
       amountMicro: 600_000,
       resourcePath: "/v1/credit",
@@ -189,6 +189,7 @@ describe("card challenges across a binding-key rotation", () => {
     const rail = createStripeCreditRail({
       secretKey: "sk_test_fake",
       networkId: "profile_test",
+      minUsd: "0.50",
       hmacSecret: ROTATED,
       previousHmacSecret: () => Promise.resolve(HMAC),
       apiBase: "https://stripe.invalid",
@@ -206,6 +207,7 @@ describe("card challenges across a binding-key rotation", () => {
     const rail = createStripeCreditRail({
       secretKey: "sk_test_fake",
       networkId: "profile_test",
+      minUsd: "0.50",
       hmacSecret: ROTATED,
       previousHmacSecret: () => Promise.resolve(undefined),
       apiBase: "https://stripe.invalid",

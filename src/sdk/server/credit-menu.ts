@@ -7,11 +7,13 @@ import type { CreditLedgerLike, CreditSnapshot } from "./credit-ledger";
 import { isNonChannelBitcoinRail } from "./credit-lots";
 
 /**
- * Smallest card top-up, in USD micro-units. Stripe refuses a USD charge below
- * $0.50, so the funding menu never advertises a lower card floor whatever the
- * builder's `credit.min` says.
+ * Stripe's own floor on a USD charge, in USD micro-units. The advertised card minimum is
+ * never lower, whatever the builder sets. The default and the builder's setting sit above it.
  */
 export const STRIPE_CREDIT_MIN_MICRO = 500_000;
+
+/** Card minimum a builder gets without setting one: $5, in USD micro-units. */
+const STRIPE_CREDIT_DEFAULT_MIN_MICRO = 5_000_000;
 
 /**
  * Public, cacheable prepaid terms exclude caller IDs and balances. toCreditTerms explicitly
@@ -110,6 +112,8 @@ export interface BuildCreditMenuArgs {
   lightningFundingMinSats?: number;
   /** Seller's Stripe network profile id when card credit is configured. */
   stripeNetworkId?: string;
+  /** Builder's card minimum in USD micro-units; absent means the $5 default. */
+  stripeMinMicro?: number;
   /**
    * Read the configured accepted mint list, not its health-filtered advertisement. Non-channel
    * Bitcoin refunds need a mint, but configuration alone does not establish refund solvency.
@@ -203,7 +207,8 @@ export async function buildCreditMenu(args: BuildCreditMenuArgs): Promise<Credit
     if (rail === "tempo") return tempoMethods.length > 0;
     if (rail === "x402") return x402Schemes.length > 0;
     // Cards are charged in USD only, so a credit in another currency cannot take one; a
-    // ceiling under Stripe's minimum charge leaves no top-up a card can make.
+    // ceiling under Stripe's minimum charge leaves no top-up a card can make. A ceiling
+    // between $0.50 and the card minimum keeps card, with the ceiling as its minimum.
     if (rail === "stripe") {
       return (
         args.stripeNetworkId !== undefined &&
@@ -244,7 +249,14 @@ export async function buildCreditMenu(args: BuildCreditMenuArgs): Promise<Credit
       args.stripeNetworkId !== undefined && {
         stripe: {
           network_id: args.stripeNetworkId,
-          min_micro: Math.max(bounds.minMicro, STRIPE_CREDIT_MIN_MICRO),
+          min_micro: Math.min(
+            Math.max(
+              args.stripeMinMicro ?? STRIPE_CREDIT_DEFAULT_MIN_MICRO,
+              bounds.minMicro,
+              STRIPE_CREDIT_MIN_MICRO
+            ),
+            bounds.maxMicro
+          ),
           currency: "usd" as const,
         },
       }),

@@ -11,6 +11,34 @@ import { MPPX_HMAC_MISMATCH_REASON } from "./mpp-setup";
 import { fiatMicroToMethodAmount } from "./mpp-units";
 import { createStripeRefundApi, type StripeRefundApi } from "./stripe-refund-api";
 
+/** Smallest card top-up a builder may set: Stripe refuses a USD charge below $0.50. */
+const STRIPE_MIN_FLOOR_MICRO = 500_000;
+
+/** Card top-up minimum when the builder sets none, in USD micro-units ($5). */
+export const STRIPE_CREDIT_DEFAULT_MIN_MICRO = 5_000_000;
+
+/**
+ * Parse a builder's card minimum, a decimal dollar amount such as `5` or `2.50`, into USD
+ * micro-units. Digits are converted exactly, never through floating point. `label` names the
+ * env var or option in the error so the builder can find what to fix.
+ */
+export function parseStripeMinUsd(value: string | number, label: string): number {
+  const text = (typeof value === "number" ? String(value) : value).trim();
+  const match = /^(\d{1,9})(?:\.(\d{1,6}))?$/.exec(text);
+  if (!match) {
+    throw new Error(
+      `${label} must be a decimal dollar amount of at least $0.50, such as 5 or 2.50 (got ${JSON.stringify(text)}).`
+    );
+  }
+  const micro = Number(match[1]) * 1_000_000 + Number((match[2] ?? "").padEnd(6, "0"));
+  if (micro < STRIPE_MIN_FLOOR_MICRO) {
+    throw new Error(
+      `${label} is ${text}, below $0.50, the smallest card charge Stripe accepts. Set it to $0.50 or more.`
+    );
+  }
+  return micro;
+}
+
 /** The env vars that opt a DVM into card-funded credit. */
 export interface StripeCreditConfig {
   /** Seller's Stripe secret key; the charge lands in this account. */
@@ -19,6 +47,8 @@ export interface StripeCreditConfig {
   networkId: string;
   /** MPP challenge-binding HMAC secret, shared with Tempo. */
   hmacSecret: string;
+  /** Builder-set card top-up minimum in dollars, from `DVMKIT_STRIPE_MIN_USD`. */
+  minUsd?: string;
 }
 
 /**
@@ -48,7 +78,9 @@ export function stripeCreditConfigFromEnv(
       "Card credit requires DVMKIT_TEMPO_SECRET_KEY: it binds MPP challenges for both Tempo and card credit. Generate one with 'openssl rand -hex 32'."
     );
   }
-  return { secretKey, networkId, hmacSecret };
+  const minUsd = env.DVMKIT_STRIPE_MIN_USD?.trim();
+  if (minUsd) parseStripeMinUsd(minUsd, "DVMKIT_STRIPE_MIN_USD");
+  return { secretKey, networkId, hmacSecret, ...(minUsd && { minUsd }) };
 }
 
 /** Stripe's own error classification: enums, never Stripe's free-text message. */
@@ -109,6 +141,11 @@ export type StripeChargeOutcome =
  */
 export interface StripeCreditRail {
   networkId: string;
+  /**
+   * The builder's card top-up minimum in USD micro-units; absent means the $5 default. The
+   * credit menu combines it with the credit bounds into the advertised `credit.stripe.min_micro`.
+   */
+  minMicro?: number;
   /** Issue a `method="stripe"` charge challenge for a top-up of `amountMicro` USD micro. */
   issueChallenge(args: {
     amountMicro: number;
@@ -132,7 +169,12 @@ export interface StripeCreditRail {
   chargeJournal?: CardChargeJournal;
 }
 
-export interface CreateStripeCreditRailOpts extends StripeCreditConfig {
+export interface CreateStripeCreditRailOpts extends Omit<StripeCreditConfig, "minUsd"> {
+  /**
+   * Smallest card top-up in USD, a decimal amount such as `5` or `2.50` (at least `0.50`).
+   * Defaults to `5`. Applies to card only; other rails and `credit.min` are unaffected.
+   */
+  minUsd?: number | string;
   /**
    * The HMAC secret that was active before the last `DVMKIT_TEMPO_SECRET_KEY` rotation,
    * while its window is open. A credential bound under it is still verified, so a resend
@@ -179,9 +221,14 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       secretKey,
     });
   const issuer = build(unusedClient, opts.hmacSecret);
+  const minMicro =
+    opts.minUsd !== undefined
+      ? parseStripeMinUsd(opts.minUsd, "createStripeCreditRail minUsd")
+      : undefined;
 
   return {
     networkId: opts.networkId,
+    ...(minMicro !== undefined && { minMicro }),
     refunds: createStripeRefundApi({ secretKey: opts.secretKey, apiBase, fetch: fetchImpl }),
     ...(opts.chargeJournal && { chargeJournal: opts.chargeJournal }),
 

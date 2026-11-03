@@ -38,7 +38,21 @@ Card-credit PaymentIntent creation includes Stripe metadata `dvmkit_dvm_id` from
 
 An in-flight charge made before identity metadata was enabled can still be recovered after an upgrade. If Stripe refuses the added metadata with HTTP 400 `idempotency_error`, the rail retries once with only `dvmkit_dvm_id` removed, under the same idempotency key. This recovers the original charge after a lost response or a crash before booking; the existing PaymentIntent keeps its original metadata. A persistent mismatch remains a payment failure and does not book credit.
 
-The menu advertises `stripe` in `credit.funding` with `credit.stripe: { network_id, min_micro, currency }`, only on a USD credit menu and independently of `paymentMethods`. Top-ups start at $0.50 (Stripe's minimum card charge), or at `credit.min` when that is higher. Amounts are charged in whole cents, and a credit whose `max` is below $0.50 does not offer cards. A declined card books nothing and returns a `hint` for the agent to relay. Rotating `DVMKIT_TEMPO_SECRET_KEY` keeps the previous key valid for card challenges during the same window as Tempo, when the host has Postgres. Wire details are in [Card-funded credit](PROTOCOL-NOTES.md#card-funded-credit).
+The menu advertises `stripe` in `credit.funding` with `credit.stripe: { network_id, min_micro, currency }`, only on a USD credit menu and independently of `paymentMethods`. Card top-ups start at $5 unless you set another minimum (see [Card top-up minimum](#card-top-up-minimum)), or at `credit.min` when that is higher. Amounts are charged in whole cents, and a credit whose `max` is below $0.50 does not offer cards. A declined card books nothing and returns a `hint` for the agent to relay. Rotating `DVMKIT_TEMPO_SECRET_KEY` keeps the previous key valid for card challenges during the same window as Tempo, when the host has Postgres. Wire details are in [Card-funded credit](PROTOCOL-NOTES.md#card-funded-credit).
+
+### Card top-up minimum
+
+Card top-ups start at $5 by default. Set `DVMKIT_STRIPE_MIN_USD` (a decimal dollar amount such as `5` or `2.50`) or pass `minUsd` to `createStripeCreditRail` to change it. It changes the card minimum only: other rails and `credit.min` are untouched, and the advertised `credit.stripe.min_micro` is the larger of your setting, `credit.min` and Stripe's $0.50 floor, capped at the credit's `max` so a DVM whose `max` is under $5 still offers cards. A setting under $0.50, one that is not a number, or one above `credit.max` fails boot with an error naming the variable.
+
+Why it exists: Stripe charges about 2.9% plus 30 cents per card payment, so a small top-up mostly pays Stripe. You bear that fee on credit that gets spent; the caller bears the fee's share of any refund of unused credit (see the refund arithmetic in [Card-funded credit](PROTOCOL-NOTES.md#card-funded-credit)).
+
+| Top-up | Stripe fee | Share of the top-up |
+| --- | --- | --- |
+| $0.50 | about $0.31 | about 63% |
+| $5 | about $0.45 | about 9% |
+| $20 | about $0.88 | about 4.4% |
+
+A higher minimum shrinks Stripe's share of each top-up; a lower one lets a caller try your DVM for less. Choose by job price: a minimum around ten jobs' worth means a first top-up covers real use, so the fee is spread over many jobs instead of one. A DVM that charges $0.10 a job can keep $1; one that charges $2 a job suits $20. Raise it if fees eat your margin; lower it if callers abandon at the first top-up. The $5 default suits most small DVMs.
 
 `DVMKIT_STRIPE_SECRET_KEY` can be a restricted key (`rk_live_…`), and should be. Give it exactly these permissions, named as the Stripe dashboard names them:
 

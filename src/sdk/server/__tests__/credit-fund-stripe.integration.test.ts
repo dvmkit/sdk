@@ -68,6 +68,7 @@ async function liveServer() {
         secretKey: KEY!,
         // What mppx's own test-mode suite uses; the charge never sends it to Stripe.
         networkId: "internal",
+        minUsd: "0.50",
         hmacSecret: HMAC,
       }),
     },
