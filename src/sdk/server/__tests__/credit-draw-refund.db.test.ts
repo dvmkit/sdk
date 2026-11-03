@@ -14,6 +14,7 @@ import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryConsumedCredentialStore } from "../consumed-credential-store";
 import type { CreditDrawRefundArgs } from "../credit-draw-refund";
 import { CreditLedger } from "../credit-ledger";
+import { DRAIN_DELIVERY_RESERVE_SATS } from "../credit-lots";
 import { toLockPubkey } from "../lock-pubkey-store";
 import { ReceiptIssuer } from "../receipt-issuer";
 import { RevenueReporter } from "../revenue-reporter";
@@ -257,6 +258,20 @@ describe.skipIf(!RUN)("completed credit draw refunds", () => {
       method: "cashu", payout: { refund_pubkey: refundPubkey }, nowMs });
     expect(drain).toMatchObject({ amountMicro: 1_000, owedSats: 132 });
     expect((await pool.query("SELECT drained_msats FROM credit_drains WHERE drain_id = 'drain'")).rows[0].drained_msats).toBe("140000");
+  });
+
+  it("refunds only the settled part of a partly settled draw, at the sats that part consumed", async () => {
+    await fund("c", 1_000, 100);
+    await ledger.draw({ creditId: "c", drawId: "d", amountMicro: 1_000, jobId: "j", nowMs });
+    await ledger.resolveDraw({ creditId: "c", drawId: "d", settleMicro: 600, nowMs });
+    await pool.query("INSERT INTO reported_job_terminals(dvm_id, job_id, created_at) VALUES ($1, 'j', $2)", [outbox.dvmId, nowMs]);
+
+    await expect(refund("past-settled", 601)).rejects.toMatchObject({ code: "refund_exceeds_draw" });
+    expect(await refund("settled-part")).toMatchObject({ amountMicro: 600, balanceAfterMicro: 1_000 });
+    // 400 released and 600 refunded: the whole 100-sat deposit is owed back again.
+    const { drain } = await ledger.requestDrain({ creditId: "c", drainId: "drain", callerPubkey,
+      method: "cashu", payout: { refund_pubkey: refundPubkey }, nowMs });
+    expect(drain).toMatchObject({ amountMicro: 1_000, owedSats: 100 - DRAIN_DELIVERY_RESERVE_SATS });
   });
 
   it("restores the original lot value when a hold forecast made settlement floor the pooled remainder", async () => {

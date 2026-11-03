@@ -24397,6 +24397,8 @@
           "symbols": [
             "CreditDrawRefundArgs",
             "CreditDrawRefundResult",
+            "DRAW_NOT_SETTLED_REFUSAL",
+            "REFUND_EXCEEDS_SETTLED_REFUSAL",
             "refundAssetDelta",
             "refundRequest"
           ],
@@ -24414,6 +24416,33 @@
         },
         {
           "module": "src/sdk/server/revenue-reporter.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/credit-draw-resolution.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Terminal draw resolution rules (settled figure validation, replay plan and settled rail-value share) used by the supported durable and memory credit ledgers.",
+          "symbols": [
+            "DrawResolutionPlan",
+            "DrawSettleRequest",
+            "assertSettleMicro",
+            "planDrawResolution",
+            "settledShare"
+          ],
+          "consumerEvidence": [
+            "supported:./server#CreditLedger",
+            "supported:./server#JobManager",
+            "supported:./server#MemoryCreditLedger"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
         }
       ]
     },
@@ -24779,6 +24808,9 @@
         },
         {
           "module": "src/sdk/server/x402-channel-store.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-draw-resolution.ts"
         }
       ]
     },
@@ -27240,6 +27272,33 @@
         },
         {
           "module": "src/sdk/server/unsigned-request.ts"
+        },
+        {
+          "module": "src/sdk/server/settled-draw-revenue.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/settled-draw-revenue.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Revenue amounts booked from a settled credit draw by the supported job manager.",
+          "symbols": [
+            "settledDrawRevenue"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-draw-resolution.ts"
         }
       ]
     },
@@ -27761,6 +27820,9 @@
         },
         {
           "module": "src/sdk/server/x402-channel-store.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-draw-resolution.ts"
         }
       ]
     },

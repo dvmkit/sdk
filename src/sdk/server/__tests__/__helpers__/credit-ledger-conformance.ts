@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CreditFundingBasis, CreditLedgerLike } from "../../credit-ledger.js";
+import { DRAIN_DELIVERY_RESERVE_SATS } from "../../credit-lots.js";
 import { TEST_FUNDING_BASIS } from "./credit-fixtures.js";
 
 /**
@@ -39,6 +40,175 @@ export function describeCreditLedgerConformance(
         .toMatchObject({ expiryMs: 10_454_401_000, balanceMicro: 300_000 });
       expect((await ledger.get(funding.creditId, { nowMs: 2_678_401_000 }))?.expiryMs)
         .toBe(10_454_401_000);
+    });
+  });
+
+  describe("CreditLedgerLike partial draw settlement conformance", () => {
+    it("settles part of a hold from the oldest Cashu lot first and releases the rest to the credit", async () => {
+      const ledger = await makeLedger();
+      // 500 micro bought 500 sats, then 500 micro bought 1,000 sats.
+      await fund(ledger, "contract-partial-lots", {
+        amountMicro: 500,
+        basis: { rail: "cashu", paidMsats: 500_000, fundingRef: "lot-cheap" },
+        nowMs: 1_000,
+      });
+      await fund(ledger, "contract-partial-lots", {
+        amountMicro: 500,
+        basis: { rail: "cashu", paidMsats: 1_000_000, fundingRef: "lot-dear" },
+        nowMs: 2_000,
+      });
+      await ledger.draw({ creditId: "contract-partial-lots", drawId: "job", amountMicro: 1_000, jobId: "job" });
+
+      const settled = await resolveDraw(ledger)({ creditId: "contract-partial-lots", drawId: "job", settleMicro: 600 });
+
+      // 500 micro from the cheap lot (500 sats) and 100 from the dear one (200 sats).
+      expect(settled).toMatchObject({
+        status: "settled",
+        replayed: false,
+        amountMicro: 600,
+        availableMicro: 400,
+        railValue: { drawMsats: 700_000, drawNative: null },
+        partialSettle: { heldMicro: 1_000, releasedMicro: 400, releasedNative: null },
+      });
+      expect(await ledger.getDraw({ creditId: "contract-partial-lots", drawId: "job" })).toMatchObject({
+        status: "settled",
+        amountMicro: 600,
+        allocatedMsats: 1_500_000,
+        railValue: { drawMsats: 700_000 },
+      });
+      expect(await ledger.get("contract-partial-lots")).toMatchObject({ balanceMicro: 400, availableMicro: 400 });
+      expect(
+        (await ledger.listFundingLots("contract-partial-lots")).map((lot) => [lot.fundingRef, lot.remainingMicro])
+      ).toEqual([["lot-dear", 400]]);
+      // The released 400 is reclaimable at the rate of the lot still holding it.
+      const reclaim = await ledger.requestDrain({
+        creditId: "contract-partial-lots",
+        drainId: "reclaim",
+        callerPubkey: CALLER_A,
+        method: "cashu",
+        payout: {},
+      });
+      expect(reclaim.drain).toMatchObject({ amountMicro: 400, owedSats: 800 - DRAIN_DELIVERY_RESERVE_SATS });
+    });
+
+    it("replays the recorded figure, refuses any other, and replays the placement against the hold", async () => {
+      const ledger = await makeLedger();
+      await fund(ledger, "contract-partial-replay", { amountMicro: 10_000 });
+      await ledger.draw({ creditId: "contract-partial-replay", drawId: "job", amountMicro: 1_000, jobId: "job" });
+      const args = { creditId: "contract-partial-replay", drawId: "job" };
+      const first = await resolveDraw(ledger)({ ...args, settleMicro: 600 });
+
+      const replay = await resolveDraw(ledger)({ ...args, settleMicro: 600 });
+      expect(replay).toEqual({ ...first, replayed: true });
+      for (const refused of [
+        () => resolveDraw(ledger)({ ...args, settleMicro: 700 }),
+        () => resolveDraw(ledger)({ ...args, settleMicro: 0 }),
+        () => ledger.settle(args),
+        () => ledger.release(args),
+      ]) {
+        await expect(refused()).rejects.toMatchObject({
+          code: "invalid_draw_state",
+          details: { currentStatus: "settled", settledMicro: 600 },
+        });
+      }
+      await expect(resolveDraw(ledger)({ ...args, settleMicro: 1_001 })).rejects.toMatchObject({
+        code: "invalid_amount",
+      });
+      expect(await ledger.get("contract-partial-replay")).toMatchObject({
+        balanceMicro: 9_400,
+        availableMicro: 9_400,
+      });
+
+      await expect(
+        ledger.draw({ ...args, amountMicro: 1_000, jobId: "job" })
+      ).resolves.toMatchObject({ replayed: true, status: "settled", amountMicro: 600 });
+      await expect(ledger.draw({ ...args, amountMicro: 600, jobId: "job" })).rejects.toMatchObject({
+        code: "draw_conflict",
+        details: { expectedAmountMicro: 1_000 },
+      });
+    });
+
+    it("treats zero as a release and the whole hold as a settle", async () => {
+      const ledger = await makeLedger();
+      await fund(ledger, "contract-partial-ends", { amountMicro: 10_000 });
+      await ledger.draw({ creditId: "contract-partial-ends", drawId: "nothing", amountMicro: 1_000 });
+      await ledger.draw({ creditId: "contract-partial-ends", drawId: "all", amountMicro: 2_000 });
+
+      const released = await resolveDraw(ledger)({ creditId: "contract-partial-ends", drawId: "nothing", settleMicro: 0 });
+      expect(released).toMatchObject({ status: "released", amountMicro: 1_000 });
+      expect(released).not.toHaveProperty("partialSettle");
+      await expect(ledger.release({ creditId: "contract-partial-ends", drawId: "nothing" }))
+        .resolves.toMatchObject({ replayed: true, status: "released" });
+
+      const whole = await resolveDraw(ledger)({ creditId: "contract-partial-ends", drawId: "all", settleMicro: 2_000 });
+      expect(whole).toMatchObject({ status: "settled", amountMicro: 2_000 });
+      expect(whole).not.toHaveProperty("partialSettle");
+      await expect(ledger.settle({ creditId: "contract-partial-ends", drawId: "all" }))
+        .resolves.toMatchObject({ replayed: true, status: "settled" });
+      expect(await ledger.get("contract-partial-ends")).toMatchObject({ balanceMicro: 8_000, availableMicro: 8_000 });
+    });
+
+    it("refuses a figure it cannot settle and leaves the hold pending", async () => {
+      const ledger = await makeLedger();
+      await fund(ledger, "contract-partial-invalid", { amountMicro: 10_000 });
+      await ledger.draw({ creditId: "contract-partial-invalid", drawId: "job", amountMicro: 1_000 });
+      for (const settleMicro of [-1, 0.5, Number.NaN, 1_001]) {
+        await expect(
+          resolveDraw(ledger)({ creditId: "contract-partial-invalid", drawId: "job", settleMicro })
+        ).rejects.toMatchObject({ code: "invalid_amount" });
+      }
+      expect(await ledger.getDraw({ creditId: "contract-partial-invalid", drawId: "job" })).toMatchObject({
+        status: "pending",
+        amountMicro: 1_000,
+      });
+      expect(await ledger.get("contract-partial-invalid")).toMatchObject({ balanceMicro: 10_000, availableMicro: 9_000 });
+    });
+
+    it("keeps the released part of a card credit owed back to the card", async () => {
+      const ledger = await makeLedger();
+      await fund(ledger, "contract-partial-card", {
+        amountMicro: 1_000_000,
+        basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 100, fundingRef: "pi_partial" },
+      });
+      await ledger.draw({ creditId: "contract-partial-card", drawId: "job", amountMicro: 1_000_000 });
+      await resolveDraw(ledger)({ creditId: "contract-partial-card", drawId: "job", settleMicro: 600_000 });
+
+      const refund = await ledger.requestDrain({
+        creditId: "contract-partial-card",
+        drainId: "to-card",
+        callerPubkey: CALLER_A,
+        method: "stripe",
+        payout: {},
+      });
+      expect(refund.drain).toMatchObject({ method: "stripe", amountMicro: 400_000 });
+      expect(refund.credit).toMatchObject({ balanceMicro: 0, availableMicro: 0 });
+      // The refund planner sizes each charge from the drain; the charge that funded it is still there.
+      expect((await ledger.listFundingLots("contract-partial-card")).map((lot) => lot.fundingRef))
+        .toEqual(["pi_partial"]);
+    });
+
+    it("earns an x402 channel only the settled part of a draw", async () => {
+      const ledger = await makeLedger();
+      const channel = channelId("c");
+      await fund(ledger, "contract-partial-x402", {
+        amountMicro: 1_000,
+        basis: {
+          rail: "x402",
+          paidMsats: 0,
+          nativeAmount: 1_000,
+          nativeAsset: "usdc",
+          x402Channel: { channelId: channel, maxClaimableAmount: "1000" },
+        },
+      });
+      await ledger.draw({ creditId: "contract-partial-x402", drawId: "job", amountMicro: 1_000 });
+      const settled = await resolveDraw(ledger)({ creditId: "contract-partial-x402", drawId: "job", settleMicro: 600 });
+
+      expect(settled).toMatchObject({
+        railValue: { drawNative: 600 },
+        partialSettle: { heldMicro: 1_000, releasedMicro: 400, releasedNative: 400 },
+      });
+      expect(await ledger.earnedNativeForX402Channel(channel)).toBe(600);
+      expect(await ledger.get("contract-partial-x402")).toMatchObject({ availableMicro: 400, nativeAvailable: 400 });
     });
   });
 
@@ -466,6 +636,12 @@ export function describeCreditLedgerConformance(
       ]);
     });
   });
+}
+
+/** Both shipping ledgers implement the optional verb; a missing one fails the case. */
+function resolveDraw(ledger: CreditLedgerLike): NonNullable<CreditLedgerLike["resolveDraw"]> {
+  if (!ledger.resolveDraw) throw new Error("ledger does not implement resolveDraw");
+  return ledger.resolveDraw.bind(ledger);
 }
 
 const CALLER_A = "11".repeat(32);

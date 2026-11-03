@@ -144,6 +144,44 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     expect(account.refunds.size).toBe(1);
   });
 
+  it("refunds the part a partial settle released to the card at expiry", async () => {
+    const account = fakeStripeAccount();
+    const now = Date.now();
+    const expiryMs = now - HOUR_MS;
+    const fundedAtMs = expiryMs - 2 * HOUR_MS;
+    await cardCredit(account, { creditId: "part-settled", pi: "pi_part", cents: 100, expiryMs, fundedAtMs });
+    await ledger.draw({ creditId: "part-settled", drawId: "j", amountMicro: 1_000_000, jobId: "j", nowMs: fundedAtMs + 1 });
+    await ledger.resolveDraw({ creditId: "part-settled", drawId: "j", settleMicro: 600_000 });
+
+    const summary = await runCardRefundSweep({ ledger, stripe: stripeApi(account), drainReport: {} }, { nowMs: now });
+    expect(summary.expiryRefunds).toContain("part-settled");
+    // $0.40 released; Stripe's fee on $1.00 is 33 cents, 13 of them on that $0.40, so the card gets 27.
+    expect([...account.refunds.values()].map((r) => [r.payment_intent, r.amount])).toEqual([["pi_part", 27]]);
+    expect(await ledger.getDrain({ creditId: "part-settled", drainId: cardExpiryDrainId(expiryMs) }))
+      .toMatchObject({ method: "stripe", status: "sent", amountMicro: 400_000 });
+    expect(await ledger.get("part-settled")).toMatchObject({ status: "refunded", balanceMicro: 0 });
+  });
+
+  it("settles, releases and part-settles holds on a credit frozen by a dispute", async () => {
+    const account = fakeStripeAccount();
+    await cardCredit(account, { creditId: "frozen-holds", pi: "pi_frozen_holds", cents: 200, expiryMs: Date.now() + HOUR_MS });
+    for (const [drawId, amountMicro] of [["part", 1_000_000], ["none", 300_000], ["whole", 200_000], ["gone", 100_000]] as const) {
+      await ledger.draw({ creditId: "frozen-holds", drawId, amountMicro, jobId: `frozen-${drawId}` });
+    }
+    expect(await ledger.freezeCardCreditsForPaymentIntent("pi_frozen_holds")).toEqual(["frozen-holds"]);
+
+    await expect(ledger.resolveDraw({ creditId: "frozen-holds", drawId: "part", settleMicro: 600_000 }))
+      .resolves.toMatchObject({ status: "settled", amountMicro: 600_000, partialSettle: { releasedMicro: 400_000 } });
+    await expect(ledger.resolveDraw({ creditId: "frozen-holds", drawId: "none", settleMicro: 0 }))
+      .resolves.toMatchObject({ status: "released" });
+    await expect(ledger.settle({ creditId: "frozen-holds", drawId: "whole" })).resolves.toMatchObject({ status: "settled" });
+    await expect(ledger.release({ creditId: "frozen-holds", drawId: "gone" })).resolves.toMatchObject({ status: "released" });
+
+    // Charged $0.80 of $2.00; the rest stays frozen with the credit until the dispute ends.
+    expect(await ledger.get("frozen-holds")).toMatchObject({ status: "disputed", balanceMicro: 1_200_000, availableMicro: 0 });
+    expect(await ledger.listPendingDraws("frozen-holds")).toEqual([]);
+  });
+
   it("tells the caller a refunded card credit is closed and where its refund went", async () => {
     const account = fakeStripeAccount();
     const { app } = await cardServer({ stripe: account, ledger });
