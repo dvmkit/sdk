@@ -293,6 +293,7 @@ function typecheckConsumer(consumer, resolution) {
     [
       `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
       `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
+      `import type { JobTerminalReportPayload } from "${manifest.name}/server";`,
       `import { createStripeCreditRail, type StripeCreditRail, type CardDrainDecision, type CardDrainRecovery, type CardDrainStateArgs } from "${manifest.name}/server";`,
       `import { type UpfrontPayment as ServerUpfrontPayment, readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, type CreditFundingEvidence, type FundingRecord, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
@@ -306,6 +307,8 @@ function typecheckConsumer(consumer, resolution) {
       "export const serverUpfront: ServerUpfrontPayment = acceptedUpfront;",
       "export const missingSignature: SignedRequestFailure = 'signature_required';",
       "export const serverMissingSignature: ServerSignedRequestFailure = missingSignature;",
+      "export const legacyTerminalReport: JobTerminalReportPayload = { dvmId: 'example-dvm', jobId: 'example-job', capability: 'work', outcome: 'completed', endedBy: null, paid: true, acceptedAtMs: 1000, terminalAtMs: 2000, callerWaitMs: 0, receiptSeq: null, chargedMicro: 100000, currency: 'usd', stoppedPiece: false };",
+      "export const terminalReport: JobTerminalReportPayload = { ...legacyTerminalReport, heldMicro: 300000, finishedPieceCount: 1 };",
       "export const cardRail: StripeCreditRail = createStripeCreditRail({ secretKey: 'sk_test_fake', networkId: 'profile_test', hmacSecret: '44'.repeat(32) });",
       "export const cardRecoveryDecision: CardDrainDecision = { decisionId: 'example-decision', action: 'close', reason: 'Refund unavailable', decidedAt: 1000 };",
       "export const cardRecoveryState: CardDrainRecovery = { revision: 0, blockedReason: 'charges_exhausted', blockedAt: 1000, decisions: [cardRecoveryDecision], writtenOffMicro: 1000000 };",

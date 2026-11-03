@@ -4333,16 +4333,23 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       if (this.opts.receiptIssuer && !receipt) return;
       // An unpaid deferred job never gets a ledger draw to wait on, and nor does one that did not
       // complete: its authorization was abandoned unspent.
-      const abandoned = deferredX402IntentId(record.creditId) !== undefined && record.status !== "completed";
+      const deferredIntent = deferredX402IntentId(record.creditId);
+      const abandoned = deferredIntent !== undefined && record.status !== "completed";
       const unpaid = abandoned || await this.deferredUnpaid(record);
       let chargedMicro = 0;
+      let heldMicro = 0;
       let currency: string | null = null;
       if (!unpaid && record.creditId && record.drawId && this.opts.creditLedger) {
         const draw = await this.opts.creditLedger.getDraw({creditId: record.creditId, drawId: record.drawId});
         if (!draw || draw.status === "pending") return;
         chargedMicro = drawChargedMicro(draw);
+        heldMicro = drawHeldMicro(draw);
         currency = draw.railValue.creditCurrency;
       }
+      // Unsigned x402 has no piece list: its single piece is paid only on successful completion.
+      const finishedPieceCount = deferredIntent
+        ? (!unpaid && record.status === "completed" ? 1 : 0)
+        : record.pieces?.filter((piece) => piece.state === "finished").length;
       await callback({
         dvmId, jobId: record.id, capability: record.capability, outcome: record.status,
         endedBy: record.status === "completed" ? null : record.endedBy ?? "provider",
@@ -4352,6 +4359,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         callerWaitMs: record.callerWaitMs ?? 0,
         receiptSeq: receipt?.seq ?? null,
         chargedMicro,
+        heldMicro,
+        ...(finishedPieceCount !== undefined && { finishedPieceCount }),
         currency,
         stoppedPiece: record.settlement?.stoppedPiece === true,
       });

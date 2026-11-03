@@ -109,6 +109,8 @@
     "callerWaitMs": 2000,
     "receiptSeq": 8,
     "chargedMicro": 300000,
+    "heldMicro": 300000,
+    "finishedPieceCount": 1,
     "currency": "usd",
     "stoppedPiece": true
   }

@@ -125,6 +125,10 @@ export interface JobTerminalReportPayload {
    * Absent on reports queued before piece charging.
    */
   chargedMicro?: number;
+  /** Original draw hold, including paid mid-job pieces, in integer micro-units of {@link currency}. `0` without a draw. */
+  heldMicro?: number;
+  /** Finished paid pieces, excluding a stopped piece. Absent when historical piece accounting is unknown. */
+  finishedPieceCount?: number;
   /** Currency of {@link chargedMicro}; `null` when the job held no draw. */
   currency?: string | null;
   /** A caller's cancel stopped a piece of work in progress and charged it. */

@@ -41,6 +41,7 @@
     "callerWaitMs": 300,
     "receiptSeq": 7,
     "chargedMicro": 0,
+    "heldMicro": 0,
     "currency": null,
     "stoppedPiece": false
   }
