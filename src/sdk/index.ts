@@ -36,6 +36,7 @@ export type {
   ApprovalContent,
   ArtifactContent,
   CancelContent,
+  DeclineContent,
   CapabilityRate,
   CashuConfig,
   CreditConfig,
@@ -61,6 +62,7 @@ export type {
   ResponseContent,
   SDKJobContext,
   SDKPaymentRequestOpts,
+  CompleteOpts,
   ZodLike,
 } from "./types";
 export {

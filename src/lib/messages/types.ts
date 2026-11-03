@@ -20,6 +20,7 @@ export type MessageType =
   | "payment"
   | "approval"
   | "cancel"
+  | "decline"
   | "complete"
   | "working"
   | "progress";
@@ -76,6 +77,12 @@ export interface PaymentRequestContent {
   expires_at_ms?: number;
   /** Exact outstanding balance charge, in integer micro-units. Use this message’s seq as request_seq. */
   credit?: { amount_micro: number; currency: string };
+  /**
+   * What declining this ask costs: the pieces of work finished so far at full price, in
+   * integer micro-units of the job's credit currency. Absent on older servers and on jobs
+   * accepted before piece charging.
+   */
+  charged_if_declined_micro?: number;
   amount_msats: number;
   reason: string;
   /**
@@ -184,6 +191,14 @@ export interface CancelContent {
   reason?: string;
 }
 
+/**
+ * Requester declines the job's open ask or prompt, ending the job. Unlike a cancel, the piece
+ * of work in progress is released rather than charged.
+ */
+export interface DeclineContent {
+  reason?: string;
+}
+
 /** Provider signals job completion. */
 export interface CompleteContent {
   /** Human-readable summary of the completed job (same value emitted on the status endpoint as `summary`). Not the payload — artifacts carry that. */
@@ -219,6 +234,7 @@ export type Message =
   | (MessageBase & { type: "payment"; content: PaymentContent })
   | (MessageBase & { type: "approval"; content: ApprovalContent })
   | (MessageBase & { type: "cancel"; content: CancelContent })
+  | (MessageBase & { type: "decline"; content: DeclineContent })
   | (MessageBase & { type: "complete"; content: CompleteContent })
   | (MessageBase & { type: "working"; content: WorkingContent })
   | (MessageBase & { type: "progress"; content: ProgressContent });

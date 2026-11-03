@@ -201,6 +201,8 @@
       "src/sdk/server/payment-mode.ts",
       "src/sdk/server/payment.ts",
       "src/sdk/server/payout-reporter.ts",
+      "src/sdk/server/piece-settlement.ts",
+      "src/sdk/server/pieces.ts",
       "src/sdk/server/postgres-consumed-credential-store.ts",
       "src/sdk/server/postgres-job-store.ts",
       "src/sdk/server/postgres-kv-store.ts",
@@ -6531,6 +6533,7 @@
             "ArtifactContent",
             "CancelContent",
             "CompleteContent",
+            "DeclineContent",
             "Message",
             "MessageFrom",
             "MessageType",
@@ -9564,6 +9567,8 @@
             "ReceiptCredit",
             "ReceiptOutcome",
             "ReceiptPayment",
+            "ReceiptPiece",
+            "ReceiptSettlement",
             "UnsignedDrainReceipt",
             "UnsignedFundingReceipt",
             "UnsignedJobReceipt",
@@ -23831,6 +23836,9 @@
         },
         {
           "module": "src/sdk/server/x402-facilitator-support.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
         }
       ]
     },
@@ -24396,6 +24404,9 @@
         },
         {
           "module": "src/sdk/server/ask-expiry.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
         }
       ]
     },
@@ -27290,6 +27301,12 @@
         },
         {
           "module": "src/sdk/types.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
+        },
+        {
+          "module": "src/sdk/server/piece-settlement.ts"
         }
       ]
     },
@@ -27326,7 +27343,9 @@
           "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
           "symbols": [
             "AppendOutgoingOptions",
+            "DeclineOutcome",
             "JobCounters",
+            "JobEndedError",
             "JobRecord",
             "JobRetentionCursor",
             "JobRetentionStore",
@@ -27452,6 +27471,9 @@
         },
         {
           "module": "src/sdk/server/credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
         }
       ]
     },
@@ -27463,12 +27485,14 @@
           "destination": "sdk",
           "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
           "symbols": [
+            "AskAlreadyOpenError",
             "JobCancelledError",
             "PaymentResolver",
             "PromptResolver",
             "ServerJob",
             "abortJob",
             "fromJobRecord",
+            "hasOpenAsk",
             "isTerminal",
             "isYieldMessage",
             "localMessage",
@@ -27570,6 +27594,9 @@
         },
         {
           "module": "src/sdk/server/ask-expiry.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
         }
       ]
     },
@@ -28012,6 +28039,9 @@
         },
         {
           "module": "src/sdk/server/payment-arrival.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
         }
       ]
     },
@@ -29630,6 +29660,12 @@
         },
         {
           "module": "src/sdk/server/payment-arrival.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
+        },
+        {
+          "module": "src/sdk/server/job.ts"
         }
       ]
     },
@@ -34712,6 +34748,7 @@
             "CapabilityConfig",
             "CapabilityDescriptor",
             "CashuMode",
+            "CompleteOpts",
             "CreditConfig",
             "CreditView",
             "DEFAULT_CREDIT_MAX",
@@ -35416,6 +35453,78 @@
         }
       ],
       "dependencies": []
+    },
+    {
+      "module": "src/sdk/server/pieces.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "JobPiece",
+            "JobSettlement",
+            "PieceEnding",
+            "PieceState",
+            "appendPiece",
+            "chargedIfDeclinedMicro",
+            "checkFinishedCharge",
+            "endPieces",
+            "finishRunningPiece",
+            "pieceCharge",
+            "runningPiece",
+            "storedPieces",
+            "terminalEnding"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager",
+            "supported:./server#PostgresJobStore",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve",
+            "supported:./testing#MemoryJobStore"
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "module": "src/sdk/server/piece-settlement.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Shared contract or implementation reached from the named production/supported consumers through runtime, type or literal dynamic source dependencies.",
+          "symbols": [
+            "drawChargedMicro",
+            "drawHeldMicro",
+            "frozenSettleMicro",
+            "receiptCreditFor",
+            "receiptSettlementFor"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/receipt.ts"
+        },
+        {
+          "module": "src/sdk/server/credit-ledger.ts"
+        },
+        {
+          "module": "src/sdk/server/funding.ts"
+        },
+        {
+          "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/pieces.ts"
+        }
+      ]
     }
   ],
   "consumerBindings": [

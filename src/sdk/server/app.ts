@@ -131,7 +131,7 @@ import { HostedSettlementReportObligations } from "./hosting-settlement-report-o
 import type { BuilderIdentity, OwnerDisplay } from "./host";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import type { ServerJob } from "./job";
-import { isTerminal, isYieldMessage, localMessage, visibleJobMessages } from "./job";
+import { hasOpenAsk, isTerminal, isYieldMessage, localMessage, visibleJobMessages } from "./job";
 import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
@@ -4683,6 +4683,42 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
   }
 
+  private noOpenAskResponse(c: Context<AppEnv>): Response {
+    return c.json(
+      {
+        error: "no_open_ask",
+        message: "The job has no open payment request or prompt to decline.",
+        hint: "Decline answers an open ask. To stop a running job, cancel it with DELETE /v1/job/:id.",
+      },
+      409
+    );
+  }
+
+  /**
+   * End a job its handler is not running here at the caller's decline. Same shape as the
+   * DELETE route's store-only cancel; the store refuses unless an ask or prompt is open.
+   */
+  private async declineStoredJob(c: Context<AppEnv>, id: string, reason: string): Promise<Response> {
+    const jm = this.jobManager;
+    const store = jm.store;
+    if (!isStreamableJobStore(store) || !store.declineJob) {
+      return c.json({ error: "decline_unavailable", message: "This job store cannot end a job at a decline." }, 409);
+    }
+    const decline = store.declineJob.bind(store);
+    let outcome: Awaited<ReturnType<typeof decline>>;
+    try {
+      outcome = await afterPaymentIntents(() => decline(id, reason), { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+    } catch (error) {
+      if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+      throw error;
+    }
+    if (outcome === "not_active") return this.jobNotActiveResponse(c);
+    if (outcome === "no_open_ask") return this.noOpenAskResponse(c);
+    await jm.finalizeStoredTerminal(id);
+    const ended = await store.get(id);
+    return c.json({ seq: ended?.seq ?? 0 }, 201);
+  }
+
   private jobNotActiveResponse(c: Context<AppEnv>): Response {
     return c.json(
       {
@@ -4774,6 +4810,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
       const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
       if (railRefusal) return railRefusal;
+      if (body.type === "decline") {
+        // A payment being verified commits first: it may pay the ask being declined.
+        try {
+          await waitForPaymentIntents(jm.store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+        } catch (error) {
+          if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+          throw error;
+        }
+        if (isTerminal(activeJob.status)) return this.jobNotActiveResponse(c);
+        if (!activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob)) {
+          return this.noOpenAskResponse(c);
+        }
+      }
 
       const inboundSeq = await jm.recordInboundPending(activeJob, body.type, body.content);
 
@@ -4840,6 +4889,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }>(c);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;
+    if (body.type === "decline") {
+      const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
+      return this.declineStoredJob(c, id, reason);
+    }
 
     // Legacy missing capabilities and capabilities removed during execution cannot
     // reactivate. Fail the job and return structured 410 before content validation.
@@ -5163,6 +5216,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // streaming, so no handler elsewhere to notify and no writer to race).
       record.endedBy = "caller";
       record.status = "cancelled";
+      record.pieceEnding = { kind: "stop" };
       record.lastActivityAt = Date.now();
       await jm.store.save(record);
       await jm.finalizeStoredTerminal(id);

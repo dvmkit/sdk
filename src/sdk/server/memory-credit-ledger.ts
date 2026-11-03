@@ -250,7 +250,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
 
   /** See {@link CreditLedger.resolveDraw}. */
   resolveDraw(
-    args: Parameters<NonNullable<CreditLedgerLike["resolveDraw"]>>[0]
+    args: Parameters<CreditLedgerLike["resolveDraw"]>[0]
   ): Promise<DrawResolution> {
     return run(() => {
       assertSettleMicro(args.settleMicro);

@@ -1,13 +1,8 @@
 /**
- * `JobManager.resolveDrawPool` carries the credit's denomination on
- * every arm, including the two that carry no spendable fiat pool.
- *
- * The auto-credit gate can't spend that figure — that part is unchanged, and
- * covered in `context-upfront-pool-auto-credit.test.ts`. But `ctx.requestPayment`
- * has to *pin* each ask in the credit's currency for the mid-job draw cap to
- * bound anything, and an implicit N=1 credit — the ordinary per-job payment —
- * takes the `rail` arm. Erasing the currency there is what left the cap
- * unenforceable on essentially every job of a DVM pricing in anything but USD.
+ * `JobManager.resolveDrawPool` carries the credit's denomination, which
+ * `ctx.requestPayment` pins each ask in so the mid-job draw cap bounds something.
+ * Erasing the currency on an implicit N=1 credit — the ordinary per-job payment —
+ * is what left the cap unenforceable on a DVM pricing in anything but USD.
  *
  * `resolveDrawPool` is private and has exactly one caller, so these reach it
  * through a typed probe rather than staging a whole job lifecycle.
@@ -75,7 +70,7 @@ describe("JobManager.resolveDrawPool — the credit's denomination", () => {
     const creditId = implicitCreditId("x402", drawId);
     const pool = await pooler(await seeded(creditId, drawId, "eur"))(jobStub(creditId, drawId));
 
-    expect(pool).toEqual({ basis: "rail", creditCurrency: "eur" });
+    expect(pool).toEqual({ basis: "draw", amountMicro: 100_000, currency: "eur" });
   });
 
   it("carries it on a credit funded with no rail basis, which allocates no msats", async () => {
@@ -91,8 +86,9 @@ describe("JobManager.resolveDrawPool — the credit's denomination", () => {
     await ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: 100_000, jobId: "job-1" });
 
     expect(await pooler(ledger)(jobStub("c1", "d1"))).toEqual({
-      basis: "rail",
-      creditCurrency: "eur",
+      basis: "draw",
+      amountMicro: 100_000,
+      currency: "eur",
     });
   });
 

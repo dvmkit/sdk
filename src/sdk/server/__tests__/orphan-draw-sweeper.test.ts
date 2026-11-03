@@ -889,7 +889,7 @@ describe("JobManager terminal-draw reconciler", () => {
     );
 
     // Stand in for the funnel releasing the draw between the scan and the settle.
-    const settle = vi.spyOn(ledger, "settle").mockImplementationOnce(() =>
+    const settle = vi.spyOn(ledger, "resolveDraw").mockImplementationOnce(() =>
       Promise.reject(
         new CreditLedgerError("invalid_draw_state", "already released", {
           currentStatus: "released"

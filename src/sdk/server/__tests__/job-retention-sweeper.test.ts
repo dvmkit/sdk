@@ -255,8 +255,8 @@ describe("JobManager job-record retention", () => {
       nowMs: OLD,
     });
     await store.save({ ...record("blocked"), creditId: funded.creditId, drawId: "held" });
-    const realSettle = ledger.settle.bind(ledger);
-    vi.spyOn(ledger, "settle").mockRejectedValueOnce(new Error("ledger unavailable"));
+    const realResolve = ledger.resolveDraw.bind(ledger);
+    vi.spyOn(ledger, "resolveDraw").mockRejectedValueOnce(new Error("ledger unavailable"));
     const failed = vi.fn();
     const recovered = vi.fn();
     const jm = manager(store, ledger, {
@@ -275,7 +275,7 @@ describe("JobManager job-record retention", () => {
       );
       expect(recovered).not.toHaveBeenCalled();
 
-      vi.mocked(ledger.settle).mockImplementation(realSettle);
+      vi.mocked(ledger.resolveDraw).mockImplementation(realResolve);
       await expect(jm.sweepJobRetention()).resolves.toMatchObject({ redacted: 1, complete: true });
       expect((await store.get("blocked"))?.redactedAt).toBeDefined();
       expect(recovered).toHaveBeenCalledWith(
@@ -312,7 +312,7 @@ describe("JobManager job-record retention", () => {
     for (let i = 0; i < 50; i++) {
       await store.save({ ...record(`job-${String(i).padStart(2, "0")}`), paidMsats: 0 });
     }
-    vi.spyOn(ledger, "settle").mockRejectedValue(new Error("held"));
+    vi.spyOn(ledger, "resolveDraw").mockRejectedValue(new Error("held"));
     const jm = manager(store, ledger);
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     try {

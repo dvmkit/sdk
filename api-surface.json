@@ -8,7 +8,8 @@
     },
     "StreamableJobStore.appendOutgoing": {
       "options": "optional { appendId?: string, ... }",
-      "appendId": "a retry with the same job and append identity returns its original sequence without reapplying counters, including after terminal log cleanup"
+      "appendId": "a retry with the same job and append identity returns its original sequence without reapplying counters, including after terminal log cleanup",
+      "terminalAsk": "a prompt or payment-request on a job that is already terminal is refused with JobEndedError and writes nothing; a payment-request finishes the job's running piece in the same transaction, at opts.finishedChargeMicro when that is below its price"
     },
     "StreamableJobStore.failJob": {
       "optional": true,
@@ -16,7 +17,16 @@
     },
     "StreamableJobStore.verifyAndCredit": {
       "creditRefused": "optional; the built-in stores verify the message but apply no credit delta or binding to a job that already ended, and return creditRefused: \"job_ended\"; a store that omits it is treated as having applied the delta",
-      "landedAsBalance": "optional opts.landedAsBalance; the built-in stores record the payment with status balance, kept out of message history and handler replay because it paid no ask; credit must be null"
+      "landedAsBalance": "optional opts.landedAsBalance; the built-in stores record the payment with status balance, kept out of message history and handler replay because it paid no ask; credit must be null",
+      "piece": "optional credit.piece; the built-in stores append it as a running piece, bought by this payment's seq, only while the job is live and its row is bound to credit.piece.drawId"
+    },
+    "StreamableJobStore.declineJob": {
+      "optional": true,
+      "behavior": "atomically end a nonterminal job with an open prompt or payment-request as cancelled by the caller, releasing the running piece; no_open_ask when nothing is open"
+    },
+    "JobRecord.pieces": {
+      "ownership": "written from the snapshot only on insert; afterwards only the transactional paths change it, and the first terminal write ends the running piece and freezes JobRecord.settlement",
+      "customStores": "a store that saves the terminal snapshot as given keeps the settlement the SDK froze on it from the job's pieces; a draw with pieces but no frozen settlement is settled from those pieces and the snapshot's ending"
     }
   },
   "wireContracts": {
@@ -74,6 +84,15 @@
       "fixture": "protocol-fixtures/payment-in-progress-v1.json",
       "status": 409,
       "behavior": "a cancel, or a message that would end a job, waits at most 5 seconds for a payment on that job being verified, then answers payment_in_progress with Retry-After and changes nothing"
+    },
+    "pieceSettlement": {
+      "fixture": "protocol-fixtures/piece-settlement-v1.json",
+      "optionalFields": [
+        "payment-request.content.charged_if_declined_micro",
+        "receipt.settlement"
+      ],
+      "unit": "integer micro-units of the job credit's currency",
+      "behavior": "each payment buys the next piece of work and a piece finishes at the next payment-request or completion; every ending charges finished pieces, a caller cancel also charges the running piece, and failure, decline and expiry release it; decline answers 201 or 409 no_open_ask; receipt credit.amount is the charged amount"
     }
   },
   "exports": [
@@ -87,6 +106,7 @@
         "CanonicalEnvelope",
         "CapabilityRate",
         "CashuConfig",
+        "CompleteOpts",
         "CreateFxFetcherOpts",
         "CreateSignedRequestVerifierOpts",
         "CreditConfig",
@@ -101,6 +121,7 @@
         "DVMConfig",
         "DVMDescriptor",
         "DVMRouteContext",
+        "DeclineContent",
         "FxFetcher",
         "FxRateSnapshot",
         "FxRateUnavailableError",
@@ -242,6 +263,7 @@
         "DVMHostOpts",
         "DVMServeResult",
         "DVM_PROTOCOL_VERSION",
+        "DeclineOutcome",
         "DrainConflictReason",
         "DrawRailValue",
         "DrawRecord",
@@ -264,9 +286,12 @@
         "InvoiceWriteOff",
         "JobContentMetadata",
         "JobCostReportPayload",
+        "JobEndedError",
         "JobManager",
         "JobManagerOpts",
+        "JobPiece",
         "JobRecord",
+        "JobSettlement",
         "JobStatus",
         "JobStore",
         "JobTerminalReportPayload",
@@ -284,6 +309,8 @@
         "PaymentMode",
         "PendingImplicitDrawGroup",
         "PendingImplicitDrawSummary",
+        "PieceEnding",
+        "PieceState",
         "PinnedFetch",
         "PlatformReporterOpts",
         "PostgresJobStore",

@@ -344,10 +344,11 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         expect((await paid).status).toBe(201);
         expect((await cancel).status).toBe(200);
         await vi.waitFor(async () => expect((await h.jobStore.get(job.jobId))?.status).toBe("cancelled"));
-        // Grown by the payment, then released by the cancel: both payments are balance again.
+        // Grown by the payment, which bought the piece the cancel then stopped: a cancel charges
+        // every paid piece, so nothing goes back to balance.
         await vi.waitFor(async () => expect(await h.ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }))
-          .toMatchObject({ status: "released", amountMicro: 2 * STEP_MICRO }));
-        expect((await h.ledger.get(job.creditId))?.availableMicro).toBe(2 * STEP_MICRO);
+          .toMatchObject({ status: "settled", amountMicro: 2 * STEP_MICRO }));
+        expect((await h.ledger.get(job.creditId))?.availableMicro).toBe(0);
       }, 30_000);
 
       it("releases the draw a payment placed after its lease ran out and the job ended", async () => {
@@ -384,8 +385,9 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         const [upfront, late] = await lockedProofs(2);
         const job = await awaitingAsk(h, upfront!, true);
         expect((await h.request(`/v1/job/${job.jobId}`, { method: "DELETE", headers: job.headers })).status).toBe(200);
+        // The cancel at the open ask charges the upfront piece that ask finished.
         await vi.waitFor(async () => expect(await h.ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }))
-          .toMatchObject({ status: "released" }));
+          .toMatchObject({ status: "settled" }));
         const requestId = randomUUID();
 
         const paid = await pay(h, job, late!, requestId);
@@ -394,8 +396,8 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         expect(await h.ledger.getFunding({ creditId: job.creditId, fundId: requestId }))
           .toMatchObject({ amountMicro: STEP_MICRO });
         expect(await h.ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }))
-          .toMatchObject({ status: "released", amountMicro: STEP_MICRO });
-        expect((await h.ledger.get(job.creditId))?.availableMicro).toBe(2 * STEP_MICRO);
+          .toMatchObject({ status: "settled", amountMicro: STEP_MICRO });
+        expect((await h.ledger.get(job.creditId))?.availableMicro).toBe(STEP_MICRO);
         expect((await h.jobStore.get(job.jobId))?.status).toBe("cancelled");
       }, 30_000);
     });

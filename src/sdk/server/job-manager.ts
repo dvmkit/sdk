@@ -16,7 +16,7 @@ import type {
   ResponseContent,
 } from "../../lib/messages/types";
 import { createMonotonicClock } from "../../lib/monotonic-clock";
-import type { DrawFundingReceipt, JobReceipt, ReceiptCredit } from "../../lib/receipt";
+import type { DrawFundingReceipt, JobReceipt, ReceiptCredit, ReceiptSettlement } from "../../lib/receipt";
 import type {
   SignedRequestAudience,
   SignedRequestDomain,
@@ -47,7 +47,7 @@ import {
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
-import { deferredX402IntentId, implicitCreditId } from "./funding";
+import { deferredX402IntentId } from "./funding";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -64,7 +64,6 @@ import type {
   AppendOutgoingOptions,
   JobRecord,
   JobRetentionCursor,
-  JobStatus,
   JobStore,
   PaymentCreditDelta,
   VerifyAndCreditOptions,
@@ -74,6 +73,7 @@ import {
   isJobRetentionStore,
   isReceiptIssuingStore,
   isStreamableJobStore,
+  JobEndedError,
 } from "./job-store";
 import { MemoryJobStore } from "./memory-job-store";
 import { PostgresJobStore } from "./postgres-job-store";
@@ -107,6 +107,8 @@ import type { ReceiptIssuer } from "./receipt-issuer";
 import { isReceiptableStatus } from "./receipt-issuer";
 import { stripProtocolEnvelope } from "./request-envelope";
 import { settledDrawRevenue } from "./settled-draw-revenue";
+import { appendPiece, endPieces, terminalEnding } from "./pieces";
+import { drawChargedMicro, drawHeldMicro, frozenSettleMicro, receiptCreditFor, receiptSettlementFor } from "./piece-settlement";
 import type {
   CreditDepositEnqueue,
   CreditDepositPayload,
@@ -255,13 +257,6 @@ const ANY_DRAW_AGE_CUTOFF_MS = Number.MAX_SAFE_INTEGER;
  */
 const ORPHAN_SWEEP_CLAIMS = new WeakSet<CreditLedgerLike>();
 
-/**
- * Rails a job's payment can attach on, and therefore the only rails an implicit
- * N=1 credit id can name. Narrower than the set `credits.rail` holds:
- * Lightning funds credits but never pays for a job, so a Lightning
- * credit is explicit by construction.
- */
-const ATTACH_RAILS = ["cashu", "x402", "tempo"] as const satisfies readonly PaymentMethod[];
 
 /**
  * Attempts Tx C gets before a mid-job payment is answered as unapplied
@@ -1153,6 +1148,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       fundingCredit: payment.fundingCredit,
       receivedProofs: payment.receivedProofs,
       requiredMsats,
+      // The upfront payment buys the first piece; a free job starts with none, and so does an
+      // unsigned x402 job, which is one piece settled only on completion whatever its list
+      // says. A draw whose amount the payment did not report keeps no list: it settles as one
+      // piece, its hold.
+      pieces: !payment.drawId || deferredX402IntentId(payment.creditId)
+        ? []
+        : payment.drawAmountMicro !== undefined
+          ? [{ amountMicro: payment.drawAmountMicro, paidSeq: 0, state: "running" }]
+          : undefined,
       listeners: new Set(),
       abort: new AbortController(),
       stepCache: new StepCache(),
@@ -1325,6 +1329,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.pendingMppChallengeIds = record.pendingMppChallengeIds;
     job.pendingX402Nonce = record.pendingX402Nonce;
     job.pendingX402AmountUsdcMicro = record.pendingX402AmountUsdcMicro;
+    job.pieces = record.pieces;
     return true;
   }
 
@@ -1389,8 +1394,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
     } else if (type === "approval" && cap?.onApproval && ctx) {
       await cap.onApproval(ctx, content as ApprovalContent);
-    } else if (type === "cancel") {
-      const reason = (content as CancelContent | undefined)?.reason ?? "Job cancelled";
+    } else if (type === "cancel" || type === "decline") {
+      const reason = (content as CancelContent | undefined)?.reason ?? (type === "decline" ? "Job declined" : "Job cancelled");
       // Signal the running handler *first* so it stops burning provider spend on
       // work the caller just cancelled. `ctx.fetch` carries this signal, so an
       // in-flight provider call aborts; builders can thread `ctx.signal` into
@@ -1410,11 +1415,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // revenue on it.
       job.endedBy = "caller";
       job.status = "cancelled";
+      // A cancel stops the work at once and charges the piece in progress with the finished
+      // ones; a decline releases it.
+      job.pieceEnding = { kind: type === "decline" ? "release" : "stop" };
       if (cap?.onCancel && ctx) {
         await cap.onCancel(ctx, content as CancelContent);
       }
-      for (const [, p] of job.pendingPrompts) p.reject(new JobCancelledError("Job cancelled"));
-      if (job.pendingPayment) job.pendingPayment.reject(new JobCancelledError("Job cancelled"));
+      const ended = type === "decline" ? "Job declined" : "Job cancelled";
+      for (const [, p] of job.pendingPrompts) p.reject(new JobCancelledError(ended));
+      if (job.pendingPayment) job.pendingPayment.reject(new JobCancelledError(ended));
       // Clear the resolver maps, not just reject them: a `response`
       // for an already-rejected prompt would otherwise still match in
       // `dispatchMessage` above and flip the job back to `processing`.
@@ -1517,6 +1526,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     }
     job.status = "failed";
     job.summary = reason;
+    // The completion never committed, so its piece is released like any failure's.
+    job.pieceEnding = undefined;
     this.outgoingQueues.delete(job);
     const store = this.jobStore;
     if (isStreamableJobStore(store) && store.failJob) {
@@ -1549,6 +1560,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // Only the terminal funnel may serialize a terminal snapshot.
     if (isTerminal(job.status) && !terminalReady) return this.persistJob(job);
     const record = toJobRecord(job);
+    if (isTerminal(job.status) && record.settlement === undefined) {
+      // The built-in stores end the pieces from their own row and ignore these; a store that
+      // saves the snapshot as given keeps the settlement the SDK froze for it.
+      const ended = endPieces(record.pieces, terminalEnding(record));
+      record.pieces = ended.pieces;
+      record.settlement = ended.settlement;
+    }
     if (isTerminal(job.status) && isStreamableJobStore(this.jobStore)) {
       // rebuild the terminal snapshot from the durable `job_messages`
       // log so it carries DB-allocated seqs and every durably-recorded message
@@ -1640,6 +1658,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.terminalAtMs = durable.terminalAtMs;
     job.callerWaitMs = durable.callerWaitMs;
     job.awaitingInputAtMs = durable.awaitingInputAtMs;
+    job.pieces = durable.pieces;
+    job.settlement = durable.settlement;
     // `cancelJob` / `cancelStaleJob` record why they terminated the job in
     // `summary`, so the caller's own words reach `ctx.signal.reason` and the
     // `onCancel` hook instead of a generic "Job cancelled". A
@@ -1933,9 +1953,21 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // when the append starts, retaining that identity through every retry.
       if (entry.pending === undefined) entry.pending = job.pendingPayment;
       const { msg, opts, pending } = entry;
-      const stored = await store.appendOutgoing(job.id, {
-        from: msg.from, type: msg.type, timestamp: msg.timestamp, content: msg.content,
-      }, opts);
+      let stored: number;
+      try {
+        stored = await store.appendOutgoing(job.id, {
+          from: msg.from, type: msg.type, timestamp: msg.timestamp, content: msg.content,
+        }, opts);
+      } catch (error) {
+        // Matched on the code as well, so a custom store's own refusal stops the queue too.
+        if (!(error instanceof JobEndedError) && (error as { code?: unknown } | null)?.code !== "job_ended") throw error;
+        // The job ended elsewhere before this ask was written. Nothing after it can be
+        // written either, so the queue is dropped rather than retried, and the durable
+        // terminal is adopted.
+        this.outgoingQueues.delete(job);
+        await this.adoptDurableTerminal(job);
+        return;
+      }
       if (msg.type === "payment-request" && pending && job.pendingPayment === pending) {
         this.paymentAskSeqs.set(pending, stored);
       }
@@ -2799,15 +2831,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   ): Promise<boolean> {
     const args = this.drawResolutionArgs(draw.creditId, draw.drawId);
     const bound = record.creditId === draw.creditId && record.drawId === draw.drawId;
-    const settle = bound && this.settlesDraw(record.status);
+    // The same frozen figure the in-line funnel settles; an unbound hold settles nothing.
+    const settleMicro = bound ? this.settleMicroFor(record, draw) : 0;
     try {
-      const resolution = settle ? await ledger.settle(args) : await ledger.release(args);
+      const resolution = await ledger.resolveDraw({ ...args, settleMicro });
+      const settle = resolution.status === "settled";
       // Draws are the revenue events, so a late settle books one —
       // off the committed draw row, through the same reporter path the funnel
       // uses. A released draw books nothing, which is what keeps "no debit on
       // job failure" true in the books as well as the ledger. `bookRevenue`
       // re-reads the draw off `record`, which is the one we just settled:
-      // `settle` implies `bound`, so the two pairs are equal by construction.
+      // a settle implies `bound`, so the two pairs are equal by construction.
       const booked = settle && !resolution.replayed ? await this.bookRevenue(record) : false;
       diagnosticConsole.warn(
         {
@@ -3262,10 +3296,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let unappliedCredit: UnappliedCredit | undefined;
     // the whole payment landed on the credit and grew no draw — a
     // second payment for an ask this job's draw already covers. It bought
-    // nothing, so Tx C moves no counters: adding it to `paid_msats` would
-    // silently pre-satisfy the *next* ask's auto-credit gate, giving away a
-    // stage of work the caller never paid for. The inbound row is still CAS'd
-    // verified, which is what stops it being retried.
+    // nothing, so Tx C moves no counters and appends no piece: adding it to
+    // `paid_msats` would satisfy an open ask's cross-machine resume check,
+    // resuming the handler for a piece the caller never paid for. The inbound
+    // row is still CAS'd verified, which is what stops it being retried.
     // The arrival decided the payment was balance, or the ledger leg found the
     // job's credit could not take it. Either way it paid no ask.
     let landing: BalanceLanding | undefined = landAsBalance ? { reason: landAsBalance } : info.landedAsBalance;
@@ -3292,6 +3326,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
                 clearPendingX402Binding: info.paymentRail === "x402",
                 creditId: info.creditId,
                 drawId: info.drawId,
+                ...(info.piece && { piece: info.piece }),
               },
           landing ? { landedAsBalance: true } : undefined
         );
@@ -3316,6 +3351,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       job.paidMsats = counters.paidMsats;
       job.pendingPaymentMsats = counters.pendingPaymentMsats;
+      if (counters.pieces) {
+        job.pieces = counters.pieces;
+      } else if (!fullyUnapplied && !result.creditRefused && job.pieces && info.piece && info.piece.amountMicro > 0 &&
+          (result.drawId ?? job.drawId ?? info.drawId) === info.piece.drawId) {
+        // A store that reports no pieces keeps none of its own; this job's view is the record.
+        job.pieces = appendPiece(job.pieces, info.piece.amountMicro, inboundSeq);
+      }
       if (
         !fullyUnapplied &&
         hadPendingPayment &&
@@ -3396,6 +3438,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     } else {
       // A payment that bought nothing moves no job counter here either.
       if (!fullyUnapplied) applyPaymentInfoToJob(job, info);
+      if (!fullyUnapplied && job.pieces && info.piece && info.piece.amountMicro > 0 && job.drawId === info.piece.drawId) {
+        job.pieces = appendPiece(job.pieces, info.piece.amountMicro, job.seq);
+      }
       if (
         !fullyUnapplied &&
         hadPendingPayment &&
@@ -3860,39 +3905,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     };
   }
 
-  /**
-   * Internal: what unit `ctx.requestPayment`'s auto-credit gate may measure this
-   * job's remaining pool in.
-   *
-   * The regime is read off the DRAW, never off the job. Implicit N=1 is exactly
-   * `credit_id === imp:<rail>:<draw_id>`, because `fundAndDraw` derives both
-   * from the same rail payment id — a fact about a row that was written once
-   * and never moves. The tempting alternative, comparing `job.payment_tx_hash`
-   * against `drawSettlementRef` (what the mid-job preflight does to inherit
-   * `drawBasis`), silently rots: Tx C overwrites that column on every mid-job
-   * credit, and a payment whose ledger leg was skipped — a cross-rail top-up,
-   * an fx outage, a draw already resolved — leaves the rail's own reference
-   * there, so an explicit-draw job would read as implicit from then on.
-   *
-   * Never throws, and never answers `rail` on a guess. `rail` is claimed only
-   * where `withDrawBasis` demonstrably left `PaymentInfo.paidMsats` alone — no
-   * draw at all, or a draw carrying no rail value to overlay it with. A job that
-   * drew and whose pool this can't read or denominate answers `unpriced`, which
-   * the gate declines to auto-credit from: the msat figure it would otherwise
-   * fall back on is a slice of the credit's rail value at a ratio pinned
-   * whenever that credit was funded, so it cannot safely fund a new ask.
-   */
-  private async hasAcceptedBalancePayment(jobId: string): Promise<boolean> {
-    return this.jobStore instanceof PostgresJobStore && !!this.opts.db && !!(await this.opts.db.query(
-      "SELECT 1 FROM credit_balance_payments WHERE job_id=$1 LIMIT 1", [jobId])).rowCount;
-  }
 
+  /**
+   * Internal: the job's draw as `ctx.requestPayment` reads it for the currency a mid-job ask
+   * is pinned in. Never rejects: a job that drew but whose draw can't be read answers
+   * `unpriced`, and the ask falls back to the DVM's declared currency.
+   */
   private async resolveDrawPool(job: ServerJob): Promise<DrawPool> {
     const ledger = this.opts.creditLedger;
-    // No ledger, or a job that never drew: `paidMsats` is the rail's own
-    // traffic. The only shape that answers with no `creditCurrency` at all,
-    // which is what tells `ctx.requestPayment` to seed the ask denomination
-    // from the DVM's declaration instead.
+    // No ledger, or a job that never drew: the only shape that answers with no
+    // currency at all, which tells `ctx.requestPayment` to seed the ask
+    // denomination from the DVM's declaration instead.
     if (!ledger || !job.creditId || !job.drawId) return { basis: "rail" };
     let draw: DrawRecord | undefined;
     try {
@@ -3905,39 +3928,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       );
       return { basis: "unpriced" };
     }
-    // The job carries a draw id the ledger has no row for. Nothing here can be
-    // concluded about `paidMsats`, so conclude nothing.
     if (!draw) {
       this.warnDrawPool(job, "draw_not_found");
       return { basis: "unpriced" };
     }
-    // `creditCurrency` rides every arm below, including the two that carry no
-    // spendable pool. The gate can't use it — but the ask still has
-    // to be *pinned* in the credit's denomination for the mid-job cap to mean
-    // anything, and an implicit N=1 credit (the ordinary per-job payment) takes
-    // the `rail` arm. Erasing it here is what made the cap unenforceable on
-    // essentially every job of a DVM that prices in anything but USD.
-    const { rail, drawMsats, creditCurrency } = draw.railValue;
-    // Legacy rail acceptance overlays only positive allocations. A durable
-    // balance authorization instead spends exact fiat even when its rail slice
-    // rounds to zero; its accepted fact keeps that pool denominated in fiat.
-    if (!rail || drawMsats <= 0) {
-      const acceptedBalance = await this.hasAcceptedBalancePayment(job.id);
-      if (!acceptedBalance) return { basis: "rail", creditCurrency: creditCurrency ?? undefined };
-    }
-    // Schema-impossible (`credits.currency` is NOT NULL) — the join's type
-    // admits it, and a pool with no denomination can't be compared in.
+    // Schema-impossible (`credits.currency` is NOT NULL) — the join's type admits it.
+    const creditCurrency = draw.railValue.creditCurrency;
     if (!creditCurrency) {
       this.warnDrawPool(job, "credit_currency_missing");
       return { basis: "unpriced" };
-    }
-    // Lightning funds credits but never attaches to a job, so a rail
-    // outside the attach set can only be explicit — `implicitCreditId` takes the
-    // attach rails for that reason, and narrowing through the list keeps the
-    // claim checked rather than cast.
-    const attachRail = ATTACH_RAILS.find((r) => r === rail);
-    if (attachRail && draw.creditId === implicitCreditId(attachRail, draw.drawId)) {
-      return { basis: "rail", creditCurrency };
     }
     return { basis: "draw", amountMicro: draw.amountMicro, currency: creditCurrency };
   }
@@ -4013,15 +4012,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return record.receipt;
     }
     if (!isReceiptableStatus(record.status)) return undefined;
-    // resolve the credit draw FIRST — settle on completed, release
-    // on failed/cancelled — so the receipt's `credit` block countersigns the
-    // post-resolution balance. Runs on every terminal funnel path (all of
+    // resolve the credit draw FIRST — settling the figure the terminal
+    // transition froze and releasing the rest — so the receipt's `credit` block
+    // countersigns the post-resolution balance. Runs on every terminal funnel path (all of
     // them converge here), receipt key or not, so pending holds never leak.
     // A resolution failure leaves the receipt unissued: the read-path
     // `ensureReceipt` retry then re-attempts BOTH (resolution is idempotent).
-    let credit: ReceiptCredit | undefined;
+    let resolved: { credit: ReceiptCredit; settlement: ReceiptSettlement } | undefined;
     try {
-      credit = await this.resolveCreditDraw(record);
+      resolved = await this.resolveCreditDraw(record);
     } catch (_err) {
       diagnosticConsole.error(
         {
@@ -4050,7 +4049,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // `ensureReceipt` re-attempts on the read paths. Without that retry the
       // stranded number would read as a permanent suppression gap.
       const seq = await store.claimReceiptSeq(record.id);
-      const receipt = issuer.issue(record, seq, undefined, credit, await this.deferredUnpaid(record));
+      const receipt = issuer.issue(record, seq, undefined, resolved?.credit, await this.deferredUnpaid(record),
+        resolved?.settlement);
       const saved = await store.saveReceipt(record.id, receipt);
       if (!saved) return undefined;
       await this.observePaidCompletion(record);
@@ -4103,24 +4103,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * Settle or release a terminal job's credit draw: `completed`
-   * settles (the hold becomes a real debit); `failed`/`cancelled` releases
-   * (the hold evaporates — "no debit on job failure", mechanically
-   * superseding the 974 no-op refund for credit-paid jobs, including
-   * the `ctx.fail` path and the stale-sweeper reap). Idempotent — a replayed
-   * resolution returns the recorded state. Returns the `ReceiptCredit` block
-   * for the receipt: `balance_after` is the recorded draw trajectory for a
-   * settled draw, and the restored available balance for a released one.
+   * Resolve a terminal job's credit draw by the piece: settle the figure its terminal
+   * transition froze (finished pieces, and on a cancel the stopped one) and release the rest,
+   * in one `resolveDraw`. Idempotent — a replayed resolution returns the recorded state.
+   * Returns the receipt's `credit` and `settlement` blocks: `credit.amount` is what the draw
+   * charged and `balance_after` the recorded draw trajectory for a settled draw, the restored
+   * available balance for a released one.
    */
-  private async resolveCreditDraw(record: JobRecord): Promise<ReceiptCredit | undefined> {
+  private async resolveCreditDraw(
+    record: JobRecord
+  ): Promise<{ credit: ReceiptCredit; settlement: ReceiptSettlement } | undefined> {
     const ledger = this.opts.creditLedger;
     if (!ledger || !record.creditId || !record.drawId) return undefined;
     const args = this.drawResolutionArgs(record.creditId, record.drawId);
-    const existing = await ledger.getDraw(args);
-    if (existing?.status === "settled" && this.settlesDraw(record.status)) {
-      return { credit_id: existing.creditId, draw_id: existing.drawId, amount: existing.amountMicro,
-        balance_after: existing.balanceAfterMicro, ledger_seq: existing.ledgerSeq };
-    }
     const deferredIntent = deferredX402IntentId(record.creditId);
     if (deferredIntent) {
       // The authorization was only verified at admission; no ledger row exists
@@ -4128,7 +4123,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // and every other terminal abandons it unspent.
       const deferred = this.opts.deferredX402;
       if (!deferred) throw new Error(`no settler for deferred x402 intent ${deferredIntent}`);
-      if (!this.settlesDraw(record.status)) {
+      if (record.status !== "completed") {
         await deferred.release(deferredIntent, record.status);
         return undefined;
       }
@@ -4142,19 +4137,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         return undefined;
       }
     }
+    const existing = await ledger.getDraw(args);
+    // A settled draw is final: attest it rather than ask the ledger to settle it again.
+    if (existing?.status === "settled") {
+      return { credit: receiptCreditFor(existing, existing.balanceAfterMicro), settlement: receiptSettlementFor(record, existing) };
+    }
+    const settleMicro = existing ? this.settleMicroFor(record, existing) : 0;
     try {
-      const res = this.settlesDraw(record.status)
-        ? await ledger.settle(args)
-        : await ledger.release(args);
+      const res = await ledger.resolveDraw({ ...args, settleMicro });
       return {
-        credit_id: res.creditId,
-        draw_id: res.drawId,
-        amount: res.amountMicro,
-        balance_after: res.status === "settled" ? res.balanceAfterMicro : res.availableMicro,
-        ledger_seq: res.ledgerSeq,
+        credit: receiptCreditFor(res, res.status === "settled" ? res.balanceAfterMicro : res.availableMicro),
+        settlement: receiptSettlementFor(record, res),
       };
     } catch (err) {
-      // A draw already resolved to the OTHER state (e.g. a cross-machine race
+      // A draw already resolved to another figure (e.g. a cross-machine race
       // between a cancel and a completion — the terminal-sticky save decides
       // the winner) surfaces as invalid_draw_state. The ledger state is
       // authoritative and final; attest the recorded draw rather than wedging
@@ -4173,27 +4169,32 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             drawStatus: rec.status,
           }
         );
-        return {
-          credit_id: rec.creditId,
-          draw_id: rec.drawId,
-          amount: rec.amountMicro,
-          balance_after: rec.balanceAfterMicro,
-          ledger_seq: rec.ledgerSeq,
-        };
+        return { credit: receiptCreditFor(rec, rec.balanceAfterMicro), settlement: receiptSettlementFor(record, rec) };
       }
       throw err;
     }
   }
 
   /**
-   * The one place a terminal job's status becomes a ledger verb:
-   * `completed` settles the hold into a real debit, `failed`/`cancelled`
-   * release it. Read by the in-line funnel (`resolveCreditDraw`) and by the
-   * late reconciler (`reconcileTerminalDraw`) — two paths that must never
-   * disagree about what an outcome means for the caller's money.
+   * The micro-units a terminal job's draw settles — the one place a terminal job becomes a
+   * ledger figure. Read by the in-line funnel (`resolveCreditDraw`) and by the late
+   * reconciler (`reconcileTerminalDraw`), two paths that must never disagree about what an
+   * ending means for the caller's money.
    */
-  private settlesDraw(status: JobStatus): boolean {
-    return status === "completed";
+  private settleMicroFor(record: JobRecord, draw: DrawRecord): number {
+    const { settleMicro, clamped } = frozenSettleMicro(record, drawHeldMicro(draw));
+    if (clamped) {
+      diagnosticConsole.warn({
+        level: "warn",
+        event: "piece_settlement_exceeds_hold",
+        jobId: record.id,
+        creditId: draw.creditId,
+        drawId: draw.drawId,
+        heldMicro: drawHeldMicro(draw),
+        chargedMicro: record.settlement?.chargedMicro,
+      });
+    }
+    return settleMicro;
   }
 
   /**
@@ -4204,7 +4205,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   private async deferredUnpaid(record: JobRecord): Promise<boolean> {
     const intentId = deferredX402IntentId(record.creditId);
-    if (!intentId || !this.settlesDraw(record.status) || !this.opts.deferredX402) return false;
+    if (!intentId || record.status !== "completed" || !this.opts.deferredX402) return false;
     return (await this.opts.deferredX402.settle(intentId)) === "unpaid";
   }
 
@@ -4330,11 +4331,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Resolve money and persist receipt evidence before exposing the terminal event.
       const receipt = await this.issueReceipt(record);
       if (this.opts.receiptIssuer && !receipt) return;
-      // An unpaid deferred job never gets a ledger draw to wait on.
-      const unpaid = await this.deferredUnpaid(record);
+      // An unpaid deferred job never gets a ledger draw to wait on, and nor does one that did not
+      // complete: its authorization was abandoned unspent.
+      const abandoned = deferredX402IntentId(record.creditId) !== undefined && record.status !== "completed";
+      const unpaid = abandoned || await this.deferredUnpaid(record);
+      let chargedMicro = 0;
+      let currency: string | null = null;
       if (!unpaid && record.creditId && record.drawId && this.opts.creditLedger) {
         const draw = await this.opts.creditLedger.getDraw({creditId: record.creditId, drawId: record.drawId});
         if (!draw || draw.status === "pending") return;
+        chargedMicro = drawChargedMicro(draw);
+        currency = draw.railValue.creditCurrency;
       }
       await callback({
         dvmId, jobId: record.id, capability: record.capability, outcome: record.status,
@@ -4344,6 +4351,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         terminalAtMs: record.terminalAtMs,
         callerWaitMs: record.callerWaitMs ?? 0,
         receiptSeq: receipt?.seq ?? null,
+        chargedMicro,
+        currency,
+        stoppedPiece: record.settlement?.stoppedPiece === true,
       });
       if ("markTerminalReported" in this.jobStore) {
         await (this.jobStore as JobStore & { markTerminalReported(jobId: string): Promise<void> }).markTerminalReported(jobId);

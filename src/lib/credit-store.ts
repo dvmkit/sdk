@@ -29,7 +29,7 @@ import {
   archiveCompletedCreditRecords, completedRefund, completedLoss, readCreditHistoryPage,
   type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage,
 } from "./credit-history";
-import { type DrawFundingReceipt, isDrawFundingReceipt, type ReceiptCredit } from "./receipt";
+import { type DrawFundingReceipt, isDrawFundingReceipt, type ReceiptCredit, type ReceiptSettlement } from "./receipt";
 import type { TrustAnchorRead } from "./receipt-contracts";
 import {
   type AttestedDvmIdentity,
@@ -1204,6 +1204,12 @@ export function applyReceiptCredit(args: {
   outcome: "completed" | "failed" | "cancelled";
   credit: ReceiptCredit;
   /**
+   * The receipt's piece settlement, when it carries one. A job that did not complete can
+   * still have been charged for the pieces it finished, so a receipt whose `charged` is
+   * positive is checked whatever its outcome.
+   */
+  settlement?: Pick<ReceiptSettlement, "charged">;
+  /**
    * Mid-job funding evidence in hand at reconciliation time, admitted under the
    * same lock before the comparison so no sibling process can settle the draw
    * between the two. Each entry is judged exactly as {@link recordDrawFunding}
@@ -1250,9 +1256,13 @@ export function applyReceiptCredit(args: {
     let mismatch: CreditDiscrepancy | undefined;
     let fundedMicro: number | undefined;
     const sequential = args.credit.ledger_seq === record.ledgerSeq + 1;
+    // What the draw charged. A receipt from before piece charging names a released draw's
+    // hold in `amount`, so only completion is checked on those.
+    const charged = args.settlement ? args.settlement.charged : args.credit.amount;
+    const charges = args.outcome === "completed" || (args.settlement?.charged ?? 0) > 0;
     if (
       sequential &&
-      args.outcome === "completed" &&
+      charges &&
       record.status === "active" &&
       !record.provisional &&
       !record.unsequencedBalance
@@ -1268,8 +1278,11 @@ export function applyReceiptCredit(args: {
       if (eligible.length > 0) {
         fundedMicro = eligible.reduce((sum, fact) => sum + fact.fundedMicro, 0);
       }
-      const expected = record.remainingMicro + (fundedMicro ?? 0) - args.credit.amount;
-      if (args.credit.balance_after !== expected) {
+      // The caller's payments are its prior balance plus the verified funding of this draw:
+      // a charge beyond them, or a balance that disagrees with them, is the DVM's to explain.
+      const paidMicro = record.remainingMicro + (fundedMicro ?? 0);
+      const expected = paidMicro - charged;
+      if (args.credit.balance_after !== expected || charged > paidMicro) {
         mismatch = {
           atMs: now,
           expectedMicro: expected,

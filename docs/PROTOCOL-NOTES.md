@@ -133,7 +133,7 @@ Fresh authorization still checks signature freshness, job ownership, credit owne
 
 HTTP 402 `{ error: "insufficient_credit", remaining_micro, shortfall_micro }` moves no money and keeps the ask available for an ordinary rail payment. It does not reserve the payment ID; the same intent may be retried after funding. HTTP 400 `invalid_message` refuses mixed credit and rail content. Unsupported storage returns HTTP 409 `balance_payment_unavailable`.
 
-Fresh balance growth also uses the existing hosted obligation fence, so a closed host cannot acquire a new hold. The credit/channel locks, draw placement or growth, job accounting, verified inbound and original response commit together. Completion settles the complete draw and includes its total in the existing receipt credit block. Failure or cancellation releases the whole hold to caller-owned spendable credit, available to the existing drain lifecycle. Balance spending creates no funding deposit and retains one draw and one revenue basis per job.
+Fresh balance growth also uses the existing hosted obligation fence, so a closed host cannot acquire a new hold. The credit/channel locks, draw placement or growth, job accounting, verified inbound and original response commit together. A balance-paid ask buys the next piece of work like any other payment, and the draw settles by the piece ([Charging by the piece](#charging-by-the-piece)); what it releases is caller-owned spendable credit, available to the existing drain lifecycle. Balance spending creates no funding deposit and retains one draw and one revenue basis per job.
 
 ### Release compatibility
 
@@ -168,6 +168,37 @@ The balance authorization is the only mid-job payment checked before money moves
 - **Mixed-version rollout:** an older worker sharing the job database neither writes nor honors payment intents. Upgrade every worker before relying on the cancel and expiry ordering above.
 
 The 409 `payment_in_progress` response is in `protocol-fixtures/payment-in-progress-v1.json`.
+
+## Charging by the piece
+
+Each payment buys the next piece of work. The upfront payment buys the first piece; each paid `payment-request` buys the piece after it. A piece is finished when the DVM sends its next `payment-request` or completes the job. However a job ends, the caller is charged for its finished pieces. When the job fails, its handler throws, the caller declines or an ask expires, the piece in progress is released to the caller's credit. A caller's cancel (`DELETE /v1/job/:id` or a `cancel` message) is the one exception: it stops the work at once, exactly as before, and charges the piece in progress with the finished ones. A cancel never spends new money; it only keeps payments the caller already made. A job with no asks is one piece: charged if it completes or is cancelled, released if it fails. An unsigned x402 job stays one piece settled only on completion, so a cancel charges it nothing; an unsigned Cashu payment is final either way.
+
+For example, a job takes $0.10 upfront, then asks $0.20, then $0.50:
+
+| Ending | Charged | Released |
+| --- | --- | --- |
+| Completes | $0.80 | $0 |
+| The provider fails during the $0.20 piece | $0.10 | $0.20 |
+| The caller declines the $0.50 ask | $0.30 | $0 (never paid) |
+| The caller cancels during the $0.20 piece | $0.30 | $0 |
+| The $0.20 piece finishes at a lowered $0.05, then the job completes | $0.65 | $0.15 |
+
+Every ask is new money: the upfront payment is never spent on an ask, however large it was. A job has one open `payment-request` at a time; a payment that arrives with no ask open lands as balance and buys no piece ([Payments that arrive as a job ends](#payments-that-arrive-as-a-job-ends)). Amounts are integer micro-units of the job credit's currency, and the figure the draw settles is computed once, in the transaction that makes the job terminal, and frozen on the job row; every later resolution of the draw settles exactly that figure.
+
+A `payment-request` carries `charged_if_declined_micro`: the pieces finished so far at full price, which is what declining that ask costs. A caller ends a job at its open ask or prompt with `{ type: "decline", content: { reason? } }` on `POST /v1/job/:id/messages`. The job ends `cancelled`, ended by the caller, with the piece in progress released; at an open ask nothing is running, since the ask finished it. The answer is HTTP 201 `{ seq }`. With no ask or prompt open the decline is refused with HTTP 409 `no_open_ask` and changes nothing; a payment still being verified holds it as it holds a cancel (HTTP 409 `payment_in_progress`).
+
+A terminal job's signed receipt keeps `v: 1` and, when the job held a credit draw, gains an optional `settlement` block: `{ held, charged, released, pieces: [{ amount, charged, paid_seq, state }] }`. `paid_seq` is the sequence of the payment message that bought the piece, `0` for the upfront payment; `state` is `finished`, `stopped` (a cancel charged it) or `released`. `credit.amount` is now the amount charged, `0` on a draw released whole; receipts issued before this change named the hold there on a released draw. `paid` keeps meaning what the caller's payments credited. `pieces` is empty on a job accepted before piece charging, which settles as one piece. The terminal report to the platform gains `chargedMicro`, its `currency` (`null` without a draw) and `stoppedPiece`, true when a cancel stopped a running piece and charged it. A caller reconciling its credit (`applyReceiptCredit`) checks a receipt whose `settlement.charged` is positive on every ending, comparing the charge and the reported balance with its own payments: its prior balance plus the verified funding of the draw.
+
+Builders: deliver a piece's output, its artifacts or partial results, before asking for the next payment, because the ask finishes the piece and a caller who declines it has already paid for that output. Ask a prompt question before the payment request whose work depends on the answer, not after it: a decline at a prompt releases the piece in progress, so a question asked after the payment leaves that paid piece at the caller's discretion. For metered work, ask at the cap and report what the piece used on the call that finishes it, `ctx.requestPayment(..., { finishedChargeMicro })` or `ctx.complete(summary, { finishedChargeMicro })`; the charge must not exceed that piece's price, and the difference goes back to the caller when the job ends. A second `ctx.requestPayment` while one is open rejects with code `ask_already_open`, and `ctx.complete` with an ask open withdraws it, so a payment arriving afterwards lands as balance.
+
+### Release compatibility
+
+- **Breaking behavior changes:** a caller's cancel charges the paid pieces, including the one in progress, instead of releasing the whole hold. An ask is never covered by the upfront payment: a handler that relied on that suspends on a `payment-request`. A failure releases only the piece in progress. A second open ask rejects with `ask_already_open` instead of replacing the first. `credit.amount` on a receipt is the charged amount. An x402 payment on a job whose ask withheld x402 is refused before it settles, and on hosts without a database a payment bound to another nonce is refused before the facilitator is called.
+- **Breaking API changes:** `CreditLedgerLike.resolveDraw` is required. `StreamableJobStore.appendOutgoing` refuses a `prompt` or `payment-request` on a terminal job with `JobEndedError` and finishes the running piece on a `payment-request`; `verifyAndCredit` appends the piece a `PaymentCreditDelta.piece` names; terminal writes freeze `JobRecord.settlement`. `StreamableJobStore.declineJob` is optional; a store without it cannot end a job at a decline its handler is not running locally. `@dvmkit/sdk/server` exports `JobEndedError` (a refusal is also recognised by `code: "job_ended"`) and the `JobPiece`, `JobSettlement`, `PieceEnding`, `PieceState` and `DeclineOutcome` types. The built-in stores keep `JobRecord.pieces` and `settlement` store-owned after insert; a custom store that saves snapshots as given keeps the settlement the SDK freezes on the terminal snapshot, which tracks the pieces this process saw.
+- **Migrations:** Postgres initialization adds nullable `jobs.pieces` and `jobs.settlement`. A job in flight at upgrade has no piece list and settles as one piece.
+- **Mixed-version rollout:** an older worker sharing the job database neither finishes nor appends pieces. Upgrade every worker before relying on piece settlement.
+
+The portable shapes are in `protocol-fixtures/piece-settlement-v1.json`.
 
 ## Mid-job draw funding evidence
 

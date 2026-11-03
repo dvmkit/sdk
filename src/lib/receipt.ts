@@ -42,11 +42,42 @@ export interface ReceiptCredit {
   credit_id: string;
   /** This draw's identifier — matches the caller-signed draw intent. */
   draw_id: string;
-  /** Amount drawn, in the credit's denomination. */
+  /**
+   * Amount charged, in micro-units of the credit's denomination: the settled part of the
+   * draw, `0` when it was released whole. Receipts issued before piece charging carried the
+   * hold here on a released draw.
+   */
   amount: number;
   balance_after: number;
   /** Per-credit monotonic draw counter. */
   ledger_seq: number;
+}
+
+/** One piece of work a job's payments bought, as its receipt attests it. */
+export interface ReceiptPiece {
+  /** Price, in micro-units of the credit's denomination. */
+  amount: number;
+  /** What the caller was charged for it: its price or a lower finishing charge, or `0`. */
+  charged: number;
+  /** Sequence of the payment message that bought it; `0` for the upfront payment. */
+  paid_seq: number;
+  /** `finished` and `stopped` pieces are charged; a `released` one went back to the caller. */
+  state: "running" | "finished" | "stopped" | "released";
+}
+
+/**
+ * How a job's credit draw was settled by the piece. All amounts are micro-units of the
+ * credit's denomination.
+ */
+export interface ReceiptSettlement {
+  /** The draw's hold before it was resolved: every paid piece. */
+  held: number;
+  /** What the draw settled: finished pieces, and on a cancel the stopped one. */
+  charged: number;
+  /** `held - charged`, returned to the caller's credit. */
+  released: number;
+  /** Empty on a job accepted before piece charging, which settled as one piece. */
+  pieces: ReceiptPiece[];
 }
 
 /**
@@ -98,6 +129,11 @@ export interface JobReceipt {
    * (failed/cancelled) one.
    */
   credit?: ReceiptCredit;
+  /**
+   * How the draw in {@link credit} settled by the piece. Optional, like every field added
+   * after `v: 1`, so receipts without it keep verifying and parsing.
+   */
+  settlement?: ReceiptSettlement;
 }
 
 export type UnsignedJobReceipt = Omit<JobReceipt, "signature">;

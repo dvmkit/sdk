@@ -1,0 +1,115 @@
+{
+  "description": "Charging mid-job work by the piece. The upfront payment buys the first piece and each paid payment-request the piece after it; a piece finishes when the DVM sends its next ask or completes. Every ending charges finished pieces; a caller cancel also charges the piece it stopped. Amounts are integer micro-units of the credit's currency.",
+  "payment_request": {
+    "seq": 3,
+    "from": "provider",
+    "timestamp": 2,
+    "type": "payment-request",
+    "content": {
+      "amount_msats": 200000,
+      "reason": "piece 2",
+      "credit": {
+        "amount_micro": 200000,
+        "currency": "usd"
+      },
+      "charged_if_declined_micro": 100000,
+      "expires_at_ms": 61000
+    }
+  },
+  "decline": {
+    "request": {
+      "type": "decline",
+      "content": {
+        "reason": "too dear"
+      }
+    },
+    "response": {
+      "status": 201,
+      "body": {
+        "seq": 4
+      }
+    },
+    "no_open_ask": {
+      "status": 409,
+      "body": {
+        "error": "no_open_ask",
+        "message": "The job has no open payment request or prompt to decline.",
+        "hint": "Decline answers an open ask. To stop a running job, cancel it with DELETE /v1/job/:id."
+      }
+    }
+  },
+  "ask_already_open": {
+    "code": "ask_already_open",
+    "status": 409
+  },
+  "receipt": {
+    "v": 1,
+    "job_id": "example-job",
+    "dvm_id": "example-dvm",
+    "dvm": "example",
+    "capability": "work",
+    "outcome": "cancelled",
+    "reason": "Job cancelled",
+    "timing": {
+      "accepted_at_ms": 1000,
+      "terminal_at_ms": 9000,
+      "caller_wait_ms": 2000
+    },
+    "ended_by": "caller",
+    "seq": 8,
+    "issued_at": 9,
+    "requester_pubkey": null,
+    "paid": {
+      "msats": 300000,
+      "rail": "x402",
+      "native_amount": 300000,
+      "native_asset": "usdc",
+      "tx_hash": "example-settlement-ref",
+      "mint": null
+    },
+    "result_hash": null,
+    "receipt_pubkey": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "credit": {
+      "credit_id": "example-credit",
+      "draw_id": "example-draw",
+      "amount": 300000,
+      "balance_after": 0,
+      "ledger_seq": 1
+    },
+    "settlement": {
+      "held": 300000,
+      "charged": 300000,
+      "released": 0,
+      "pieces": [
+        {
+          "amount": 100000,
+          "charged": 100000,
+          "paid_seq": 0,
+          "state": "finished"
+        },
+        {
+          "amount": 200000,
+          "charged": 200000,
+          "paid_seq": 2,
+          "state": "stopped"
+        }
+      ]
+    },
+    "signature": "a230c9bfb899439a0b9074727a2b42b10f6539ac09b8f80aff051b0a8577f9ad588db645d9ec01851336a8faf1ea364dfad4376707a83dceb6b626493eab5438"
+  },
+  "terminal_report": {
+    "dvmId": "example-dvm",
+    "jobId": "example-job",
+    "capability": "work",
+    "outcome": "cancelled",
+    "endedBy": "caller",
+    "paid": true,
+    "acceptedAtMs": 1000,
+    "terminalAtMs": 9000,
+    "callerWaitMs": 2000,
+    "receiptSeq": 8,
+    "chargedMicro": 300000,
+    "currency": "usd",
+    "stoppedPiece": true
+  }
+}

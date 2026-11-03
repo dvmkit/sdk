@@ -113,33 +113,36 @@ function watch<T>(p: Promise<T>): { settled: () => boolean; value: () => T | und
   return { settled: () => done, value: () => value };
 }
 
-describe("buildContext.requestPayment — upfront-pool auto-credit", () => {
-
-  it("consumes the upfront pool before yielding for another payment", async () => {
-    const job = blankJob(19_000); // upfront credited via verifyUpfrontPayment
+describe("buildContext.requestPayment — every ask is new money", () => {
+  it("suspends on an ask the upfront payment would have covered", async () => {
+    // The upfront payment bought the first piece of work; it never pays for an ask.
+    const job = blankJob(19_000);
     const ctx = buildContext(job, { store: new MemoryKVStore(), env: {} });
 
-    const result = await ctx.requestPayment(7_000, "base");
-
-    expect(result.amount_msats).toBe(7_000);
-    // Status stays processing — no yield, no payment-request emitted.
-    expect(job.status).toBe("processing");
-    expect(job.messages.length).toBe(0);
-    // paidMsats untouched — the auto-credit is bookkeeping, not a new receipt.
-    expect(job.paidMsats).toBe(19_000);
-    expect(job.pendingPaymentMsats).toBeUndefined();
-    expect((await ctx.requestPayment(5_000, "size surcharge")).amount_msats).toBe(5_000);
-    expect((await ctx.requestPayment(7_000, "extract")).amount_msats).toBe(7_000);
-    expect(job.status).toBe("processing");
-    expect(job.messages).toHaveLength(0);
-    expect(job.paidMsats).toBe(19_000);
-
-    void ctx.requestPayment(5_000, "another stage");
+    const ask = watch(ctx.requestPayment(7_000, "base"));
     await tick();
+
+    expect(ask.settled()).toBe(false);
     expect(job.status).toBe("awaiting-input");
-    expect(job.pendingPaymentMsats).toBe(5_000);
-    expect(job.messages).toHaveLength(1);
-    expect(job.messages[0].type).toBe("payment-request");
+    expect(job.pendingPaymentMsats).toBe(7_000);
+    expect(job.messages.map((m) => m.type)).toEqual(["payment-request"]);
+    expect(job.paidMsats).toBe(19_000);
+  });
+
+  it("refuses a second ask while one is open, leaving the first in place", async () => {
+    const job = blankJob(0);
+    const ctx = buildContext(job, { store: new MemoryKVStore(), env: {} });
+
+    const first = watch(ctx.requestPayment(7_000, "base"));
+    await tick();
+    await expect(ctx.requestPayment(5_000, "surcharge")).rejects.toMatchObject({
+      code: "ask_already_open",
+      status: 409,
+    });
+
+    expect(first.settled()).toBe(false);
+    expect(job.pendingPaymentMsats).toBe(7_000);
+    expect(job.messages.filter((m) => m.type === "payment-request")).toHaveLength(1);
   });
 
   it("yields on first call when pool is empty", async () => {
@@ -152,49 +155,6 @@ describe("buildContext.requestPayment — upfront-pool auto-credit", () => {
     expect(job.status).toBe("awaiting-input");
     expect(job.pendingPaymentMsats).toBe(7_000);
     expect(job.messages[0].type).toBe("payment-request");
-  });
-
-  it("resumes pool accounting after a yielded call is paid via dispatch", async () => {
-    const job = blankJob(0);
-    const ctx = buildContext(job, { store: new MemoryKVStore(), env: {} });
-
-    // First call yields.
-    const p1 = ctx.requestPayment(7_000, "base");
-    await new Promise((r) => setTimeout(r, 0));
-    expect(job.status).toBe("awaiting-input");
-
-    // Simulate dispatchMessage paying the request: credit paidMsats, flip status
-    // back to processing, resolve resolver. Mirrors job-manager dispatchMessage.
-    job.paidMsats += 12_000; // agent overpaid (covers base + future surcharge)
-    const resolver = job.pendingPayment;
-    expect(resolver).not.toBeNull();
-    job.status = "processing";
-    job.pendingPayment = null;
-    resolver?.resolve({ amount_msats: 7_000 });
-    await p1;
-
-    // Second call should auto-credit from the leftover pool (5_000 still available).
-    const r2 = await ctx.requestPayment(5_000, "size surcharge");
-    expect(r2.amount_msats).toBe(5_000);
-    expect(job.status).toBe("processing");
-  });
-
-  it("rebuilt ctx (e.g. on reactivation) re-derives consumption deterministically", async () => {
-    const job = blankJob(19_000);
-    const ctx1 = buildContext(job, { store: new MemoryKVStore(), env: {} });
-    await ctx1.requestPayment(7_000, "base");
-    await ctx1.requestPayment(5_000, "surcharge");
-
-    // Reactivation replaces the ctx; the new ctx must re-walk the same call
-    // sequence and reach the same conclusion (no double-counting).
-    const ctx2 = buildContext(job, { store: new MemoryKVStore(), env: {} });
-    await ctx2.requestPayment(7_000, "base"); // pool: 19_000 - 7_000 = 12_000
-    await ctx2.requestPayment(5_000, "surcharge"); // pool: 7_000
-    const r = await ctx2.requestPayment(7_000, "extract"); // pool: 0
-
-    expect(r.amount_msats).toBe(7_000);
-    expect(job.status).toBe("processing");
-    expect(job.messages.length).toBe(0);
   });
 });
 
@@ -225,50 +185,10 @@ function poolStub(
 }
 
 describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
-  it("auto-credits an ask the drifted msat pool refuses", async () => {
-    // BTC halved to $25k since the deposit, so $0.60 is 2_400_000 msats —
-    // more than the whole 2_000_000-msat slice, though the caller drew $1.00.
-    const job = blankJob(DRAW_MSATS);
-    const ctx = buildContext(job, {
-      store: new MemoryKVStore(),
-      env: {},
-      fxFetcher: fxAt(25_000),
-      drawPool: poolStub(DRAW_MICRO).fn,
-    });
-
-    const result = await ctx.requestPayment(usd(0.6), "base");
-
-    expect(result.amount_msats).toBe(2_400_000);
-    expect(job.status).toBe("processing");
-    expect(job.messages.length).toBe(0);
-    expect(job.pendingPaymentMsats).toBeUndefined();
-  });
-
-  it("spends the fiat pool down exactly, then yields", async () => {
-    const job = blankJob(DRAW_MSATS);
-    const ctx = buildContext(job, {
-      store: new MemoryKVStore(),
-      env: {},
-      fxFetcher: fxAt(25_000),
-      drawPool: poolStub(DRAW_MICRO).fn,
-    });
-
-    await ctx.requestPayment(usd(0.6), "base"); // $0.40 left
-    await ctx.requestPayment(usd(0.4), "surcharge"); // $0.00 left
-    void ctx.requestPayment(usd(0.5), "overage");
-    await tick();
-
-    expect(job.messages.length).toBe(1);
-    expect(job.messages[0].type).toBe("payment-request");
-    expect(job.status).toBe("awaiting-input");
-    expect(job.pendingPaymentFiatMicro).toBe(500_000);
-    expect(job.pendingPaymentFiatCurrency).toBe("usd");
-  });
-
-  it("does not resume the suspended handler on leftover msat headroom", async () => {
-    // The resume gate is a second reading of the same predicate. Left in msats
-    // it fires on the 1_000_000 msats the fiat gate never spent — before any
-    // payment lands — and the handler does the overage for free.
+  it("does not resume the suspended handler on the upfront payment", async () => {
+    // Every ask is new money. A resume gate that read the job's whole paidMsats
+    // would fire on the upfront payment before any payment for this ask lands,
+    // and the handler would do the overage for free.
     const job = blankJob(DRAW_MSATS);
     const notify = notifyHarness({ status: "awaiting-input", paidMsats: DRAW_MSATS });
     const ctx = buildContext(job, {
@@ -279,8 +199,6 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
       ...notify.opts,
     });
 
-    await ctx.requestPayment(usd(0.6), "base");
-    await ctx.requestPayment(usd(0.4), "surcharge");
     const overage = watch(ctx.requestPayment(usd(0.5), "overage"));
     await tick();
     expect(job.status).toBe("awaiting-input");
@@ -293,12 +211,11 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
     expect(job.status).toBe("awaiting-input");
   });
 
-  it("resumes once the top-up lands, on a pool the msat counter has overshot", async () => {
-    // The mirror failure: BTC fell, so the fiat gate auto-credited past the msat
-    // slice and `creditedToHandlerMsats` (4_000_000) now exceeds `paidMsats`
-    // (2_000_000). An msat resume gate can never fire again — a fully-paid job
-    // would hang to the idle timeout.
+  it("resumes once the top-up lands, and takes the piece it bought", async () => {
+    // BTC fell, so the ask is worth more msats than the whole upfront slice; the
+    // gate measures only what was credited since the ask.
     const job = blankJob(DRAW_MSATS);
+    job.pieces = [{ amountMicro: DRAW_MICRO, paidSeq: 0, state: "running" }];
     const pool = poolStub(DRAW_MICRO);
     const notify = notifyHarness({ status: "awaiting-input", paidMsats: DRAW_MSATS });
     const ctx = buildContext(job, {
@@ -309,22 +226,28 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
       ...notify.opts,
     });
 
-    await ctx.requestPayment(usd(0.6), "base");
-    await ctx.requestPayment(usd(0.4), "surcharge");
     const overage = watch(ctx.requestPayment(usd(0.5), "overage"));
     await tick();
     expect(overage.settled()).toBe(false);
+    notify.set({ paidMsats: DRAW_MSATS + 1_999_000, pendingPaymentMsats: 1_000 });
+    await notify.fire();
+    expect(overage.settled()).toBe(false);
 
     // The caller pays 2000 sats: `fund` + `growDraw` on the job's credit, then
-    // Tx C credits the earmarked rail value and notifies this machine.
+    // Tx C credits the earmarked rail value, appends the piece, and notifies this machine.
+    const pieces = [
+      { amountMicro: DRAW_MICRO, paidSeq: 0, state: "finished" as const },
+      { amountMicro: 500_000, paidSeq: 2, state: "running" as const },
+    ];
     pool.set(DRAW_MICRO + 500_000);
-    notify.set({ paidMsats: DRAW_MSATS + 2_000_000, pendingPaymentMsats: undefined });
+    notify.set({ paidMsats: DRAW_MSATS + 2_000_000, pendingPaymentMsats: undefined, pieces });
     await notify.fire();
 
     expect(overage.settled()).toBe(true);
     expect(overage.value()?.amount_msats).toBe(2_000_000);
     expect(notify.claim).toHaveBeenCalledTimes(1);
     expect(job.status).toBe("processing");
+    expect(job.pieces).toEqual(pieces);
   });
 
   it("resumes when the payment credited the job but skipped the ledger leg", async () => {
@@ -341,8 +264,6 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
       ...notify.opts,
     });
 
-    await ctx.requestPayment(usd(0.6), "base");
-    await ctx.requestPayment(usd(0.4), "surcharge");
     const overage = watch(ctx.requestPayment(usd(0.5), "overage"));
     await tick();
 
@@ -351,43 +272,6 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
 
     expect(overage.settled()).toBe(true);
     expect(overage.value()?.amount_msats).toBe(500_000);
-  });
-
-  it("replays the whole ask sequence against the grown draw", async () => {
-    // Reactivation rebuilds the context, so both counters reset and the handler
-    // re-walks the same asks. The draw it re-walks against has grown by exactly
-    // what the paid ask consumed, so the two cancel and every ask lands where it
-    // did the first time — including the one that originally yielded.
-    const job = blankJob(DRAW_MSATS + 2_000_000);
-    job.messages = [
-      {
-        seq: 1,
-        type: "payment",
-        from: "requester",
-        content: { amount_msats: 2_000_000 },
-        timestamp: 0,
-      },
-    ] as ServerJob["messages"];
-    job.seq = 1;
-    job.replayHighSeq = 1;
-    job.reactivationPaymentApplied = true;
-    const ctx = buildContext(job, {
-      store: new MemoryKVStore(),
-      env: {},
-      fxFetcher: fxAt(25_000),
-      drawPool: poolStub(DRAW_MICRO + 500_000).fn,
-    });
-
-    await ctx.requestPayment(usd(0.6), "base");
-    await ctx.requestPayment(usd(0.4), "surcharge");
-    const overage = await ctx.requestPayment(usd(0.5), "overage");
-
-    expect(overage.amount_msats).toBe(2_000_000);
-    expect(job.status).toBe("processing");
-    // No new payment-request: the auto-credit branch never emits one, which is
-    // what the `replayProviderSkip` seed counts on.
-    expect(job.messages.length).toBe(1);
-    expect(job.replayPaymentIndex).toBe(1);
   });
 
   it("replays a credited draw without comparing its rail slice to the live ask", async () => {
@@ -639,7 +523,9 @@ describe("buildContext.requestPayment — explicit draw pool is fiat", () => {
 
     void ctx.requestPayment(usd(0.6), "base");
     await tick();
-    job.pendingPayment = null;
+    // Pay the open ask, as a landed payment does, so the next one can be made.
+    job.pendingPayment!.resolve({ amount_msats: 0 } as never);
+    await tick();
     void ctx.requestPayment(usd(0.6), "surcharge");
     await tick();
 

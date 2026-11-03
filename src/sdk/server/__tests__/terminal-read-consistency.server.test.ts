@@ -131,10 +131,11 @@ describe("HTTP terminal read ordering", () => {
       }
       expect(await store.claimReceiptSeq(job.job_id)).toBe(completed.receipt?.seq);
       if (paid) {
+        // A cancel charges the piece it stops, so both endings settle this one-piece job.
         expect(await ledger.getDraw({ creditId: "example-credit", drawId: "example-draw" })).toMatchObject({
-          status: cancel ? "released" : "settled", amountMicro: 100_000, ledgerSeq: 1,
+          status: "settled", amountMicro: 100_000, ledgerSeq: 1,
         });
-        expect((await ledger.get("example-credit"))?.balanceMicro).toBe(cancel ? 100_000 : 0);
+        expect((await ledger.get("example-credit"))?.balanceMicro).toBe(0);
         expect(completed.receipt?.credit?.ledger_seq).toBe(1);
       }
       expect(executions).toBe(1);

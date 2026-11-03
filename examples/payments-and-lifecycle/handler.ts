@@ -15,7 +15,7 @@ export default configureDVM({
   async onJob(ctx) {
     await ctx.requestPayment(
       { amount: ctx.input.units * 0.002, currency: "usd" },
-      "Usage above the upfront allowance"
+      "Processing the requested units"
     );
     ctx.cost({ amount: ctx.input.units * 0.0005, currency: "usd" });
     ctx.complete(`Processed ${ctx.input.units} units`);
