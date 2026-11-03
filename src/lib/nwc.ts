@@ -14,10 +14,18 @@ import type {
 
 let webSocketImplementationConfigured = false;
 
+class NwcWebSocket extends WebSocket {
+  constructor(...args: ConstructorParameters<typeof WebSocket>) {
+    super(...args);
+    // nostr-tools removes its own listener before ws emits the close-while-connecting error.
+    this.on("error", () => undefined);
+  }
+}
+
 /** Install Node's WebSocket only when an NWC operation actually opens or uses a pool. */
 function ensureWebSocketImplementation(): void {
   if (webSocketImplementationConfigured) return;
-  useWebSocketImplementation(WebSocket);
+  useWebSocketImplementation(NwcWebSocket);
   webSocketImplementationConfigured = true;
 }
 
