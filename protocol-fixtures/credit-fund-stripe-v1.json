@@ -1,6 +1,12 @@
 {
   "version": 1,
   "description": "Card-funded prepaid credit over an MPP method=\"stripe\" charge. The caller's human approves a top-up in Link, which mints a Shared Payment Token (spt_…); the agent builds an MPP credential from it for the challenge the DVM issued, binds the credential's SHA-256 into the signed fund request as fund.commitment, and the DVM charges the token once and books the PaymentIntent as the funding. Amounts are USD micro-units on the wire and cents on the challenge. Card credit is offered only on POST /v1/credit; /v1/job never lists or accepts method=\"stripe\".",
+  "payment_intent_metadata": {
+    "source": "Server canonicalDvmId, falling back to server dvmId; never credential metadata. Host resolves DVMKIT_CANONICAL_DVM_ID with DVMKIT_DVM_ID as fallback.",
+    "configured": { "dvmkit_dvm_id": "00000000-0000-4000-8000-000000000001" },
+    "unconfigured": "dvmkit_dvm_id is omitted; standalone charging remains available",
+    "behavior": "Sent on PaymentIntent creation, including declined confirmations; existing mpp_* metadata is preserved"
+  },
   "menu": {
     "credit": {
       "funding_includes": "stripe",

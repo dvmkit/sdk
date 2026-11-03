@@ -68,7 +68,11 @@
         "credit.stripe"
       ],
       "unit": "integer USD micro-units on the wire; integer cents on the MPP challenge",
-      "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it"
+      "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it",
+      "paymentIntentMetadata": {
+        "dvmkit_dvm_id": "server canonicalDvmId, falling back to dvmId; omitted without identity; sent on creation including declined confirmations; credential metadata cannot override it",
+        "chargeContext": "StripeCreditRail.charge accepts optional canonicalDvmId supplied by the server; existing mpp_* metadata and idempotency keys are preserved"
+      }
     },
     "cardCreditRefund": {
       "fixture": "protocol-fixtures/credit-drain-stripe-v1.json",

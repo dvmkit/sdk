@@ -103,7 +103,8 @@ export type StripeChargeOutcome =
     };
 
 /**
- * The card-credit rail. Separate from the Tempo MPP handle on purpose: no job
+ * Card-credit rail with optional server-owned `dvmkit_dvm_id` PaymentIntent metadata.
+ * Separate from the Tempo MPP handle on purpose: no job
  * surface ever holds it, so `/v1/job` cannot issue or accept a stripe challenge.
  */
 export interface StripeCreditRail {
@@ -118,7 +119,12 @@ export interface StripeCreditRail {
   /** Verify the credential against this top-up and charge the token once. */
   charge(
     credential: string,
-    args: { amountMicro: number; resourcePath: string }
+    args: {
+      amountMicro: number;
+      resourcePath: string;
+      /** Server-resolved identity for `metadata[dvmkit_dvm_id]`; omitted for standalone servers. */
+      canonicalDvmId?: string;
+    }
   ): Promise<StripeChargeOutcome>;
   /** The same Stripe account's refund, dispute and lookup calls, for returning card credit. */
   refunds: StripeRefundApi;
@@ -147,8 +153,9 @@ export interface CreateStripeCreditRailOpts extends StripeCreditConfig {
  * Build the card-credit rail on mppx's Stripe charge method.
  *
  * mppx owns the challenge, its HMAC binding, expiry, the amount check and the
- * PaymentIntent parameters (including the idempotency key
- * `mppx_<challengeId>_<spt>`). This module owns the HTTP call, for one reason:
+ * PaymentIntent parameters except the server-owned `dvmkit_dvm_id` metadata,
+ * including the idempotency key `mppx_<challengeId>_<spt>`.
+ * This module owns the HTTP call because
  * mppx refuses a Stripe idempotent replay as "already processed", which would
  * leave a charge that succeeded before a crash permanently unbooked. Reporting
  * the replayed PaymentIntent as an ordinary success lets a retry of the same
@@ -186,7 +193,7 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       });
     },
 
-    async charge(serialized, { amountMicro, resourcePath }) {
+    async charge(serialized, { amountMicro, resourcePath, canonicalDvmId }) {
       let credential: ReturnType<typeof Credential.deserialize>;
       try {
         credential = Credential.deserialize(serialized);
@@ -216,7 +223,7 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       // The decimal amount ("0.60"); mppx turns it into cents for Stripe.
       const amount = fiatMicroToMethodAmount(amountMicro, "stripe");
       const broadcast = (secretKey: string) =>
-        build(fetchClient({ apiBase, secretKey: opts.secretKey, fetchImpl, attempt, beforeCharge }), secretKey)
+        build(fetchClient({ apiBase, secretKey: opts.secretKey, fetchImpl, attempt, beforeCharge, canonicalDvmId }), secretKey)
           .broadcastCredential(serialized, {
             request: { amount },
             meta: { path: resourcePath, nonce: readNonce(credential.challenge) },
@@ -332,11 +339,16 @@ function fetchClient(args: {
   fetchImpl: typeof fetch;
   attempt: ChargeAttempt;
   beforeCharge?: () => Promise<void>;
+  canonicalDvmId?: string;
 }): StripeClientLike {
   return {
     paymentIntents: {
       async create(params, options) {
         await args.beforeCharge?.();
+        const form = formEncode(params);
+        // Reserve this key for server configuration, including when no identity is configured.
+        form.delete("metadata[dvmkit_dvm_id]");
+        if (args.canonicalDvmId) form.set("metadata[dvmkit_dvm_id]", args.canonicalDvmId);
         args.attempt.called = true;
         const response = await args.fetchImpl(`${args.apiBase}/v1/payment_intents`, {
           method: "POST",
@@ -347,7 +359,7 @@ function fetchClient(args: {
             ...(options.apiVersion && { "Stripe-Version": options.apiVersion }),
             ...(options.stripeAccount && { "Stripe-Account": options.stripeAccount }),
           },
-          body: formEncode(params),
+          body: form,
         });
         const body = (await response.json().catch(() => ({}))) as {
           id?: unknown;

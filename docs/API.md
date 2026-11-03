@@ -295,7 +295,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `StripeChargeFacts` | interface | What a refund needs to know about the charge behind one funding PaymentIntent. |
 | `StripeChargeOutcome` | type | What one charge attempt established. |
 | `StripeCreditConfig` | interface | The env vars that opt a DVM into card-funded credit. |
-| `StripeCreditRail` | interface | The card-credit rail. |
+| `StripeCreditRail` | interface | Card-credit rail with optional server-owned `dvmkit_dvm_id` PaymentIntent metadata. |
 | `StripeDispute` | interface | Exported declaration from the built public entry point. |
 | `StripeErrorCodes` | interface | Stripe's own error classification: enums, never Stripe's free-text message. |
 | `StripePaymentIntentSummary` | interface | Exported declaration from the built public entry point. |
