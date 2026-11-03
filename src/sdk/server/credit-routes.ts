@@ -1712,11 +1712,19 @@ function drainBody(record: CreditDrainRecord): Record<string, unknown> {
  * refunded; any sub-cent remainder of `amount_micro` is credit no card refund can carry.
  */
 function cardRefundBody(record: CreditDrainRecord): Record<string, unknown> {
-  if (!record.cardRefund) return { refund_ids: [] };
-  const summary = cardRefundSummary(record.cardRefund);
+  const recovery = record.cardRecovery ? { recovery: {
+    revision: record.cardRecovery.revision,
+    blocked_reason: record.cardRecovery.blockedReason,
+    blocked_at: record.cardRecovery.blockedAt,
+    refunded_gross_micro: record.cardRecovery.refundedGrossMicro,
+    written_off_micro: record.cardRecovery.writtenOffMicro,
+  } } : {};
+  if (!record.cardRefund) return { refund_ids: [], card_refund: recovery };
+  const summary = cardRefundSummary(record.cardRefund, record.status === "written_off");
   return {
     refund_ids: summary.refundIds,
     card_refund: {
+      ...recovery,
       refunded_usd: usdFromCents(summary.refundedCents),
       stripe_fee_share_usd: usdFromCents(summary.feeShareCents),
       refunded_cents: summary.refundedCents,
@@ -1734,6 +1742,14 @@ function cardRefundBody(record: CreditDrainRecord): Record<string, unknown> {
 
 function cardRefundCopy(record: CreditDrainRecord): { display: string; hint: string } {
   const sent = record.status === "sent";
+  if (record.status === "refund_blocked") return {
+    display: "The card processor cannot finish this refund. The unpaid balance remains reserved while the service operator resolves it.",
+    hint: "Contact the service operator with this drain_id. Polling does not retry a blocked refund.",
+  };
+  if (record.status === "written_off") return {
+    display: "The service operator closed this card refund and recorded its unpaid remainder as written off. See card_refund.recovery for the amounts.",
+    hint: "Contact the service operator about the written-off amount. This drain will make no further refunds.",
+  };
   if (!record.cardRefund) {
     return {
       display:
@@ -1762,10 +1778,13 @@ function cardRefundCopy(record: CreditDrainRecord): { display: string; hint: str
 }
 
 function drainCopy(record: CreditDrainRecord): { display: string; hint: string } {
-  if (record.method === "stripe" && (record.status === "pending" || record.status === "sent")) {
+  if (record.method === "stripe") {
     return cardRefundCopy(record);
   }
   switch (record.status) {
+    case "refund_blocked":
+    case "written_off":
+      return cardRefundCopy(record);
     case "pending":
       if (record.method === "cashu") {
         return {
@@ -2819,6 +2838,11 @@ function drainLedgerErrorResponse(
   creditId: string,
   drainId: string
 ): Response {
+  if (error.code === "card_refund_busy" || error.code === "card_refund_unavailable") {
+    return Response.json({ error: error.code, message: error.message, retryable: true,
+      drain_registered: true, drain_id: drainId, hint: "Retry this same drain_id after refund recovery is available." },
+      { status: error.code === "card_refund_busy" ? 409 : 503 });
+  }
   if (error.code === "nothing_to_drain") {
     return jsonPaymentError("nothing_to_drain", 409, {
       message: `credit ${creditId} has no available balance to drain.`,

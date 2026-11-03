@@ -157,8 +157,18 @@ export function createStripeRefundApi(opts: StripeRefundApiOpts): StripeRefundAp
 
     async listRefunds(paymentIntentId) {
       const query = new URLSearchParams({ payment_intent: paymentIntentId, limit: "100" });
-      const page = await call("GET", "/v1/refunds", { query });
-      return arrayOf(page.data).map(refundFrom);
+      const refunds: StripeRefund[] = [];
+      for (let index = 0; index < 100; index++) {
+        const page = await call("GET", "/v1/refunds", { query });
+        const entries = arrayOf(page.data).map(refundFrom);
+        refunds.push(...entries);
+        if (page.has_more !== true) return refunds;
+        const last = entries.at(-1)?.id;
+        if (!last || last === query.get("starting_after")) break;
+        query.set("starting_after", last);
+      }
+      // Incomplete history cannot establish that an uncertain submission never paid.
+      throw new StripeApiError(0, { code: "refund_history_incomplete" });
     },
 
     async createRefund(args) {

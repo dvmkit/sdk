@@ -1,5 +1,6 @@
 /* Card refunds on Postgres: the expiry refund that closes a card credit for good, the
  * dispute that freezes one, the charge that was never booked, and the drain report. */
+import { readFileSync } from "node:fs";
 import { Credential } from "mppx";
 import type { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -8,6 +9,7 @@ import { createPostgresCardChargeJournal } from "../card-charge-journal";
 import { runCardRefundSweep } from "../card-refund-sweep";
 import { cardExpiryDrainId, CreditLedger } from "../credit-ledger";
 import type { CreditDrainPayload } from "../revenue-reporter";
+import { recoverCardDrain, runStripeDrain } from "../stripe-drain-leg";
 import { createStripeCreditRail } from "../stripe-credit";
 import { createStripeRefundApi, StripeApiError } from "../stripe-refund-api";
 import { CALLER, cardServer, credentialFor, drain, fund, HMAC } from "./__helpers__/card-credit";
@@ -410,4 +412,115 @@ describe.skipIf(!RUN)("card refunds on Postgres", () => {
     await sweep(Date.now() + 25 * HOUR_MS);
     expect(await unresolved(Date.now() + 25 * HOUR_MS)).not.toContain("challenge-not-indexed-yet");
   });
+
+  it("serializes operator recovery across ledger instances and works with a one-connection pool", async () => {
+    const account = fakeStripeAccount();
+    await cardCredit(account, { creditId: "recovery-race", pi: "pi_race", cents: 200, expiryMs: Date.now() + HOUR_MS });
+    account.intents.get("pi_race")!.refunded = 200;
+    const { drain: requested } = await ledger.requestDrain({ creditId: "recovery-race", drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    const deps = { ledger, stripe: stripeApi(account), drainReport: {} };
+    expect((await runStripeDrain(deps, requested)).drain.status).toBe("refund_blocked");
+    account.intents.get("pi_race")!.refunded = 0;
+    const pg = await import("pg");
+    const single = new pg.default.Pool({ connectionString: DATABASE_URL, max: 1, options: `-c search_path=${SCHEMA}` });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const stripe = { ...stripeApi(account), retrieveCharge: async (id: string) => {
+      entered(); await gate; return stripeApi(account).retrieveCharge(id);
+    } };
+    const replan = recoverCardDrain({ ledger: new CreditLedger(single), stripe, drainReport: {} }, {
+      creditId: "recovery-race", drainId: "d", decisionId: "replan", action: "replan", reason: "Funding repaired" });
+    try {
+      await started;
+      await expect(recoverCardDrain({ ...deps, ledger: new CreditLedger(db) }, {
+        creditId: "recovery-race", drainId: "d", decisionId: "close", action: "close", reason: "No refund" }))
+        .rejects.toMatchObject({ code: "card_refund_busy" });
+    } finally { release(); }
+    try {
+      expect((await replan).drain.status).toBe("sent");
+      expect([...account.refunds.values()].map((refund) => refund.amount)).toEqual([164]);
+      expect((await ledger.getDrain({ creditId: "recovery-race", drainId: "d" }))?.cardRecovery?.decisions)
+        .toEqual([expect.objectContaining({ decisionId: "replan", action: "replan" })]);
+    } finally { await single.end(); }
+  });
+
+  it("lets expiry refund remaining released holds after a blocked drain is written off", async () => {
+    const account = fakeStripeAccount();
+    const now = Date.now();
+    await cardCredit(account, { creditId: "recover-expiry", pi: "pi_recover_expiry", cents: 200, expiryMs: now + HOUR_MS });
+    await ledger.draw({ creditId: "recover-expiry", drawId: "hold", amountMicro: 300_000, jobId: "hold" });
+    const { drain: requested } = await ledger.requestDrain({ creditId: "recover-expiry", drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    account.intents.get("pi_recover_expiry")!.refunded = 200;
+    const deps = { ledger, stripe: stripeApi(account), drainReport: {} };
+    await runStripeDrain(deps, requested);
+    await ledger.release({ creditId: "recover-expiry", drawId: "hold" });
+    const expiry = now + 2 * HOUR_MS;
+    expect(await ledger.openCardExpiryRefund({ creditId: "recover-expiry", nowMs: expiry })).toBeUndefined();
+    await recoverCardDrain(deps, { creditId: "recover-expiry", drainId: "d", decisionId: "close", action: "close", reason: "Reviewed permanent refusal" });
+    account.intents.get("pi_recover_expiry")!.refunded = 170;
+    const summary = await runCardRefundSweep(deps, { nowMs: expiry });
+    expect(summary.expiryRefunds).toContain("recover-expiry");
+    expect((await ledger.getDrain({ creditId: "recover-expiry", drainId: cardExpiryDrainId(now + HOUR_MS) }))?.status).toBe("sent");
+    expect([...account.refunds.values()].map((refund) => refund.amount)).toEqual([25]);
+    expect((await ledger.getDrain({ creditId: "recover-expiry", drainId: "d" }))?.cardRecovery?.writtenOffMicro).toBe(1_700_000);
+    expect(await ledger.get("recover-expiry")).toMatchObject({ status: "refunded", balanceMicro: 0 });
+  });
+
+  it("preserves refund evidence across the additive recovery migration", async () => {
+    const account = fakeStripeAccount();
+    await cardCredit(account, { creditId: "legacy-refund", pi: "pi_legacy_refund", cents: 200, expiryMs: Date.now() + HOUR_MS });
+    const { drain: requested } = await ledger.requestDrain({ creditId: "legacy-refund", drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    account.control.rejectRefunds = 1;
+    await runStripeDrain({ ledger, stripe: stripeApi(account), drainReport: {} }, requested);
+    const before = await ledger.getDrain({ creditId: "legacy-refund", drainId: "d" });
+    await db.query("ALTER TABLE credit_drains DROP COLUMN card_recovery");
+    const migrated = new CreditLedger(db);
+    await migrated.init();
+    await migrated.init();
+    const after = await migrated.getDrain({ creditId: "legacy-refund", drainId: "d" });
+    expect(after?.cardRefund).toEqual(before?.cardRefund);
+    expect(after?.cardRecovery).toBeNull();
+    expect((await runStripeDrain({ ledger: migrated, stripe: stripeApi(account), drainReport: {} }, after!)).drain.status).toBe("sent");
+    expect(account.refunds.size).toBe(1);
+  });
+
+
+  it("rolls booking back with the outbox while retaining completed Stripe refunds for retry", async () => {
+    const account = fakeStripeAccount();
+    await cardCredit(account, { creditId: "report-rollback", pi: "pi_report_rollback", cents: 200, expiryMs: Date.now() + HOUR_MS });
+    const { drain: requested } = await ledger.requestDrain({ creditId: "report-rollback", drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    const stripe = stripeApi(account);
+    await expect(runStripeDrain({ ledger, stripe, drainReport: { db, dvmId: "example", enqueueCreditDrain: async () => { throw new Error("outbox unavailable"); } } }, requested))
+      .rejects.toThrow("outbox unavailable");
+    const pending = (await ledger.getDrain({ creditId: "report-rollback", drainId: "d" }))!;
+    expect(pending).toMatchObject({ status: "pending", sentRef: null, cardRefund: { entries: [expect.objectContaining({ status: "succeeded" })] } });
+    const reports: CreditDrainPayload[] = [];
+    expect((await runStripeDrain({ ledger, stripe, drainReport: { db, dvmId: "example", enqueueCreditDrain: async (_tx, report) => { reports.push(report); } } }, pending)).drain.status).toBe("sent");
+    expect(account.refunds.size).toBe(1);
+    expect(reports).toEqual([expect.objectContaining({ status: "sent", amountMicro: 2_000_000 })]);
+  });
+
+  it("exports write-off amounts and decisions without operator free text", async () => {
+    const account = fakeStripeAccount();
+    await cardCredit(account, { creditId: "export-close", pi: "pi_export_close", cents: 200, expiryMs: Date.now() + HOUR_MS });
+    account.intents.get("pi_export_close")!.refunded = 200;
+    const { drain: requested } = await ledger.requestDrain({ creditId: "export-close", drainId: "d", callerPubkey: CALLER, method: "stripe", payout: {} });
+    const deps = { ledger, stripe: stripeApi(account), drainReport: {} };
+    await runStripeDrain(deps, requested);
+    await recoverCardDrain(deps, { creditId: "export-close", drainId: "d", action: "close", decisionId: "private-decision-sentinel", reason: "private-reason-sentinel" });
+    const recipe = readFileSync(new URL("../../../../recipes/postgres/financial-export-v1.sql", import.meta.url), "utf8");
+    const client = await db.connect();
+    try {
+      const results = await client.query(recipe) as unknown as import("pg").QueryResult[];
+      const exported = results.find((result) => result.rows?.[0]?.jsonb_build_object)?.rows[0].jsonb_build_object;
+      expect(exported.drains).toContainEqual(expect.objectContaining({ credit_id: "export-close", status: "written_off",
+        card_recovery: { revision: 0, blockedAt: expect.any(Number), blockedReason: "charges_exhausted", refundedGrossMicro: 0,
+          writtenOffMicro: 2_000_000, decisions: [{ action: "close", decidedAt: expect.any(Number) }] } }));
+      expect(JSON.stringify(exported)).not.toContain("private-reason-sentinel");
+      expect(JSON.stringify(exported)).not.toContain("private-decision-sentinel");
+    } finally { client.release(); }
+  });
+
 });

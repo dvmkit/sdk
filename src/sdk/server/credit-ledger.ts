@@ -446,6 +446,7 @@ export class CreditLedger {
     // A card refund's plan and progress, fixed before the first Stripe call so every retry
     // sends the same amounts under the same idempotency keys. NULL on every other rail.
     await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS card_refund JSONB`);
+    await this.pool.query(`ALTER TABLE credit_drains ADD COLUMN IF NOT EXISTS card_recovery JSONB`);
     // the operator's decision on a channel drain the payout floor
     // refused. Two nullable columns rather than a separate drain status, because
     // a write-off books nothing and moves no money — the drain is still
@@ -2841,8 +2842,9 @@ export class CreditLedger {
   async getDrain(args: {
     creditId: string;
     drainId: string;
+    tx?: CreditLedgerQuerier;
   }): Promise<CreditDrainRecord | undefined> {
-    const { rows } = await this.pool.query<DrainJoinRow>(
+    const { rows } = await (args.tx ?? this.pool).query<DrainJoinRow>(
       `SELECT d.*, ${DRAIN_CREDIT_COLUMNS} FROM credit_drains d
        JOIN credits c ON c.credit_id = d.credit_id
        WHERE d.credit_id = $1 AND d.drain_id = $2`,
@@ -2862,16 +2864,53 @@ export class CreditLedger {
     drainId: string;
     plan: CardRefundPlan;
     onlyIfUnset?: boolean;
+    revision?: number;
+    tx?: CreditLedgerQuerier;
   }): Promise<CardRefundPlan | null> {
-    const { rows } = await this.pool.query<{ card_refund: CardRefundPlan | null }>(
+    const { rows } = await (args.tx ?? this.pool).query<{ card_refund: CardRefundPlan | null }>(
       `UPDATE credit_drains SET card_refund = $3
         WHERE credit_id = $1 AND drain_id = $2 AND method = 'stripe' AND status = 'pending'
           AND ($4::boolean IS FALSE OR card_refund IS NULL)
+          AND COALESCE((card_recovery->>'revision')::integer, 0) = $5
         RETURNING card_refund`,
-      [args.creditId, args.drainId, JSON.stringify(args.plan), args.onlyIfUnset === true]
+      [args.creditId, args.drainId, JSON.stringify(args.plan), args.onlyIfUnset === true, args.revision ?? 0]
     );
     if (rows.length > 0) return rows[0].card_refund;
-    return (await this.readDrain(this.pool, args.creditId, args.drainId))?.card_refund ?? null;
+    return (await this.readDrain(args.tx ?? this.pool, args.creditId, args.drainId))?.card_refund ?? null;
+  }
+
+  /** Serialize refunds and recovery across machines without holding an uncommitted plan. */
+  async withCardRefundLock<T>(creditId: string, operation: (query?: CreditLedgerQuerier) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    let locked = false;
+    let destroy = false;
+    try {
+      const { rows } = await client.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked", [`card-refund:${creditId}`]);
+      locked = rows[0]?.locked === true;
+      if (!locked) throw new CreditLedgerError("card_refund_busy", "Another card refund operation is in progress; retry this request.");
+      // All callback queries use this client, including short accounting transactions. A
+      // pool of size one works, and waiting refunds cannot exhaust the pool with lock holders.
+      return await operation(client);
+    } finally {
+      if (locked) await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [`card-refund:${creditId}`])
+        .catch(() => { destroy = true; });
+      client.release(destroy);
+    }
+  }
+
+  async saveCardDrainState(args: CardDrainStateArgs): Promise<CreditDrainRecord> {
+    assertCardDrainTransition(args);
+    const q = args.tx ?? this.pool;
+    const { rows } = await q.query<DrainRow>(
+      `UPDATE credit_drains SET status=$3, card_recovery=$4,
+          card_refund=CASE WHEN $5::boolean THEN $6::jsonb ELSE card_refund END
+        WHERE credit_id=$1 AND drain_id=$2 AND method='stripe' AND status=$7
+          AND COALESCE((card_recovery->>'revision')::integer, 0)=$8 RETURNING *`,
+      [args.creditId, args.drainId, args.status, JSON.stringify(args.recovery),
+        args.plan !== undefined, JSON.stringify(args.plan ?? null), args.expectedStatus, args.expectedRevision]);
+    if (!rows[0]) throw new CreditLedgerError("drain_decision_conflict", "The card drain changed before this decision committed.");
+    return this.rejoin(q, rows[0]);
   }
 
   /**
@@ -2889,7 +2928,7 @@ export class CreditLedger {
           )
           AND NOT EXISTS (
             SELECT 1 FROM credit_drains r
-             WHERE r.credit_id = c.credit_id AND r.method = 'stripe' AND r.status = 'pending'
+             WHERE r.credit_id = c.credit_id AND r.method = 'stripe' AND r.status IN ('pending','refund_blocked')
           )
         ORDER BY c.expiry_ms
         LIMIT $2`,
@@ -3025,8 +3064,8 @@ export class CreditLedger {
    * public read behind the reclaim's own arithmetic, for anything that needs
    * to show its work.
    */
-  async listFundingLots(creditId: string): Promise<FundingLot[]> {
-    return this.openLots(this.pool, creditId);
+  async listFundingLots(creditId: string, tx?: CreditLedgerQuerier): Promise<FundingLot[]> {
+    return this.openLots(tx ?? this.pool, creditId);
   }
 
   /**
@@ -3144,7 +3183,7 @@ export class CreditLedger {
     const { rows } = await this.pool.query<DrainJoinRow>(
       `SELECT d.*, ${DRAIN_CREDIT_COLUMNS} FROM credit_drains d
        JOIN credits c ON c.credit_id = d.credit_id
-       WHERE d.status IN ('pending','exit_required') ORDER BY d.created_at, d.credit_id, d.drain_id`
+       WHERE d.status IN ('pending','exit_required','refund_blocked') ORDER BY d.created_at, d.credit_id, d.drain_id`
     );
     return rows.map(drainRecordFromJoinRow);
   }
@@ -3891,7 +3930,7 @@ export class CreditLedger {
   ): Promise<string | undefined> {
     const { rows } = await q.query<{ drain_id: string }>(
       `SELECT drain_id FROM credit_drains
-        WHERE credit_id = $1 AND method = 'stripe' AND status = 'pending'
+        WHERE credit_id = $1 AND method = 'stripe' AND status IN ('pending','refund_blocked')
         ORDER BY created_at LIMIT 1`,
       [creditId]
     );
@@ -4018,12 +4057,16 @@ export interface CreditLedgerLike {
     nowMs?: number;
     limit?: number;
   }): Promise<{ released: CreditExpiryRelease[] }>;
+  withCardRefundLock?<T>(creditId: string, operation: (query?: CreditLedgerQuerier) => Promise<T>): Promise<T>;
+  saveCardDrainState?(args: CardDrainStateArgs): Promise<CreditDrainRecord>;
   /** See {@link CreditLedger.saveCardRefund}. */
   saveCardRefund?(args: {
     creditId: string;
     drainId: string;
     plan: CardRefundPlan;
     onlyIfUnset?: boolean;
+    revision?: number;
+    tx?: CreditLedgerQuerier;
   }): Promise<CardRefundPlan | null>;
   /**
    * Card-refund sweep reads and writes. Optional and Postgres-only, like the expiry sweep:
@@ -4247,11 +4290,11 @@ export interface CreditLedgerLike {
     tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<DrainRequestResult>;
-  getDrain(args: { creditId: string; drainId: string }): Promise<CreditDrainRecord | undefined>;
+  getDrain(args: { creditId: string; drainId: string; tx?: CreditLedgerQuerier }): Promise<CreditDrainRecord | undefined>;
   listPendingDrains(): Promise<CreditDrainRecord[]>;
   /** See {@link CreditLedger.bitcoinDepositLiability} — the in-kind deposit floor. */
   bitcoinDepositLiability(): Promise<BitcoinDepositLiability>;
-  listFundingLots(creditId: string): Promise<FundingLot[]>;
+  listFundingLots(creditId: string, tx?: CreditLedgerQuerier): Promise<FundingLot[]>;
   listChannelDrains(args: {
     limit: number;
     after?: ChannelDrainCursor;
@@ -4420,7 +4463,7 @@ export function isDrainMethod(value: string): value is DrainMethod {
  * `exit_required` ends cooperative attempts without restoring the debit;
  * a late confirmed close can still fulfill it as `sent`.
  */
-export type DrainStatus = "pending" | "parked" | "picked_up" | "sent" | "released" | "exit_required";
+export type DrainStatus = "pending" | "parked" | "picked_up" | "sent" | "released" | "exit_required" | "refund_blocked" | "written_off";
 
 /**
  * The sats a DVM owes back on undrawn non-channel Bitcoin credit —
@@ -4592,6 +4635,7 @@ export interface CreditDrainRecord {
   refundPaymentProven?: boolean;
   /** A `stripe` drain's refunds to the card: plan and progress. Null until planned. */
   cardRefund?: CardRefundPlan | null;
+  cardRecovery?: CardDrainRecovery | null;
 }
 
 /**
@@ -4614,11 +4658,49 @@ export interface CardRefundEntry {
    * refund, because Stripe replays a key's first answer, errors included.
    */
   attempt: number;
+  /** Absent on plans written before recovery revisions existed. */
+  revision?: number;
   refundId: string | null;
   /** Stripe's refund status, `planned` before any refund exists, `rejected` when refused. */
   status: "planned" | "pending" | "requires_action" | "succeeded" | "failed" | "canceled" | "rejected";
   /** Stripe's enum code for the last refusal or failure; never Stripe's free text. */
   lastError: string | null;
+}
+
+export interface CardDrainDecision {
+  decisionId: string;
+  action: "close" | "replan";
+  reason: string;
+  decidedAt: number;
+}
+
+export interface CardDrainRecovery {
+  revision: number;
+  blockedReason: string | null;
+  blockedAt: number | null;
+  decisions: CardDrainDecision[];
+  /** Gross credit already discharged by succeeded refunds, including their fee shares. */
+  refundedGrossMicro?: number;
+  /** Unpaid credit extinguished by the operator, never reported as a successful refund. */
+  writtenOffMicro?: number;
+}
+
+export interface CardDrainStateArgs {
+  creditId: string;
+  drainId: string;
+  expectedStatus: "pending" | "refund_blocked";
+  expectedRevision: number;
+  status: "pending" | "refund_blocked" | "written_off";
+  recovery: CardDrainRecovery;
+  plan?: CardRefundPlan | null;
+  tx?: CreditLedgerQuerier;
+}
+
+export function assertCardDrainTransition(args: CardDrainStateArgs): void {
+  if (!(args.expectedStatus === "pending" && args.status === "refund_blocked" ||
+    args.expectedStatus === "refund_blocked" && ["pending", "written_off", "refund_blocked"].includes(args.status))) {
+    throw new CreditLedgerError("invalid_drain_state", "Only a pending card refund can be blocked, and only a blocked refund can be recovered.");
+  }
 }
 
 export interface CardRefundPlan {
@@ -5178,6 +5260,9 @@ export type CreditLedgerErrorCode =
   | "drain_not_found"
   | "drain_conflict"
   | "invalid_drain_state"
+  | "card_refund_busy"
+  | "card_refund_uncertain"
+  | "card_refund_unavailable"
   | "tempo_drain_close_pending"
   | "tempo_drain_refund_paid"
   | "tempo_drain_refund_unknown"
@@ -5533,6 +5618,7 @@ interface DrainRow {
   proven_refund_native: string | null;
   refund_payment_proven: boolean;
   card_refund?: CardRefundPlan | null;
+  card_recovery?: CardDrainRecovery | null;
 }
 
 /**
@@ -5740,6 +5826,7 @@ function drainRecordFromRow(row: DrainRow, credit: DrainCreditJoin): CreditDrain
     provenRefundNative: row.proven_refund_native ?? null,
     refundPaymentProven: row.refund_payment_proven ?? false,
     cardRefund: row.card_refund ?? null,
+    cardRecovery: row.card_recovery ?? null,
   };
 }
 

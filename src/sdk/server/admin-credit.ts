@@ -59,7 +59,7 @@ import {
   X402_SPEND_BLOCKING_SETTLEMENT_STATUSES,
   type X402SettlementCursor,
 } from "./x402-channel-store";
-import { cardRefundSummary, runStripeDrain } from "./stripe-drain-leg";
+import { cardRefundSummary, recoverCardDrain, runStripeDrain } from "./stripe-drain-leg";
 import type { StripeRefundApi } from "./stripe-refund-api";
 import { completeX402ChannelDrain } from "./x402-drain-leg";
 import {
@@ -144,6 +144,8 @@ export function installAdminCreditRoutes<E extends Env = Env, S extends BlankSch
   app.get("/admin/credit/bitcoin-liability", (c) => handleBitcoinLiability(c, opts));
   app.post("/admin/credit/park-drain", (c) => handleParkDrain(c, opts));
   app.post("/admin/credit/mark-drain-sent", (c) => handleMarkDrainSent(c, opts));
+  app.post("/admin/credit/close-card-drain", (c) => handleCardDrainDecision(c, opts, "close"));
+  app.post("/admin/credit/replan-card-drain", (c) => handleCardDrainDecision(c, opts, "replan"));
   app.get("/admin/credit/blocked-invoices", (c) => handleBlockedInvoices(c, opts));
   app.post("/admin/credit/reconcile-invoice", (c) => handleReconcileInvoice(c, opts));
   app.post("/admin/credit/write-off-invoice", (c) => handleWriteOffInvoice(c, opts));
@@ -449,6 +451,7 @@ async function handlePendingDrains(
       settlement,
       channel_id: d.channelId,
       created_at: d.createdAt,
+      status: d.status,
       ...(d.method === "stripe" && { card_refund: cardRefundStatus(d) }),
     };
   });
@@ -911,7 +914,14 @@ async function handleMarkDrainSent(
 
   // A card refund is booked only on Stripe's word: this verb retries its refunds rather than
   // taking the operator's. The plan on the drain makes a retry safe to repeat.
-  if (existing?.method === "stripe") return retryCardRefund(c, opts, existing);
+  if (existing?.method === "stripe") {
+    try { return await retryCardRefund(c, opts, existing); }
+    catch (error) {
+      if (error instanceof CreditLedgerError) return c.json({ error: error.code, message: error.message },
+        error.code === "card_refund_unavailable" ? 503 : 409);
+      throw error;
+    }
+  }
 
   // Commit the terminal CAS and drain report together. Only the non-replayed transition
   // queues it; recovery calls may repeat this endpoint.
@@ -2729,10 +2739,11 @@ function parseSerializedDleq(raw: unknown): { e: string; s: string; r?: string }
 /** A pending card refund's progress, for the operator deciding whether to retry it. */
 function cardRefundStatus(drain: CreditDrainRecord): Record<string, unknown> {
   const plan = drain.cardRefund;
-  if (!plan) return { planned: false };
-  const summary = cardRefundSummary(plan);
+  if (!plan) return { planned: false, recovery: drain.cardRecovery ?? null };
+  const summary = cardRefundSummary(plan, drain.status === "written_off");
   return {
     planned: true,
+    recovery: drain.cardRecovery ?? null,
     refunded_cents: summary.refundedCents,
     fee_share_cents: summary.feeShareCents,
     sub_cent_micro: summary.subCentMicro,
@@ -2785,4 +2796,37 @@ async function retryCardRefund(
     },
     after.status === "sent" ? 200 : 202
   );
+}
+
+async function handleCardDrainDecision(
+  c: Context, opts: InstallAdminCreditRoutesOpts, action: "close" | "replan"
+): Promise<Response> {
+  const auth = await requireAuth(c, opts);
+  if ("response" in auth) return auth.response;
+  let body: Record<string, unknown>;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: "invalid_body", message: "Request body must be JSON." }, 400); }
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+    !["credit_id", "drain_id", "decision_id", "reason"].every((key) => typeof body[key] === "string" && (body[key] as string).trim().length > 0) ||
+    (body.decision_id as string).length > 128 || (body.reason as string).trim().length > 2000) {
+    return c.json({ error: "invalid_body", message: "Provide credit_id, drain_id, decision_id (1–128 characters), and reason (1–2000 characters)." }, 400);
+  }
+  if (!opts.stripeRefunds) return c.json({ error: "card_refund_unavailable" }, 503);
+  try {
+    const result = await recoverCardDrain({ ledger: opts.ledger, stripe: opts.stripeRefunds,
+      drainReport: { db: opts.db, dvmId: opts.dvmId, enqueueCreditDrain: opts.enqueueCreditDrain },
+      receiptIssuer: opts.receiptIssuer }, {
+      creditId: body.credit_id as string, drainId: body.drain_id as string,
+      decisionId: body.decision_id as string, reason: body.reason as string, action });
+    return c.json({ credit_id: result.drain.creditId, drain_id: result.drain.drainId,
+      status: result.drain.status, replayed: result.replayed, card_refund: cardRefundStatus(result.drain) });
+  } catch (error) {
+    if (error instanceof CreditLedgerError) {
+      const status = error.code === "drain_not_found" ? 404 : error.code === "card_refund_unavailable" ? 503 : 409;
+      return c.json({ error: error.code, message: error.message }, status);
+    }
+    // Failed evidence reads leave the decision uncommitted; a later booking failure can
+    // leave a recorded replan pending. Its decision id remains safe to repeat.
+    return c.json({ error: "card_refund_unavailable", message: "Refund evidence could not be read; retry the same decision_id." }, 503);
+  }
 }
