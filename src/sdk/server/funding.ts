@@ -225,13 +225,22 @@ export function pinAskFiat(args: {
   exact?: { amount: number; currency: string };
 }): PriceFiat | undefined {
   if (!args.msats) return undefined;
-  const amount =
-    args.exact?.currency === args.currency
-      ? args.exact.amount
-      : satsToFiat(args.msats / 1000, fxRateFor(args.fx, args.currency));
-  const rounded = Math.round(amount * 1_000_000);
+  if (args.exact?.currency === args.currency) return fiatAmountMicro(args.exact);
+  return fiatAmountMicro({
+    amount: satsToFiat(args.msats / 1000, fxRateFor(args.fx, args.currency)),
+    currency: args.currency,
+  });
+}
+
+/**
+ * A major-unit fiat amount as integer micro-units, at least one. The single
+ * conversion every pinned ask uses, so an ask's `fiat_amount` re-read later
+ * yields exactly the figure that was pinned from it.
+ */
+export function fiatAmountMicro(fiat: { amount: number; currency: string }): PriceFiat | undefined {
+  const rounded = Math.round(fiat.amount * 1_000_000);
   if (!Number.isSafeInteger(rounded)) return undefined;
-  return { currency: args.currency, amountMicro: Math.max(1, rounded) };
+  return { currency: fiat.currency, amountMicro: Math.max(1, rounded) };
 }
 
 /**

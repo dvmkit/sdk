@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { servedApps } from "../../test-support/served-app";
 import { configureDVM } from "../configure";
 import { createDVMServer } from "../server/app";
+import { ASK_EXPIRY_GRACE_MS } from "../server/ask-expiry";
 import { MemoryJobStore } from "../server/memory-job-store";
 import { MemoryKVStore } from "../store";
 
@@ -71,7 +72,7 @@ describe("idle timeout", () => {
     await startApp(descriptor, jobStore);
     await postJson(`${baseUrl}/v1/job/${job_id}/messages`, JSON.stringify({ type: "text", content: { text: "thinking" } }), job_token);
     expect(calls).toBe(1);
-    await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms - Date.now() + 100));
+    await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms + ASK_EXPIRY_GRACE_MS - Date.now() + 100));
     const result = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
     expect((await result.json()).status).toBe("cancelled");
     expect((await jobStore.get(job_id))?.endedBy).toBe("caller");
@@ -120,7 +121,7 @@ describe("idle timeout", () => {
     expect(waiting.status).toBe("awaiting-input");
     const replayedMessages = await fetch(`${baseUrl}/v1/job/${job_id}/messages`, { headers: tokenHeader(job_token) });
     expect((await replayedMessages.json()).messages.filter((m: { type: string }) => m.type === type)).toEqual([ask]);
-    await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms - Date.now() + 100));
+    await vi.advanceTimersByTimeAsync(Math.max(0, ask.content.expires_at_ms + ASK_EXPIRY_GRACE_MS - Date.now() + 100));
     const final = await fetch(`${baseUrl}/v1/job/${job_id}`, { headers: tokenHeader(job_token) });
     expect((await final.json()).status).toBe("cancelled");
     expect((await jobStore.get(job_id))?.endedBy).toBe("caller");
@@ -172,8 +173,8 @@ describe("idle timeout", () => {
     });
     expect((await statusRes.json()).status).toBe("awaiting-input");
 
-    // Advance time past the idle timeout
-    vi.advanceTimersByTime(6_000);
+    // Advance time past the idle timeout and its grace
+    vi.advanceTimersByTime(6_000 + ASK_EXPIRY_GRACE_MS);
 
     // Allow microtasks to settle
     await new Promise((r) => {
@@ -220,8 +221,8 @@ describe("idle timeout", () => {
       setTimeout(r, 0);
     });
 
-    // Advance another 4 seconds (total 8s from start, but only 4s since last activity)
-    vi.advanceTimersByTime(4_000);
+    // Past the first prompt's expiry, but only 34s since the second was emitted
+    vi.advanceTimersByTime(4_000 + ASK_EXPIRY_GRACE_MS);
 
     // Job should still be awaiting second prompt (not cancelled)
     const statusRes = await fetch(`${baseUrl}/v1/job/${job_id}`, {

@@ -7,6 +7,7 @@ import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
 import type { OutgoingMessage } from "../job-store";
 import { MemoryJobStore } from "../memory-job-store";
+import type { RecordedPaymentArrival } from "../payment-arrival";
 
 class DelayedInboundStore extends MemoryJobStore {
   afterRecord?: () => Promise<void>;
@@ -15,6 +16,14 @@ class DelayedInboundStore extends MemoryJobStore {
     const seq = await super.recordInbound(jobId, message);
     await this.afterRecord?.();
     return seq;
+  }
+
+  override async recordPaymentArrival(
+    ...args: Parameters<MemoryJobStore["recordPaymentArrival"]>
+  ): Promise<RecordedPaymentArrival> {
+    const arrival = await super.recordPaymentArrival(...args);
+    await this.afterRecord?.();
+    return arrival;
   }
 }
 
@@ -27,6 +36,8 @@ describe("payment history across hosts", () => {
     const descriptor = configureDVM({
       name: "shared-payment-history", capability: "test",
       async onJob(ctx) {
+        // An open ask, so the accepted payment pays it rather than landing as balance.
+        ctx.sendMessage("payment-request", { amount_msats: 1000, reason: "work" });
         ctx.working();
         await work;
         ctx.complete("done");
@@ -42,6 +53,7 @@ describe("payment history across hosts", () => {
     let release!: () => void;
     let streamed: Promise<Response> | undefined;
     let paid: Promise<Response> | undefined;
+    let refusedSeq: number | null = null;
     try {
       const submitted = await fetch(`${workerUrl}/v1/job`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -72,7 +84,7 @@ describe("payment history across hosts", () => {
         });
         await pending;
       } else {
-        await worker.jobManager.recordInboundPending(job, "payment", { dev_auto: true });
+        refusedSeq = await worker.jobManager.recordInboundPending(job, "payment", { dev_auto: true });
       }
       job.sdkCtx!.sendMessage("text", { text: "During verification" });
       await job.messageAppenderTail;
@@ -81,6 +93,9 @@ describe("payment history across hosts", () => {
       if (paymentAccepted) {
         release();
         expect((await paid!).status).toBe(201);
+      } else {
+        // Its verification fails, which releases the job to complete.
+        await backing.markInboundFailed(job_id, refusedSeq!, "payment_invalid");
       }
       finish();
       const messages = (await response.text()).split("\n").filter(line => line.startsWith("data:"))

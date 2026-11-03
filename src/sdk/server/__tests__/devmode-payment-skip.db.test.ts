@@ -67,9 +67,9 @@ describe.skipIf(!RUN)("development payment skips preserve durable input claims",
     });
     const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
     const payment = { type: "payment" as const, content: explicit ? { dev_auto: true } : {} };
-    async function pay() {
+    async function pay(outcome: object = {}) {
       const seq = await jm.recordInboundPending(job, payment.type, payment.content);
-      expect(await jm.processPayment(job, payment, seq)).toEqual({});
+      expect(await jm.processPayment(job, payment, seq)).toEqual(outcome);
       await jm.dispatchMessage(job, payment.type, payment.content);
       await jm.persistJob(job);
       return seq;
@@ -92,7 +92,8 @@ describe.skipIf(!RUN)("development payment skips preserve durable input claims",
       if (prompt) {
         await vi.waitFor(() => expect(job.pendingPrompts.has("question")).toBe(true));
         await jm.persistJob(job);
-        await pay();
+        // The ask is already paid: this one arrives with none open and buys nothing.
+        await pay({ landedAsBalance: "no_open_ask" });
         const waitingStatus = (await store.get(job.id))?.status;
         if (foreignClaim) expect(await store.claimForProcessing(job.id)).toBe(true);
         const response = { prompt_id: "question", text: "yes" };

@@ -23,8 +23,15 @@ import type {
   RequestIdClaim,
   RequestIdClaimResult,
   StreamableJobStore,
+  VerifyAndCreditOptions,
   VerifyAndCreditResult,
 } from "./job-store";
+import {
+  decidePaymentDisposition,
+  PaymentIntentOpenError,
+  type PaymentArrivalStore,
+  type RecordedPaymentArrival,
+} from "./payment-arrival";
 
 const JOB_MESSAGES_CHANNEL = "job_messages";
 const JOB_DVM_ID = Symbol("jobDvmId");
@@ -40,7 +47,7 @@ interface NotifySubscriber {
 }
 
 /** Postgres-backed JobStore with cross-machine message streaming via LISTEN/NOTIFY. */
-export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore {
+export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore, PaymentArrivalStore {
   private pool: Pool;
   private hostingCleanupFence?: HostingCleanupFence;
   private listenChannel: ListenChannel | null = null;
@@ -282,6 +289,24 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         CONSTRAINT receipt_counter_singleton CHECK (id)
       );
       INSERT INTO receipt_counter (id, n) VALUES (TRUE, 0) ON CONFLICT (id) DO NOTHING;
+
+      -- One row per payment that reached recordPaymentArrival, written under
+      -- the job row lock before verification. An unresolved row whose lease
+      -- has not passed holds the job non-terminal; Tx C or a refusal resolves
+      -- it. Kept after resolution as the arrival record.
+      CREATE TABLE IF NOT EXISTS job_payment_intents (
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        arrived_at_ms BIGINT NOT NULL,
+        lease_expires_at_ms BIGINT NOT NULL,
+        disposition TEXT NOT NULL,
+        balance_reason TEXT,
+        resolved_at_ms BIGINT,
+        outcome TEXT,
+        PRIMARY KEY (job_id, seq)
+      );
+      CREATE INDEX IF NOT EXISTS job_payment_intents_open
+        ON job_payment_intents (job_id) WHERE resolved_at_ms IS NULL;
     `);
   }
 
@@ -671,9 +696,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       // Lock an existing row before speculative insertion touches its unique
       // indexes. Otherwise a concurrent indexed UPDATE can become the deadlock
       // victim, and retrying only this save cannot recover that other writer.
-      const existing = await tx.query<{ dvm_id: string | null }>(
-        "SELECT dvm_id FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
+      const existing = await tx.query<{ dvm_id: string | null; status: JobStatus }>(
+        "SELECT dvm_id, status FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
       );
+      if (existing.rows[0] && !isTerminalStatus(existing.rows[0].status) && isTerminalStatus(record.status)) {
+        await this.assertNoOpenPaymentIntent(tx, record.id);
+      }
       if (this.hostingCleanupFence) {
         if (existing.rows[0]) {
           if (existing.rows[0].dvm_id !== null &&
@@ -1110,18 +1138,104 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     }
   }
 
+  async recordPaymentArrival(
+    jobId: string,
+    message: { from: "requester"; type: "payment"; timestamp: number; content: Record<string, unknown> },
+    opts: { arrivedAtMs: number; leaseMs: number }
+  ): Promise<RecordedPaymentArrival> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.hostingCleanupFence?.assertNewIntent(client);
+      // The row lock every terminal write also takes: the disposition below
+      // and the intent that holds the job open commit before any cancel or
+      // expiry can, or see the job already ended.
+      const { rows: [row] } = await client.query<{ status: JobStatus; pending_payment_msats: string | null }>(
+        "SELECT status, pending_payment_msats FROM jobs WHERE id = $1 AND redacted_at IS NULL FOR UPDATE",
+        [jobId]
+      );
+      if (!row) throw new Error(`recordPaymentArrival: job ${jobId} not found`);
+      const { rows: [ask] } = await client.query<{ data: Message }>(
+        `SELECT data FROM job_messages WHERE job_id = $1 AND status = 'verified'
+           AND data->>'from' = 'provider' AND data->>'type' = 'payment-request'
+         ORDER BY seq DESC LIMIT 1`,
+        [jobId]
+      );
+      const disposition = decidePaymentDisposition({
+        status: row.status,
+        pendingPaymentMsats: row.pending_payment_msats === null ? undefined : Number(row.pending_payment_msats),
+        ask: ask?.data,
+        arrivedAtMs: opts.arrivedAtMs,
+      });
+      const { rows: [allocated] } = await client.query<{ seq: number }>(
+        `UPDATE jobs SET next_seq = next_seq + 1,
+           last_activity_at = CASE WHEN status IN ('completed','failed','cancelled') THEN last_activity_at ELSE $2 END
+         WHERE id = $1 RETURNING (next_seq - 1) AS seq`,
+        [jobId, Date.now()]
+      );
+      const seq = allocated.seq;
+      await client.query(
+        `INSERT INTO job_messages (job_id, seq, data, status, created_at_ms)
+         VALUES ($1, $2, $3, 'pending-verification', $4)`,
+        [jobId, seq, JSON.stringify({ ...message, seq }), opts.arrivedAtMs]
+      );
+      await client.query(
+        `INSERT INTO job_payment_intents
+           (job_id, seq, arrived_at_ms, lease_expires_at_ms, disposition, balance_reason)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [jobId, seq, opts.arrivedAtMs, opts.arrivedAtMs + opts.leaseMs, disposition.disposition,
+          disposition.disposition === "balance" ? disposition.reason : null]
+      );
+      await client.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+      await client.query("COMMIT");
+      return { seq, disposition };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async openPaymentIntentUntil(jobId: string, nowMs: number): Promise<number | undefined> {
+    return this.openPaymentIntentUntilOn(this.pool, jobId, nowMs);
+  }
+
+  private async openPaymentIntentUntilOn(q: Pool | PoolClient, jobId: string, nowMs: number): Promise<number | undefined> {
+    const { rows: [row] } = await q.query<{ until: string | null }>(
+      `SELECT MAX(lease_expires_at_ms) AS until FROM job_payment_intents
+       WHERE job_id = $1 AND resolved_at_ms IS NULL AND lease_expires_at_ms > $2`,
+      [jobId, nowMs]
+    );
+    return row?.until == null ? undefined : Number(row.until);
+  }
+
+  /** Under the job row lock: refuse a terminal write while a payment intent is open. */
+  private async assertNoOpenPaymentIntent(tx: PoolClient, jobId: string): Promise<void> {
+    const until = await this.openPaymentIntentUntilOn(tx, jobId, Date.now());
+    if (until !== undefined) throw new PaymentIntentOpenError(jobId, until);
+  }
+
   async verifyAndCredit(
     jobId: string,
     seq: number,
-    credit: PaymentCreditDelta | null
+    credit: PaymentCreditDelta | null,
+    opts?: VerifyAndCreditOptions
   ): Promise<VerifyAndCreditResult> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       const { rowCount } = await client.query(
-        "UPDATE job_messages SET status='verified' WHERE job_id = $1 AND seq = $2 AND status = 'pending-verification'",
-        [jobId, seq]
+        "UPDATE job_messages SET status=$3 WHERE job_id = $1 AND seq = $2 AND status = 'pending-verification'",
+        [jobId, seq, opts?.landedAsBalance ? "balance" : "verified"]
       );
+      if (rowCount) {
+        await client.query(
+          `UPDATE job_payment_intents SET resolved_at_ms = $3, outcome = 'verified'
+           WHERE job_id = $1 AND seq = $2 AND resolved_at_ms IS NULL`,
+          [jobId, seq, Date.now()]
+        );
+      }
       if (!rowCount) {
         const counters = await this.fetchCountersTx(client, jobId);
         // the binding is read back on this path too. A retry after a
@@ -1193,14 +1307,24 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
              cashu_flow = COALESCE($9, cashu_flow),
              pending_x402_nonce = CASE WHEN $11::boolean THEN NULL ELSE pending_x402_nonce END,
              pending_x402_amount_usdc_micro = CASE WHEN $11::boolean THEN NULL ELSE pending_x402_amount_usdc_micro END,
-             last_activity_at = CASE WHEN status IN ('completed','failed','cancelled') THEN last_activity_at ELSE $12 END
-           WHERE id = $1
+             last_activity_at = $12
+           WHERE id = $1 AND status NOT IN ('completed','failed','cancelled')
            RETURNING status, paid_msats, pending_payment_msats, credit_id, draw_id`,
           params
         );
         if (rows.length === 0) {
-          await client.query("ROLLBACK");
-          throw new Error(`verifyAndCredit: job ${jobId} not found`);
+          // An ended job takes no payment and no credit binding; the caller
+          // lands the money as balance instead.
+          const ended = await this.fetchCountersTx(client, jobId);
+          if (!ended) {
+            await client.query("ROLLBACK");
+            throw new Error(`verifyAndCredit: job ${jobId} not found`);
+          }
+          const endedBinding = await this.fetchCreditBindingTx(client, jobId);
+          await client.query("UPDATE job_messages SET status='balance' WHERE job_id = $1 AND seq = $2", [jobId, seq]);
+          await client.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+          await client.query("COMMIT");
+          return { counters: ended, alreadyVerified: false, ...endedBinding, creditRefused: "job_ended" };
         }
         counters = {
           status: rows[0].status,
@@ -1251,7 +1375,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       `SELECT j.status, j.paid_msats, j.pending_payment_msats, j.summary, j.credit_id, j.draw_id
          FROM jobs j
          JOIN job_messages m ON m.job_id = j.id AND m.seq = $2
-        WHERE j.id = $1 AND m.status = 'verified'`,
+        WHERE j.id = $1 AND m.status IN ('verified', 'balance')`,
       [jobId, seq]
     );
     if (rows.length === 0) return undefined;
@@ -1269,9 +1393,12 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       `WITH failed AS (
          UPDATE job_messages SET status='failed-verify'
          WHERE job_id = $1 AND seq = $2 AND status = 'pending-verification'
-         RETURNING job_id
+         RETURNING job_id, seq
+       ), resolved AS (
+         UPDATE job_payment_intents SET resolved_at_ms = $3, outcome = 'failed'
+         WHERE (job_id, seq) IN (SELECT job_id, seq FROM failed) AND resolved_at_ms IS NULL
        ) SELECT pg_notify('job_messages', job_id) FROM failed`,
-      [jobId, seq]
+      [jobId, seq, Date.now()]
     );
   }
 
@@ -1555,6 +1682,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         await client.query("ROLLBACK");
         return false;
       }
+      await this.assertNoOpenPaymentIntent(client, jobId);
       const record = rowToRecord(rows[0]);
       const { rows: messages } = await client.query<{ data: Message }>(
         "SELECT data FROM job_messages WHERE job_id=$1 AND status='verified' ORDER BY seq", [jobId]);

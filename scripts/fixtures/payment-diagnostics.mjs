@@ -99,10 +99,11 @@ try {
       creditLedger: ledger, processedPayments: new MemoryProcessedPaymentStore(),
       fxFetcher: { fetch: async () => { throw entry.error; }, supportedCurrencies: () => ["usd"], lastKnown: () => null },
     }, { pendingPaymentMsats: 8000, requesterPubkey: "11".repeat(32) });
-    assert.equal(result.error, undefined);
-    assert.equal(result.verified?.paidMsats, 8000);
-    assert.equal(result.verified.creditId, undefined);
-    assert.ok(warnings.some((row) => row.event === "credit_topup_skipped" && row.reason === "denomination_unavailable" && row.cause === entry.cause));
+    // No rate means no ledger amount: refused before the token is received, so it can be resent.
+    assert.equal(result.verified, undefined);
+    assert.equal(result.error?.status, 503);
+    assert.equal(result.error?.body.error, "fx_rate_unavailable");
+    assert.ok(warnings.some((row) => row.event === "credit_topup_refused" && row.reason === "denomination_unavailable" && row.cause === entry.cause));
     cashuCases++;
   }
 

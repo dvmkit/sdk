@@ -347,6 +347,17 @@ export const UNCAPPABLE_ASK_TOTAL = -1;
  * inbound row was previously marked verified (idempotency guard); the credit
  * is skipped in that case.
  */
+/** How Tx C records an inbound payment that paid nothing. */
+export interface VerifyAndCreditOptions {
+  /**
+   * The payment landed on credit as balance and paid no ask. The built-in
+   * stores record it with status `balance` rather than `verified`, which keeps
+   * it out of the job's message history and handler replay: replaying it as a
+   * payment would answer an ask it never paid. `credit` must be null.
+   */
+  landedAsBalance?: boolean;
+}
+
 export interface VerifyAndCreditResult {
   counters: JobCounters;
   alreadyVerified: boolean;
@@ -364,6 +375,12 @@ export interface VerifyAndCreditResult {
   creditId?: string;
   /** The draw the job row holds after this call. Same read-back rule. */
   drawId?: string;
+  /**
+   * Set when this call verified the message but applied none of its credit
+   * delta, because the job had already ended. A payment can only reach that
+   * state once its arrival's intent lease has passed; it paid no ask.
+   */
+  creditRefused?: "job_ended";
 }
 
 /** Secret-free identity for atomically reserving one public request id. */
@@ -548,7 +565,8 @@ export interface StreamableJobStore extends JobStore {
   verifyAndCredit(
     jobId: string,
     seq: number,
-    credit: PaymentCreditDelta | null
+    credit: PaymentCreditDelta | null,
+    opts?: VerifyAndCreditOptions
   ): Promise<VerifyAndCreditResult>;
 
   /**

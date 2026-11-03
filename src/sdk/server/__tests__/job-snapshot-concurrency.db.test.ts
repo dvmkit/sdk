@@ -111,7 +111,11 @@ describe.skipIf(!RUN)("concurrent job snapshots", () => {
     ]);
     expect(failures(results)).toEqual([]);
     expect(allocated.toSorted((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(await store.get(job.id)).toMatchObject({ status: "completed", summary: "done", paidMsats: 8000 });
+    // A credit that committed before the terminal snapshot survives it; one that
+    // arrives after it is refused rather than applied to the ended job.
+    const applied = results.slice(8).filter((result) => result.status === "fulfilled" &&
+      !(result.value as { creditRefused?: string }).creditRefused).length;
+    expect(await store.get(job.id)).toMatchObject({ status: "completed", summary: "done", paidMsats: 1000 * applied });
     const counter = await snapshots.query("SELECT next_seq FROM jobs WHERE id=$1", [job.id]);
     expect(counter.rows[0].next_seq).toBe(9);
   });

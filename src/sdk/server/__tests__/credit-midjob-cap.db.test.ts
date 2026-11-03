@@ -568,8 +568,14 @@ describe.skipIf(!RUN)("the mid-job draw growth cap", () => {
       // exists for. Taking it afterwards would test the satisfied-ask path.
       const stale = { ...job, messages: [] } as ServerJob;
       try {
-        const first = await pay(jm, job, "header-a");
-        const duplicate = await pay(jm, stale, "header-b");
+        // Both arrive while the ask is open, so the arrival lets both through
+        // to the ledger and the ceiling alone must stop the second.
+        const bodyA = { type: "payment" as const, content: { x402_payment: "header-a" } };
+        const bodyB = { type: "payment" as const, content: { x402_payment: "header-b" } };
+        const seqA = await jm.recordInboundPending(job, bodyA.type, bodyA.content);
+        const seqB = await jm.recordInboundPending(stale, bodyB.type, bodyB.content);
+        const first = await jm.processPayment(job, bodyA, seqA);
+        const duplicate = await jm.processPayment(stale, bodyB, seqB);
         return { first, duplicate };
       } finally {
         jm.shutdown();

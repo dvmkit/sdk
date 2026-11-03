@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { configureDVM } from "../../configure";
 import { createFxFetcher } from "../../pricing";
@@ -8,6 +8,7 @@ import { localMessage, providerMessage } from "../job";
 import { JobManager } from "../job-manager";
 import type { JobStore } from "../job-store";
 import { MemoryJobStore } from "../memory-job-store";
+import { PAYMENT_INTENT_LEASE_MS } from "../payment-arrival";
 
 describe("inbound payment history", () => {
   it.each([
@@ -43,6 +44,33 @@ describe("inbound payment history", () => {
       const { messages } = await history.json() as { messages: { type: string }[] };
       expect(messages.some(message => message.type === "payment-request")).toBe(true);
       expect(messages.filter(message => message.type === "payment")).toEqual([]);
+    } finally {
+      jobManager.shutdown();
+    }
+  });
+
+  it("refuses a paid message for a redacted job, which keeps no history to record it against", async () => {
+    const jobStore = new MemoryJobStore();
+    const { app, jobManager } = await createDVMServer(configureDVM({
+      name: "redacted-payment", capability: "test", onJob: async () => undefined,
+    }), { env: {}, store: new MemoryKVStore(), jobStore, devMode: true });
+    try {
+      const submitted = await app.request("/v1/job", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capability: "test", input: "" }),
+      });
+      const { job_id, job_token } = await submitted.json() as { job_id: string; job_token: string };
+      const headers = { "Content-Type": "application/json", "X-Job-Token": job_token };
+      expect((await app.request(`/v1/job/${job_id}`, { method: "DELETE", headers })).status).toBe(200);
+      const ended = (await jobStore.get(job_id))!;
+      expect(await jobStore.redactJob({ jobId: job_id, expectedLastActivityAt: ended.lastActivityAt, redactedAt: Date.now() }))
+        .toBe(true);
+      jobManager.activeJobs.delete(job_id);
+      const paid = await app.request(`/v1/job/${job_id}/messages`, {
+        method: "POST", headers, body: JSON.stringify({ type: "payment", content: { cashu_token: "cashuB" } }),
+      });
+      expect(paid.status).toBe(409);
+      expect(await paid.json()).toMatchObject({ error: "job_not_active" });
     } finally {
       jobManager.shutdown();
     }
@@ -95,10 +123,11 @@ describe("inbound payment history", () => {
     }
   });
 
-  it("publishes completion while an earlier payment remains unresolved", async () => {
+  it("publishes completion while an earlier payment remains unresolved, and commits it after", async () => {
+    const jobStore = new MemoryJobStore();
     const { app, jobManager } = await createDVMServer(configureDVM({
       name: "complete-payment-history", capability: "test", onJob: async () => undefined,
-    }), { env: {}, store: new MemoryKVStore(), devMode: true });
+    }), { env: {}, store: new MemoryKVStore(), jobStore, devMode: true });
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let streamed: Promise<string> | undefined;
     try {
@@ -121,7 +150,8 @@ describe("inbound payment history", () => {
           text += decoder.decode(chunk.value, { stream: true });
         }
       })();
-      await jobManager.recordInboundPending(job, "payment", { dev_auto: true });
+      const payment = { type: "payment" as const, content: { dev_auto: true } };
+      const seq = await jobManager.recordInboundPending(job, payment.type, payment.content);
       const seen: string[] = [];
       job.listeners.add(message => seen.push(message.type));
       providerMessage(job, "text", { text: "Final output" });
@@ -132,7 +162,11 @@ describe("inbound payment history", () => {
         .toEqual(["text", "complete"]);
       expect((await streamed).split("\n").filter(line => line.startsWith("data:"))
         .map(line => (JSON.parse(line.slice(5).trim()) as { type: string }).type)).toEqual(["text", "complete"]);
+      // The payment's intent holds the durable terminal write until it resolves.
+      expect((await jobStore.get(job_id))?.status).not.toBe("completed");
+      expect((await jobManager.processPayment(job, payment, seq)).error).toBeUndefined();
       await job.terminalWork;
+      expect((await jobStore.get(job_id))?.status).toBe("completed");
     } finally {
       await reader?.cancel();
       await streamed?.catch(() => undefined);
@@ -167,7 +201,7 @@ describe("inbound payment history", () => {
     }
   });
 
-  it("delivers cancellation without waiting for an in-flight payment", async () => {
+  it("delivers a cancellation that a payment's expired lease let through ahead of it", async () => {
     const store = new MemoryJobStore();
     const jm = new JobManager(configureDVM({ name: "cancel-payment-history", capability: "test", onJob: async () => undefined }), {
       env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true,
@@ -185,14 +219,18 @@ describe("inbound payment history", () => {
         const seq = await jm.recordInboundPending(job, payment.type, payment.content);
         providerMessage(job, "text", { text: "Before cancellation" });
         await job.messageAppenderTail;
+        // The verifying process stalled past its intent's lease, so the cancel no longer waits.
+        vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + PAYMENT_INTENT_LEASE_MS });
         await store.cancelJob(job.id, "Stopped");
         localMessage(job, "provider", "cancel", { reason: "Stopped" });
         expect(local).toEqual(["text", "cancel"]);
         expect(durable).toEqual(["text", "cancel"]);
-        await expect(jm.processPayment(job, payment, seq)).rejects.toThrow("not found");
+        // Its late outcome still lands, behind the terminal cursor.
+        expect(await jm.processPayment(job, payment, seq)).toEqual({ landedAsBalance: "no_open_ask" });
         expect(job.messages.filter(message => message.type === "payment")).toEqual([]);
       } finally {
         unsubscribe();
+        vi.useRealTimers();
       }
     } finally {
       jm.shutdown();

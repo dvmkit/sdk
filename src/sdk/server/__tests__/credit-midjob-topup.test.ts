@@ -1,6 +1,7 @@
 /* The facilitator is mocked; real ledger top-ups are checked separately from HTTP receipt/revenue wiring. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { encodePayment } from "../../../lib/x402/spec";
 import type { X402Config } from "../../../lib/x402/types";
 import { initLoggers } from "../../../observability/loggers";
 import { SpanWriter } from "../../../observability/span-writer";
@@ -11,15 +12,16 @@ import { receiptPubkeyFromSecret } from "../../../lib/receipt-key";
 import { configureDVM } from "../../configure";
 import type { FxFetcher, FxRateSnapshot } from "../../pricing/fx";
 import { createFxFetcher, FxRateUnavailableError } from "../../pricing/fx";
+import { StepCache } from "../../step-cache";
 import { MemoryKVStore } from "../../store";
 import type { CreditFundingBasis } from "../credit-ledger";
 import { drawSettlementRef } from "../funding";
-import type { ServerJob } from "../job";
+import { fromJobRecord, toJobRecord, type ServerJob } from "../job";
 import { JobManager } from "../job-manager";
-import { UNCAPPABLE_ASK_TOTAL } from "../job-store";
+import { type JobStore, UNCAPPABLE_ASK_TOTAL } from "../job-store";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
-import type { VerifyIncomingSnapshot } from "../payment";
+import type { VerifiedIncomingPayment, VerifyIncomingSnapshot } from "../payment";
 import { verifyIncomingPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
 import { ReceiptIssuer } from "../receipt-issuer";
@@ -439,6 +441,62 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         } as unknown as ServerJob;
       }
 
+      it("moves no counter on a store without arrival support when the ask has expired", async () => {
+        const h = harness();
+        await upfrontDraw(h);
+        const backing = new MemoryJobStore();
+        // A custom store with no streaming surface: the arrival is decided from the in-memory job.
+        const plain: JobStore = {
+          get: (id) => backing.get(id), save: (record) => backing.save(record), delete: (id) => backing.delete(id),
+          findJobByPaymentTxHash: (txHash) => backing.findJobByPaymentTxHash(txHash),
+        };
+        const jm = new JobManager(configureDVM({ name: "plain-store", capability: "test", tag: "test", onJob: () => undefined }), {
+          env: {}, store: new MemoryKVStore(), jobStore: plain, fxFetcher: warmFetcher(), dvmId: DVM_ID, x402: X402,
+          creditLedger: h.ledger, processedPayments: h.processedPayments,
+        });
+        const job = boundJob();
+        job.messages = [{ seq: 1, from: "provider", type: "payment-request", timestamp: 0,
+          content: { amount_msats: TOPUP_MSATS, reason: "next step", expires_at_ms: Date.now() - 31_000 } }];
+        try {
+          const outcome = await jm.processPayment(job, { type: "payment", content: { x402_payment: "base64_header" } }, null);
+          expect(outcome).toMatchObject({ landedAsBalance: "ask_expired", unappliedCredit: { credit_id: "c1" } });
+        } finally {
+          jm.shutdown();
+        }
+        expect(job.paidMsats).toBe(UPFRONT_MSATS);
+        expect(job.pendingPaymentMsats).toBe(TOPUP_MSATS);
+        expect(job.status).toBe("awaiting-input");
+        expect((await h.ledger.getDraw({ creditId: "c1", drawId: "d1" }))?.amountMicro).toBe(UPFRONT_MICRO);
+      });
+
+      it("releases the arrival when verification throws, so the job can end", async () => {
+        const h = harness();
+        await upfrontDraw(h, { rail: "cashu" });
+        const store = new MemoryJobStore();
+        const jm = new JobManager(configureDVM({ name: "throwing-verify", capability: "test", tag: "test", onJob: () => undefined }), {
+          env: {}, store: new MemoryKVStore(), jobStore: store, fxFetcher: warmFetcher(), dvmId: DVM_ID,
+          creditLedger: h.ledger, processedPayments: h.processedPayments,
+          cashuMode: "p2pk-accumulator", db: {} as never, mints: ["https://mint.example"],
+        });
+        const record = { ...toJobRecord({ ...boundJob(), paymentRail: "cashu", seq: 0, receivedProofs: [],
+          stepCache: new StepCache(), state: {}, tags: [], capability: "test", input: "", params: {},
+          createdAt: Date.now(), lastActivityAt: Date.now() } as ServerJob) };
+        await store.save(record);
+        const job = fromJobRecord(record);
+        vi.mocked(acceptAccumulatorPayment).mockRejectedValueOnce(new Error("accumulator unavailable"));
+        const body = { type: "payment" as const, content: { cashu_token: "cashuTok", cashu_request_id: "req-throw" } };
+        try {
+          const seq = await jm.recordInboundPending(job, body.type, body.content);
+          expect(await store.openPaymentIntentUntil(JOB_ID, Date.now())).toBeDefined();
+          await expect(jm.processPayment(job, body, seq, { lockPubkeys: ["02" + "ab".repeat(32)] as never }))
+            .rejects.toThrow("accumulator unavailable");
+        } finally {
+          jm.shutdown();
+        }
+        expect(await store.openPaymentIntentUntil(JOB_ID, Date.now())).toBeUndefined();
+        expect(await store.cancelJob(JOB_ID, "caller stopped")).toBe(true);
+      });
+
       it("signs the fact once and hands the same bytes back on a replay", async () => {
         const h = harness();
         await upfrontDraw(h);
@@ -697,8 +755,18 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
     });
   });
 
-  describe("degrades rather than refusing money", () => {
-    it("accepts a cross-rail top-up without a ledger row", async () => {
+  describe("lands money the job's draw cannot take as balance, never without a ledger row", () => {
+    async function expectFreshBalance(h: Harness, verified: VerifiedIncomingPayment | undefined): Promise<void> {
+      const fresh = `imp:x402:${TOPUP_TX}`;
+      expect(verified?.funding).toMatchObject({ creditId: fresh, amountMicro: TOPUP_MICRO, callerPubkey: CALLER });
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect(await h.ledger.get(fresh)).toMatchObject({ callerPubkey: CALLER, availableMicro: TOPUP_MICRO });
+      expect(await h.ledger.listPendingDraws(fresh)).toEqual([]);
+      const draw = await h.ledger.getDraw({ creditId: "c1", drawId: "d1" });
+      expect(draw?.amountMicro).toBe(UPFRONT_MICRO);
+    }
+
+    it("lands a cross-rail top-up on a fresh credit of the same caller", async () => {
       const h = harness();
       // The credit was funded on cashu; sats and USDC microunits aren't
       // summable, so `fund` would refuse — inside the rail transaction, where a
@@ -707,56 +775,132 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
 
       const { verified, error } = await payMidJob(h, explicitJob());
       expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.paymentTxHash).toBe(TOPUP_TX);
-
-      const draw = await h.ledger.getDraw({ creditId: "c1", drawId: "d1" });
-      expect(draw?.amountMicro).toBe(UPFRONT_MICRO);
+      await expectFreshBalance(h, verified);
     });
 
-    it("accepts an exact top-up on a channel-bound credit without a ledger row", async () => {
+    it("lands an exact top-up on a channel-bound credit on a fresh credit", async () => {
       const h = harness();
-      // Same rail, different instrument: reject before exact settlement encounters a channel-bound ledger.
+      // Same rail, different instrument: the channel-bound credit's upsert would refuse it.
       await upfrontDraw(h, {
         x402Channel: { channelId: "0xchannel", maxClaimableAmount: "1000000" }
       });
-      const fund = vi.spyOn(h.ledger, "fund");
 
       const { verified, error } = await payMidJob(h, explicitJob());
       expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.paymentTxHash).toBe(TOPUP_TX);
-      expect(fund).not.toHaveBeenCalled();
-
-      const draw = await h.ledger.getDraw({ creditId: "c1", drawId: "d1" });
-      expect(draw?.amountMicro).toBe(UPFRONT_MICRO);
+      await expectFreshBalance(h, verified);
       const credit = await h.ledger.get("c1");
       expect(credit?.balanceMicro).toBe(UPFRONT_MICRO);
     });
 
-    it("accepts a top-up on a job whose draw already resolved", async () => {
+    it("lands a top-up on a job whose draw already resolved as balance on its credit", async () => {
       const h = harness();
       await upfrontDraw(h);
       await h.ledger.settle({ creditId: "c1", drawId: "d1" });
 
       const { verified, error } = await payMidJob(h, explicitJob());
       expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect(verified?.funding).toMatchObject({ creditId: "c1", amountMicro: TOPUP_MICRO });
 
       const draw = await h.ledger.getDraw({ creditId: "c1", drawId: "d1" });
       expect(draw?.amountMicro).toBe(UPFRONT_MICRO);
       expect(draw?.status).toBe("settled");
+      expect((await h.ledger.get("c1"))?.availableMicro).toBe(TOPUP_MICRO);
     });
 
-    it("accepts a payment on a DVM with no ledger wired", async () => {
+    it.each([
+      ["the job's credit is gone", async (_h: Harness) => undefined],
+      ["the job's credit is no longer active", async (h: Harness) => {
+        await upfrontDraw(h);
+        // `fund` refuses a credit that is not active; the preflight must read it so.
+        const read = h.ledger.get.bind(h.ledger);
+        vi.spyOn(h.ledger, "get").mockImplementation(async (creditId, opts) => {
+          const credit = await read(creditId, opts);
+          return creditId === "c1" && credit ? { ...credit, status: "refunded" } : credit;
+        });
+      }],
+      ["the job's draw belongs to another job", async (h: Harness) => {
+        await h.ledger.fund({ creditId: "c1", callerPubkey: CALLER, currency: "usd", amountMicro: UPFRONT_MICRO,
+          expiryMs: FUTURE_MS, basis: { rail: "x402", paidMsats: UPFRONT_MSATS, fundingRef: "0xupfront" } });
+        await h.ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: UPFRONT_MICRO, jobId: "another-job" });
+      }],
+    ])("lands the payment on a fresh credit when %s", async (_case, setup) => {
+      const h = harness();
+      await setup(h);
+      const { verified, error } = await payMidJob(h, explicitJob());
+      expect(error).toBeUndefined();
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect(await h.ledger.get(`imp:x402:${TOPUP_TX}`)).toMatchObject({ callerPubkey: CALLER, availableMicro: TOPUP_MICRO });
+    });
+
+    it("lands a payment with no ask open and no credit bound on a fresh credit, growing nothing", async () => {
+      const h = harness();
+      const { verified, error } = await payMidJob(h, { requesterPubkey: CALLER });
+      expect(error).toBeUndefined();
+      expect(verified?.unappliedMicro).toBe(verified?.funding?.amountMicro);
+      expect(verified?.creditId).toBeUndefined();
+      expect(await h.ledger.get(`imp:x402:${TOPUP_TX}`)).toMatchObject({ callerPubkey: CALLER });
+      expect(await h.ledger.listPendingDraws(`imp:x402:${TOPUP_TX}`)).toEqual([]);
+    });
+
+    it("keys a mid-job settlement that reports no transaction hash on its authorization", async () => {
+      const h = harness();
+      await upfrontDraw(h);
+      vi.mocked(verifyX402Payment).mockResolvedValueOnce({
+        verified: true, amountMsats: TOPUP_MSATS, amountUsdcMicro: TOPUP_USDC, txHash: undefined,
+      } as Awaited<ReturnType<typeof verifyX402Payment>>);
+      const nonce = `0x${"34".repeat(32)}`;
+      const from = "0x2222222222222222222222222222222222222222";
+      const header = encodePayment({ x402Version: 1, scheme: "exact", network: "eip155:8453", payload: {
+        signature: "0xdeadbeef", authorization: { from, to: X402.payTo, value: String(TOPUP_USDC),
+          validAfter: "0", validBefore: "9999999999", nonce } } });
+
+      const { verified, error } = await verifyIncomingPayment(
+        { type: "payment", content: { x402_payment: header } },
+        { x402Config: X402, dvmId: DVM_ID, jobId: JOB_ID, fxFetcher: warmFetcher(),
+          creditLedger: h.ledger, processedPayments: h.processedPayments },
+        explicitJob()
+      );
+      expect(error).toBeUndefined();
+      expect(verified?.funding?.fundingId).toBe(`eip3009:${from}:${nonce}`);
+      expect((await h.ledger.getDraw({ creditId: "c1", drawId: "d1" }))?.amountMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
+    });
+
+    it("lands as balance when the draw resolves between the preflight and the rail commit", async () => {
+      const h = harness();
+      await upfrontDraw(h, { rail: "cashu" });
+      vi.mocked(acceptAccumulatorPayment).mockImplementation(async (opts) => {
+        const accepted = { grossMsats: TOPUP_MSATS, inputFeeMsats: 0, mintUrl: "https://mint.example",
+          netMsats: TOPUP_MSATS, paidMsats: TOPUP_MSATS, requestId: opts.requestId ?? "" };
+        // A cancel whose wait outlasted the payment's intent lease ends the job mid-verification.
+        await h.ledger.release({ creditId: "c1", drawId: "d1" });
+        await opts.withCommitTx?.({} as never, accepted);
+        return { kind: "accumulated" as const, ...accepted };
+      });
+
+      const { verified, error } = await verifyIncomingPayment(
+        { type: "payment", content: { cashu_token: "cashuTok", cashu_request_id: "req-slow" } },
+        { cashuMode: "p2pk-accumulator", accumulatorDb: {} as never, lockPubkeys: ["02" + "ab".repeat(32)] as never,
+          mints: ["https://mint.example"], dvmId: DVM_ID, jobId: JOB_ID, fxFetcher: warmFetcher(),
+          creditLedger: h.ledger, processedPayments: h.processedPayments },
+        explicitJob({ paymentRail: "cashu" })
+      );
+      expect(error).toBeUndefined();
+      expect(verified?.unappliedMicro).toBe(TOPUP_MICRO);
+      expect(await h.ledger.getDraw({ creditId: "c1", drawId: "d1" }))
+        .toMatchObject({ status: "released", amountMicro: UPFRONT_MICRO });
+      expect((await h.ledger.get("c1"))?.availableMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
+    });
+
+    it("refuses a payment on a DVM with no ledger wired before the facilitator settles", async () => {
       const { verified, error } = await verifyIncomingPayment(
         { type: "payment", content: { x402_payment: "base64_header" } },
         { x402Config: X402, dvmId: DVM_ID, jobId: JOB_ID, fxFetcher: warmFetcher() },
         explicitJob()
       );
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.paymentTxHash).toBe(TOPUP_TX);
+      expect(verified).toBeUndefined();
+      expect(error).toMatchObject({ status: 402, body: { error: "payment_invalid" } });
+      expect(verifyX402Payment).not.toHaveBeenCalled();
     });
 
     it("re-denominates when the pinned ask and the credit disagree on currency", async () => {
@@ -832,6 +976,16 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
     }
 
     const CACHED_AT = 1_700_000_000_000;
+
+    /** No rate means no ledger amount: refused before the accumulator receives the token. */
+    function expectRefusedUnreceived(
+      verified: VerifiedIncomingPayment | undefined,
+      error: Awaited<ReturnType<typeof payCashu>>["error"]
+    ): void {
+      expect(verified).toBeUndefined();
+      expect(error).toMatchObject({ status: 503, body: { error: "fx_rate_unavailable", retryable: true } });
+      expect(acceptAccumulatorPayment).not.toHaveBeenCalled();
+    }
     const SNAPSHOT: FxRateSnapshot = {
       rates: { usd: RATE } as FxRateSnapshot["rates"],
       as_of: new Date(0).toISOString()
@@ -863,7 +1017,7 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
           })
           .filter(
             (row) =>
-              row.event === "credit_topup_skipped" || row.event === "credit_topup_stale_rate"
+              row.event === "credit_topup_refused" || row.event === "credit_topup_stale_rate"
           );
         return { ...result, skips };
       } finally {
@@ -918,12 +1072,10 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       );
 
       // Do not serve a cached snapshot after the rate provider definitively refuses its validity.
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.creditId).toBeUndefined();
+      expectRefusedUnreceived(verified, error);
       expect(skips).toHaveLength(1);
       expect(skips[0]).toEqual({
-        event: "credit_topup_skipped",
+        event: "credit_topup_refused",
         job_id_hash: JOB_ID_HASH,
         level: "warn",
         rail: "cashu",
@@ -933,14 +1085,12 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       });
     });
 
-    it("names the cause when there is no rate anywhere, and still takes the money", async () => {
+    it("names the cause when there is no rate anywhere, and refuses before receiving the token", async () => {
       const h = harness();
 
       const { verified, error, skips } = await payAndCapture(h, unpinnedJob(), coldFetcher());
 
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.creditId).toBeUndefined();
+      expectRefusedUnreceived(verified, error);
       expect(skips).toHaveLength(1);
       expect(skips[0]).toMatchObject({ reason: "denomination_unavailable", cause: "rate_unavailable" });
       expect(skips[0].source_failure).toBe("unknown");
@@ -948,7 +1098,21 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       expect(JSON.stringify(skips[0])).not.toContain("coingecko 429");
     });
 
-    it("accepts payment without cached denomination after an injected typed stale refusal", async () => {
+    it.each([
+      ["fiat_amount", { askFiatAmount: { amount: 0.05, currency: "usd" } }],
+      ["x402 quote", { pendingX402AmountUsdcMicro: String(TOPUP_USDC) }],
+    ] as const)("values a Cashu payment from the ask's own %s when no rate exists", async (_quote, quote) => {
+      // The token is in hand and its value was quoted on the ask: no rate is needed to record it.
+      const h = harness();
+      const { verified, error } = await payCashu(h, unpinnedJob(quote), coldFetcher());
+      expect(error).toBeUndefined();
+      expect(verified?.funding).toMatchObject({ amountMicro: TOPUP_MICRO, currency: "usd" });
+      expect(verified?.creditId).toBe(`imp:cashu:${REQUEST_ID}`);
+      expect(await h.ledger.getDraw({ creditId: `imp:cashu:${REQUEST_ID}`, drawId: REQUEST_ID }))
+        .toMatchObject({ amountMicro: TOPUP_MICRO, status: "pending" });
+    });
+
+    it("refuses without cached denomination after an injected typed stale refusal", async () => {
       const h = harness();
       const refusal = new FxRateUnavailableError("stale", undefined, { staleDays: 6 });
       const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ bitcoin: { usd: RATE } }))
@@ -958,15 +1122,13 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       await fx.fetch();
       now = 2;
       const { verified, error, skips } = await payAndCapture(h, unpinnedJob(), fx);
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.creditId).toBeUndefined();
+      expectRefusedUnreceived(verified, error);
       expect(fetchFn).toHaveBeenCalledTimes(2);
       expect(skips).toHaveLength(1);
       expect(skips[0]).toMatchObject({ cause: "rate_stale_refused" });
     });
 
-    it.each(["field accessor", "category accessor", "descriptor failure"] as const)("diagnostic %s cannot change accepted-payment behavior", async (shape) => {
+    it.each(["field accessor", "category accessor", "descriptor failure"] as const)("diagnostic %s cannot change the refusal", async (shape) => {
       const h = harness();
       const getter = vi.fn(() => { throw new Error("METADATA_SECRET"); });
       const failure = new FxRateUnavailableError("provider text");
@@ -979,9 +1141,7 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         Object.defineProperty(failure, "sourceFailure", { value: metadata });
       }
       const { verified, error, skips } = await payAndCapture(h, unpinnedJob(), coldFetcher({ err: failure }));
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.creditId).toBeUndefined();
+      expectRefusedUnreceived(verified, error);
       expect(skips).toHaveLength(1);
       expect(skips[0]).toMatchObject({ cause: "rate_unavailable", source_failure: "unknown" });
       expect(JSON.stringify(skips)).not.toContain("METADATA_SECRET");
@@ -997,12 +1157,10 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         : { kind: "platform" as const, url: "https://example.com/fx?token=URL_SECRET", token: "BEARER_SECRET" };
       const fetchFn = vi.fn(async () => new Response("BODY_SECRET", { status: 429 })) as unknown as typeof fetch;
       const { verified, error, skips } = await payAndCapture(h, unpinnedJob({ creditId, drawId }), createFxFetcher({ source, fetchFn, retries: 1, retryDelayMs: 0 }));
-      expect(error).toBeUndefined();
-      expect(verified?.paidMsats).toBe(TOPUP_MSATS);
-      expect(verified?.creditId).toBeUndefined();
+      expectRefusedUnreceived(verified, error);
       expect(skips).toHaveLength(1);
       expect(skips[0]).toEqual({
-        event: "credit_topup_skipped", level: "warn", rail: "cashu",
+        event: "credit_topup_refused", level: "warn", rail: "cashu",
         reason: "denomination_unavailable", currency: "usd", cause: "rate_unavailable",
         job_id_hash: JOB_ID_HASH, source_failure: "http_error", source_status: 429,
       });
@@ -1019,10 +1177,10 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         lastKnown: vi.fn(() => null)
       });
 
-      expect(error).toBeUndefined();
+      expect(error).toMatchObject({ status: 503 });
       expect(skips).toHaveLength(1);
       expect(skips[0]).toEqual({
-        event: "credit_topup_skipped",
+        event: "credit_topup_refused",
         job_id_hash: JOB_ID_HASH,
         level: "warn",
         rail: "cashu",
@@ -1042,10 +1200,10 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         lastKnown: vi.fn(() => null)
       });
 
-      expect(error).toBeUndefined();
+      expect(error).toMatchObject({ status: 503 });
       expect(skips).toHaveLength(1);
       expect(skips[0]).toEqual({
-        event: "credit_topup_skipped",
+        event: "credit_topup_refused",
         job_id_hash: JOB_ID_HASH,
         level: "warn",
         rail: "cashu",

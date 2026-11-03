@@ -13,6 +13,10 @@
     "StreamableJobStore.failJob": {
       "optional": true,
       "behavior": "atomically fail a nonterminal job with a cancel reason and its verified durable history"
+    },
+    "StreamableJobStore.verifyAndCredit": {
+      "creditRefused": "optional; the built-in stores verify the message but apply no credit delta or binding to a job that already ended, and return creditRefused: \"job_ended\"; a store that omits it is treated as having applied the delta",
+      "landedAsBalance": "optional opts.landedAsBalance; the built-in stores record the payment with status balance, kept out of message history and handler replay because it paid no ask; credit must be null"
     }
   },
   "wireContracts": {
@@ -65,6 +69,11 @@
       ],
       "unit": "integer USD micro-units for the drained credit; integer cents for refunds and the fee share",
       "behavior": "POST /v1/credit drain with method stripe and no payout refunds card-funded credit to the card as partial refunds of the funding PaymentIntents, oldest first, less the refund's proportional share of Stripe's processing fee; card credit drains on no other method and stripe drains no other credit; a refund Stripe does not finish leaves the drain pending and a poll retries it; an expired card balance is refunded the same way and the credit closes (credit_closed)"
+    },
+    "paymentInProgress": {
+      "fixture": "protocol-fixtures/payment-in-progress-v1.json",
+      "status": 409,
+      "behavior": "a cancel, or a message that would end a job, waits at most 5 seconds for a payment on that job being verified, then answers payment_in_progress with Retry-After and changes nothing"
     }
   },
   "exports": [
