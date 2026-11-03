@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { inspectSurface } from "../scripts/api-surface.mjs";
+import { hasValueExport, inspectDeclaration, inspectSurface } from "../scripts/api-surface.mjs";
 
 const script = resolve("scripts/check-api-surface.mjs");
 const directories: string[] = [];
@@ -104,6 +104,74 @@ describe("public signature gate", () => {
     expect(check(root, "--write").status).toBe(0);
     expect(check(root).status).toBe(0);
     expect(readFileSync(join(root, "api-baseline.json"), "utf8")).toBe(baseline);
+  });
+
+  const typeOnlyExports = [
+    ["declaration modifier", "export { run, overloaded, generic };\nexport type { Worker };"],
+    ["specifier modifier", "export { run, type Worker, overloaded, generic };"],
+  ];
+
+  it.each(entryPoints.flatMap((entryPoint) => typeOnlyExports.map(([style, replacement]) => [entryPoint, style, replacement])))(
+    "rejects an unmarked constructor removal in %s through a %s",
+    (entryPoint, _style, replacement) => {
+      const root = fixture();
+      change(root, "export { run, Worker, overloaded, generic };", replacement, entryPoint);
+      refreshCurrent(root);
+      const result = check(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("without a breaking-change section");
+      expect(result.stderr).toContain(`${entryPoint}:Worker`);
+    }
+  );
+
+  it.each(typeOnlyExports)("accepts a disclosed constructor removal through a %s", (_style, replacement) => {
+    const root = fixture();
+    change(root, "export { run, Worker, overloaded, generic };", replacement);
+    notes(root, "### Breaking changes\n\n- Worker is now available only as a type.\n");
+    expect(check(root, "--write").status).toBe(0);
+    expect(check(root).status).toBe(0);
+  });
+
+  it.each([
+    "export { run, overloaded, generic } from './implementation'; export type { Worker } from './implementation';",
+    "export { run, type Worker, overloaded, generic } from './implementation';",
+    "export { run, overloaded, generic } from './implementation'; import type { Worker } from './implementation'; export { Worker };",
+    "export type * from './implementation';",
+    "export type * from './implementation'; export { run, overloaded, generic } from './implementation';",
+  ])("detects type-only availability through an intermediate alias: %s", (middle) => {
+    const root = fixture();
+    writeFileSync(join(root, "dist/implementation.d.ts"), declaration);
+    writeFileSync(join(root, "dist/middle.d.ts"), "export { run, Worker, overloaded, generic } from './implementation';");
+    writeFileSync(join(root, "dist/index.d.ts"), "export { run, Worker, overloaded, generic } from './middle';");
+    const fingerprint = () => {
+      const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+      return inspectSurface(root, manifest).find((entry) => entry.export === ".")!.signatures!.Worker.signature;
+    };
+    const availability = () => {
+      const { checker, symbols } = inspectDeclaration(root, "dist/index.d.ts");
+      return hasValueExport(symbols.find((symbol) => symbol.getName() === "Worker")!, checker);
+    };
+    const before = fingerprint();
+    expect(availability()).toBe(true);
+    writeFileSync(join(root, "dist/middle.d.ts"), middle);
+    expect(availability()).toBe(false);
+    expect(fingerprint()).not.toBe(before);
+  });
+
+  it("preserves value availability and fingerprints through ordinary star forwarding", () => {
+    const root = fixture();
+    writeFileSync(join(root, "dist/implementation.d.ts"), declaration);
+    writeFileSync(join(root, "dist/index.d.ts"), "export { run, Worker, overloaded, generic } from './implementation';");
+    const fingerprint = () => {
+      const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+      return inspectSurface(root, manifest).find((entry) => entry.export === ".")!.signatures!.Worker.signature;
+    };
+    const before = fingerprint();
+    writeFileSync(join(root, "dist/middle.d.ts"), "export type * from './implementation'; export * from './implementation';");
+    writeFileSync(join(root, "dist/index.d.ts"), "export { run, Worker, overloaded, generic } from './middle';");
+    const { checker, symbols } = inspectDeclaration(root, "dist/index.d.ts");
+    expect(hasValueExport(symbols.find((symbol) => symbol.getName() === "Worker")!, checker)).toBe(true);
+    expect(fingerprint()).toBe(before);
   });
 
   it.each([

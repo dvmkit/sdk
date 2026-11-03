@@ -10,6 +10,7 @@ export interface SurfaceEntry {
 export const publicEntryPoints: string[];
 export function readStability(root: string, entryPoint: string): Map<string, string>;
 export function inspectDeclaration(root: string, declaration: string, program?: ts.Program): { checker: ts.TypeChecker; symbols: ts.Symbol[] };
+export function hasValueExport(exported: ts.Symbol, checker: ts.TypeChecker): boolean;
 export function signatureOf(exported: ts.Symbol, checker: ts.TypeChecker): string;
 export function inspectSurface(root: string, manifest: { exports: Record<string, { types: string }> }): SurfaceEntry[];
 export function hasBreakingMarker(changelog: string, version: string, baselineVersion: string): boolean;

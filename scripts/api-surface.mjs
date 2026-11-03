@@ -49,6 +49,64 @@ export function inspectDeclaration(root, declaration, program = declarationProgr
   return { checker, symbols: checker.getExportsOfModule(symbol).sort((a, b) => a.getName().localeCompare(b.getName())) };
 }
 
+/** @param {ts.Symbol} exported @param {ts.TypeChecker} checker */
+export function hasValueExport(exported, checker) {
+  /** @type {Set<ts.Symbol>} */
+  const aliases = new Set();
+  /** @type {Map<ts.Symbol, Set<string>>} */
+  const modules = new Map();
+
+  /** @param {ts.Symbol | undefined} module @param {string} name @returns {boolean} */
+  function fromModule(module, name) {
+    if (!module) return false;
+    const binding = checker.getExportsOfModule(module).find((symbol) => symbol.getName() === name);
+    if (!binding) return false;
+    const active = modules.get(module) ?? new Set();
+    if (active.has(name)) return false;
+    modules.set(module, active);
+    active.add(name);
+    try {
+      const sources = module.declarations?.map((node) => node.getSourceFile()) ?? [];
+      if (binding.declarations?.some((node) => sources.includes(node.getSourceFile()))) return fromSymbol(binding);
+      // Star forwarding can return the original symbol without an alias node.
+      // Follow value-bearing paths rather than losing an `export type *` edge.
+      return sources.some((source) => source.statements.some((node) =>
+        ts.isExportDeclaration(node) && !node.exportClause && !node.isTypeOnly && node.moduleSpecifier &&
+        fromModule(checker.getSymbolAtLocation(node.moduleSpecifier), name)
+      ));
+    } finally {
+      active.delete(name);
+    }
+  }
+
+  /** @param {ts.Symbol} symbol @returns {boolean} */
+  function fromSymbol(symbol) {
+    const target = symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    if (!(target.flags & ts.SymbolFlags.Value)) return false;
+    if (!(symbol.flags & ts.SymbolFlags.Alias)) return true;
+    // Unwrapping every alias at once loses type-only export/import modifiers.
+    if (aliases.has(symbol) || symbol.declarations?.some(ts.isTypeOnlyImportOrExportDeclaration)) return false;
+    aliases.add(symbol);
+    try {
+      for (const node of symbol.declarations ?? []) {
+        if (ts.isExportSpecifier(node) && node.parent.parent.moduleSpecifier) {
+          return fromModule(checker.getSymbolAtLocation(node.parent.parent.moduleSpecifier), (node.propertyName ?? node.name).text);
+        }
+        if (ts.isImportSpecifier(node)) {
+          return fromModule(checker.getSymbolAtLocation(node.parent.parent.parent.moduleSpecifier), (node.propertyName ?? node.name).text);
+        }
+        if (ts.isImportClause(node)) return fromModule(checker.getSymbolAtLocation(node.parent.moduleSpecifier), "default");
+      }
+      const immediate = checker.getImmediateAliasedSymbol(symbol);
+      return immediate ? fromSymbol(immediate) : false;
+    } finally {
+      aliases.delete(symbol);
+    }
+  }
+
+  return fromSymbol(exported);
+}
+
 /**
  * Include reachable local declarations: printing only `f(input: Options): Result`
  * would miss changes to Options or Result. Canonical names discard the bundler's
@@ -105,7 +163,10 @@ export function signatureOf(exported, checker) {
       transformed.dispose();
     }
   }
-  return createHash("sha256").update(declarations.join("\n")).digest("hex");
+  // Declaration-only types already encode their lack of a value. A class,
+  // function or namespace behind a type-only alias needs this extra distinction.
+  const availability = root.flags & ts.SymbolFlags.Value && !hasValueExport(exported, checker) ? "type-only alias\n" : "";
+  return createHash("sha256").update(availability + declarations.join("\n")).digest("hex");
 }
 
 /**

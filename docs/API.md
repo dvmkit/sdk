@@ -4,356 +4,356 @@
 
 This reference is generated from the built TypeScript declarations and covers 331 names across the three supported public entry points. Run `npm run build && npm run docs:api` to refresh it; `npm run check:api` rejects stale output.
 
-Stability levels follow the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning).
+Stability levels follow the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning). Runtime exports are available as JavaScript values; type-only exports are available only to TypeScript.
 
 ## `@dvmkit/sdk`
 
 Builder declarations, handler context, schemas, pricing, and safe request helpers. Generated from `./dist/index.d.ts`.
 
-| Name | Kind | Stability | Guidance |
-| --- | --- | --- | --- |
-| `ApprovalContent` | interface | stable | Requester approves a proposed action or cost. |
-| `ArtifactContent` | interface | stable | Job output — inline data or a URL reference. |
-| `assertSafeUrl` | function | stable | Reject URLs whose host points at internal infrastructure — private / link-local IP ranges, the AWS / GCP metadata IP, Fly's `*.internal` service-discovery names, and a small denylist of obviously-internal hostnames. |
-| `buildUpfront` | function | stable | Build a validated `Upfront` literal. |
-| `CancelContent` | interface | stable | Requester or provider cancels the job. |
-| `CanonicalEnvelope` | interface | stable | Exported declaration from the built public entry point. |
-| `CapabilityRate` | interface | stable | One line of a capability's published rate card, declared on `CapabilityConfig.rates`. |
-| `CashuConfig` | interface | stable | Refund-locktime floors for Cashu payments. |
-| `CompleteOpts` | interface | stable | Options for SDKJobContext.complete. |
-| `configureDVM` | function | stable | Configure a DVM; idleTimeout limits each caller answer/payment window (1–604800 seconds), not processing time. |
-| `createFxFetcher` | function | stable | Build the default fx fetcher backed by `DVMKIT_FX_SOURCE` (or CoinGecko). |
-| `CreateFxFetcherOpts` | interface | stable | Options for `createFxFetcher`. |
-| `createPinnedFetch` | function | stable | Resolve the URL's host once, validate every answer against the same denylist `assertSafeUrl` applies, then return a `fetch` whose `connect.lookup` replays that frozen, pre-validated address set (see buildPinnedLookup). |
-| `createSignedRequestVerifier` | function | stable | Signatures cover the raw input, not Zod-parsed output. |
-| `CreateSignedRequestVerifierOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `CreditConfig` | interface | stable | Prepaid-credit sizing this DVM advertises. |
-| `CreditView` | interface | stable | Read-only snapshot of a caller's credit, surfaced on QuoteContext; it mirrors the ledger's `CreditSnapshot` minus the write surface and the fields a quote handler has no business branching on. |
-| `Currency` | type | stable | Currency-code identifier used throughout the SDK's pricing surface. |
-| `DeclineContent` | interface | stable | Requester declines the job's open ask or prompt, ending the job. |
-| `DEFAULT_CREDIT_MAX` | value | stable | Platform default for CreditConfig.max — the largest residual balance a caller may hold. |
-| `DEFAULT_CREDIT_MIN` | value | stable | Platform default for CreditConfig.min — a dust floor below which rail fees dominate. |
-| `DEFAULT_CREDIT_TTL_SECONDS` | value | stable | Platform default for CreditConfig.ttl: 90 days. |
-| `DEFAULT_FX_CURRENCIES` | value | stable | Default fiat set the bundled fx fetcher resolves against BTC. |
-| `DEFAULT_FX_RATE_SOURCE` | value | stable | Default fx-rate source. |
-| `DEFAULT_JOB_RETENTION_DAYS` | value | stable | Default lifetime of caller-controlled job content before it is redacted. |
-| `DVMConfig` | interface | stable | Configuration object passed to configureDVM(). |
-| `DVMDescriptor` | interface | stable | Immutable descriptor returned by configureDVM(). |
-| `DVMRouteContext` | interface | stable | Deployment identity shared with DVM-scoped custom routes. |
-| `envFlag` | function | stable | Exported declaration from the built public entry point. |
-| `fiatToSatsCeil` | function | stable | Convert a fiat amount to integer sats at the supplied fiat-per-BTC rate. |
-| `formatFiat` | function | stable | Format a fiat amount with currency-aware symbol, precision, and ISO code. |
-| `formatUsd` | function | stable | Format a USD amount with adaptive precision so sub-cent amounts don't render as `$0.00`. |
-| `FxFetcher` | interface | stable | Snapshot fetcher for BTC against one or more fiat currencies. |
-| `fxRateFor` | function | stable | Look up `currency`'s rate in `snapshot`. |
-| `FxRateSnapshot` | interface | stable | Quote-time FX snapshot. |
-| `FxRateUnavailableError` | class | stable | Thrown when the fx source can't be reached or returns an unparseable rate. |
-| `FxSourceFailure` | interface | stable | Observed source failure only; never provider text or an inferred root cause. |
-| `FxSourceFailureCategory` | type | stable | Exported declaration from the built public entry point. |
-| `IncomingMessage` | interface | stable | Exported declaration from the built public entry point. |
-| `InputType` | type | stable | Exported declaration from the built public entry point. |
-| `InvalidCurrencyError` | class | stable | Thrown by `validateCurrency` when the input doesn't match `/^[a-z]{3}$/`. |
-| `InvalidFxRateError` | class | stable | Thrown by `fiatToSatsCeil` / `satsToFiat` when the supplied `ratePerBtc` is non-finite or non-positive. |
-| `isConfiguredDVMDescriptor` | function | stable | Check whether this SDK module instance created a value through `configureDVM`. |
-| `isZodSchema` | function | stable | Exported declaration from the built public entry point. |
-| `JobCost` | interface | stable | What one job cost the builder to serve, as declared by the handler through SDKJobContext.cost. |
-| `JobRecord` | interface | stable | Exported declaration from the built public entry point. |
-| `JobStatus` | type | stable | Exported declaration from the built public entry point. |
-| `JobStore` | interface | stable | Exported declaration from the built public entry point. |
-| `KVStore` | interface | stable | Persistent cross-job key-value storage scoped to the DVM. |
-| `Logger` | interface | stable | Exported declaration from the built public entry point. |
-| `PaymentContent` | interface | stable | Requester sends a rail proof or signed balance authorization; provider sends change/refund. |
-| `PaymentMethod` | type | stable | Exported declaration from the built public entry point. |
-| `PinnedFetch` | interface | stable | A `fetch`-compatible function pinned to a single pre-validated IP address. |
-| `PlatformFxSource` | interface | stable | Platform-served fx source. |
-| `PriceValue` | type | stable | A builder-declared price — a USD literal, always (`"$0.05"`). |
-| `ProgressContent` | interface | stable | Provider heartbeat with a structured progress signal. |
-| `ProgressHeartbeatOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `PromptOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `QuoteConfig` | interface | stable | Exported declaration from the built public entry point. |
-| `QuoteContext` | interface | stable | Exported declaration from the built public entry point. |
-| `QuoteResult` | interface | stable | Result returned by the onQuote handler — the fiat-first envelope. |
-| `ResolvedCashuConfig` | interface | stable | A CashuConfig with refund floors and the result wait filled from their defaults. |
-| `ResolvedCreditConfig` | interface | stable | A CreditConfig with every optional field filled from the platform defaults — what `configureDVM` puts on the descriptor so no downstream consumer re-derives a default. |
-| `resolveFxSourceFromEnv` | function | stable | Resolve an environment override for `createFxFetcher`. |
-| `ResponseContent` | interface | stable | Requester's response to a provider prompt. |
-| `roundUsd` | function | stable | Round a USD value to 4 decimal places. |
-| `satsToFiat` | function | stable | Convert integer sats back to a fiat amount at the supplied fiat-per-BTC rate. |
-| `SDKJobContext` | interface | stable | Exported declaration from the built public entry point. |
-| `SDKPaymentRequestOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `SIGNED_REQUEST_AUTH_ID` | value | stable | Auth identifier advertised by DVMs using audience-bound caller proofs. |
-| `SIGNED_REQUEST_STATEMENT_VERSION` | value | stable | Version of the canonical audience-bound caller statement. |
-| `SignedRequestAudience` | interface | stable | Attested service identity a signed caller statement is intended for. |
-| `SignedRequestDomain` | interface | stable | Operation fields kept outside the signed input to prevent schema substitution. |
-| `SignedRequestError` | class | stable | Exported declaration from the built public entry point. |
-| `SignedRequestFailure` | type | stable | Authentication failure; signature_required means no envelope fields were supplied. |
-| `SignedRequestReplayStore` | interface | stable | Exported declaration from the built public entry point. |
-| `SignedRequestSignOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `signedRequestStatementHeader` | function | stable | Build the versioned header persisted beside a caller's flat input envelope. |
-| `SignedRequestStatementHeader` | interface | stable | Domain fields carried with every v2 signed-request envelope. |
-| `SignedRequestVerifier` | interface | stable | Authentication does not touch replay state. |
-| `SSRFError` | class | stable | Thrown when an input URL points at internal infrastructure we refuse to fetch from inside the cluster. |
-| `SSRFGuardOpts` | interface | stable | Configurable hooks for `assertSafeUrl`. |
-| `SSRFReason` | type | stable | Why `assertSafeUrl` refused this URL. |
-| `SSRFResolver` | type | stable | Pluggable DNS resolver. |
-| `UnsupportedCurrencyError` | class | stable | A valid currency code that the configured FX snapshot cannot price. |
-| `Upfront` | interface | stable | Upfront fiat commitment converted to sats at settlement time. |
-| `UpfrontPayment` | interface | stable | Original accepted job payment, fixed before handler execution. |
-| `validateCurrency` | function | stable | Validate `raw` is a 3-letter lowercase ISO 4217-style currency code. |
-| `withProgressHeartbeat` | function | stable | Wrap a long-running async op with a periodic progress heartbeat at fixed `phase` and `percent`. |
-| `z` | export | stable | Exported declaration from the built public entry point. |
-| `ZodLike` | interface | stable | Structural type matching any Zod schema. |
+| Name | Kind | Availability | Stability | Guidance |
+| --- | --- | --- | --- | --- |
+| `ApprovalContent` | interface | type-only | stable | Requester approves a proposed action or cost. |
+| `ArtifactContent` | interface | type-only | stable | Job output — inline data or a URL reference. |
+| `assertSafeUrl` | function | runtime | stable | Reject URLs whose host points at internal infrastructure — private / link-local IP ranges, the AWS / GCP metadata IP, Fly's `*.internal` service-discovery names, and a small denylist of obviously-internal hostnames. |
+| `buildUpfront` | function | runtime | stable | Build a validated `Upfront` literal. |
+| `CancelContent` | interface | type-only | stable | Requester or provider cancels the job. |
+| `CanonicalEnvelope` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `CapabilityRate` | interface | type-only | stable | One line of a capability's published rate card, declared on `CapabilityConfig.rates`. |
+| `CashuConfig` | interface | type-only | stable | Refund-locktime floors for Cashu payments. |
+| `CompleteOpts` | interface | type-only | stable | Options for SDKJobContext.complete. |
+| `configureDVM` | function | runtime | stable | Configure a DVM; idleTimeout limits each caller answer/payment window (1–604800 seconds), not processing time. |
+| `createFxFetcher` | function | runtime | stable | Build the default fx fetcher backed by `DVMKIT_FX_SOURCE` (or CoinGecko). |
+| `CreateFxFetcherOpts` | interface | type-only | stable | Options for `createFxFetcher`. |
+| `createPinnedFetch` | function | runtime | stable | Resolve the URL's host once, validate every answer against the same denylist `assertSafeUrl` applies, then return a `fetch` whose `connect.lookup` replays that frozen, pre-validated address set (see buildPinnedLookup). |
+| `createSignedRequestVerifier` | function | runtime | stable | Signatures cover the raw input, not Zod-parsed output. |
+| `CreateSignedRequestVerifierOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `CreditConfig` | interface | type-only | stable | Prepaid-credit sizing this DVM advertises. |
+| `CreditView` | interface | type-only | stable | Read-only snapshot of a caller's credit, surfaced on QuoteContext; it mirrors the ledger's `CreditSnapshot` minus the write surface and the fields a quote handler has no business branching on. |
+| `Currency` | type | type-only | stable | Currency-code identifier used throughout the SDK's pricing surface. |
+| `DeclineContent` | interface | type-only | stable | Requester declines the job's open ask or prompt, ending the job. |
+| `DEFAULT_CREDIT_MAX` | value | runtime | stable | Platform default for CreditConfig.max — the largest residual balance a caller may hold. |
+| `DEFAULT_CREDIT_MIN` | value | runtime | stable | Platform default for CreditConfig.min — a dust floor below which rail fees dominate. |
+| `DEFAULT_CREDIT_TTL_SECONDS` | value | runtime | stable | Platform default for CreditConfig.ttl: 90 days. |
+| `DEFAULT_FX_CURRENCIES` | value | runtime | stable | Default fiat set the bundled fx fetcher resolves against BTC. |
+| `DEFAULT_FX_RATE_SOURCE` | value | runtime | stable | Default fx-rate source. |
+| `DEFAULT_JOB_RETENTION_DAYS` | value | runtime | stable | Default lifetime of caller-controlled job content before it is redacted. |
+| `DVMConfig` | interface | type-only | stable | Configuration object passed to configureDVM(). |
+| `DVMDescriptor` | interface | type-only | stable | Immutable descriptor returned by configureDVM(). |
+| `DVMRouteContext` | interface | type-only | stable | Deployment identity shared with DVM-scoped custom routes. |
+| `envFlag` | function | runtime | stable | Exported declaration from the built public entry point. |
+| `fiatToSatsCeil` | function | runtime | stable | Convert a fiat amount to integer sats at the supplied fiat-per-BTC rate. |
+| `formatFiat` | function | runtime | stable | Format a fiat amount with currency-aware symbol, precision, and ISO code. |
+| `formatUsd` | function | runtime | stable | Format a USD amount with adaptive precision so sub-cent amounts don't render as `$0.00`. |
+| `FxFetcher` | interface | type-only | stable | Snapshot fetcher for BTC against one or more fiat currencies. |
+| `fxRateFor` | function | runtime | stable | Look up `currency`'s rate in `snapshot`. |
+| `FxRateSnapshot` | interface | type-only | stable | Quote-time FX snapshot. |
+| `FxRateUnavailableError` | class | runtime | stable | Thrown when the fx source can't be reached or returns an unparseable rate. |
+| `FxSourceFailure` | interface | type-only | stable | Observed source failure only; never provider text or an inferred root cause. |
+| `FxSourceFailureCategory` | type | type-only | stable | Exported declaration from the built public entry point. |
+| `IncomingMessage` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `InputType` | type | type-only | stable | Exported declaration from the built public entry point. |
+| `InvalidCurrencyError` | class | runtime | stable | Thrown by `validateCurrency` when the input doesn't match `/^[a-z]{3}$/`. |
+| `InvalidFxRateError` | class | runtime | stable | Thrown by `fiatToSatsCeil` / `satsToFiat` when the supplied `ratePerBtc` is non-finite or non-positive. |
+| `isConfiguredDVMDescriptor` | function | runtime | stable | Check whether this SDK module instance created a value through `configureDVM`. |
+| `isZodSchema` | function | runtime | stable | Exported declaration from the built public entry point. |
+| `JobCost` | interface | type-only | stable | What one job cost the builder to serve, as declared by the handler through SDKJobContext.cost. |
+| `JobRecord` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `JobStatus` | type | type-only | stable | Exported declaration from the built public entry point. |
+| `JobStore` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `KVStore` | interface | type-only | stable | Persistent cross-job key-value storage scoped to the DVM. |
+| `Logger` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `PaymentContent` | interface | type-only | stable | Requester sends a rail proof or signed balance authorization; provider sends change/refund. |
+| `PaymentMethod` | type | type-only | stable | Exported declaration from the built public entry point. |
+| `PinnedFetch` | interface | type-only | stable | A `fetch`-compatible function pinned to a single pre-validated IP address. |
+| `PlatformFxSource` | interface | type-only | stable | Platform-served fx source. |
+| `PriceValue` | type | type-only | stable | A builder-declared price — a USD literal, always (`"$0.05"`). |
+| `ProgressContent` | interface | type-only | stable | Provider heartbeat with a structured progress signal. |
+| `ProgressHeartbeatOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `PromptOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `QuoteConfig` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `QuoteContext` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `QuoteResult` | interface | type-only | stable | Result returned by the onQuote handler — the fiat-first envelope. |
+| `ResolvedCashuConfig` | interface | type-only | stable | A CashuConfig with refund floors and the result wait filled from their defaults. |
+| `ResolvedCreditConfig` | interface | type-only | stable | A CreditConfig with every optional field filled from the platform defaults — what `configureDVM` puts on the descriptor so no downstream consumer re-derives a default. |
+| `resolveFxSourceFromEnv` | function | runtime | stable | Resolve an environment override for `createFxFetcher`. |
+| `ResponseContent` | interface | type-only | stable | Requester's response to a provider prompt. |
+| `roundUsd` | function | runtime | stable | Round a USD value to 4 decimal places. |
+| `satsToFiat` | function | runtime | stable | Convert integer sats back to a fiat amount at the supplied fiat-per-BTC rate. |
+| `SDKJobContext` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `SDKPaymentRequestOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `SIGNED_REQUEST_AUTH_ID` | value | runtime | stable | Auth identifier advertised by DVMs using audience-bound caller proofs. |
+| `SIGNED_REQUEST_STATEMENT_VERSION` | value | runtime | stable | Version of the canonical audience-bound caller statement. |
+| `SignedRequestAudience` | interface | type-only | stable | Attested service identity a signed caller statement is intended for. |
+| `SignedRequestDomain` | interface | type-only | stable | Operation fields kept outside the signed input to prevent schema substitution. |
+| `SignedRequestError` | class | runtime | stable | Exported declaration from the built public entry point. |
+| `SignedRequestFailure` | type | type-only | stable | Authentication failure; signature_required means no envelope fields were supplied. |
+| `SignedRequestReplayStore` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `SignedRequestSignOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `signedRequestStatementHeader` | function | runtime | stable | Build the versioned header persisted beside a caller's flat input envelope. |
+| `SignedRequestStatementHeader` | interface | type-only | stable | Domain fields carried with every v2 signed-request envelope. |
+| `SignedRequestVerifier` | interface | type-only | stable | Authentication does not touch replay state. |
+| `SSRFError` | class | runtime | stable | Thrown when an input URL points at internal infrastructure we refuse to fetch from inside the cluster. |
+| `SSRFGuardOpts` | interface | type-only | stable | Configurable hooks for `assertSafeUrl`. |
+| `SSRFReason` | type | type-only | stable | Why `assertSafeUrl` refused this URL. |
+| `SSRFResolver` | type | type-only | stable | Pluggable DNS resolver. |
+| `UnsupportedCurrencyError` | class | runtime | stable | A valid currency code that the configured FX snapshot cannot price. |
+| `Upfront` | interface | type-only | stable | Upfront fiat commitment converted to sats at settlement time. |
+| `UpfrontPayment` | interface | type-only | stable | Original accepted job payment, fixed before handler execution. |
+| `validateCurrency` | function | runtime | stable | Validate `raw` is a 3-letter lowercase ISO 4217-style currency code. |
+| `withProgressHeartbeat` | function | runtime | stable | Wrap a long-running async op with a periodic progress heartbeat at fixed `phase` and `percent`. |
+| `z` | export | runtime | stable | Exported declaration from the built public entry point. |
+| `ZodLike` | interface | type-only | stable | Structural type matching any Zod schema. |
 
 ## `@dvmkit/sdk/server`
 
 Node server hosting, persistence, authentication, compatibility, and payment infrastructure. Generated from `./dist/server/index.d.ts`.
 
-| Name | Kind | Stability | Guidance |
-| --- | --- | --- | --- |
-| `allocateDrawValue` | function | experimental | Allocate a draw's share of a credit's unspent rail value. |
-| `assertSafeUrl` | function | experimental | Reject URLs whose host points at internal infrastructure — private / link-local IP ranges, the AWS / GCP metadata IP, Fly's `*.internal` service-discovery names, and a small denylist of obviously-internal hostnames. |
-| `attachCreditMenu` | function | experimental | Omit the credit key entirely when there is no menu; consumers use presence to determine whether credit is offered. |
-| `baselineContentExpiry` | function | experimental | Exported declaration from the built public entry point. |
-| `BitcoinDepositLiability` | interface | experimental | The sats a DVM owes back on undrawn non-channel Bitcoin credit — the deposit pot inside the hub's balance, which the operator's sweep may never bank below. |
-| `BlockedInvoiceCursor` | interface | experimental | Keyset position in `listBlockedInvoices`'s `(created_at, credit_id, fund_id)` ordering. |
-| `buildCreditMenu` | function | experimental | Return no menu for static ineligibility or unresolvable denomination bounds. |
-| `BuildCreditMenuArgs` | interface | experimental | Exported declaration from the built public entry point. |
-| `BuilderIdentity` | interface | experimental | Builder identity advertised on /v1/info. |
-| `CanonicalEnvelope` | interface | experimental | Exported declaration from the built public entry point. |
-| `CardChargeAttempt` | interface | experimental | Exported declaration from the built public entry point. |
-| `CardChargeJournal` | interface | experimental | A durable note of every card charge this DVM attempts, written before Stripe is called. |
-| `CardDrainDecision` | interface | experimental | Exported declaration from the built public entry point. |
-| `CardDrainRecovery` | interface | experimental | Exported declaration from the built public entry point. |
-| `CardDrainStateArgs` | interface | experimental | Exported declaration from the built public entry point. |
-| `CLIENT_COMPATIBILITY_HEADERS` | value | experimental | HTTP headers used by the additive client-compatibility contract. |
-| `ClientCompatibility` | interface | experimental | Exported declaration from the built public entry point. |
-| `clientCompatibilityAttributes` | function | experimental | Structured request-span attributes for support and rollout observation. |
-| `ClientCompatibilityEnv` | interface | experimental | Exported declaration from the built public entry point. |
-| `ClientCompatibilityGate` | type | experimental | Exported declaration from the built public entry point. |
-| `clientCompatibilityMiddleware` | function | experimental | Parse request metadata and advertise the server protocol version on every response. |
-| `ClientCompatibilityRequirement` | interface | experimental | Exported declaration from the built public entry point. |
-| `ClientSemVer` | interface | experimental | Exported declaration from the built public entry point. |
-| `clientUpgradeRequired` | function | experimental | Exported declaration from the built public entry point. |
-| `ConsumedCredentialStore` | interface | experimental | Tracks MPP challenge ids that have already been consumed by an upfront-flow request, scoped per-DVM realm. |
-| `ContentHold` | interface | experimental | Exported declaration from the built public entry point. |
-| `ContentHoldError` | class | experimental | Exported declaration from the built public entry point. |
-| `ContentHoldEvent` | interface | experimental | Exported declaration from the built public entry point. |
-| `ContentHoldHistory` | interface | experimental | Exported declaration from the built public entry point. |
-| `ContentHoldMutation` | type | experimental | Exported declaration from the built public entry point. |
-| `ContentHoldsResponse` | interface | experimental | Admin-only history; reasons and signer identities never appear on caller responses. |
-| `ContentHoldStore` | interface | experimental | Mutations and redaction must serialize on the same job, including across processes. |
-| `contentMetadata` | function | experimental | Exported declaration from the built public entry point. |
-| `createDVMHost` | function | experimental | Single wiring locus for SDK-side construction. |
-| `createPinnedFetch` | function | experimental | Resolve the URL's host once, validate every answer against the same denylist `assertSafeUrl` applies, then return a `fetch` whose `connect.lookup` replays that frozen, pre-validated address set (see buildPinnedLookup). |
-| `createSignedRequestVerifier` | function | experimental | Signatures cover the raw input, not Zod-parsed output. |
-| `CreateSignedRequestVerifierOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `createStripeCreditRail` | function | experimental | Build the card-credit rail on mppx's Stripe charge method. |
-| `CreateStripeCreditRailOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `createX402BatchSettlementServer` | function | experimental | Initialize upstream's scheme and channel manager against dvmkit storage. |
-| `CreateX402BatchSettlementServerOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `CREDIT_ENVELOPE_KEYS` | value | experimental | Exported declaration from the built public entry point. |
-| `CREDIT_REQUEST_SCHEMA` | value | experimental | Authenticate the raw body, including op. |
-| `CreditDrawRefundArgs` | type | experimental | Exported declaration from the built public entry point. |
-| `CreditDrawRefundResult` | interface | experimental | Exported declaration from the built public entry point. |
-| `CreditEnvelope` | interface | experimental | Credit fields belong to the raw signed body. |
-| `CreditEnvelopeError` | class | experimental | Thrown by extractCreditEnvelope on a structurally invalid credit envelope — half a pair, a `fund` block without credit fields, wrong types. |
-| `creditEnvelopeIgnoreFields` | function | experimental | Return protocol keys not declared by the schema. |
-| `CreditFundCommitment` | interface | experimental | Exported declaration from the built public entry point. |
-| `CreditFundingBasis` | interface | experimental | Rail value one funding contributes to a credit. |
-| `CreditFundingEvidence` | type | experimental | The signed artifact a funding row holds: an opening or `/v1/credit` funding receipt, or a mid-job draw funding receipt. |
-| `CreditInvoiceRecord` | interface | experimental | Exported declaration from the built public entry point. |
-| `CreditInvoiceStatus` | type | experimental | Lifecycle of a Lightning funding invoice. |
-| `CreditLedger` | class | experimental | Every write to credit_draws takes SELECT … FOR UPDATE on its parent credit within the same transaction. |
-| `CreditLedgerError` | class | experimental | Thrown by every CreditLedger method on refusal. |
-| `CreditLedgerErrorCode` | type | experimental | Exported declaration from the built public entry point. |
-| `CreditLedgerErrorDetails` | interface | experimental | Exported declaration from the built public entry point. |
-| `CreditLedgerLike` | interface | experimental | Implemented by durable Postgres and per-process memory ledgers. |
-| `CreditLedgerPool` | type | experimental | Exported declaration from the built public entry point. |
-| `CreditLedgerQuerier` | interface | experimental | Subset of `pg.Pool` the ledger uses for plain queries. |
-| `CreditMenu` | interface | experimental | Funding options and sizing in the wire denomination. |
-| `CreditRequest` | type | experimental | Exported declaration from the built public entry point. |
-| `CreditRouteDeps` | interface | experimental | Exported declaration from the built public entry point. |
-| `CreditSnapshot` | interface | experimental | Read model with funded balance and pending holds. |
-| `CreditStatus` | type | experimental | `unbacked`: Tempo backing finalized before the DVM was protected. |
-| `CreditTerms` | interface | experimental | Public, cacheable prepaid terms exclude caller IDs and balances. |
-| `DeclineOutcome` | type | experimental | What a store did with a caller's decline: ended the job, or why it refused. |
-| `DEFAULT_INVOICE_TTL_SECONDS` | value | experimental | Default bolt11 lifetime — long enough to pay by hand, short enough to retire. |
-| `DRAIN_DELIVERY_RESERVE_SATS` | value | experimental | Refund delivery uses a fixed eight-sat reserve so owed_sats cannot shrink after it is promised. |
-| `DrainConflictReason` | type | experimental | Structured drain_conflict reasons select caller instructions without matching prose. |
-| `DrawRailValue` | interface | experimental | A draw’s rail value and funding identity. |
-| `DrawRecord` | interface | experimental | Exported declaration from the built public entry point. |
-| `DrawResolution` | interface | experimental | Result of `settle`, `release` or `resolveDraw`: the draw's recorded tuple plus a fresh available-balance read. |
-| `DrawResult` | interface | experimental | Exported declaration from the built public entry point. |
-| `drawSettlementRef` | function | experimental | Settlement reference stamped on the revenue event of an **explicit** draw; one funding backs N draws, so the funding's own rail reference cannot key them: `revenue_events` carries a global `UNIQUE (rail, tx_hash)` that deliberately drops cross-job reuse of a settlement reference, and reusing it would silently discard every draw but the first. |
-| `DrawStatus` | type | experimental | Draw lifecycle: two-phase hold → terminal settle/release. |
-| `DVM_PROTOCOL_VERSION` | value | experimental | Protocol version spoken by this SDK generation. |
-| `DVMAuthScheme` | interface | experimental | Auth runs before payment; replay commits after accepted upfront payment. |
-| `DVMHost` | interface | experimental | Exported declaration from the built public entry point. |
-| `DVMHostOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `DVMServeResult` | interface | experimental | Exported declaration from the built public entry point. |
-| `extractCreditEnvelope` | function | experimental | Extract the credit envelope from the raw wire `body.data`. |
-| `fundingCommitment` | function | experimental | SHA-256 hex over the raw funding artifact — the value an explicit fund-and-draw request must sign as `fund.commitment` (the funding-commitment rule). |
-| `FundingRecord` | interface | experimental | Exported declaration from the built public entry point. |
-| `GrownDrawResult` | interface | experimental | Result of `growDraw` — the draw's post-growth tuple, plus the slice this top-up added. |
-| `handleCreditRequest` | function | experimental | Exported declaration from the built public entry point. |
-| `hasInvalidRequestId` | function | experimental | Exported declaration from the built public entry point. |
-| `HostedTempoCloseReportWriteOff` | interface | experimental | Exported declaration from the built public entry point. |
-| `HostingClosureCommand` | interface | experimental | Exported declaration from the built public entry point. |
-| `HostingClosureEvidence` | interface | experimental | Exported declaration from the built public entry point. |
-| `HostingControlCommand` | interface | experimental | Exported declaration from the built public entry point. |
-| `HostingControlConfig` | interface | experimental | Exported declaration from the built public entry point. |
-| `HostingControlStatus` | interface | experimental | Exported declaration from the built public entry point. |
-| `IMPLICIT_CREDIT_TTL_MS` | value | experimental | Default lifetime of a per-call implicit credit: 90 days before the ledger refuses new draws. |
-| `InitLockPool` | type | experimental | Pool-shaped handle the lock needs — `connect`, since the lock and the unlock must ride one pinned client, plus `pg`'s resolved config when it's there (a hand-rolled pool shape won't have it) so the size check below can run. |
-| `installAdminContentRoutes` | function | experimental | Exported declaration from the built public entry point. |
-| `InstallAdminContentRoutesOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `InvoiceReconciliation` | interface | experimental | Reconciliation keeps the original invoice identity; funding and credit describe the operator-selected target credit, which may differ from the invoice’s original credit. |
-| `InvoiceSettlement` | interface | experimental | Exported declaration from the built public entry point. |
-| `InvoiceWriteOff` | interface | experimental | Exported declaration from the built public entry point. |
-| `isContentHoldStore` | function | experimental | Exported declaration from the built public entry point. |
-| `isStreamableJobStore` | function | experimental | Runtime type guard for StreamableJobStore. |
-| `JobContentMetadata` | interface | experimental | Authenticated caller metadata; omitted fields on older services mean unknown. |
-| `JobCostReportPayload` | interface | experimental | JSON wire shape POSTed to the platform's `/_internal/job-cost` endpoint when a terminal job incurred a declared builder cost but produced no revenue report. |
-| `JobEndedError` | class | experimental | Thrown by `appendOutgoing` for an ask (`prompt` or `payment-request`) on a job that is already terminal. |
-| `JobManager` | class | experimental | Transport-agnostic job lifecycle manager. |
-| `JobManagerOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `JobPiece` | interface | experimental | One piece of work a job's payment bought, as a job store keeps it on `JobRecord.pieces`. |
-| `JobRecord` | interface | experimental | Exported declaration from the built public entry point. |
-| `JobSettlement` | interface | experimental | The settlement a job's terminal transition froze, read by every later draw resolution. |
-| `JobStatus` | type | experimental | Exported declaration from the built public entry point. |
-| `JobStore` | interface | experimental | Exported declaration from the built public entry point. |
-| `JobTerminalReportPayload` | interface | experimental | Privacy-preserving terminal evidence; contains no caller or payment references. |
-| `LightningReceive` | class | experimental | Prepaid Lightning funding over a receive-safe NWC connection. |
-| `LightningReceiveConfig` | interface | experimental | Exported declaration from the built public entry point. |
-| `MemoryConsumedCredentialStore` | class | experimental | In-memory `ConsumedCredentialStore`. |
-| `MemoryConsumedCredentialStoreOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `MemoryCreditLedger` | class | experimental | Per-process development/test ledger without durability or cross-machine safety. |
-| `MemoryProcessedPaymentStore` | class | experimental | In-memory ProcessedPaymentStore for pool-less setups. |
-| `MemoryX402ExactSettlementStore` | class | experimental | In-memory exact settlement store used by dev and unit tests. |
-| `MIN_INVOICE_TTL_SECONDS` | value | experimental | Floor on the invoice lifetime: twice the signed-request drift window, so the bolt11 always outlives the funding negotiation that produced it. |
-| `MountOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `OwnerDisplay` | interface | experimental | Owner display identity surfaced on `/v1/info#owner`. |
-| `PaidJobCompletion` | interface | experimental | A completed job's settled customer charge, never the builder's reported cost. |
-| `parseClientCapabilities` | function | experimental | Parse a sorted, unique comma-separated capability list. |
-| `parseClientCompatibility` | function | experimental | Parse and validate compatibility headers without trusting them as identity. |
-| `parseDvmClient` | function | experimental | Parse the exact `dvm/<semver>` client header. |
-| `parseProtocolVersion` | function | experimental | Parse a canonical non-negative integer protocol version. |
-| `PaymentMode` | interface | experimental | Effective boot-time payment configuration for one mounted DVM. |
-| `PendingImplicitDrawGroup` | interface | experimental | Exported declaration from the built public entry point. |
-| `PendingImplicitDrawSummary` | interface | experimental | Exported declaration from the built public entry point. |
-| `PieceEnding` | type | experimental | How a job's terminal transition ends its running piece. |
-| `PieceState` | type | experimental | Where a piece of work stands: `finished` and `stopped` pieces are charged, `released` ones are not. |
-| `PinnedFetch` | interface | experimental | A `fetch`-compatible function pinned to a single pre-validated IP address. |
-| `PlatformReporterOpts` | interface | experimental | Platform reporter overrides — the host falls back to env when omitted. |
-| `PostgresJobStore` | class | experimental | Postgres-backed JobStore with cross-machine message streaming via LISTEN/NOTIFY. |
-| `PostgresKVStore` | class | experimental | Postgres-backed KVStore. |
-| `PostgresProcessedPaymentStore` | class | experimental | Postgres-backed ProcessedPaymentStore — the production implementation. |
-| `PostgresReplayStore` | class | experimental | The (pubkey, timestamp, nonce) primary key detects concurrent duplicates atomically across machines. |
-| `PostgresReplayStoreOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `PostgresX402ChannelStorage` | class | experimental | Postgres implementation of x402's server-side ChannelStorage. |
-| `PostgresX402ExactSettlementStore` | class | experimental | Exported declaration from the built public entry point. |
-| `PriceFiat` | interface | experimental | Fiat denomination of the job price, pinned per request. |
-| `ProcessedPaymentQuerier` | interface | experimental | Subset of `pg.Pool` the store queries through; `PoolClient` satisfies it too. |
-| `ProcessedPaymentRail` | type | experimental | Rails that commit through the marker (Cashu commits via the accumulator). |
-| `ProcessedPaymentRecord` | interface | experimental | One recorded funding marker. |
-| `ProcessedPaymentReplayError` | class | experimental | Thrown by `record` when the payment id was already processed on this rail. |
-| `ProcessedPaymentStore` | interface | experimental | x402/Tempo marker, funding and draw commit in one transaction so a retry cannot fund twice. |
-| `protocolEnvelopeIgnoreFields` | function | experimental | Auth-schema fields the protocol owns rather than the builder input schema. |
-| `readPendingImplicitDraws` | function | experimental | Read database-wide pending holds on implicit credits using a single SELECT. |
-| `ReplayStoreBackend` | type | experimental | Boot-summary backend: postgres is shared across machines; memory is per-process. |
-| `REQUEST_ID_FIELD` | value | experimental | Protocol-owned request field carried inside a signed request body. |
-| `requestIdFromEnvelope` | function | experimental | Read and validate the optional recovery id from a signed request body. |
-| `requireClientCompatibility` | value | experimental | Exported declaration from the built public entry point. |
-| `resolveCashuOptsFromEnv` | function | experimental | Resolves the builder-lock and Cashu accumulator opts from environment variables, initializing DB tables when their prerequisites are met. |
-| `ResolvedCashuOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `retryHostedTempoCloseReport` | function | experimental | Restart a terminal close-report search after the operator repairs incomplete RPC history. |
-| `RetryTempoCloseReportResponse` | interface | experimental | Exported declaration from the built public entry point. |
-| `RevenueSkippedNoRailPayload` | interface | experimental | JSON wire shape POSTed to the platform's `/_internal/revenue-skipped-no-rail` endpoint when a settled credit draw has no usable payment rail for its revenue event. |
-| `RevenueSkippedNoRailReason` | type | experimental | Exported declaration from the built public entry point. |
-| `SDK_INIT_ADVISORY_LOCK` | value | experimental | All SDK boot DDL shares one advisory-lock key. |
-| `secp256k1Auth` | function | experimental | One scheme covers all capabilities and shares their replay store. |
-| `Secp256k1AuthOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `selectPrimaryCredit` | function | experimental | Choose the largest live, active, same-currency spendable balance; newest creation breaks a tie. |
-| `serve` | function | experimental | Single-DVM host. |
-| `SIGNED_REQUEST_AUTH_ID` | value | experimental | Auth identifier advertised by DVMs using audience-bound caller proofs. |
-| `SIGNED_REQUEST_STATEMENT_VERSION` | value | experimental | Version of the canonical audience-bound caller statement. |
-| `SignedRequestAudience` | interface | experimental | Attested service identity a signed caller statement is intended for. |
-| `SignedRequestDomain` | interface | experimental | Operation fields kept outside the signed input to prevent schema substitution. |
-| `SignedRequestError` | class | experimental | Exported declaration from the built public entry point. |
-| `SignedRequestFailure` | type | experimental | Authentication failure; signature_required means no envelope fields were supplied. |
-| `signedRequestInput` | function | experimental | Raw structured input for authentication and durable replay. |
-| `SignedRequestReplayStore` | interface | experimental | Exported declaration from the built public entry point. |
-| `SignedRequestSignOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `signedRequestStatementHeader` | function | experimental | Build the versioned header persisted beside a caller's flat input envelope. |
-| `SignedRequestStatementHeader` | interface | experimental | Domain fields carried with every v2 signed-request envelope. |
-| `SignedRequestVerifier` | interface | experimental | Authentication does not touch replay state. |
-| `signHostingClosure` | function | experimental | Exported declaration from the built public entry point. |
-| `signHostingControl` | function | experimental | Ordered JSON arrays are the versioned wire signing contract. |
-| `SSRFError` | class | experimental | Thrown when an input URL points at internal infrastructure we refuse to fetch from inside the cluster. |
-| `SSRFGuardOpts` | interface | experimental | Configurable hooks for `assertSafeUrl`. |
-| `SSRFReason` | type | experimental | Why `assertSafeUrl` refused this URL. |
-| `SSRFResolver` | type | experimental | Pluggable DNS resolver. |
-| `StalePendingDrawCursor` | interface | experimental | Keyset cursor into CreditLedgerLike.listStalePendingDraws, holding the sort key of the last row a caller examined; offset paging would not do: the scan skips holds it can't resolve (their job row exists), so those rows stay `pending` and reappear at the head of every subsequent page. |
-| `StreamableJobStore` | interface | experimental | JobStore extension for cross-machine message streaming + the transactional model (Tx A / Tx B / Tx C). |
-| `stripCreditEnvelope` | function | experimental | Remove undeclared credit keys before schema parsing. |
-| `STRIPE_CREDIT_MIN_MICRO` | value | experimental | Stripe's own floor on a USD charge, in USD micro-units. |
-| `StripeChargeFacts` | interface | experimental | What a refund needs to know about the charge behind one funding PaymentIntent. |
-| `StripeChargeOutcome` | type | experimental | What one charge attempt established. |
-| `StripeCreditConfig` | interface | experimental | The env vars that opt a DVM into card-funded credit. |
-| `StripeCreditRail` | interface | experimental | Card-credit rail with optional server-owned `dvmkit_dvm_id` PaymentIntent metadata. |
-| `StripeDispute` | interface | experimental | Exported declaration from the built public entry point. |
-| `StripeErrorCodes` | interface | experimental | Stripe's own error classification: enums, never Stripe's free-text message. |
-| `StripePaymentIntentSummary` | interface | experimental | Exported declaration from the built public entry point. |
-| `StripeRefund` | interface | experimental | Exported declaration from the built public entry point. |
-| `StripeRefundApi` | interface | experimental | Exported declaration from the built public entry point. |
-| `stripProtocolEnvelope` | function | experimental | Remove protocol-owned credit and recovery fields before builder input parsing. |
-| `TempoCloseReportsResponse` | interface | experimental | Exported declaration from the built public entry point. |
-| `TempoCloseReportSummary` | interface | experimental | Exported declaration from the built public entry point. |
-| `TempoDrainDecision` | interface | experimental | Immutable full-refund attestation or unpaid-release decision, independent of chain proof. |
-| `TempoDrainDecisionArgs` | interface | experimental | Exported declaration from the built public entry point. |
-| `TempoDrainDecisionResult` | interface | experimental | Exported declaration from the built public entry point. |
-| `TempoDrainHoldReason` | type | experimental | Latest established refund-proof refusal; transient read failures do not replace it. |
-| `toCreditView` | function | experimental | Exported declaration from the built public entry point. |
-| `UpfrontPayment` | interface | experimental | Original accepted job payment, fixed before handler execution. |
-| `withSdkInitLock` | function | experimental | Overlapping callers on one pool share a pinned session lock and run their guarded work in order. |
-| `writeOffHostedTempoCloseReport` | function | experimental | Forgo an unmatched builder payout report; includeDetails returns the amount without another read. |
-| `WriteOffTempoCloseReportResponse` | interface | experimental | Exported declaration from the built public entry point. |
-| `X402_BATCH_AUTO_SETTLEMENT` | value | experimental | Default claim and transfer cadence; comfortably inside the default 24-hour exit window. |
-| `X402_BATCH_MIN_WITHDRAW_DELAY_SECONDS` | value | experimental | Default withdrawal grace and minimum outside Base Sepolia; seconds. |
-| `X402_BATCH_SETTLEMENT_NETWORK` | value | experimental | Hosted-facilitator channel network retained for the existing testnet path. |
-| `X402BatchAcceptance` | interface | experimental | Successful batch-settlement result plus the caller-owned ledger result. |
-| `X402BatchFunding` | interface | experimental | Natural identity and incremental value carried by an accepted channel voucher. |
-| `X402BatchRefusal` | interface | experimental | Structured refusal that can be turned back into a corrective 402. |
-| `X402BatchSettlementServer` | interface | experimental | Runtime server handle used only by `/v1/credit`. |
-| `X402ChannelStorageOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `X402ExactAcceptance` | type | experimental | Result of accepting or recovering one exact x402 authorization. |
-| `X402ExactIntentConflictError` | class | experimental | Raised when the same on-chain authorization is presented for a different local effect. |
-| `X402ExactSettlementAttempt` | interface | experimental | Evidence recorded around one facilitator settlement call. |
-| `X402ExactSettlementChainEvidence` | interface | experimental | Chain evidence recovered for one exact x402 authorization. |
-| `X402ExactSettlementEffect` | interface | experimental | Serializable local economic effect that follows an exact settlement. |
-| `X402ExactSettlementEvidenceMissingError` | class | experimental | Raised when operator repair cannot prove the payment on chain. |
-| `X402ExactSettlementEvidenceReader` | interface | experimental | Chain boundary used by exact-settlement recovery. |
-| `X402ExactSettlementIntent` | interface | experimental | Exported declaration from the built public entry point. |
-| `X402ExactSettlementNotReadyError` | class | experimental | Raised when local finalization is attempted before settlement is evidenced. |
-| `X402ExactSettlementServer` | class | experimental | Durable coordinator for irreversible exact x402 settlement. |
-| `X402ExactSettlementServerOpts` | interface | experimental | Exported declaration from the built public entry point. |
-| `X402ExactSettlementStatus` | type | experimental | Exported declaration from the built public entry point. |
-| `X402ExactSettlementStore` | interface | experimental | Persistence contract for exact x402 settlement recovery. |
-| `X402RelayLockHolder` | interface | experimental | Best-effort identification of the backend holding the relay submission lock. |
-| `X402RelaySubmissionLock` | interface | experimental | Fleet-wide serialisation of the self-relay's chain submissions. |
-| `X402RelaySubmissionLockError` | class | experimental | The fleet-wide relay submission lock was still held when the wait ceiling expired. |
-| `X402SettlementChainEvidence` | interface | experimental | Exact successful chain action recovered for one ambiguous settlement attempt. |
-| `X402SettlementEvidenceReader` | interface | experimental | Chain boundary used to bookmark and reconcile irreversible x402 submissions. |
-| `X402SettlementSubmissionError` | class | experimental | The chain submission behind an accepted voucher did not return success. |
+| Name | Kind | Availability | Stability | Guidance |
+| --- | --- | --- | --- | --- |
+| `allocateDrawValue` | function | runtime | experimental | Allocate a draw's share of a credit's unspent rail value. |
+| `assertSafeUrl` | function | runtime | experimental | Reject URLs whose host points at internal infrastructure — private / link-local IP ranges, the AWS / GCP metadata IP, Fly's `*.internal` service-discovery names, and a small denylist of obviously-internal hostnames. |
+| `attachCreditMenu` | function | runtime | experimental | Omit the credit key entirely when there is no menu; consumers use presence to determine whether credit is offered. |
+| `baselineContentExpiry` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `BitcoinDepositLiability` | interface | type-only | experimental | The sats a DVM owes back on undrawn non-channel Bitcoin credit — the deposit pot inside the hub's balance, which the operator's sweep may never bank below. |
+| `BlockedInvoiceCursor` | interface | type-only | experimental | Keyset position in `listBlockedInvoices`'s `(created_at, credit_id, fund_id)` ordering. |
+| `buildCreditMenu` | function | runtime | experimental | Return no menu for static ineligibility or unresolvable denomination bounds. |
+| `BuildCreditMenuArgs` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `BuilderIdentity` | interface | type-only | experimental | Builder identity advertised on /v1/info. |
+| `CanonicalEnvelope` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CardChargeAttempt` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CardChargeJournal` | interface | type-only | experimental | A durable note of every card charge this DVM attempts, written before Stripe is called. |
+| `CardDrainDecision` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CardDrainRecovery` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CardDrainStateArgs` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CLIENT_COMPATIBILITY_HEADERS` | value | runtime | experimental | HTTP headers used by the additive client-compatibility contract. |
+| `ClientCompatibility` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `clientCompatibilityAttributes` | function | runtime | experimental | Structured request-span attributes for support and rollout observation. |
+| `ClientCompatibilityEnv` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `ClientCompatibilityGate` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `clientCompatibilityMiddleware` | function | runtime | experimental | Parse request metadata and advertise the server protocol version on every response. |
+| `ClientCompatibilityRequirement` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `ClientSemVer` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `clientUpgradeRequired` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `ConsumedCredentialStore` | interface | type-only | experimental | Tracks MPP challenge ids that have already been consumed by an upfront-flow request, scoped per-DVM realm. |
+| `ContentHold` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `ContentHoldError` | class | runtime | experimental | Exported declaration from the built public entry point. |
+| `ContentHoldEvent` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `ContentHoldHistory` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `ContentHoldMutation` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `ContentHoldsResponse` | interface | type-only | experimental | Admin-only history; reasons and signer identities never appear on caller responses. |
+| `ContentHoldStore` | interface | type-only | experimental | Mutations and redaction must serialize on the same job, including across processes. |
+| `contentMetadata` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `createDVMHost` | function | runtime | experimental | Single wiring locus for SDK-side construction. |
+| `createPinnedFetch` | function | runtime | experimental | Resolve the URL's host once, validate every answer against the same denylist `assertSafeUrl` applies, then return a `fetch` whose `connect.lookup` replays that frozen, pre-validated address set (see buildPinnedLookup). |
+| `createSignedRequestVerifier` | function | runtime | experimental | Signatures cover the raw input, not Zod-parsed output. |
+| `CreateSignedRequestVerifierOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `createStripeCreditRail` | function | runtime | experimental | Build the card-credit rail on mppx's Stripe charge method. |
+| `CreateStripeCreditRailOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `createX402BatchSettlementServer` | function | runtime | experimental | Initialize upstream's scheme and channel manager against dvmkit storage. |
+| `CreateX402BatchSettlementServerOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CREDIT_ENVELOPE_KEYS` | value | runtime | experimental | Exported declaration from the built public entry point. |
+| `CREDIT_REQUEST_SCHEMA` | value | runtime | experimental | Authenticate the raw body, including op. |
+| `CreditDrawRefundArgs` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditDrawRefundResult` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditEnvelope` | interface | type-only | experimental | Credit fields belong to the raw signed body. |
+| `CreditEnvelopeError` | class | runtime | experimental | Thrown by extractCreditEnvelope on a structurally invalid credit envelope — half a pair, a `fund` block without credit fields, wrong types. |
+| `creditEnvelopeIgnoreFields` | function | runtime | experimental | Return protocol keys not declared by the schema. |
+| `CreditFundCommitment` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditFundingBasis` | interface | type-only | experimental | Rail value one funding contributes to a credit. |
+| `CreditFundingEvidence` | type | type-only | experimental | The signed artifact a funding row holds: an opening or `/v1/credit` funding receipt, or a mid-job draw funding receipt. |
+| `CreditInvoiceRecord` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditInvoiceStatus` | type | type-only | experimental | Lifecycle of a Lightning funding invoice. |
+| `CreditLedger` | class | runtime | experimental | Every write to credit_draws takes SELECT … FOR UPDATE on its parent credit within the same transaction. |
+| `CreditLedgerError` | class | runtime | experimental | Thrown by every CreditLedger method on refusal. |
+| `CreditLedgerErrorCode` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditLedgerErrorDetails` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditLedgerLike` | interface | type-only | experimental | Implemented by durable Postgres and per-process memory ledgers. |
+| `CreditLedgerPool` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditLedgerQuerier` | interface | type-only | experimental | Subset of `pg.Pool` the ledger uses for plain queries. |
+| `CreditMenu` | interface | type-only | experimental | Funding options and sizing in the wire denomination. |
+| `CreditRequest` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditRouteDeps` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `CreditSnapshot` | interface | type-only | experimental | Read model with funded balance and pending holds. |
+| `CreditStatus` | type | type-only | experimental | `unbacked`: Tempo backing finalized before the DVM was protected. |
+| `CreditTerms` | interface | type-only | experimental | Public, cacheable prepaid terms exclude caller IDs and balances. |
+| `DeclineOutcome` | type | type-only | experimental | What a store did with a caller's decline: ended the job, or why it refused. |
+| `DEFAULT_INVOICE_TTL_SECONDS` | value | runtime | experimental | Default bolt11 lifetime — long enough to pay by hand, short enough to retire. |
+| `DRAIN_DELIVERY_RESERVE_SATS` | value | runtime | experimental | Refund delivery uses a fixed eight-sat reserve so owed_sats cannot shrink after it is promised. |
+| `DrainConflictReason` | type | type-only | experimental | Structured drain_conflict reasons select caller instructions without matching prose. |
+| `DrawRailValue` | interface | type-only | experimental | A draw’s rail value and funding identity. |
+| `DrawRecord` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `DrawResolution` | interface | type-only | experimental | Result of `settle`, `release` or `resolveDraw`: the draw's recorded tuple plus a fresh available-balance read. |
+| `DrawResult` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `drawSettlementRef` | function | runtime | experimental | Settlement reference stamped on the revenue event of an **explicit** draw; one funding backs N draws, so the funding's own rail reference cannot key them: `revenue_events` carries a global `UNIQUE (rail, tx_hash)` that deliberately drops cross-job reuse of a settlement reference, and reusing it would silently discard every draw but the first. |
+| `DrawStatus` | type | type-only | experimental | Draw lifecycle: two-phase hold → terminal settle/release. |
+| `DVM_PROTOCOL_VERSION` | value | runtime | experimental | Protocol version spoken by this SDK generation. |
+| `DVMAuthScheme` | interface | type-only | experimental | Auth runs before payment; replay commits after accepted upfront payment. |
+| `DVMHost` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `DVMHostOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `DVMServeResult` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `extractCreditEnvelope` | function | runtime | experimental | Extract the credit envelope from the raw wire `body.data`. |
+| `fundingCommitment` | function | runtime | experimental | SHA-256 hex over the raw funding artifact — the value an explicit fund-and-draw request must sign as `fund.commitment` (the funding-commitment rule). |
+| `FundingRecord` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `GrownDrawResult` | interface | type-only | experimental | Result of `growDraw` — the draw's post-growth tuple, plus the slice this top-up added. |
+| `handleCreditRequest` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `hasInvalidRequestId` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `HostedTempoCloseReportWriteOff` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `HostingClosureCommand` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `HostingClosureEvidence` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `HostingControlCommand` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `HostingControlConfig` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `HostingControlStatus` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `IMPLICIT_CREDIT_TTL_MS` | value | runtime | experimental | Default lifetime of a per-call implicit credit: 90 days before the ledger refuses new draws. |
+| `InitLockPool` | type | type-only | experimental | Pool-shaped handle the lock needs — `connect`, since the lock and the unlock must ride one pinned client, plus `pg`'s resolved config when it's there (a hand-rolled pool shape won't have it) so the size check below can run. |
+| `installAdminContentRoutes` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `InstallAdminContentRoutesOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `InvoiceReconciliation` | interface | type-only | experimental | Reconciliation keeps the original invoice identity; funding and credit describe the operator-selected target credit, which may differ from the invoice’s original credit. |
+| `InvoiceSettlement` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `InvoiceWriteOff` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `isContentHoldStore` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `isStreamableJobStore` | function | runtime | experimental | Runtime type guard for StreamableJobStore. |
+| `JobContentMetadata` | interface | type-only | experimental | Authenticated caller metadata; omitted fields on older services mean unknown. |
+| `JobCostReportPayload` | interface | type-only | experimental | JSON wire shape POSTed to the platform's `/_internal/job-cost` endpoint when a terminal job incurred a declared builder cost but produced no revenue report. |
+| `JobEndedError` | class | runtime | experimental | Thrown by `appendOutgoing` for an ask (`prompt` or `payment-request`) on a job that is already terminal. |
+| `JobManager` | class | runtime | experimental | Transport-agnostic job lifecycle manager. |
+| `JobManagerOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `JobPiece` | interface | type-only | experimental | One piece of work a job's payment bought, as a job store keeps it on `JobRecord.pieces`. |
+| `JobRecord` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `JobSettlement` | interface | type-only | experimental | The settlement a job's terminal transition froze, read by every later draw resolution. |
+| `JobStatus` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `JobStore` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `JobTerminalReportPayload` | interface | type-only | experimental | Privacy-preserving terminal evidence; contains no caller or payment references. |
+| `LightningReceive` | class | runtime | experimental | Prepaid Lightning funding over a receive-safe NWC connection. |
+| `LightningReceiveConfig` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `MemoryConsumedCredentialStore` | class | runtime | experimental | In-memory `ConsumedCredentialStore`. |
+| `MemoryConsumedCredentialStoreOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `MemoryCreditLedger` | class | runtime | experimental | Per-process development/test ledger without durability or cross-machine safety. |
+| `MemoryProcessedPaymentStore` | class | runtime | experimental | In-memory ProcessedPaymentStore for pool-less setups. |
+| `MemoryX402ExactSettlementStore` | class | runtime | experimental | In-memory exact settlement store used by dev and unit tests. |
+| `MIN_INVOICE_TTL_SECONDS` | value | runtime | experimental | Floor on the invoice lifetime: twice the signed-request drift window, so the bolt11 always outlives the funding negotiation that produced it. |
+| `MountOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `OwnerDisplay` | interface | type-only | experimental | Owner display identity surfaced on `/v1/info#owner`. |
+| `PaidJobCompletion` | interface | type-only | experimental | A completed job's settled customer charge, never the builder's reported cost. |
+| `parseClientCapabilities` | function | runtime | experimental | Parse a sorted, unique comma-separated capability list. |
+| `parseClientCompatibility` | function | runtime | experimental | Parse and validate compatibility headers without trusting them as identity. |
+| `parseDvmClient` | function | runtime | experimental | Parse the exact `dvm/<semver>` client header. |
+| `parseProtocolVersion` | function | runtime | experimental | Parse a canonical non-negative integer protocol version. |
+| `PaymentMode` | interface | type-only | experimental | Effective boot-time payment configuration for one mounted DVM. |
+| `PendingImplicitDrawGroup` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `PendingImplicitDrawSummary` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `PieceEnding` | type | type-only | experimental | How a job's terminal transition ends its running piece. |
+| `PieceState` | type | type-only | experimental | Where a piece of work stands: `finished` and `stopped` pieces are charged, `released` ones are not. |
+| `PinnedFetch` | interface | type-only | experimental | A `fetch`-compatible function pinned to a single pre-validated IP address. |
+| `PlatformReporterOpts` | interface | type-only | experimental | Platform reporter overrides — the host falls back to env when omitted. |
+| `PostgresJobStore` | class | runtime | experimental | Postgres-backed JobStore with cross-machine message streaming via LISTEN/NOTIFY. |
+| `PostgresKVStore` | class | runtime | experimental | Postgres-backed KVStore. |
+| `PostgresProcessedPaymentStore` | class | runtime | experimental | Postgres-backed ProcessedPaymentStore — the production implementation. |
+| `PostgresReplayStore` | class | runtime | experimental | The (pubkey, timestamp, nonce) primary key detects concurrent duplicates atomically across machines. |
+| `PostgresReplayStoreOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `PostgresX402ChannelStorage` | class | runtime | experimental | Postgres implementation of x402's server-side ChannelStorage. |
+| `PostgresX402ExactSettlementStore` | class | runtime | experimental | Exported declaration from the built public entry point. |
+| `PriceFiat` | interface | type-only | experimental | Fiat denomination of the job price, pinned per request. |
+| `ProcessedPaymentQuerier` | interface | type-only | experimental | Subset of `pg.Pool` the store queries through; `PoolClient` satisfies it too. |
+| `ProcessedPaymentRail` | type | type-only | experimental | Rails that commit through the marker (Cashu commits via the accumulator). |
+| `ProcessedPaymentRecord` | interface | type-only | experimental | One recorded funding marker. |
+| `ProcessedPaymentReplayError` | class | runtime | experimental | Thrown by `record` when the payment id was already processed on this rail. |
+| `ProcessedPaymentStore` | interface | type-only | experimental | x402/Tempo marker, funding and draw commit in one transaction so a retry cannot fund twice. |
+| `protocolEnvelopeIgnoreFields` | function | runtime | experimental | Auth-schema fields the protocol owns rather than the builder input schema. |
+| `readPendingImplicitDraws` | function | runtime | experimental | Read database-wide pending holds on implicit credits using a single SELECT. |
+| `ReplayStoreBackend` | type | type-only | experimental | Boot-summary backend: postgres is shared across machines; memory is per-process. |
+| `REQUEST_ID_FIELD` | value | runtime | experimental | Protocol-owned request field carried inside a signed request body. |
+| `requestIdFromEnvelope` | function | runtime | experimental | Read and validate the optional recovery id from a signed request body. |
+| `requireClientCompatibility` | value | runtime | experimental | Exported declaration from the built public entry point. |
+| `resolveCashuOptsFromEnv` | function | runtime | experimental | Resolves the builder-lock and Cashu accumulator opts from environment variables, initializing DB tables when their prerequisites are met. |
+| `ResolvedCashuOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `retryHostedTempoCloseReport` | function | runtime | experimental | Restart a terminal close-report search after the operator repairs incomplete RPC history. |
+| `RetryTempoCloseReportResponse` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `RevenueSkippedNoRailPayload` | interface | type-only | experimental | JSON wire shape POSTed to the platform's `/_internal/revenue-skipped-no-rail` endpoint when a settled credit draw has no usable payment rail for its revenue event. |
+| `RevenueSkippedNoRailReason` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `SDK_INIT_ADVISORY_LOCK` | value | runtime | experimental | All SDK boot DDL shares one advisory-lock key. |
+| `secp256k1Auth` | function | runtime | experimental | One scheme covers all capabilities and shares their replay store. |
+| `Secp256k1AuthOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `selectPrimaryCredit` | function | runtime | experimental | Choose the largest live, active, same-currency spendable balance; newest creation breaks a tie. |
+| `serve` | function | runtime | experimental | Single-DVM host. |
+| `SIGNED_REQUEST_AUTH_ID` | value | runtime | experimental | Auth identifier advertised by DVMs using audience-bound caller proofs. |
+| `SIGNED_REQUEST_STATEMENT_VERSION` | value | runtime | experimental | Version of the canonical audience-bound caller statement. |
+| `SignedRequestAudience` | interface | type-only | experimental | Attested service identity a signed caller statement is intended for. |
+| `SignedRequestDomain` | interface | type-only | experimental | Operation fields kept outside the signed input to prevent schema substitution. |
+| `SignedRequestError` | class | runtime | experimental | Exported declaration from the built public entry point. |
+| `SignedRequestFailure` | type | type-only | experimental | Authentication failure; signature_required means no envelope fields were supplied. |
+| `signedRequestInput` | function | runtime | experimental | Raw structured input for authentication and durable replay. |
+| `SignedRequestReplayStore` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `SignedRequestSignOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `signedRequestStatementHeader` | function | runtime | experimental | Build the versioned header persisted beside a caller's flat input envelope. |
+| `SignedRequestStatementHeader` | interface | type-only | experimental | Domain fields carried with every v2 signed-request envelope. |
+| `SignedRequestVerifier` | interface | type-only | experimental | Authentication does not touch replay state. |
+| `signHostingClosure` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `signHostingControl` | function | runtime | experimental | Ordered JSON arrays are the versioned wire signing contract. |
+| `SSRFError` | class | runtime | experimental | Thrown when an input URL points at internal infrastructure we refuse to fetch from inside the cluster. |
+| `SSRFGuardOpts` | interface | type-only | experimental | Configurable hooks for `assertSafeUrl`. |
+| `SSRFReason` | type | type-only | experimental | Why `assertSafeUrl` refused this URL. |
+| `SSRFResolver` | type | type-only | experimental | Pluggable DNS resolver. |
+| `StalePendingDrawCursor` | interface | type-only | experimental | Keyset cursor into CreditLedgerLike.listStalePendingDraws, holding the sort key of the last row a caller examined; offset paging would not do: the scan skips holds it can't resolve (their job row exists), so those rows stay `pending` and reappear at the head of every subsequent page. |
+| `StreamableJobStore` | interface | type-only | experimental | JobStore extension for cross-machine message streaming + the transactional model (Tx A / Tx B / Tx C). |
+| `stripCreditEnvelope` | function | runtime | experimental | Remove undeclared credit keys before schema parsing. |
+| `STRIPE_CREDIT_MIN_MICRO` | value | runtime | experimental | Stripe's own floor on a USD charge, in USD micro-units. |
+| `StripeChargeFacts` | interface | type-only | experimental | What a refund needs to know about the charge behind one funding PaymentIntent. |
+| `StripeChargeOutcome` | type | type-only | experimental | What one charge attempt established. |
+| `StripeCreditConfig` | interface | type-only | experimental | The env vars that opt a DVM into card-funded credit. |
+| `StripeCreditRail` | interface | type-only | experimental | Card-credit rail with optional server-owned `dvmkit_dvm_id` PaymentIntent metadata. |
+| `StripeDispute` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `StripeErrorCodes` | interface | type-only | experimental | Stripe's own error classification: enums, never Stripe's free-text message. |
+| `StripePaymentIntentSummary` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `StripeRefund` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `StripeRefundApi` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `stripProtocolEnvelope` | function | runtime | experimental | Remove protocol-owned credit and recovery fields before builder input parsing. |
+| `TempoCloseReportsResponse` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `TempoCloseReportSummary` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `TempoDrainDecision` | interface | type-only | experimental | Immutable full-refund attestation or unpaid-release decision, independent of chain proof. |
+| `TempoDrainDecisionArgs` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `TempoDrainDecisionResult` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `TempoDrainHoldReason` | type | type-only | experimental | Latest established refund-proof refusal; transient read failures do not replace it. |
+| `toCreditView` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `UpfrontPayment` | interface | type-only | experimental | Original accepted job payment, fixed before handler execution. |
+| `withSdkInitLock` | function | runtime | experimental | Overlapping callers on one pool share a pinned session lock and run their guarded work in order. |
+| `writeOffHostedTempoCloseReport` | function | runtime | experimental | Forgo an unmatched builder payout report; includeDetails returns the amount without another read. |
+| `WriteOffTempoCloseReportResponse` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `X402_BATCH_AUTO_SETTLEMENT` | value | runtime | experimental | Default claim and transfer cadence; comfortably inside the default 24-hour exit window. |
+| `X402_BATCH_MIN_WITHDRAW_DELAY_SECONDS` | value | runtime | experimental | Default withdrawal grace and minimum outside Base Sepolia; seconds. |
+| `X402_BATCH_SETTLEMENT_NETWORK` | value | runtime | experimental | Hosted-facilitator channel network retained for the existing testnet path. |
+| `X402BatchAcceptance` | interface | type-only | experimental | Successful batch-settlement result plus the caller-owned ledger result. |
+| `X402BatchFunding` | interface | type-only | experimental | Natural identity and incremental value carried by an accepted channel voucher. |
+| `X402BatchRefusal` | interface | type-only | experimental | Structured refusal that can be turned back into a corrective 402. |
+| `X402BatchSettlementServer` | interface | type-only | experimental | Runtime server handle used only by `/v1/credit`. |
+| `X402ChannelStorageOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `X402ExactAcceptance` | type | type-only | experimental | Result of accepting or recovering one exact x402 authorization. |
+| `X402ExactIntentConflictError` | class | runtime | experimental | Raised when the same on-chain authorization is presented for a different local effect. |
+| `X402ExactSettlementAttempt` | interface | type-only | experimental | Evidence recorded around one facilitator settlement call. |
+| `X402ExactSettlementChainEvidence` | interface | type-only | experimental | Chain evidence recovered for one exact x402 authorization. |
+| `X402ExactSettlementEffect` | interface | type-only | experimental | Serializable local economic effect that follows an exact settlement. |
+| `X402ExactSettlementEvidenceMissingError` | class | runtime | experimental | Raised when operator repair cannot prove the payment on chain. |
+| `X402ExactSettlementEvidenceReader` | interface | type-only | experimental | Chain boundary used by exact-settlement recovery. |
+| `X402ExactSettlementIntent` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `X402ExactSettlementNotReadyError` | class | runtime | experimental | Raised when local finalization is attempted before settlement is evidenced. |
+| `X402ExactSettlementServer` | class | runtime | experimental | Durable coordinator for irreversible exact x402 settlement. |
+| `X402ExactSettlementServerOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
+| `X402ExactSettlementStatus` | type | type-only | experimental | Exported declaration from the built public entry point. |
+| `X402ExactSettlementStore` | interface | type-only | experimental | Persistence contract for exact x402 settlement recovery. |
+| `X402RelayLockHolder` | interface | type-only | experimental | Best-effort identification of the backend holding the relay submission lock. |
+| `X402RelaySubmissionLock` | interface | type-only | experimental | Fleet-wide serialisation of the self-relay's chain submissions. |
+| `X402RelaySubmissionLockError` | class | runtime | experimental | The fleet-wide relay submission lock was still held when the wait ceiling expired. |
+| `X402SettlementChainEvidence` | interface | type-only | experimental | Exact successful chain action recovered for one ambiguous settlement attempt. |
+| `X402SettlementEvidenceReader` | interface | type-only | experimental | Chain boundary used to bookmark and reconcile irreversible x402 submissions. |
+| `X402SettlementSubmissionError` | class | runtime | experimental | The chain submission behind an accepted voucher did not return success. |
 
 ## `@dvmkit/sdk/testing`
 
 Deterministic in-memory contexts and stores for testing handlers without a live server or payment rail. Generated from `./dist/testing/index.d.ts`.
 
-| Name | Kind | Stability | Guidance |
-| --- | --- | --- | --- |
-| `createTestContext` | function | stable | Create a test-only SDKJobContext for unit testing DVM handlers. |
-| `MemoryJobStore` | class | stable | In-memory JobStore implementing the transactional + streaming surface; used by unit tests and not production-safe — there's no real concurrency control beyond JS's single-threaded execution. |
-| `RecordedMessage` | interface | stable | Recorded outbound message. |
-| `TestContextOpts` | interface | stable | Exported declaration from the built public entry point. |
-| `TestJobContext` | interface | stable | Extended SDKJobContext exposing test inspection properties. |
+| Name | Kind | Availability | Stability | Guidance |
+| --- | --- | --- | --- | --- |
+| `createTestContext` | function | runtime | stable | Create a test-only SDKJobContext for unit testing DVM handlers. |
+| `MemoryJobStore` | class | runtime | stable | In-memory JobStore implementing the transactional + streaming surface; used by unit tests and not production-safe — there's no real concurrency control beyond JS's single-threaded execution. |
+| `RecordedMessage` | interface | type-only | stable | Recorded outbound message. |
+| `TestContextOpts` | interface | type-only | stable | Exported declaration from the built public entry point. |
+| `TestJobContext` | interface | type-only | stable | Extended SDKJobContext exposing test inspection properties. |

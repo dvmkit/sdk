@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 
 import ts from "typescript";
 
-import { inspectDeclaration, publicEntryPoints, readStability } from "./api-surface.mjs";
+import { hasValueExport, inspectDeclaration, publicEntryPoints, readStability } from "./api-surface.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const outputPath = join(root, "docs", "API.md");
@@ -73,7 +73,7 @@ function describeSymbol(exported, checker) {
     ts.displayPartsToString(exported.getDocumentationComment(checker)) ||
       ts.displayPartsToString(symbol.getDocumentationComment(checker))
   );
-  return { name: exported.getName(), kind, documentation };
+  return { name: exported.getName(), kind, availability: hasValueExport(exported, checker) ? "runtime" : "type-only", documentation };
 }
 
 /** @param {string} raw */
@@ -88,7 +88,7 @@ function cleanDocumentation(raw) {
   return firstSentence.replace(/\|/gu, "\\|");
 }
 
-/** @param {{ entryPoint: string, declaration: string, symbols: { name: string, kind: string, documentation: string, stability: string }[] }[]} sections */
+/** @param {{ entryPoint: string, declaration: string, symbols: { name: string, kind: string, availability: string, documentation: string, stability: string }[] }[]} sections */
 function render(sections) {
   const count = sections.reduce((sum, section) => sum + section.symbols.length, 0);
   const lines = [
@@ -98,7 +98,7 @@ function render(sections) {
     "",
     `This reference is generated from the built TypeScript declarations and covers ${count} names across the three supported public entry points. Run \`npm run build && npm run docs:api\` to refresh it; \`npm run check:api\` rejects stale output.`,
     "",
-    "Stability levels follow the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning).",
+    "Stability levels follow the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning). Runtime exports are available as JavaScript values; type-only exports are available only to TypeScript.",
     "",
   ];
 
@@ -106,9 +106,9 @@ function render(sections) {
     const specifier = `@dvmkit/sdk${section.entryPoint === "." ? "" : section.entryPoint.slice(1)}`;
     lines.push(`## \`${specifier}\``, "");
     lines.push(`${entryPointGuidance(section.entryPoint)} Generated from \`${section.declaration}\`.`, "");
-    lines.push("| Name | Kind | Stability | Guidance |", "| --- | --- | --- | --- |");
+    lines.push("| Name | Kind | Availability | Stability | Guidance |", "| --- | --- | --- | --- | --- |");
     for (const symbol of section.symbols) {
-      lines.push(`| \`${symbol.name}\` | ${symbol.kind} | ${symbol.stability} | ${symbol.documentation} |`);
+      lines.push(`| \`${symbol.name}\` | ${symbol.kind} | ${symbol.availability} | ${symbol.stability} | ${symbol.documentation} |`);
     }
     lines.push("");
   }
