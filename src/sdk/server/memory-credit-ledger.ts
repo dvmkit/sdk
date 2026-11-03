@@ -13,6 +13,8 @@ import type {
   BitcoinDepositLiability,
   BlockedInvoiceCursor,
   CardRefundPlan,
+  CardDrainRecovery,
+  CardDrainStateArgs,
   ChannelDrainCursor,
   CreditDrainRecord,
   CreditFundingBasis,
@@ -47,6 +49,7 @@ import type {
 } from "./credit-ledger";
 import {
   allocateDrawValue,
+  assertCardDrainTransition,
   assertCardDrainMatchesRail,
   cardRefundPendingConflict,
   assertFundingBasis,
@@ -1200,7 +1203,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
       if (credit.status !== "active") throw terminalCreditError(args.creditId);
       if (args.method === "stripe") {
         const blocking = [...credit.drains.values()].find(
-          (drain) => drain.method === "stripe" && drain.status === "pending"
+          (drain) => drain.method === "stripe" && (drain.status === "pending" || drain.status === "refund_blocked")
         );
         if (blocking) throw cardRefundPendingConflict(args.creditId, blocking.drainId);
       }
@@ -1274,6 +1277,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         provenRefundNative: null,
         refundPaymentProven: false,
         cardRefund: null,
+        cardRecovery: null,
       };
       applyLotDebits(credit, drain.lotDebits, -1);
       credit.drains.set(args.drainId, drain);
@@ -1381,7 +1385,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     const out: CreditDrainRecord[] = [];
     for (const credit of this.credits.values()) {
       for (const drain of credit.drains.values()) {
-        if (drain.status === "pending" || drain.status === "exit_required") out.push(drainRecord(drain, credit));
+        if (drain.status === "pending" || drain.status === "exit_required" || drain.status === "refund_blocked") out.push(drainRecord(drain, credit));
       }
     }
     out.sort((a, b) => a.createdAt - b.createdAt || a.creditId.localeCompare(b.creditId));
@@ -1591,16 +1595,41 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     });
   }
 
+  private readonly cardRefundLocks = new Set<string>();
+
+  async withCardRefundLock<T>(creditId: string, operation: (query?: CreditLedgerQuerier) => Promise<T>): Promise<T> {
+    if (this.cardRefundLocks.has(creditId)) throw new CreditLedgerError("card_refund_busy", "Another card refund operation is in progress; retry this request.");
+    this.cardRefundLocks.add(creditId);
+    try { return await operation(); }
+    finally { this.cardRefundLocks.delete(creditId); }
+  }
+
+  async saveCardDrainState(args: CardDrainStateArgs): Promise<CreditDrainRecord> {
+    assertCardDrainTransition(args);
+    const { credit, drain } = this.requireDrain(args.creditId, args.drainId);
+    if (drain.method !== "stripe" || drain.status !== args.expectedStatus ||
+      (drain.cardRecovery?.revision ?? 0) !== args.expectedRevision) {
+      throw new CreditLedgerError("drain_decision_conflict", "The card drain changed before this decision committed.");
+    }
+    drain.status = args.status;
+    drain.cardRecovery = structuredClone(args.recovery);
+    if (args.plan !== undefined) drain.cardRefund = structuredClone(args.plan);
+    return drainRecord(drain, credit);
+  }
+
   saveCardRefund(args: {
     creditId: string;
     drainId: string;
     plan: CardRefundPlan;
     onlyIfUnset?: boolean;
+    revision?: number;
+    tx?: CreditLedgerQuerier;
   }): Promise<CardRefundPlan | null> {
     return run(() => {
       const drain = this.credits.get(args.creditId)?.drains.get(args.drainId);
       if (!drain) return null;
-      const writable = drain.method === "stripe" && drain.status === "pending";
+      const writable = drain.method === "stripe" && drain.status === "pending" &&
+        (drain.cardRecovery?.revision ?? 0) === (args.revision ?? 0);
       if (writable && !(args.onlyIfUnset && drain.cardRefund)) {
         drain.cardRefund = structuredClone(args.plan);
       }
@@ -1806,6 +1835,7 @@ interface MemoryDrain {
   provenRefundNative: string | null;
   refundPaymentProven: boolean;
   cardRefund: CardRefundPlan | null;
+  cardRecovery: CardDrainRecovery | null;
 }
 
 interface MemoryDraw {
@@ -2018,6 +2048,7 @@ function drainRecord(drain: MemoryDrain, credit: MemoryCredit): CreditDrainRecor
     provenRefundNative: drain.provenRefundNative,
     refundPaymentProven: drain.refundPaymentProven,
     cardRefund: drain.cardRefund ? structuredClone(drain.cardRefund) : null,
+    cardRecovery: drain.cardRecovery ? structuredClone(drain.cardRecovery) : null,
   };
 }
 

@@ -7,6 +7,8 @@ import { Hono } from "hono";
 import { Credential } from "mppx";
 import { describe, expect, it, vi } from "vitest";
 
+import { runCardRefundSweep } from "../card-refund-sweep";
+import { runStripeDrain } from "../stripe-drain-leg";
 import { buildAdminChallenge } from "../admin-cashu";
 import { installAdminCreditRoutes } from "../admin-credit";
 import type { CardChargeJournal } from "../card-charge-journal";
@@ -39,6 +41,8 @@ const fixture = JSON.parse(
   fee_example: Record<string, number>;
   sent: Exchange;
   pending: Exchange;
+  blocked: Exchange;
+  written_off: Exchange;
   refusals: Record<
     "card_credit_other_method" | "stripe_for_non_card_credit" | "stripe_with_payout" | "closed_card_credit",
     Exchange
@@ -557,4 +561,341 @@ describe("the operator's view of a pending card refund", () => {
     const booked = await ledger.getDrain({ creditId, drainId: "refund-1" });
     expect(booked?.sentRef).not.toHaveProperty("by");
   });
+
+  function decide(admin: Hono, action: "close" | "replan", creditId: string, decisionId = "decision-1", reason = "Reviewed refund evidence") {
+    const path = `/admin/credit/${action}-card-drain`;
+    return admin.request(path, { method: "POST", headers: {
+      "Content-Type": "application/json", Authorization: signAuth("POST", path),
+    }, body: JSON.stringify({ credit_id: creditId, drain_id: "refund-1", decision_id: decisionId, reason }) });
+  }
+
+  it.each([
+    ["exhausted", "charges_exhausted"], ["nonrefundable", "charge_not_refundable"],
+  ])("blocks a %s charge and leaves it visible as an unpaid liability", async (kind, code) => {
+    const account = fakeStripeAccount();
+    const { app, ledger, creditId } = await fundedCard(account, { fundId: kind, amountMicro: 2_000_000, drawnMicro: 300_000 });
+    const intent = account.intents.get("pi_test_1")!;
+    if (kind === "exhausted") intent.refunded = intent.amount;
+    else intent.status = "canceled";
+    const blocked = await (await cardDrain(app, creditId)).json();
+    if (kind === "exhausted") expect(blocked).toMatchObject(fixture.blocked.body);
+    expect(blocked.drain).toMatchObject({ status: "refund_blocked", card_refund: { recovery: { blocked_reason: code } } });
+    const calls = account.calls.length;
+    await cardDrain(app, creditId);
+    await runCardRefundSweep({ ledger, stripe: createStripeRefundApi({ secretKey: "sk_test_fake", fetch: account.fetchImpl }), drainReport: {} });
+    expect(account.calls).toHaveLength(calls);
+    expect(await ledger.listPendingDrains()).toEqual([expect.objectContaining({ status: "refund_blocked", amountMicro: 1_700_000 })]);
+    await expect(ledger.requestDrain({ creditId, drainId: "second", callerPubkey: CALLER, method: "stripe", payout: {} }))
+      .rejects.toMatchObject({ code: "drain_conflict" });
+    const admin = adminApp(ledger, account);
+    const listed = await admin.request("/admin/credit/pending-drains", { headers: { Authorization: signAuth("GET", "/admin/credit/pending-drains") } });
+    expect(await listed.json()).toMatchObject({ drains: [{ status: "refund_blocked" }], liability: { card_micro: 1_700_000 } });
+    const closed = await decide(admin, "close", creditId);
+    expect(closed.status).toBe(200);
+    expect(await closed.json()).toMatchObject({ status: "written_off", replayed: false,
+      card_refund: { recovery: { writtenOffMicro: 1_700_000, refundedGrossMicro: 0, decisions: [{ reason: "Reviewed refund evidence" }] } } });
+    expect(await ledger.listPendingDrains()).toEqual([]);
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(0);
+    expect(await (await decide(admin, "close", creditId)).json()).toMatchObject({ status: "written_off", replayed: true });
+    expect((await decide(admin, "close", creditId, "decision-1", "Changed decision")).status).toBe(409);
+    expect(await (await cardDrain(app, creditId)).json()).toMatchObject(fixture.written_off.body);
+    expect(refundCreates(account)).toHaveLength(0);
+  });
+
+  async function partiallyBlocked(account: FakeStripeAccount, firstStatus = "succeeded", loseResponse = false) {
+    const { app, ledger } = await cardServer({ stripe: account });
+    for (const [index, pi] of ["pi_first", "pi_second"].entries()) {
+      account.seedIntent({ id: pi, amount: 200 });
+      await ledger.fund({ creditId: "partial", callerPubkey: CALLER, currency: "usd", amountMicro: 2_000_000,
+        expiryMs: Date.now() + DAY_MS, nowMs: Date.now() - 1000 + index,
+        basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 200, fundingRef: pi } });
+    }
+    await drawAndSettle(ledger, "partial", 1_000_000);
+    // First establish the fixed plan with two definite refusals, then let one refund pay
+    // while a dashboard refund makes the second allocation too large.
+    account.control.rejectRefunds = 2;
+    await cardDrain(app, "partial");
+    account.intents.get("pi_second")!.refunded = 150;
+    account.control.refundStatus = firstStatus === "lost" ? "succeeded" : firstStatus;
+    if (firstStatus === "lost" || loseResponse) account.control.loseRefundResponses = 1;
+    expect((await (await cardDrain(app, "partial")).json()).drain.status).toBe("refund_blocked");
+    return { app, ledger, admin: adminApp(ledger, account) };
+  }
+
+  it("writes off only the unpaid gross remainder after a partial card refund", async () => {
+    const account = fakeStripeAccount();
+    const { ledger, admin } = await partiallyBlocked(account);
+    const before = refundCreates(account).length;
+    expect(await (await decide(admin, "close", "partial")).json()).toMatchObject({ status: "written_off",
+      card_refund: { refunded_cents: 164, fee_share_cents: 36, recovery: { refundedGrossMicro: 2_000_000, writtenOffMicro: 1_000_000 } } });
+    const record = await ledger.getDrain({ creditId: "partial", drainId: "refund-1" });
+    expect(record?.cardRefund?.entries[0]).toMatchObject({ status: "succeeded", grossCents: 200, amountCents: 164 });
+    expect(record?.sentRef).toBeNull();
+    expect(record?.receipts).not.toContainEqual(expect.objectContaining({ event: "sent" }));
+    expect(refundCreates(account)).toHaveLength(before);
+    expect((await ledger.get("partial"))?.balanceMicro).toBe(0);
+  });
+
+  it("replans only unpaid credit and retains the successful allocation and its fee", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, admin } = await partiallyBlocked(account);
+    account.seedIntent({ id: "pi_extra", amount: 100 });
+    await ledger.fund({ creditId: "partial", callerPubkey: CALLER, currency: "usd", amountMicro: 1_000_000,
+      expiryMs: Date.now() + DAY_MS, basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 100, fundingRef: "pi_extra" } });
+    const response = await decide(admin, "replan", "partial");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "sent", replayed: false, card_refund: { recovery: { revision: 1 } } });
+    const record = await ledger.getDrain({ creditId: "partial", drainId: "refund-1" });
+    expect(record?.cardRefund?.entries.map((entry) => [entry.paymentIntentId, entry.grossCents, entry.status])).toEqual([
+      ["pi_first", 200, "succeeded"], ["pi_second", 50, "succeeded"], ["pi_extra", 50, "succeeded"],
+    ]);
+    expect([...account.refunds.values()].filter((refund) => refund.payment_intent === "pi_first")).toHaveLength(1);
+    const creates = refundCreates(account).length;
+    expect(await (await decide(admin, "replan", "partial")).json()).toMatchObject({ status: "sent", replayed: true });
+    await cardDrain(app, "partial");
+    expect(refundCreates(account)).toHaveLength(creates);
+    expect((await ledger.get("partial"))?.balanceMicro).toBe(1_000_000);
+    expect(new Set(refundCreates(account).map((call) => call.idempotencyKey)).size).toBe(refundCreates(account).length);
+  });
+
+  it.each(["close", "replan"] as const)("refuses to %s while another refund may still pay", async (action) => {
+    const account = fakeStripeAccount();
+    const { ledger, admin } = await partiallyBlocked(account, "pending");
+    const creates = refundCreates(account).length;
+    expect(await (await decide(admin, action, "partial")).json()).toMatchObject({ error: "card_refund_uncertain" });
+    expect((await ledger.getDrain({ creditId: "partial", drainId: "refund-1" }))?.status).toBe("refund_blocked");
+    expect(refundCreates(account)).toHaveLength(creates);
+    for (const refund of account.refunds.values()) refund.status = "succeeded";
+    if (action === "close") expect(await (await decide(admin, action, "partial")).json()).toMatchObject({
+      status: "written_off", card_refund: { recovery: { writtenOffMicro: 1_000_000 } },
+    });
+  });
+
+  const terminalRecoveryCases = (["pending", "requires_action", "planned"] as const).flatMap((initial) =>
+    (["failed", "canceled"] as const).flatMap((outcome) =>
+      (["close", "replan"] as const).map((action) => ({ initial, outcome, action }))));
+
+  it.each(terminalRecoveryCases)("allows $action after a $initial refund becomes $outcome", async ({ initial, outcome, action }) => {
+    const account = fakeStripeAccount();
+    const { ledger, admin } = await partiallyBlocked(account, initial === "planned" ? "pending" : initial, initial === "planned");
+    const refund = [...account.refunds.values()][0]!;
+    refund.status = outcome;
+    account.intents.get("pi_first")!.refunded = 0;
+    const creates = refundCreates(account).length;
+    if (action === "replan") {
+      account.seedIntent({ id: "pi_recovery", amount: 100 });
+      await ledger.fund({ creditId: "partial", callerPubkey: CALLER, currency: "usd", amountMicro: 1_000_000,
+        expiryMs: Date.now() + DAY_MS, basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 100, fundingRef: "pi_recovery" } });
+      account.control.refundStatus = "succeeded";
+    }
+    const response = await decide(admin, action, "partial");
+    expect(response.status).toBe(200);
+    if (action === "close") {
+      expect(await response.json()).toMatchObject({ status: "written_off", replayed: false,
+        card_refund: { refunded_cents: 0, recovery: { refundedGrossMicro: 0, writtenOffMicro: 3_000_000 } } });
+      expect(refundCreates(account)).toHaveLength(creates);
+      expect((await ledger.get("partial"))?.balanceMicro).toBe(0);
+    } else {
+      expect(await response.json()).toMatchObject({ status: "sent", replayed: false,
+        card_refund: { refunded_cents: 238, recovery: { revision: 1 } } });
+      expect(refundCreates(account)).toHaveLength(creates + 3);
+      expect((await ledger.get("partial"))?.balanceMicro).toBe(1_000_000);
+    }
+    const after = refundCreates(account).length;
+    expect(await (await decide(admin, action, "partial")).json()).toMatchObject({ replayed: true });
+    expect(refundCreates(account)).toHaveLength(after);
+  });
+
+  it.each(["failed", "canceled"])("recovers a %s refund by id when it is absent from the listing", async (outcome) => {
+    const account = fakeStripeAccount();
+    const { ledger } = await partiallyBlocked(account, "pending");
+    const refund = [...account.refunds.values()][0]!;
+    refund.status = outcome;
+    const listingWithoutCurrent = { ...account, fetchImpl: (async (input, init) => {
+      const url = new URL(String(input));
+      const response = await account.fetchImpl(input, init);
+      if (url.pathname !== "/v1/refunds" || (init?.method ?? "GET") !== "GET") return response;
+      const body = await response.json();
+      return Response.json({ ...body, data: body.data.filter((item: { id: string }) => item.id !== refund.id) });
+    }) as typeof fetch };
+    const creates = refundCreates(account).length;
+    const response = await decide(adminApp(ledger, listingWithoutCurrent), "close", "partial");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "written_off", card_refund: { recovery: { writtenOffMicro: 3_000_000 } } });
+    expect(account.calls).toContainEqual(expect.objectContaining({ method: "GET", path: `/v1/refunds/${refund.id}` }));
+    expect(refundCreates(account)).toHaveLength(creates);
+  });
+
+  it.each(["close", "replan"] as const)("refuses to %s when only an older attempt has a failed refund", async (action) => {
+    const account = fakeStripeAccount();
+    const { ledger, admin } = await partiallyBlocked(account, "pending", true);
+    const refund = [...account.refunds.values()][0]!;
+    refund.status = "failed";
+    refund.metadata.dvmkit_attempt = "1";
+    const creates = refundCreates(account).length;
+    const response = await decide(admin, action, "partial");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "card_refund_uncertain" });
+    expect(await ledger.getDrain({ creditId: "partial", drainId: "refund-1" })).toMatchObject({
+      status: "refund_blocked", cardRecovery: { decisions: [] },
+    });
+    expect(refundCreates(account)).toHaveLength(creates);
+    expect((await ledger.get("partial"))?.balanceMicro).toBe(0);
+  });
+
+  it("blocks a dispute lost after planning but keeps an open dispute retryable", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, creditId } = await fundedCard(account, { fundId: "lost-dispute", amountMicro: 2_000_000, drawnMicro: 300_000 });
+    account.control.rejectRefunds = 1;
+    await cardDrain(app, creditId);
+    account.dispute("pi_test_1");
+    expect((await (await cardDrain(app, creditId)).json()).drain.status).toBe("pending");
+    account.settleDisputes("pi_test_1", "lost");
+    expect((await (await cardDrain(app, creditId)).json()).drain).toMatchObject({ status: "refund_blocked",
+      card_refund: { recovery: { blocked_reason: "charge_dispute_lost" } } });
+    const calls = account.calls.length;
+    await cardDrain(app, creditId);
+    expect(account.calls).toHaveLength(calls);
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(0);
+  });
+
+  it("requires admin authentication and a reason before any recovery side effect", async () => {
+    const account = fakeStripeAccount();
+    const { ledger, creditId } = await fundedCard(account, { fundId: "auth-recovery", amountMicro: 2_000_000, drawnMicro: 0 });
+    const admin = adminApp(ledger, account);
+    const calls = account.calls.length;
+    for (const action of ["close", "replan"] as const) {
+      expect((await admin.request(`/admin/credit/${action}-card-drain`, { method: "POST", body: "{}" })).status).toBe(401);
+      expect((await decide(admin, action, creditId, "decision", " ")).status).toBe(400);
+    }
+    expect(account.calls).toHaveLength(calls);
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(2_000_000);
+  });
+
+  it("retries a fresh drain behind 201 blocked drains in one sweep pass", async () => {
+    const account = fakeStripeAccount();
+    const { ledger } = await cardServer({ stripe: account });
+    const stripe = createStripeRefundApi({ secretKey: "sk_test_fake", fetch: account.fetchImpl });
+    const deps = { ledger, stripe, drainReport: {} };
+    for (let index = 0; index < 202; index++) {
+      const creditId = `page-${index}`;
+      const pi = `pi_page_${index}`;
+      account.seedIntent({ id: pi, amount: 100, refunded: index < 201 ? 100 : 0 });
+      await ledger.fund({ creditId, callerPubkey: CALLER, currency: "usd", amountMicro: 1_000_000,
+        expiryMs: Date.now() + DAY_MS, basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 100, fundingRef: pi } });
+      const { drain: record } = await ledger.requestDrain({ creditId, drainId: "refund", callerPubkey: CALLER, method: "stripe", payout: {} });
+      if (index < 201) await runStripeDrain(deps, record);
+    }
+    const calls = account.calls.length;
+    const pass = await runCardRefundSweep(deps);
+    expect(pass.completed).toEqual(["page-201:refund"]);
+    expect(pass.pending).toEqual([]);
+    expect(account.calls.slice(calls).filter((call) => call.path.startsWith("/v1/payment_intents/"))
+      .every((call) => call.path.endsWith("pi_page_201"))).toBe(true);
+    expect([...account.refunds.values()].map((refund) => [refund.payment_intent, refund.amount])).toEqual([["pi_page_201", 67]]);
+    const after = account.calls.length;
+    await runCardRefundSweep(deps);
+    expect(account.calls).toHaveLength(after);
+  });
+
+
+  it("resumes a replan interrupted before its replacement plan is stored", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, admin } = await partiallyBlocked(account);
+    account.intents.get("pi_second")!.refunded = 0;
+    const save = vi.spyOn(ledger, "saveCardRefund").mockRejectedValueOnce(new Error("storage unavailable"));
+    const interrupted = await decide(admin, "replan", "partial");
+    expect(await interrupted.json()).toMatchObject({ status: "pending", card_refund: { recovery: { revision: 1 } } });
+    save.mockRestore();
+    const before = await ledger.getDrain({ creditId: "partial", drainId: "refund-1" });
+    expect(before?.cardRefund?.entries).toHaveLength(1);
+    const completed = await (await cardDrain(app, "partial")).json();
+    expect(completed.drain.status).toBe("sent");
+    expect([...account.refunds.values()].map((refund) => [refund.payment_intent, refund.amount])).toEqual([
+      ["pi_first", 164], ["pi_second", 82],
+    ]);
+  });
+
+  it("books a newly completed refund instead of writing off a paid drain", async () => {
+    const account = fakeStripeAccount();
+    const { ledger, admin } = await partiallyBlocked(account, "pending");
+    const held = (await ledger.getDrain({ creditId: "partial", drainId: "refund-1" }))!;
+    const rejected = held.cardRefund!.entries[1]!;
+    account.intents.get("pi_second")!.refunded = 0;
+    const stripe = createStripeRefundApi({ secretKey: "sk_test_fake", fetch: account.fetchImpl });
+    await stripe.createRefund({ paymentIntentId: "pi_second", amount: 82, idempotencyKey: "external-recovery",
+      metadata: { dvmkit_drain: "partial:refund-1", dvmkit_lot: rejected.lotId, dvmkit_revision: "0" } });
+    for (const refund of account.refunds.values()) refund.status = "succeeded";
+    expect(await (await decide(admin, "close", "partial")).json()).toMatchObject({ status: "sent",
+      card_refund: { recovery: { writtenOffMicro: 0 } } });
+    expect((await ledger.getDrain({ creditId: "partial", drainId: "refund-1" }))?.sentRef).toMatchObject({ refunded_cents: 246 });
+  });
+
+
+  it("parks a lost dispute even while an existing refund is processing", async () => {
+    const account = fakeStripeAccount();
+    const { app, creditId } = await fundedCard(account, { fundId: "pending-dispute", amountMicro: 2_000_000, drawnMicro: 0 });
+    account.control.refundStatus = "pending";
+    expect((await (await cardDrain(app, creditId)).json()).drain.status).toBe("pending");
+    account.dispute("pi_test_1", "lost");
+    expect((await (await cardDrain(app, creditId)).json()).drain).toMatchObject({ status: "refund_blocked",
+      card_refund: { recovery: { blocked_reason: "charge_dispute_lost" } } });
+    const calls = account.calls.length;
+    await cardDrain(app, creditId);
+    expect(account.calls).toHaveLength(calls);
+  });
+
+
+  it("answers a competing caller with a retryable conflict before any Stripe call", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, creditId } = await fundedCard(account, { fundId: "busy-refund", amountMicro: 2_000_000, drawnMicro: 0 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls = account.calls.length;
+    const lock = ledger.withCardRefundLock!(creditId, async () => { await gate; });
+    try {
+      const response = await cardDrain(app, creditId);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: "card_refund_busy", retryable: true, drain_registered: true, drain_id: "refund-1" });
+      expect(account.calls).toHaveLength(calls);
+    } finally { release(); await lock; }
+    expect((await (await cardDrain(app, creditId)).json()).drain.status).toBe("sent");
+    expect(account.refunds.size).toBe(1);
+  });
+
+
+  it("recovers a lost response after a rejected attempt from a later refund-history page", async () => {
+    const account = fakeStripeAccount();
+    const { ledger } = await partiallyBlocked(account, "lost");
+    const before = await ledger.getDrain({ creditId: "partial", drainId: "refund-1" });
+    expect(before?.cardRefund?.entries[0]).toMatchObject({ status: "planned", lastError: "stripe_unreachable", refundId: null });
+    const paged = { ...account, fetchImpl: (async (input, init) => {
+      const url = new URL(String(input));
+      const response = await account.fetchImpl(input, init);
+      if (url.pathname !== "/v1/refunds" || (init?.method ?? "GET") !== "GET") return response;
+      const body = await response.json();
+      if (url.searchParams.has("starting_after")) return Response.json({ ...body, has_more: false });
+      return Response.json({ has_more: true, data: [{ id: "re_unrelated", amount: 1, status: "succeeded", metadata: {} }] });
+    }) as typeof fetch };
+    const creates = refundCreates(account).length;
+    expect(await (await decide(adminApp(ledger, paged), "close", "partial")).json()).toMatchObject({ status: "written_off",
+      card_refund: { refunded_cents: 164, recovery: { refundedGrossMicro: 2_000_000, writtenOffMicro: 1_000_000 } } });
+    expect(refundCreates(account)).toHaveLength(creates);
+    expect(account.refunds.size).toBe(1);
+  });
+
+
+  it("replans against another refundable charge when an older charge is permanently unavailable", async () => {
+    const account = fakeStripeAccount();
+    const { app, ledger, creditId } = await fundedCard(account, { fundId: "alternate-charge", amountMicro: 2_000_000, drawnMicro: 0 });
+    account.intents.get("pi_test_1")!.status = "canceled";
+    expect((await (await cardDrain(app, creditId)).json()).drain.status).toBe("refund_blocked");
+    account.seedIntent({ id: "pi_alternate", amount: 200 });
+    await ledger.fund({ creditId, callerPubkey: CALLER, currency: "usd", amountMicro: 2_000_000,
+      expiryMs: Date.now() + DAY_MS, basis: { rail: "stripe", paidMsats: 0, nativeAsset: "usd-cents", nativeAmount: 200, fundingRef: "pi_alternate" } });
+    expect(await (await decide(adminApp(ledger, account), "replan", creditId)).json()).toMatchObject({ status: "sent" });
+    expect([...account.refunds.values()].map((refund) => [refund.payment_intent, refund.amount])).toEqual([["pi_alternate", 164]]);
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(2_000_000);
+  });
+
 });

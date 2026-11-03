@@ -27,6 +27,14 @@
     "JobRecord.pieces": {
       "ownership": "written from the snapshot only on insert; afterwards only the transactional paths change it, and the first terminal write ends the running piece and freezes JobRecord.settlement",
       "customStores": "a store that saves the terminal snapshot as given keeps the settlement the SDK froze on it from the job's pieces; a draw with pieces but no frozen settlement is settled from those pieces and the snapshot's ending"
+    },
+    "CreditLedgerLike.cardRecovery": {
+      "methods": [
+        "withCardRefundLock",
+        "saveCardDrainState",
+        "saveCardRefund"
+      ],
+      "behavior": "Required for card refunds; serialize refund/recovery per credit across machines, honor the callback query connection, persist plans and submission attempts before external calls, and compare expected state/revision. Missing entry revisions mean zero and retain legacy idempotency keys."
     }
   },
   "wireContracts": {
@@ -84,7 +92,7 @@
         "credit.refund_drain_id"
       ],
       "unit": "integer USD micro-units for the drained credit; integer cents for refunds and the fee share",
-      "behavior": "POST /v1/credit drain with method stripe and no payout refunds card-funded credit to the card as partial refunds of the funding PaymentIntents, oldest first, less the refund's proportional share of Stripe's processing fee; card credit drains on no other method and stripe drains no other credit; a refund Stripe does not finish leaves the drain pending and a poll retries it; an expired card balance is refunded the same way and the credit closes (credit_closed)"
+      "behavior": "POST /v1/credit drain with method stripe and no payout refunds card-funded credit to the card as partial refunds of the funding PaymentIntents, oldest first, less the refund's proportional share of Stripe's processing fee; card credit drains on no other method and stripe drains no other credit; a refund Stripe does not finish leaves the drain pending and a poll retries it; an expired card balance is refunded the same way and the credit closes (credit_closed); terminal refusals enter refund_blocked and are excluded before the retry limit; signed close-card-drain writes off only unpaid credit, while replan-card-drain retains successes and immediately replans the remainder under a new revision; decisions require a reason and replay by decision_id; uncertain or still-processing refunds refuse recovery; written_off is terminal and does not represent a successful refund"
     },
     "paymentInProgress": {
       "fixture": "protocol-fixtures/payment-in-progress-v1.json",
@@ -224,6 +232,9 @@
         "CanonicalEnvelope",
         "CardChargeAttempt",
         "CardChargeJournal",
+        "CardDrainDecision",
+        "CardDrainRecovery",
+        "CardDrainStateArgs",
         "ClientCompatibility",
         "ClientCompatibilityEnv",
         "ClientCompatibilityGate",

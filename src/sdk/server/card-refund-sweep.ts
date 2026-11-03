@@ -15,8 +15,8 @@ import type { StripeRefundApi } from "./stripe-refund-api";
  *    credit is unfrozen and refundable again.
  * 2. Expiry: an expired card credit's balance becomes a refund to the card and the credit
  *    closes. It is never released to the builder.
- * 3. Retry: every pending card refund is advanced (Stripe still processing, rejected,
- *    unreachable).
+ * 3. Retry: advance pending card refunds. Terminal refusals become `refund_blocked`
+ *    and leave the retry page until an operator resolves them.
  * 4. Stranded charges: a charge this DVM attempted, that Stripe completed, but that no credit
  *    booked, is refunded in full.
  *
@@ -39,6 +39,7 @@ export interface CardRefundSweepResult {
   expiryRefunds: string[];
   completed: string[];
   pending: string[];
+  blocked: string[];
   strandedRefunds: string[];
   /** Steps that threw, by name; the rest of the pass still ran. */
   failedSteps: string[];
@@ -80,6 +81,7 @@ export async function runCardRefundSweep(
     expiryRefunds: [],
     completed: [],
     pending: [],
+    blocked: [],
     strandedRefunds: [],
     failedSteps: [],
   };
@@ -121,7 +123,7 @@ export async function runCardRefundSweep(
     for (const drain of pending.slice(0, limit)) {
       try {
         const { drain: after } = await runStripeDrain(legDeps, drain);
-        (after.status === "sent" ? result.completed : result.pending).push(
+        (after.status === "sent" ? result.completed : after.status === "refund_blocked" ? result.blocked : result.pending).push(
           `${drain.creditId}:${drain.drainId}`
         );
       } catch {
@@ -162,6 +164,7 @@ export function startCardRefundSweep(
           summary.expiryRefunds.length +
           summary.completed.length +
           summary.pending.length +
+          summary.blocked.length +
           summary.strandedRefunds.length;
         if (moved === 0) return;
         diagnosticConsole.log({
@@ -171,6 +174,7 @@ export function startCardRefundSweep(
           expiry_refunds: summary.expiryRefunds.length,
           completed: summary.completed.length,
           pending: summary.pending.length,
+          blocked: summary.blocked.length,
           stranded_refunds: summary.strandedRefunds.length,
         });
       })

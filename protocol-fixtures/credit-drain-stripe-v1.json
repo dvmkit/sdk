@@ -4,7 +4,10 @@
   "drain_request": {
     "op": "drain",
     "credit_id": "<card-funded credit>",
-    "drain": { "drain_id": "refund-1", "method": "stripe" }
+    "drain": {
+      "drain_id": "refund-1",
+      "method": "stripe"
+    }
   },
   "fee_example": {
     "charged_cents": 200,
@@ -36,33 +39,145 @@
           "sub_cent_micro": 0
         }
       },
-      "credit": { "balance_micro": 0, "remaining_micro": 0 }
+      "credit": {
+        "balance_micro": 0,
+        "remaining_micro": 0
+      }
     }
   },
   "pending": {
     "status": 200,
     "body": {
       "op": "drain",
-      "drain": { "method": "stripe", "status": "pending", "amount_micro": 1700000 },
-      "credit": { "balance_micro": 0 }
+      "drain": {
+        "method": "stripe",
+        "status": "pending",
+        "amount_micro": 1700000
+      },
+      "credit": {
+        "balance_micro": 0
+      }
     }
   },
   "refusals": {
     "card_credit_other_method": {
       "status": 409,
-      "body": { "error": "card_credit_not_drainable", "retryable": false }
+      "body": {
+        "error": "card_credit_not_drainable",
+        "retryable": false
+      }
     },
     "stripe_for_non_card_credit": {
       "status": 409,
-      "body": { "error": "invalid_request", "retryable": false }
+      "body": {
+        "error": "invalid_request",
+        "retryable": false
+      }
     },
     "stripe_with_payout": {
       "status": 400,
-      "body": { "error": "invalid_request" }
+      "body": {
+        "error": "invalid_request"
+      }
     },
     "closed_card_credit": {
       "status": 409,
-      "body": { "error": "credit_closed", "retryable": false }
+      "body": {
+        "error": "credit_closed",
+        "retryable": false
+      }
     }
+  },
+  "blocked": {
+    "status": 200,
+    "body": {
+      "op": "drain",
+      "drain": {
+        "method": "stripe",
+        "status": "refund_blocked",
+        "amount_micro": 1700000,
+        "card_refund": {
+          "recovery": {
+            "blocked_reason": "charges_exhausted"
+          }
+        }
+      },
+      "credit": {
+        "balance_micro": 0
+      }
+    }
+  },
+  "written_off": {
+    "status": 200,
+    "body": {
+      "op": "drain",
+      "drain": {
+        "method": "stripe",
+        "status": "written_off",
+        "amount_micro": 1700000,
+        "card_refund": {
+          "recovery": {
+            "refunded_gross_micro": 0,
+            "written_off_micro": 1700000
+          }
+        }
+      },
+      "credit": {
+        "balance_micro": 0
+      }
+    }
+  },
+  "operator_recovery": {
+    "close": {
+      "path": "/admin/credit/close-card-drain",
+      "request": {
+        "credit_id": "example-card-credit",
+        "drain_id": "refund-1",
+        "decision_id": "close-1",
+        "reason": "The charge cannot be refunded"
+      },
+      "response": {
+        "status": "written_off",
+        "replayed": false,
+        "card_refund": {
+          "recovery": {
+            "revision": 0,
+            "refundedGrossMicro": 0,
+            "writtenOffMicro": 1700000
+          }
+        }
+      }
+    },
+    "replan": {
+      "path": "/admin/credit/replan-card-drain",
+      "request": {
+        "credit_id": "example-card-credit",
+        "drain_id": "refund-1",
+        "decision_id": "replan-1",
+        "reason": "Refund capacity repaired"
+      },
+      "response": {
+        "status": "sent",
+        "replayed": false,
+        "card_refund": {
+          "recovery": {
+            "revision": 1
+          }
+        }
+      }
+    },
+    "uncertain": {
+      "status": 409,
+      "body": {
+        "error": "card_refund_uncertain"
+      }
+    },
+    "busy": {
+      "status": 409,
+      "body": {
+        "error": "card_refund_busy"
+      }
+    },
+    "semantics": "Both operations require signed admin authentication and a reason. Repeating a decision_id with the same action and trimmed reason returns replayed=true without another replan. Reusing it for a different action or reason returns 409 drain_decision_conflict. Replan retains successful entries and reserves the debit; closure writes off only the unpaid remainder. A newly observed complete refund is booked sent instead of written off. Unknown or still-processing refunds refuse either decision."
   }
 }

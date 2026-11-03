@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Terminally refused card refunds now enter `refund_blocked` and stop consuming sweep retry slots. Signed admin routes `close-card-drain` and `replan-card-drain` require a decision id and reason; closing records the unpaid remainder as `written_off`, while replanning retains successful refunds and immediately retries only the remainder. Unknown or processing refunds refuse recovery. Postgres adds nullable `credit_drains.card_recovery`; the financial export retains structured refund/write-off amounts without operator free text. Custom card ledgers must implement serialized recovery and honor the supplied query connection. Clients must handle the two new drain states; see `protocol-fixtures/credit-drain-stripe-v1.json`.
+
 - Caller-side credit parsing now preserves the card funding profile, minimum, and USD currency. Malformed `stripe` blocks reject the terms or menu, matching Tempo and x402 validation; unknown fields remain stripped. Operating guidance states Link's supported payer regions.
 
 - Card-credit PaymentIntents now include server-owned Stripe metadata `dvmkit_dvm_id` from the server's canonical identity (falling back to its DVM id), including declined confirmations. Environment-created and explicit rails share this behavior; standalone servers without identity omit the field. `StripeCreditRail.charge` accepts optional server-side `canonicalDvmId`. A Stripe parameter mismatch triggers one retry without the new metadata under the same idempotency key, preserving recovery of pre-upgrade charges; existing PaymentIntents keep their original metadata. MPP challenge and idempotency formats are unchanged; no storage migration is required. See `protocol-fixtures/credit-fund-stripe-v1.json`.

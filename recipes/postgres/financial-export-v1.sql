@@ -59,6 +59,23 @@ CREATE OR REPLACE FUNCTION pg_temp.drain_decision_v1(value jsonb) RETURNS jsonb 
     || CASE WHEN value->>'source'='operator' THEN jsonb_build_object('source','operator') ELSE '{}'::jsonb END
     || CASE WHEN value->>'decision' IN ('book_refunded','release') THEN jsonb_build_object('decision',value->'decision') ELSE '{}'::jsonb END
 $$;
+CREATE OR REPLACE FUNCTION pg_temp.card_recovery_v1(value jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT pg_temp.scalars_v1(value, ARRAY[]::text[], ARRAY['revision','blockedAt','refundedGrossMicro','writtenOffMicro'])
+    || CASE WHEN value->>'blockedReason' IN ('charges_exhausted','charge_not_refundable','amount_too_large','charge_already_refunded','charge_dispute_lost')
+      THEN jsonb_build_object('blockedReason',value->'blockedReason') ELSE '{}'::jsonb END
+    || jsonb_build_object('decisions', (SELECT COALESCE(jsonb_agg(
+      pg_temp.scalars_v1(item, ARRAY[]::text[], ARRAY['decidedAt'])
+      || CASE WHEN item->>'action' IN ('close','replan') THEN jsonb_build_object('action',item->'action') ELSE '{}'::jsonb END), '[]'::jsonb)
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(value->'decisions')='array' THEN value->'decisions' ELSE '[]'::jsonb END) item))
+$$;
+CREATE OR REPLACE FUNCTION pg_temp.card_refund_v1(value jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT pg_temp.scalars_v1(value, ARRAY[]::text[], ARRAY['grossCents','subCentMicro'])
+    || jsonb_build_object('entries', (SELECT COALESCE(jsonb_agg(
+      pg_temp.scalars_v1(item, ARRAY[]::text[], ARRAY['grossCents','feeShareCents','amountCents','attempt','revision'])
+      || CASE WHEN item->>'status' IN ('planned','pending','requires_action','succeeded','failed','canceled','rejected')
+        THEN jsonb_build_object('status',item->'status') ELSE '{}'::jsonb END), '[]'::jsonb)
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(value->'entries')='array' THEN value->'entries' ELSE '[]'::jsonb END) item))
+$$;
 CREATE OR REPLACE FUNCTION pg_temp.settlement_v1(value jsonb) RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
   SELECT pg_temp.scalars_v1(value,
     ARRAY['tx_hash','transaction','channel_id','network','repair_kind','payer'],
@@ -111,6 +128,8 @@ BEGIN
       CASE WHEN key=ANY(ARRAY[''sent_ref'',''settle_response'']) THEN pg_temp.settlement_v1(value)
            WHEN key=ANY(ARRAY[''proven_refund_native'',''refunded_to_payer_native'',''loss_native'']) THEN CASE WHEN value #>> ''{}'' ~ ''^[0-9]+$'' THEN to_jsonb(value #>> ''{}'') ELSE NULL END
            WHEN key=''loss_basis'' THEN CASE WHEN value #>> ''{}'' IN (''cooperative_close'',''payer_exit'',''caller_asserted'') THEN value ELSE NULL END
+           WHEN key=''card_recovery'' THEN pg_temp.card_recovery_v1(value)
+           WHEN key=''card_refund'' THEN pg_temp.card_refund_v1(value)
            WHEN key=''operator_decision'' THEN pg_temp.drain_decision_v1(value)
            WHEN key=''result'' THEN pg_temp.draw_refund_result_v1(value)
            WHEN key=''fulfilment'' THEN pg_temp.fulfilment_v1(value)
@@ -135,7 +154,7 @@ SELECT jsonb_build_object(
   'funding_lots', pg_temp.financial_rows_v1('credit_funding_lots', ARRAY['lot_id','credit_id','rail','sats_funded','sats_basis_known','credited_micro','remaining_micro','funding_ref','created_at']),
   'draws', pg_temp.financial_rows_v1('credit_draws', ARRAY['credit_id','draw_id','job_id','amount_micro','ledger_seq','status','balance_after_micro','created_at','resolved_at','draw_msats','allocated_msats','settled_sats','refund_dvm_id','draw_native','grown_micro']),
   'draw_refunds', pg_temp.financial_rows_v1('credit_draw_refunds', ARRAY['refund_id','credit_id','draw_id','amount_micro','restored_sats','result']),
-  'drains', pg_temp.financial_rows_v1('credit_drains', ARRAY['credit_id','drain_id','method','amount_micro','balance_after_micro','drained_msats','drained_native','owed_sats','ledger_seq','status','receipts','sent_ref','fulfilment','lot_debits','created_at','parked_at','picked_up_at','sent_at','released_at','written_off_at','operator_decision','hold_reason','proven_refund_native','refund_payment_proven']),
+  'drains', pg_temp.financial_rows_v1('credit_drains', ARRAY['credit_id','drain_id','method','amount_micro','balance_after_micro','drained_msats','drained_native','owed_sats','ledger_seq','status','receipts','sent_ref','fulfilment','lot_debits','created_at','parked_at','picked_up_at','sent_at','released_at','written_off_at','card_recovery','card_refund','operator_decision','hold_reason','proven_refund_native','refund_payment_proven']),
   'invoices', pg_temp.financial_rows_v1('credit_invoices', ARRAY['credit_id','fund_id','caller_pubkey','currency','amount_micro','amount_msats','payment_hash','status','expires_at','created_at','settled_at','reconciled_credit_id','reconciled_fund_id','resolved_at']),
   'expiry_releases', pg_temp.financial_rows_v1('credit_expiry_releases', ARRAY['credit_id','release_id','caller_pubkey','currency','rail','amount_micro','expiry_ms','released_at','reversed_at']),
   'tempo_channels', pg_temp.financial_rows_v1('mpp_tempo_channels', ARRAY['channel_key','state_json','updated_at']),
