@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 
 import {
   PostgresX402ExactSettlementStore,
+  X402ExactPayerLimitError,
   type X402ExactSettlementEffect,
 } from "../x402-exact-settlement-store";
 
@@ -210,6 +211,72 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
     expect(new Set(claims.map((claim) => claim.intent.id))).toEqual(new Set(["intent-claimed"]));
     expect((await store.claim(exactIntent("intent-claimed"))).inserted).toBe(false);
   });
+
+  it("admits one of many parallel claims for a payer, across separate pools", async () => {
+    const otherPool = new pg.Pool({ connectionString: DATABASE_URL });
+    const stores = [store, new PostgresX402ExactSettlementStore(otherPool)];
+    try {
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: 8 }, (_, i) =>
+          stores[i % 2].claim(exactIntent(`intent-race-${i}`, undefined, PAYER_A, i), {
+            maxOutstandingPerPayer: 1,
+          })
+        )
+      );
+      const admitted = outcomes.filter((o) => o.status === "fulfilled");
+      const refused = outcomes.filter((o) => o.status === "rejected");
+      expect(admitted).toHaveLength(1);
+      expect(refused).toHaveLength(7);
+      for (const o of refused) {
+        expect((o as PromiseRejectedResult).reason).toBeInstanceOf(X402ExactPayerLimitError);
+      }
+      const { rows } = await pool.query(
+        "SELECT count(*)::int AS n FROM x402_exact_settlement_intents WHERE dvm_id = $1",
+        [DVM_ID]
+      );
+      expect(rows[0].n).toBe(1);
+    } finally {
+      await otherPool.end();
+    }
+  });
+
+  it("does not let one payer's cap block another payer", async () => {
+    await store.claim(exactIntent("intent-a", undefined, PAYER_A, 1), { maxOutstandingPerPayer: 1 });
+    await expect(
+      store.claim(exactIntent("intent-a2", undefined, PAYER_A, 2), { maxOutstandingPerPayer: 1 })
+    ).rejects.toBeInstanceOf(X402ExactPayerLimitError);
+    const b = await store.claim(exactIntent("intent-b", undefined, PAYER_B, 3), {
+      maxOutstandingPerPayer: 1,
+    });
+    expect(b.inserted).toBe(true);
+  });
+
+  it("treats a replay of an admitted authorization as a replay, not a second outstanding one", async () => {
+    await store.claim(exactIntent("intent-a", undefined, PAYER_A, 1), { maxOutstandingPerPayer: 1 });
+    const replay = await store.claim(exactIntent("intent-a", undefined, PAYER_A, 1), {
+      maxOutstandingPerPayer: 1,
+    });
+    expect(replay.inserted).toBe(false);
+  });
+
+  it("stops counting an authorization once it is past valid_before or released", async () => {
+    const expired = { ...exactIntent("intent-old", undefined, PAYER_A, 1), validBefore: "1000" };
+    await store.claim(expired, { maxOutstandingPerPayer: 1 });
+    await store.claim(exactIntent("intent-new", undefined, PAYER_A, 2), {
+      maxOutstandingPerPayer: 1,
+    });
+    await expect(
+      store.claim(exactIntent("intent-third", undefined, PAYER_A, 3), { maxOutstandingPerPayer: 1 })
+    ).rejects.toBeInstanceOf(X402ExactPayerLimitError);
+    await store.release({ dvmId: DVM_ID, intentId: "intent-new", reason: "test" });
+    expect(
+      (
+        await store.claim(exactIntent("intent-third", undefined, PAYER_A, 3), {
+          maxOutstandingPerPayer: 1,
+        })
+      ).inserted
+    ).toBe(true);
+  });
 });
 
 async function settledIntent(
@@ -234,9 +301,14 @@ async function settledIntent(
   });
 }
 
+const PAYER_A = "0x2222222222222222222222222222222222222222";
+const PAYER_B = "0x5555555555555555555555555555555555555555";
+
 function exactIntent(
   intentId: string,
-  effect?: Parameters<PostgresX402ExactSettlementStore["prepare"]>[0]["effect"]
+  effect?: Parameters<PostgresX402ExactSettlementStore["prepare"]>[0]["effect"],
+  from = PAYER_A,
+  nonceSeed?: number
 ): Parameters<PostgresX402ExactSettlementStore["prepare"]>[0] {
   return {
     id: intentId,
@@ -244,12 +316,15 @@ function exactIntent(
     resource: "/v1/job",
     network: "eip155:8453",
     asset: "0x1111111111111111111111111111111111111111",
-    from: "0x2222222222222222222222222222222222222222",
+    from,
     to: "0x3333333333333333333333333333333333333333",
     value: "1000",
     validAfter: "0",
     validBefore: "9999999999",
-    nonce: `0x${"44".repeat(32)}`,
+    nonce:
+      nonceSeed === undefined
+        ? `0x${"44".repeat(32)}`
+        : `0x${nonceSeed.toString(16).padStart(64, "0")}`,
     fingerprint: "fingerprint",
     effect,
   };

@@ -8,6 +8,10 @@
 - Deduplicate outgoing append retries across lost acknowledgements, including payment counters and terminal log cleanup. Postgres initialization adds `job_outgoing_appends`; custom streaming stores must honor stable `appendId` values. Existing receipt bytes remain write-once.
 - Receipt persistence may lag settlement after the full result is durable. Terminal responses with receipt support expose `receipt_pending: true` until a signed receipt is stored. Later reads after restart rebuild missing receipts from the stored result and resolved draw, reuse the receipt sequence, and do not settle an already settled draw again. Historical missing output is not reconstructed.
 
+### Security fixes
+
+- An unsigned x402 job's output is now withheld until its payment settles. Previously a caller could read the summary, artifacts and streamed messages, then cancel the authorization or move the funds before the settlement ran, and keep the result unpaid. Reads now show `content_available: false` with `content_withheld` until the facilitator settles, a refused settlement reads as `failed` with no content, and mid-run streaming is unavailable on these jobs. A settled-as-unpaid job's receipt reports nothing paid and `onJobTerminal` reports `paid: false`. A payer is limited to one outstanding authorization (HTTP 429 `x402_payer_busy`), and `X402ExactSettlementStore.claim` takes an optional `maxOutstandingPerPayer`; Postgres adds the index `idx_x402_exact_settlement_payer`. See `docs/PROTOCOL-NOTES.md#unsigned-x402-payments`.
+
 ### Breaking changes
 
 - Prepaid and implicit per-call credits now default to 90 days instead of 30 days. Builders hold unspent balances longer before expiry release. Existing credits retain their stored expiry until their next top-up; funding extends expiry to the later of its current value and funding time plus the configured TTL. Set `credit: { ttl: 2_592_000 }` to keep a 30-day lifetime. Explicit TTL overrides remain supported; no database migration is required.

@@ -20,6 +20,7 @@ import type { X402Config, X402ExactVersionSupport, X402Receipt } from "../../lib
 import type { ProcessedPaymentQuerier } from "./processed-payment-store";
 import {
   X402ExactIntentConflictError,
+  X402ExactPayerLimitError,
   type X402ExactAuthorizationFacts,
   type X402ExactSettlementAttempt,
   type X402ExactSettlementEffect,
@@ -142,6 +143,12 @@ export class X402ExactSettlementServer {
     /** Refuse, before any facilitator call, an authorization that expires sooner than this. */
     minValidSeconds: number;
     maxTimeoutSeconds: number;
+    /**
+     * Refuse a payer who already has this many authorizations that may still
+     * settle. `/verify` reserves nothing, so N parallel presentations backed
+     * by one balance would otherwise all be admitted and only one could pay.
+     */
+    maxOutstandingPerPayer?: number;
     nowMs?: number;
   }): Promise<
     | {
@@ -153,6 +160,7 @@ export class X402ExactSettlementServer {
       }
     | { outcome: "replayed"; intentId: string }
     | { outcome: "authorization_too_short"; intentId: string; validBefore: string }
+    | { outcome: "payer_limit"; intentId: string }
     | { outcome: "rejected"; intentId?: string; reason: string }
   > {
     const decoded = decodeAndDescribe(args);
@@ -182,18 +190,27 @@ export class X402ExactSettlementServer {
     // presentation that created the row may run the work.
     // Each presentation carries its own job id, so the loser of the race also
     // trips the store's binding check against the winner's row.
+    let payerLimited = false;
     const claimed = await this.opts.store
-      .claim({
-        id: intentId,
-        dvmId: args.dvmId,
-        resource: args.resource,
-        ...facts,
-        effect: args.effect,
-      })
+      .claim(
+        {
+          id: intentId,
+          dvmId: args.dvmId,
+          resource: args.resource,
+          ...facts,
+          effect: args.effect,
+        },
+        { maxOutstandingPerPayer: args.maxOutstandingPerPayer }
+      )
       .catch((err: unknown) => {
+        if (err instanceof X402ExactPayerLimitError) {
+          payerLimited = true;
+          return undefined;
+        }
         if (err instanceof X402ExactIntentConflictError) return undefined;
         throw err;
       });
+    if (payerLimited) return { outcome: "payer_limit", intentId };
     if (!claimed?.inserted) return { outcome: "replayed", intentId };
     return { outcome: "prepared", intentId, payload, requirements, validBeforeMs };
   }

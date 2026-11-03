@@ -10,6 +10,7 @@ import { JobManager } from "../job-manager";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
+import { ReceiptIssuer } from "../receipt-issuer";
 import {
   type PaymentInfo,
   repairX402ExactSettlementEffect,
@@ -34,7 +35,11 @@ const X402: X402Config = {
 let nonceSeed = 0;
 
 /** A v1 exact authorization for the full price that stays valid for `validForSeconds`. */
-function authorization(validForSeconds: number, nonce = `0x${(++nonceSeed).toString(16).padStart(64, "0")}`) {
+function authorization(
+  validForSeconds: number,
+  nonce = `0x${(++nonceSeed).toString(16).padStart(64, "0")}`,
+  from = "0x2222222222222222222222222222222222222222"
+) {
   return encodePayment({
     x402Version: X402_V1_VERSION,
     scheme: "exact",
@@ -42,7 +47,7 @@ function authorization(validForSeconds: number, nonce = `0x${(++nonceSeed).toStr
     payload: {
       signature: `0x${"ab".repeat(65)}`,
       authorization: {
-        from: "0x2222222222222222222222222222222222222222",
+        from,
         to: X402.payTo,
         value: String(PRICE_MICRO),
         validAfter: "0",
@@ -59,9 +64,12 @@ interface Rig {
   settlement: X402ExactSettlementServer;
   settler: InProcessDeferredX402Settler;
   facilitatorCalls: (suffix: "/verify" | "/settle") => number;
+  /** What the facilitator's /settle answers, changed in place with `answerSettle`. */
+  settleBody: Record<string, unknown>;
 }
 
 function rig(verifyGate?: Promise<void>): Rig {
+  const settleBody: Record<string, unknown> = { success: true, transaction: TX, network: X402.network };
   const ledger = new MemoryCreditLedger();
   const processedPayments = new MemoryProcessedPaymentStore();
   const store = new MemoryX402ExactSettlementStore();
@@ -72,7 +80,7 @@ function rig(verifyGate?: Promise<void>): Rig {
     const body = url.endsWith("/verify")
       ? { isValid: true }
       : url.endsWith("/settle")
-        ? { success: true, transaction: TX, network: X402.network }
+        ? settleBody
         : undefined;
     if (!body) throw new Error(`unexpected request to ${url}`);
     return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
@@ -94,9 +102,15 @@ function rig(verifyGate?: Promise<void>): Rig {
     store,
     settlement,
     settler,
+    settleBody,
     facilitatorCalls: (suffix) =>
       fetch.mock.calls.filter(([input]) => String(input).endsWith(suffix)).length,
   };
+}
+
+function answerSettle(r: Rig, body: Record<string, unknown>): void {
+  for (const key of Object.keys(r.settleBody)) delete r.settleBody[key];
+  Object.assign(r.settleBody, { network: X402.network }, body);
 }
 
 function admit(r: Rig, header: string | undefined, jobId: string): Promise<PaymentInfo & { error?: { status: number; body: Record<string, unknown>; x402Requirements?: { maxTimeoutSeconds: number }[] } }> {
@@ -119,7 +133,8 @@ function manager(
   r: Rig,
   onJob: Parameters<typeof configureDVM>[0]["onJob"],
   maxRuntimeSeconds = RUNTIME_SECONDS,
-  settler: InProcessDeferredX402Settler = r.settler
+  settler: InProcessDeferredX402Settler = r.settler,
+  extra: Partial<ConstructorParameters<typeof JobManager>[1]> = {}
 ) {
   const completed = vi.fn();
   const descriptor = configureDVM({
@@ -143,6 +158,7 @@ function manager(
     staleJobTimeoutMs: 0,
     processingWatchdogMs: 0,
     heartbeatIntervalMs: 0,
+    ...extra,
   });
   return { jobs, completed };
 }
@@ -328,5 +344,111 @@ describe("unsigned x402 settled after the job", () => {
     await run(jobs, results[winner]!, `job-race-${["a", "b", "c"][winner]}`);
     expect(r.facilitatorCalls("/settle")).toBe(1);
     jobs.shutdown();
+  });
+  describe("a completed job whose payment is not collected", () => {
+    const receiptIssuer = () => new ReceiptIssuer({ secret: "77".repeat(32), dvm: "test", dvmId: DVM_ID });
+
+    it("signs no payment claim and reports the job as unpaid, once", async () => {
+      const r = rig();
+      // The reference facilitator answers a cancelled or spent authorization like this.
+      answerSettle(r, { success: false, errorReason: "invalid_exact_evm_nonce_already_used" });
+      const terminal = vi.fn(async (_info: unknown) => undefined);
+      const { jobs, completed } = manager(r, (ctx) => ctx.complete("done"), RUNTIME_SECONDS, r.settler, {
+        receiptIssuer: receiptIssuer(),
+        onJobTerminal: terminal,
+      });
+      const payment = await admit(r, authorization(60), "job-unpaid");
+
+      await run(jobs, payment, "job-unpaid");
+
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      expect(r.facilitatorCalls("/settle")).toBe(1);
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("rejected");
+      const stored = await jobs.store.get("job-unpaid");
+      expect(stored?.receipt).toMatchObject({
+        outcome: "completed",
+        paid: { msats: 0, rail: null, native_amount: null, native_asset: null, tx_hash: null },
+      });
+      expect(stored?.receipt).not.toHaveProperty("credit");
+      expect(terminal).toHaveBeenCalledTimes(1);
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ jobId: "job-unpaid", outcome: "completed", paid: false });
+      expect(completed).not.toHaveBeenCalled();
+      jobs.shutdown();
+    });
+
+    it("keeps reporting nothing while the outcome is unknown, then settles on the read-path retry", async () => {
+      const r = rig();
+      answerSettle(r, { success: false, errorReason: "facilitator_status_503" });
+      const terminal = vi.fn(async (_info: unknown) => undefined);
+      const { jobs } = manager(r, (ctx) => ctx.complete("done"), RUNTIME_SECONDS, r.settler, {
+        receiptIssuer: receiptIssuer(),
+        onJobTerminal: terminal,
+      });
+      const payment = await admit(r, authorization(60), "job-unknown");
+
+      await run(jobs, payment, "job-unknown");
+
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+      expect((await jobs.store.get("job-unknown"))?.receipt).toBeUndefined();
+      expect(terminal).not.toHaveBeenCalled();
+
+      answerSettle(r, { success: true, transaction: TX });
+      await jobs.ensureReceipt((await jobs.store.get("job-unknown"))!);
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      expect((await jobs.store.get("job-unknown"))?.receipt).toMatchObject({ paid: { rail: "x402" } });
+      expect(terminal).toHaveBeenCalledTimes(1);
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+  });
+
+  describe("one payer's outstanding authorizations", () => {
+    const PAYER_A = "0x3333333333333333333333333333333333333333";
+    const PAYER_B = "0x4444444444444444444444444444444444444444";
+
+    it("admits one at a time per payer, whatever its balance, and never starts the refused job", async () => {
+      const r = rig();
+      const first = await admit(r, authorization(60, undefined, PAYER_A), "job-p1");
+      expect(first.error).toBeUndefined();
+
+      const second = await admit(r, authorization(60, undefined, PAYER_A), "job-p2");
+      const other = await admit(r, authorization(60, undefined, PAYER_B), "job-p3");
+
+      expect(second.error).toMatchObject({ status: 429, body: { error: "x402_payer_busy" } });
+      expect(second.creditId).toBeUndefined();
+      expect(other.error).toBeUndefined();
+      const intents = await r.store.list({ dvmId: DVM_ID, limit: 10, includeResolved: true });
+      expect(intents.filter((intent) => intent.from === PAYER_A)).toHaveLength(1);
+    });
+
+    it("admits the payer again once the earlier job has ended", async () => {
+      const r = rig();
+      const { jobs } = manager(r, (ctx) => ctx.complete("done"));
+      const first = await admit(r, authorization(60, undefined, PAYER_A), "job-q1");
+      await run(jobs, first, "job-q1");
+
+      const next = await admit(r, authorization(60, undefined, PAYER_A), "job-q2");
+
+      expect(next.error).toBeUndefined();
+      jobs.shutdown();
+    });
+
+    it("does not let an authorization that can no longer settle lock the payer out", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const r = rig();
+        const stranded = await admit(r, authorization(30, undefined, PAYER_A), "job-s1");
+        expect(stranded.error).toBeUndefined();
+        vi.setSystemTime(Date.now() + 31_000);
+
+        const next = await admit(r, authorization(60, undefined, PAYER_A), "job-s2");
+
+        expect(next.error).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });
