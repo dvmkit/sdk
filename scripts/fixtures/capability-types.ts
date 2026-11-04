@@ -53,6 +53,21 @@ export const typedCapabilities = configureDVM({
         },
       },
     }),
+    transformed: defineCapability({
+      input: countInput,
+      onJob(ctx) { ctx.complete(String(ctx.input.count)); },
+      onQuote: {
+        schema: z.object({ count: z.number() }).transform((value) => value.count),
+        async handler(ctx) {
+          const count: number = ctx.data;
+          // @ts-expect-error Whole-schema transforms change the quote data itself.
+          ctx.data.count;
+          // @ts-expect-error The inferred quote output must not become any.
+          const _text: string = ctx.data;
+          return { upfront: { amount: count * 0.01, currency: "usd" }, description: "Transformed" };
+        },
+      },
+    }),
     raw: defineCapability({
       onJob(ctx) { ctx.complete(ctx.input.toUpperCase()); },
       onQuote: {

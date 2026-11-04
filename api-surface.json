@@ -253,7 +253,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "500be17a371e534db84f0aa0767ab2e62b2f3fcaa1fadb918057c568db551f61"
+          "signature": "f8ec0fbc18a5067a20130f9b7f36f12747e9692058be315f59ed4fcdb76c2e4b"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -321,11 +321,11 @@
         },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "fd97bd4f972db6e1686829063f93ac8e160f0b771ff2fa17e550551b9096a51e"
+          "signature": "dc752c2bca7c93b25083b30862160b52284675b1d2c2327f1f52180c40e4f91a"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "143f2f813d5ede5bf2f0b5ef59011ec467cf77ed03774b65c16665e87dbf91f8"
+          "signature": "5efdf7a3ecd279e44ec129533f67743a95a10edc1de1d1ff92ba2b6202ff60a8"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -389,7 +389,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "bbe6074d39380bca4c0a76b32b3b33194fd580a56dd4e72a4cf929cebc6487cc"
+          "signature": "925c2fb4ee4cdc884a7ff16eedbc89ca2af87c139146bee23d38bc48a1a26809"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -1003,7 +1003,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "98ded996fb0c812ce425588d0a8f8d72e8fa84fda8b736c8c1bcbca924f92471"
+          "signature": "37e0c305de52e123ea6af565a596f3c9b5f1d18642cc1920105cd6c69bc36dc1"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1183,7 +1183,7 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "eec81aeaa2fac5da5ecd6c44229d9ab7bddd830c8afc666da524752c526c8ff8"
+          "signature": "88a0d19926f283d359ccfa27d95ae5015c5a1e250cafcc68ef39f573b86cb1ca"
         },
         "DVMHostOpts": {
           "stability": "experimental",
@@ -1291,7 +1291,7 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "f747eb60c65fcd7213d9bbd69dc631863ab04f9a99528df2202b3206bc2f2eb8"
+          "signature": "629c54425088a3a9402e1b08c8a3c3891ab47a74bbffa11cc8850081274aa099"
         },
         "JobManagerOpts": {
           "stability": "experimental",
@@ -1527,7 +1527,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "8ea087891b2402f73f6cb9c82f3d63b506fe7bce638707bd0f80e945ada129d3"
+          "signature": "030f4c4abad83cca1bbd89b3e60a2a5e9617bee4e9d6614ff7a8e6ba43354574"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",

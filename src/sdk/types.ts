@@ -848,7 +848,7 @@ export interface DVMConfig<
    * `onJob`, and optional message handlers.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  capabilities?: Record<string, CapabilityConfig<any, any>>;
+  capabilities?: Record<string, CapabilityConfig<any, any, any>>;
   /** Single tag (convenience). */
   tag?: string;
   /** Multiple tags (explicit). */

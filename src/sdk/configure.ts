@@ -333,7 +333,7 @@ Record<string, CapabilityDescriptor<any, any>> {
  */
 function buildExplicitCapabilities(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  capabilities: Record<string, CapabilityConfig<any, any>>,
+  capabilities: Record<string, CapabilityConfig<any, any, any>>,
   currency: Currency
 ): // eslint-disable-next-line @typescript-eslint/no-explicit-any
 Record<string, CapabilityDescriptor<any, any>> {
@@ -357,7 +357,7 @@ Record<string, CapabilityDescriptor<any, any>> {
       name,
       description: cap.description ?? "",
       // Per-capability `input` is the builder's Zod schema; the `any` widening
-      // through `Record<string, CapabilityConfig<any, any>>` is unavoidable
+      // through `Record<string, CapabilityConfig<any, any, any>>` is unavoidable
       // here.
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       input: cap.input,
