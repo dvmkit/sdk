@@ -10,9 +10,9 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 /** @type {{ package: string, version: string, exports: { export: string, declaration: string, names: string[] }[] }} */
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
-  ".": ["configureDVM", "isConfiguredDVMDescriptor"],
+  ".": ["configureDVM", "defineCapability", "isConfiguredDVMDescriptor"],
   "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
-  "./testing": ["createTestContext"],
+  "./testing": ["createTestContext", "StepCache"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
   "./internal": [
@@ -401,11 +401,13 @@ function typecheckConsumer(consumer, resolution) {
       "",
     ].join("\n")
   );
+  const capabilityTypes = join(consumer, `capability-types-${resolution}.ts`);
+  cpSync(join(root, "scripts", "fixtures", "capability-types.ts"), capabilityTypes);
   const moduleKind = resolution === "node16" ? ts.ModuleKind.Node16 : ts.ModuleKind.ESNext;
   const moduleResolution =
     resolution === "node16" ? ts.ModuleResolutionKind.Node16 : ts.ModuleResolutionKind.Bundler;
   const program = ts.createProgram({
-    rootNames: [entry],
+    rootNames: [entry, capabilityTypes],
     options: {
       module: moduleKind,
       moduleResolution,
@@ -430,6 +432,7 @@ function typecheckConsumer(consumer, resolution) {
     fail(`a ${resolution} consumer does not typecheck against the packed package:\n${formatted}`);
   }
   rmSync(entry, { force: true });
+  rmSync(capabilityTypes, { force: true });
 }
 
 /** @param {string[]} args @param {string} cwd */

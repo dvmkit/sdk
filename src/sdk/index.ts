@@ -1,5 +1,6 @@
 export type { UpfrontPayment } from "../lib/upfront-payment";
 export { configureDVM, isConfiguredDVMDescriptor } from "./configure";
+export { defineCapability } from "./define-capability";
 export { envFlag } from "./env";
 export type { ProgressHeartbeatOpts } from "./heartbeat";
 export { withProgressHeartbeat } from "./heartbeat";
@@ -37,6 +38,7 @@ export type {
   ArtifactContent,
   CancelContent,
   DeclineContent,
+  CapabilityConfig,
   CapabilityRate,
   CashuConfig,
   CreditConfig,

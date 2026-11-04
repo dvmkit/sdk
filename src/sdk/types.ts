@@ -681,6 +681,7 @@ export const DEFAULT_JOB_RETENTION_DAYS = 730;
 export interface CapabilityConfig<
   State = Record<string, unknown>,
   InputSchema extends ZodLike | undefined = undefined,
+  QuoteData = Record<string, unknown>,
 > {
   /** Human-readable description surfaced on `/v1/info`. */
   description?: string;
@@ -702,7 +703,7 @@ export interface CapabilityConfig<
   state?: State;
   /** Static price — a USD literal ("$0.05"). Free capabilities omit this and `onQuote`. */
   price?: PriceValue;
-  onQuote?: QuoteConfig;
+  onQuote?: QuoteConfig<QuoteData>;
   /**
    * Rate card published on `/v1/info` as `pricing.rates`: 1 to 5
    * {@link CapabilityRate} entries, exactly as declared. Allowed only on a

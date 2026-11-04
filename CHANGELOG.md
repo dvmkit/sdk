@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Handler tests can supply `auth` and replay completed `ctx.step` work with `createTestContext({ stepCache })` and `StepCache` from `@dvmkit/sdk/testing`. Each context now caches successful steps by default; reuse a cache for the same job across recreated contexts, supplying the next response or payment, to test re-entry. Cached steps replay their cost declarations, while failed steps run again. This simulates completed-step replay, not crash durability or exactly-once side effects.
+- `defineCapability` and the `CapabilityConfig` type are now exported from `@dvmkit/sdk`. Wrap individual `capabilities` entries in `defineCapability({ input, onJob, onQuote, ... })` to infer each handler's input, state, and quote data from its own schemas. Existing capability maps remain supported; `CapabilityConfig` gains an optional third type parameter for quote data.
+
 - Terminal reports now include `heldMicro`, the original draw hold including paid mid-job pieces, and `finishedPieceCount`, which excludes a piece stopped by cancellation. Both fields are optional for compatibility with older reports; historical jobs without piece accounting omit the count. See `protocol-fixtures/piece-settlement-v1.json`.
 
 - Terminally refused card refunds now enter `refund_blocked` and stop consuming sweep retry slots. Signed admin routes `close-card-drain` and `replan-card-drain` require a decision id and reason; closing records the unpaid remainder as `written_off`, while replanning retains successful refunds and immediately retries only the remainder. Unknown or processing refunds refuse recovery. Postgres adds nullable `credit_drains.card_recovery`; the financial export retains structured refund/write-off amounts without operator free text. Custom card ledgers must implement serialized recovery and honor the supplied query connection. Clients must handle the two new drain states; see `protocol-fixtures/credit-drain-stripe-v1.json`.

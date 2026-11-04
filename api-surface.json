@@ -120,6 +120,7 @@
         "ArtifactContent",
         "CancelContent",
         "CanonicalEnvelope",
+        "CapabilityConfig",
         "CapabilityRate",
         "CashuConfig",
         "CompleteOpts",
@@ -193,6 +194,7 @@
         "createFxFetcher",
         "createPinnedFetch",
         "createSignedRequestVerifier",
+        "defineCapability",
         "envFlag",
         "fiatToSatsCeil",
         "formatFiat",
@@ -215,6 +217,8 @@
       "names": [
         "MemoryJobStore",
         "RecordedMessage",
+        "StepCache",
+        "StepRecord",
         "TestContextOpts",
         "TestJobContext",
         "createTestContext"
