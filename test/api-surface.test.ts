@@ -245,6 +245,29 @@ describe("public signature gate", () => {
     expect(check(root).status).toBe(0);
   });
 
+  function dependencyNamespace(root: string, dependency = "fixture-contracts") {
+    const path = join(root, "node_modules", dependency);
+    mkdirSync(path, { recursive: true });
+    json(root, `node_modules/${dependency}/package.json`, { name: dependency, version: "1.0.0", type: "module", types: "index.d.ts" });
+    writeFileSync(join(path, "index.d.ts"), "export declare function parse(value: string): string;\n");
+    writeFileSync(join(root, "dist/index.d.ts"), `${declaration}\nexport * as contracts from "${dependency}";\n`);
+    writeFileSync(join(root, "src/sdk/index.ts"), '/** @stability stable */\nexport { run, Worker, overloaded, generic, contracts } from "./implementation";\n');
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    return inspectSurface(root, manifest).find((entry) => entry.export === ".")!.signatures!.contracts.signature;
+  }
+
+  it("keeps dependency namespace fingerprints stable across physical installation roots", () => {
+    const original = dependencyNamespace(fixture());
+    const relocated = dependencyNamespace(fixture());
+    expect(relocated).toBe(original);
+  });
+
+  it("keeps different dependency namespace identities distinct", () => {
+    const original = dependencyNamespace(fixture());
+    const other = dependencyNamespace(fixture(), "other-contracts");
+    expect(other).not.toBe(original);
+  });
+
   it("still rejects a stale current snapshot even when the break is disclosed", () => {
     const root = fixture();
     change(root, "run(input: Input)", "run(input: number)");

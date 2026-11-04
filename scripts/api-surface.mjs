@@ -135,8 +135,16 @@ export function signatureOf(exported, checker) {
     const symbol = pending[index];
     const nodes = symbol.declarations?.filter(isLocalTopLevel) ?? [];
     if (!nodes.length) {
-      // Keep dependency identity without vendor source or compiler paths.
-      declarations.push(`external ${symbol.getName()}`);
+      // TypeScript names dependency modules with quoted absolute paths. Keep
+      // their package-relative identity so a clean install has the same hash.
+      let identity = symbol.getName();
+      if (identity.startsWith('"') && identity.endsWith('"')) {
+        const modulePath = identity.slice(1, -1).replaceAll("\\", "/");
+        const marker = "/node_modules/";
+        const dependency = modulePath.lastIndexOf(marker);
+        if (dependency >= 0) identity = JSON.stringify(modulePath.slice(dependency + marker.length));
+      }
+      declarations.push(`external ${identity}`);
       continue;
     }
     for (const node of nodes) {
