@@ -49,7 +49,7 @@ If a maintainer has explicitly invited a pull request on a specific issue, say s
 
 Accepting an issue means we agree the problem is real and worth solving. It is not a delivery date, a place in a queue, an assignment, or a commitment to any particular design.
 
-Nothing about an accepted issue extends the support or stability promises in [Compatibility and versioning](README.md#compatibility-and-versioning). This is a pre-1.0 alpha SDK: breaking changes happen, they are announced in the release notes for the release that carries them, and there is no long-term support release.
+Nothing about an accepted issue extends the support or stability promises in [Compatibility and versioning](docs/PROTOCOL-NOTES.md#compatibility-and-versioning).
 
 Maintainers retain authority over the public API, the roadmap, and design direction. Contributing a report, a discussion, or a reproduction does not confer any of the three. We may implement a reported problem differently from the way it was proposed, or decide not to implement it at all.
 

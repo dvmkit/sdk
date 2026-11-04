@@ -51,11 +51,7 @@ Out of scope for this repository:
 
 ## Supported versions and what alpha means here
 
-This is pre-1.0 alpha software, and the support promise matches that honestly:
-
-- Security fixes are made on the **latest published release**. There is **no long-term support release** and no backport branch.
-- Reproduce on the latest release before reporting where it is safe to do so. A report against an older pre-release may be answered with an upgrade rather than a fix.
-- Breaking changes happen between pre-1.0 versions, including in response to a security finding, and are announced in the release notes for the release that carries them.
+The [compatibility policy](docs/PROTOCOL-NOTES.md#compatibility-and-versioning) defines supported releases, runtime support, and stability promises. Reproduce on the latest release before reporting where it is safe to do so; a report against an older release may be answered with an upgrade.
 
 ## Coordinated disclosure and safe harbour
 
