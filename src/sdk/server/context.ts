@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 
 import { msatsToUsdc } from "../../lib/payment-amounts";
@@ -17,6 +16,7 @@ import {
   validateCurrency,
 } from "../pricing/index";
 import type { StepRecord } from "../step-cache";
+import { createStepRunner } from "../step-runner";
 import type { JobCost, KVStore, PaymentMethod, SDKJobContext } from "../types";
 import { resolveServerBtcUsdRate } from "./btc-rate";
 import type { FiatDenominationFailure, PriceFiat } from "./funding";
@@ -184,18 +184,6 @@ function restrictToCreditRail(content: Record<string, unknown>, rail: CreditRail
   }
 }
 
-/**
- * The cost declarations captured by each active `ctx.step()` miss
- *
- * Every declaration is copied into every frame in the current async branch.
- * That makes an inner miss part of both its own record and its outer miss's
- * record; replaying an inner hit while an outer miss is active does the same.
- * Sibling steps only see the frames they inherited, so a fanned-out batch does
- * not leak one step's costs into another step's record. The owner also keeps a
- * different job started from the same async call tree from inheriting them.
- */
-const stepCostScope = new AsyncLocalStorage<{ owner: object; frames: JobCost[][] }>();
-
 export function buildContext(
   job: ServerJob,
   opts: BuildContextOpts
@@ -307,8 +295,6 @@ export function buildContext(
   let declaredCostCurrency: Currency | undefined;
   let declaredCostRevision = 0;
   let costPoisoned = false;
-  const stepWrites = new Map<string, Promise<void>>();
-  const stepCostOwner = {};
 
   const declareCost = (declared: JobCost): void => {
     if (terminated("cost")) return;
@@ -332,10 +318,7 @@ export function buildContext(
     // Copy only the validated declaration. The handler may retain and mutate
     // its input object after this call, but persisted replay must not change.
     const replayable = { amount: declared.amount, currency };
-    const scope = stepCostScope.getStore();
-    if (scope?.owner === stepCostOwner) {
-      for (const frame of scope.frames) frame.push(replayable);
-    }
+    steps.recordCost(replayable);
 
     if (declaredCostCurrency !== undefined && declaredCostCurrency !== currency) {
       costPoisoned = true;
@@ -355,6 +338,8 @@ export function buildContext(
     job.costAmountMicro = micro;
     job.costCurrency = currency;
   };
+
+  const steps = createStepRunner(job.stepCache, declareCost, opts.onStep);
 
   const ctx: SDKJobContext<unknown, unknown> = {
     jobId: job.id,
@@ -1043,32 +1028,7 @@ export function buildContext(
 
     cost: declareCost,
 
-    step: async <T>(id: string, fn: () => Promise<T>): Promise<T> => {
-      if (job.stepCache.has(id)) {
-        await stepWrites.get(id);
-        const record = job.stepCache.getRecord(id);
-        for (const declared of record.costs ?? []) declareCost(declared);
-        return record.value as T;
-      }
-      const costs: JobCost[] = [];
-      const scope = stepCostScope.getStore();
-      const parentFrames = scope?.owner === stepCostOwner ? scope.frames : [];
-      const result = await stepCostScope.run(
-        { owner: stepCostOwner, frames: [...parentFrames, costs] },
-        fn
-      );
-      job.stepCache.set(id, result, costs);
-      if (opts.onStep) {
-        const persistence = opts.onStep(job.stepCache.getRecord(id));
-        stepWrites.set(id, persistence);
-        try {
-          await persistence;
-        } finally {
-          stepWrites.delete(id);
-        }
-      }
-      return result;
-    },
+    step: steps.step,
 
     state: job.state as Record<string, unknown>,
     store: instrumentedStore,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { configureDVM } from "../configure";
-import { createTestContext } from "../testing/test-context";
+import { createTestContext, StepCache } from "../testing/index";
 import type { SDKJobContext } from "../types";
 
 describe("createTestContext", () => {
@@ -108,6 +108,77 @@ describe("createTestContext", () => {
     const ctx = createTestContext();
     const result = await ctx.step("compute", async () => 42);
     expect(result).toBe(42);
+  });
+
+  it.each(["prompt", "payment"] as const)("replays completed work after a %s wait", async (wait) => {
+    const stepCache = new StepCache();
+    let calls = 0;
+    const handler = async (ctx: SDKJobContext) => {
+      const result = await ctx.step("vendor", async () => {
+        calls++;
+        ctx.cost({ amount: 0.25, currency: "usd" });
+        return "prepared";
+      });
+      if (wait === "prompt") await ctx.prompt("confirm", "Continue?");
+      else await ctx.requestPayment(1000, "Continue");
+      ctx.complete(result);
+    };
+    const first = createTestContext({ stepCache });
+    await expect(handler(first)).rejects.toThrow(/no pre-programmed/);
+    const replay = createTestContext({
+      stepCache: StepCache.deserialize(stepCache.serialize()),
+      responses: { confirm: { prompt_id: "confirm", text: "yes" } },
+      payment: { amount_msats: 1000 },
+    });
+    await handler(replay);
+    expect(calls).toBe(1);
+    expect(replay.summary).toBe("prepared");
+    expect(replay.reportedCost).toEqual({ amountMicro: 250_000, currency: "usd" });
+  });
+
+  it("caches undefined by exact step ID and isolates default contexts", async () => {
+    let calls = 0;
+    const body = async () => { calls++; };
+    const ctx = createTestContext();
+    await ctx.step("work", body);
+    expect(await ctx.step("work", body)).toBeUndefined();
+    await ctx.step(" work", body);
+    await createTestContext().step("work", body);
+    expect(calls).toBe(3);
+  });
+
+  it("retries rejected work rather than caching its failure", async () => {
+    const ctx = createTestContext();
+    let attempts = 0;
+    const body = async () => {
+      if (++attempts === 1) throw new Error("vendor unavailable");
+      return "recovered";
+    };
+    await expect(ctx.step("retry", body)).rejects.toThrow("vendor unavailable");
+    expect(await ctx.step("retry", body)).toBe("recovered");
+    expect(await ctx.step("retry", body)).toBe("recovered");
+    expect(attempts).toBe(2);
+  });
+
+  it("lets a handler authorize by caller pubkey and envelope fields", async () => {
+    const pubkey = "11".repeat(32);
+    const auth = {
+      pubkey,
+      envelope: { pubkey, signature: "22".repeat(64), timestamp: 1700000000, nonce: "example-nonce", resource: "example" },
+    };
+    const handler = (ctx: SDKJobContext) => {
+      if (ctx.auth?.pubkey !== pubkey || ctx.auth.envelope.resource !== "example") {
+        ctx.fail("unauthorized");
+        return;
+      }
+      ctx.complete(ctx.auth.envelope.pubkey);
+    };
+    const allowed = createTestContext({ auth });
+    handler(allowed);
+    expect(allowed.summary).toBe(pubkey);
+    const anonymous = createTestContext();
+    handler(anonymous);
+    expect(anonymous.failError).toBe("unauthorized");
   });
 
   it("state is cloned from opts (no pollution)", () => {

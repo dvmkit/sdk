@@ -8,6 +8,8 @@ import { createNoopLogger } from "../logger";
 import { type Currency, validateCurrency } from "../pricing/index";
 import { createInstrumentedFetch } from "../server/instrumented-fetch";
 import { JobCancelledError } from "../server/job";
+import { StepCache } from "../step-cache";
+import { createStepRunner } from "../step-runner";
 import { MemoryKVStore } from "../store";
 import type {
   JobCost,
@@ -34,6 +36,15 @@ export interface TestContextOpts<State = Record<string, unknown>, Input = string
   params?: Record<string, string>;
   /** Opaque requester identifier. */
   requesterId?: string;
+  /** Caller identity supplied directly for handler authorization tests; no signature verification is performed. */
+  auth?: SDKJobContext["auth"];
+  /**
+   * Completed steps for one job. Default: a fresh cache for this context.
+   * Reuse across recreated contexts to test handler replay after a prompt/payment wait.
+   * Failed bodies are retried; completed bodies are skipped, including their side effects.
+   * This in-memory simulation does not prove crash durability or exactly-once execution.
+   */
+  stepCache?: StepCache;
   /** Total msats paid so far. */
   paidMsats?: number;
   /** Initial per-job state (cloned to avoid test pollution). */
@@ -105,12 +116,15 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
   const log = opts?.log ?? createNoopLogger();
   const input = (opts?.input ?? "") as Input;
 
+  const steps = createStepRunner(opts?.stepCache ?? new StepCache(), (cost) => ctx.cost(cost));
+
   const ctx: TestJobContext<State, Input> = {
     jobId: opts?.jobId ?? "test-job-1",
     tags: opts?.tags ?? [],
     input,
     params: opts?.params ?? {},
     requesterId: opts?.requesterId ?? "test-requester",
+    auth: opts?.auth,
     paidMsats: opts?.paidMsats ?? 0,
 
     get messages() {
@@ -230,8 +244,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       // Mirrors the runtime: terminal is terminal, a currency switch reports
       // nothing rather than something wrong, and declarations are summed in
       // major units and rounded once so a sub-millionth call is not floored
-      // away. `step` below never caches, so it can execute declarations in its
-      // body directly without needing the runtime's replay metadata.
+      // away. Step cache hits replay declarations through this same accumulator.
       if (cancelled) return;
       const currency = validateCurrency(declared.currency);
       const total = costAmount + declared.amount;
@@ -243,6 +256,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
             `${String(declared.amount)}`
         );
       }
+      steps.recordCost({ amount: declared.amount, currency });
       if (costCurrency !== undefined && costCurrency !== currency) costPoisoned = true;
       costCurrency ??= currency;
       if (costPoisoned) return;
@@ -250,9 +264,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       costMicro = micro;
     },
 
-    async step<T>(_id: string, fn: () => Promise<T>): Promise<T> {
-      return fn();
-    },
+    step: steps.step,
 
     state,
     store,

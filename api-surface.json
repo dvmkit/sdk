@@ -120,6 +120,7 @@
         "ArtifactContent",
         "CancelContent",
         "CanonicalEnvelope",
+        "CapabilityConfig",
         "CapabilityRate",
         "CashuConfig",
         "CompleteOpts",
@@ -193,6 +194,7 @@
         "createFxFetcher",
         "createPinnedFetch",
         "createSignedRequestVerifier",
+        "defineCapability",
         "envFlag",
         "fiatToSatsCeil",
         "formatFiat",
@@ -233,6 +235,10 @@
           "stability": "stable",
           "signature": "57df426186ce09bdd3fc3ed79e625582b40db3715881a14727e94540d0759247"
         },
+        "CapabilityConfig": {
+          "stability": "stable",
+          "signature": "52167de961cfa1282f81de0b92efb9edbb64b461077d3c5eb9e6a931d7c20851"
+        },
         "CapabilityRate": {
           "stability": "stable",
           "signature": "ceff27177e0de114ae4ac766a2e4504aa82e32b32e31a91efe8b3dfa3b53df64"
@@ -247,7 +253,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "52660150d3be1bdef53f0f61c7ab4b5db74f60a3436a71dc9d0ea33dae68a554"
+          "signature": "f8ec0fbc18a5067a20130f9b7f36f12747e9692058be315f59ed4fcdb76c2e4b"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -309,13 +315,17 @@
           "stability": "stable",
           "signature": "43cf0c71be436bbf27b6bfafb8c650659a5cd0d9348cb4aaa989d336515ea4bb"
         },
+        "defineCapability": {
+          "stability": "stable",
+          "signature": "7da81c3977885a77ea5382892dad1d84631eb00bc5bc7c4239d7de6d87a3841a"
+        },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "b2130e7e2d8d493bb41cba34bba56489c0991ed7af6770e3bb3f39106af560db"
+          "signature": "dc752c2bca7c93b25083b30862160b52284675b1d2c2327f1f52180c40e4f91a"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "e3e590f56a3ddcae175548ae0f95a1afdd105df827ea6ffe06b5475f862af508"
+          "signature": "5efdf7a3ecd279e44ec129533f67743a95a10edc1de1d1ff92ba2b6202ff60a8"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -379,7 +389,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "0e6cd220a19e88bc88861ab74e84eb3d51e4b94e8bfd76e4b27c23b992e5902f"
+          "signature": "925c2fb4ee4cdc884a7ff16eedbc89ca2af87c139146bee23d38bc48a1a26809"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -581,6 +591,8 @@
       "names": [
         "MemoryJobStore",
         "RecordedMessage",
+        "StepCache",
+        "StepRecord",
         "TestContextOpts",
         "TestJobContext",
         "createTestContext"
@@ -588,7 +600,7 @@
       "signatures": {
         "createTestContext": {
           "stability": "stable",
-          "signature": "6ef1e171c03d15cec23d82570335f0e1964b16cd19ee63c1ad02c6b25c444e1c"
+          "signature": "f9db2a2cf29e4d450fee65d57de14999382576f36fa7783bddcd5bb1ad14b025"
         },
         "MemoryJobStore": {
           "stability": "stable",
@@ -598,9 +610,17 @@
           "stability": "stable",
           "signature": "a5726e756fe55da629b6980b242efeb0e39acf40f92daedec877c5692c3a39bc"
         },
+        "StepCache": {
+          "stability": "stable",
+          "signature": "43a8d7024607afc509dd00e8277c745349e7d6117daed5506e1e1497db2d9671"
+        },
+        "StepRecord": {
+          "stability": "stable",
+          "signature": "ed2f0f53898130d8155725fc2e899ed1f8be68ee731aad1e16cb4c8d7a052a25"
+        },
         "TestContextOpts": {
           "stability": "stable",
-          "signature": "02f50fbd1af79ec19a1265c48aa40fcc5d7f3a03525ec85cb5a0e843632a2b72"
+          "signature": "582be83545365212ebf8806476d28e6240179164f70cbbd5eb27d5d034e04ef9"
         },
         "TestJobContext": {
           "stability": "stable",
@@ -983,7 +1003,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "745a2339bd7cb552c1d82f4017a884d3a91b1d8272f41906530691f8170c4f3b"
+          "signature": "37e0c305de52e123ea6af565a596f3c9b5f1d18642cc1920105cd6c69bc36dc1"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1163,7 +1183,7 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "753476e58a4dde79658be779beab4fe33d5e87d3b544b95d299a7464668dfcd1"
+          "signature": "88a0d19926f283d359ccfa27d95ae5015c5a1e250cafcc68ef39f573b86cb1ca"
         },
         "DVMHostOpts": {
           "stability": "experimental",
@@ -1271,7 +1291,7 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "3f659fafc6e70dec3d9e28a0aa721ca9c3c9f1205cd7f86866caec0f21981164"
+          "signature": "629c54425088a3a9402e1b08c8a3c3891ab47a74bbffa11cc8850081274aa099"
         },
         "JobManagerOpts": {
           "stability": "experimental",
@@ -1507,7 +1527,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "ac48b8d5259f2561f51ca99b5327943772af37c5022411e9471825d02def73da"
+          "signature": "030f4c4abad83cca1bbd89b3e60a2a5e9617bee4e9d6614ff7a8e6ba43354574"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",

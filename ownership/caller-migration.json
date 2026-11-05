@@ -20217,6 +20217,27 @@
       ]
     },
     {
+      "module": "src/sdk/define-capability.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Builder helper preserves per-capability handler types before heterogeneous map erasure.",
+          "symbols": [
+            "defineCapability"
+          ],
+          "consumerEvidence": [
+            "supported:.#defineCapability"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/types.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/env.ts",
       "allocations": [
         {
@@ -20308,6 +20329,9 @@
         },
         {
           "module": "src/sdk/server/ssrf.ts"
+        },
+        {
+          "module": "src/sdk/define-capability.ts"
         }
       ]
     },
@@ -23839,6 +23863,9 @@
         },
         {
           "module": "src/sdk/server/pieces.ts"
+        },
+        {
+          "module": "src/sdk/step-runner.ts"
         }
       ]
     },
@@ -34628,6 +34655,31 @@
       ]
     },
     {
+      "module": "src/sdk/step-runner.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Runtime and handler test contexts share step execution, cost capture, and cache key rules.",
+          "symbols": [
+            "createStepRunner"
+          ],
+          "consumerEvidence": [
+            "supported:./testing#createTestContext",
+            "supported:./server#createDVMHost"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/step-cache.ts"
+        },
+        {
+          "module": "src/sdk/types.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/store.ts",
       "allocations": [
         {
@@ -34687,6 +34739,9 @@
         },
         {
           "module": "src/sdk/testing/test-context.ts"
+        },
+        {
+          "module": "src/sdk/step-cache.ts"
         }
       ]
     },
@@ -34734,6 +34789,12 @@
         },
         {
           "module": "src/sdk/types.ts"
+        },
+        {
+          "module": "src/sdk/step-cache.ts"
+        },
+        {
+          "module": "src/sdk/step-runner.ts"
         }
       ]
     },
