@@ -90,11 +90,12 @@ export function finishRunningPiece(pieces: readonly JobPiece[], chargeMicro?: nu
 }
 
 /**
- * The finished pieces at full price: what an ask tells the caller declining it would cost. At an
- * open ask no piece is running, so a cancel there charges the same.
+ * What an ask tells the caller declining it would cost: the finished pieces at their charge, a
+ * lowered one where the DVM gave it, exactly what a decline's release ending settles. At an open
+ * ask no piece is running, so a cancel there charges the same.
  */
 export function chargedIfDeclinedMicro(pieces: readonly JobPiece[] | undefined): number {
-  return (pieces ?? []).reduce((sum, piece) => (piece.state === "finished" ? sum + piece.amountMicro : sum), 0);
+  return (pieces ?? []).reduce((sum, piece) => sum + pieceCharge(piece), 0);
 }
 
 /**

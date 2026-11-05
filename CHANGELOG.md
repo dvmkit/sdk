@@ -50,6 +50,8 @@
 
 ### Bug fixes
 
+- A `payment-request`'s `charged_if_declined_micro` now quotes the finished pieces at their charge, including a piece the DVM lowered with `finishedChargeMicro`. It used to sum their full prices, so an ask that lowered the finishing piece told the caller a decline would cost more than the decline then settled. The quote now equals what a decline settles; jobs that lower no piece quote the same as before.
+
 - An ask that withheld x402 because the job's credit holds another rail used to clear the job's x402 binding, so an x402 payment sent anyway settled and landed as balance. The job now keeps a nonce nobody was shown and the payment is refused before it settles. On hosts without a database, an x402 payment bound to another job's nonce is now refused before the facilitator is called, rather than after it settled.
 
 - `applyReceiptCredit` now checks a receipt whose `settlement.charged` is positive on every ending, not only completions, against the caller's prior balance plus verified draw funding.
