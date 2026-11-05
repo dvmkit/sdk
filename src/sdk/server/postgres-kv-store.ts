@@ -96,8 +96,9 @@ export class PostgresKVStore implements KVStore {
     const now = this.lastSweepStartedAt;
     let deleted = 0;
     for (let batch = 0; batch < KV_EXPIRY_SWEEP_MAX_BATCHES && !this.closed; batch++) {
-      // The keys are collected first as an array so the delete probes the
-      // primary key per key instead of scanning the table for each batch.
+      // ORDER BY expires_at keeps the planner on the expires_at index instead
+      // of a full scan even when few rows qualify. The keys are collected
+      // first as an array so the delete probes the primary key per key.
       // SKIP LOCKED leaves a row another transaction holds (a concurrent `set`
       // or sweeper) for a later sweep instead of waiting on it. The outer
       // expiry check repeats the condition on the row version being deleted.
@@ -106,6 +107,7 @@ export class PostgresKVStore implements KVStore {
          WHERE key = ANY(ARRAY(
            SELECT key FROM kv_store
            WHERE expires_at IS NOT NULL AND expires_at <= $1
+           ORDER BY expires_at
            LIMIT $2
            FOR UPDATE SKIP LOCKED
          )) AND expires_at <= $1`,
