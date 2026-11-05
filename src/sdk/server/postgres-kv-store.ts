@@ -12,9 +12,9 @@ const KV_EXPIRY_SWEEP_MAX_BATCHES = 100;
 /** Expiry sweep tuning for a directly constructed {@link PostgresKVStore}. */
 export interface PostgresKVStoreOpts {
   /**
-   * Milliseconds between expiry sweeps. Defaults to 60,000. The worst-case delay between a row's
-   * expiry and its deletion is one interval while fewer than 100,000 rows
-   * expire per interval.
+   * Milliseconds between expiry sweeps. Defaults to 60,000. While the store
+   * is running, the worst-case delay between a row's expiry and its deletion
+   * is one interval while fewer than 100,000 rows expire per interval.
    */
   sweepIntervalMs?: number;
 }
@@ -26,10 +26,12 @@ export interface PostgresKVStoreOpts {
  * sweep: `init()` runs one and starts a timer that sweeps every
  * `sweepIntervalMs` (default one minute), and a write also starts one when
  * the last began at least an interval ago. A sweep deletes in bounded batches
- * of 1,000 rows, at most 100 batches per sweep, so a row is deleted within one
- * interval of its `expires_at` while fewer than 100,000 rows expire per
- * interval; a larger backlog drains at that rate. Several machines sharing a
- * database may sweep concurrently. Call `close()` before ending the pool.
+ * of 1,000 rows, at most 100 batches per sweep, so while a store is running a
+ * row is deleted within one interval of its `expires_at`, or of the next
+ * `init()` after a stop, while fewer than 100,000 rows expire per interval; a
+ * larger backlog drains at that rate. Several machines sharing a database may
+ * sweep concurrently. Call `close()` before ending the pool; otherwise each
+ * later sweep fails and logs `kv_expiry_sweep_failed`.
  */
 export class PostgresKVStore implements KVStore {
   private pool: Pool;
@@ -78,7 +80,8 @@ export class PostgresKVStore implements KVStore {
   }
 
   private sweepInBackground(): void {
-    if (this.closed) return;
+    // Joining a running sweep would log its failure once per joiner.
+    if (this.closed || this.sweepInFlight) return;
     this.sweepExpired().catch((err: unknown) => {
       diagnosticConsole.error({
         level: "error",
@@ -93,18 +96,19 @@ export class PostgresKVStore implements KVStore {
     const now = this.lastSweepStartedAt;
     let deleted = 0;
     for (let batch = 0; batch < KV_EXPIRY_SWEEP_MAX_BATCHES && !this.closed; batch++) {
-      // SKIP LOCKED keeps concurrent sweepers from queuing on each other's
-      // rows. The outer expiry predicate is re-checked on the row version a
-      // concurrent `set` may have written, so a renewed TTL is never deleted.
+      // The keys are collected first as an array so the delete probes the
+      // primary key per key instead of scanning the table for each batch.
+      // SKIP LOCKED leaves a row another transaction holds (a concurrent `set`
+      // or sweeper) for a later sweep instead of waiting on it. The outer
+      // expiry check repeats the condition on the row version being deleted.
       const { rowCount } = await this.pool.query(
         `DELETE FROM kv_store
-         WHERE key IN (
+         WHERE key = ANY(ARRAY(
            SELECT key FROM kv_store
            WHERE expires_at IS NOT NULL AND expires_at <= $1
-           ORDER BY expires_at
            LIMIT $2
            FOR UPDATE SKIP LOCKED
-         ) AND expires_at <= $1`,
+         )) AND expires_at <= $1`,
         [now, KV_EXPIRY_SWEEP_BATCH_SIZE]
       );
       deleted += rowCount ?? 0;

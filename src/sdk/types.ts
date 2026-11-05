@@ -76,7 +76,9 @@ export interface KVStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
   /**
    * Store a value. Optionally set a TTL in seconds; the built-in Postgres
-   * store deletes the entry within one minute after the TTL passes.
+   * store deletes the entry within one minute after the TTL passes while a
+   * host is running, and a stopped or suspended service deletes it within one
+   * minute of its next start.
    */
   set(key: string, value: unknown, opts?: { ttl?: number }): Promise<void>;
   delete(key: string): Promise<void>;

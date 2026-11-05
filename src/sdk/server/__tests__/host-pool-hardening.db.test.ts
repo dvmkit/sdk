@@ -7,10 +7,11 @@
  * host.ts wires both onto the production PostgresJobStore pool; the retry
  * behaviour itself is covered by src/lib/__tests__/pg-retry.test.ts.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { configureDVM } from "../../configure";
 import { createDVMHost } from "../host";
+import { PostgresKVStore } from "../postgres-kv-store";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
@@ -230,5 +231,36 @@ describe.skipIf(!RUN)("SDK host pool hardening for suspend/resume", () => {
 
     if (!ownedPool) throw new Error("onBoot did not observe the host-owned pool");
     await expect(ownedPool.query("SELECT 1")).rejects.toThrow(/pool after calling end/i);
+  });
+
+  it("closes its KV store at shutdown so the expiry sweep stops", async () => {
+    const pg = await import("pg");
+    const suppliedPool = new pg.default.Pool({ connectionString: DATABASE_URL });
+    const close = vi.spyOn(PostgresKVStore.prototype, "close");
+    const dvm = configureDVM({
+      name: "kv-sweep-shutdown",
+      capability: "test",
+      tag: "test",
+      onJob(ctx) {
+        ctx.complete("ok");
+      },
+    });
+
+    try {
+      const host = createDVMHost({ devMode: true, port: 0, env: {}, pool: suppliedPool });
+      host.mount(dvm);
+      server = await host.serve();
+      expect(close).not.toHaveBeenCalled();
+
+      await server.close();
+      server = undefined;
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      if (server) {
+        await server.close();
+        server = undefined;
+      }
+      await suppliedPool.end();
+    }
   });
 });

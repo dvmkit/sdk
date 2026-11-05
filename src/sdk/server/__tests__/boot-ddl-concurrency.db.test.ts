@@ -61,9 +61,10 @@ async function bootSdkSchema(pool: Pool): Promise<void> {
   await initLockPubkeyTable(pool);
   await seedLockPubkeyState(pool, DVM_ID, LOCK_PUBKEY);
   await initMppSecretStateTable(pool);
+  const kvStore = new PostgresKVStore(pool);
   await Promise.all([
     new PostgresJobStore(pool).init(),
-    new PostgresKVStore(pool).init(),
+    kvStore.init(),
     new PostgresReplayStore(pool).init(),
     new PostgresConsumedCredentialStore(pool).init(),
     new PostgresTempoSessionStore(pool).init(),
@@ -72,6 +73,8 @@ async function bootSdkSchema(pool: Pool): Promise<void> {
     new PostgresProcessedPaymentStore(pool).init(),
   ]);
   await new RevenueReporter(pool, "https://platform.invalid", "token").init();
+  // Stop the expiry sweep before the test drops the schema and ends the pool.
+  await kvStore.close();
 }
 
 /** One table from each init in `bootSdkSchema`, so a silently-skipped one fails. */
