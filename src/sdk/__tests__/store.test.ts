@@ -64,5 +64,25 @@ describe("MemoryKVStore", () => {
       vi.advanceTimersByTime(2000);
       expect(await store.list()).toEqual(["live"]);
     });
+
+    it("a sweep drops expired entries that were never read", async () => {
+      vi.useFakeTimers();
+      store = new MemoryKVStore();
+      await store.set("expired", "a", { ttl: 1 });
+      await store.set("live", "b", { ttl: 3600 });
+      await store.set("forever", "c");
+      vi.advanceTimersByTime(2000);
+      expect(store.sweepExpired()).toBe(1);
+      expect(await store.list()).toEqual(["live", "forever"]);
+    });
+
+    it("a write a minute after the last sweep drops expired entries", async () => {
+      vi.useFakeTimers();
+      store = new MemoryKVStore();
+      await store.set("expired", "a", { ttl: 1 });
+      vi.advanceTimersByTime(60_000);
+      await store.set("other", "b");
+      expect(store.sweepExpired()).toBe(0);
+    });
   });
 });

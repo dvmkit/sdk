@@ -742,6 +742,7 @@
         "PlatformReporterOpts",
         "PostgresJobStore",
         "PostgresKVStore",
+        "PostgresKVStoreOpts",
         "PostgresProcessedPaymentStore",
         "PostgresReplayStore",
         "PostgresReplayStoreOpts",
@@ -1415,7 +1416,11 @@
         },
         "PostgresKVStore": {
           "stability": "experimental",
-          "signature": "8544297583b8c6484fe0a675acbb5bb2800e0b0c2dd45692c3d711d14138c3da"
+          "signature": "69a6620a632574ba3ca65b59bf12110f68a1b0e3212a30893200d363da57bb94"
+        },
+        "PostgresKVStoreOpts": {
+          "stability": "experimental",
+          "signature": "285592dcd0386c83ded4e63916971e2e9b69878cccc71f9a0c06d684e89de1fe"
         },
         "PostgresProcessedPaymentStore": {
           "stability": "experimental",

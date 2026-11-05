@@ -131,6 +131,10 @@ For Bitcoin credit monitoring, `GET /admin/credit/bitcoin-liability` reports exa
 The public [SDK guide](https://dvmkit.com/docs/sdk) covers signed requests, custom routes, rail configuration, credit reclaim, persistence, and deployment in depth. The [protocol guide](https://dvmkit.com/docs/protocol) specifies the HTTP contract.
 
 
+## KV storage retention
+
+`ctx.store.set(key, value, { ttl })` makes an entry unreadable once its TTL passes. With the Postgres store, which the host uses whenever it has a database, the expired row is then physically deleted from `kv_store` within one minute of expiry. A sweep runs when the host starts and every minute after, in batches of 1,000 rows and at most 100,000 rows per sweep; if more than 100,000 entries expire in one minute, the backlog drains at that rate. A retention period you state for TTL data is therefore the TTL plus one minute at that volume. Hosts sharing one database may sweep concurrently. A failed sweep logs `kv_expiry_sweep_failed` and is retried at the next interval; reads and writes are unaffected. Entries written without a TTL are kept until deleted with `ctx.store.delete`. `PostgresKVStore` accepts `sweepIntervalMs` when constructed directly, and the bound scales with it; call `close()` before ending its pool. The in-memory development store drops expired entries on read and on a write at least a minute after its last sweep.
+
 ## Diagnostic retention
 
 [Payment diagnostics](./DIAGNOSTICS.md) documents the closed failure categories, stages, and top-up causes retained by safe logging sinks.
