@@ -78,9 +78,9 @@ export interface PaymentRequestContent {
   /** Exact outstanding balance charge, in integer micro-units. Use this message’s seq as request_seq. */
   credit?: { amount_micro: number; currency: string };
   /**
-   * What declining this ask costs: the pieces of work finished so far at full price, in
-   * integer micro-units of the job's credit currency. Absent on older servers and on jobs
-   * accepted before piece charging.
+   * What declining this ask costs: the pieces of work finished so far at their charge, a lowered
+   * one where the DVM gave it, in integer micro-units of the job's credit currency. Absent on
+   * older servers and on jobs accepted before piece charging.
    */
   charged_if_declined_micro?: number;
   amount_msats: number;

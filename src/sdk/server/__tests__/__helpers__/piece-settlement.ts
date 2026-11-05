@@ -427,6 +427,23 @@ export function pieceSettlementSuite(
       expectSettlement(outcome, UPFRONT, 0);
     });
 
+    it("an ask that lowers the finished piece quotes the lowered charge, and a decline settles it", async () => {
+      const h = await host();
+      const job = await h.submit("lowered");
+      await h.awaitAsks(job, 1);
+      await h.pay(job);
+      await h.awaitAsks(job, 2);
+      // Ask 3 finishes piece 2 at $0.05 instead of its $0.20 price.
+      const ask3 = (await h.asks(job))[1];
+      expect(ask3.content.charged_if_declined_micro).toBe(UPFRONT + 50_000);
+      const declined = await h.request(`/v1/job/${job.job_id}/messages`, { token: job.job_token, body: fixture.decline.request });
+      expect(declined.status).toBe(fixture.decline.response.status);
+      const outcome = await h.settled(job);
+      expect(outcome.status).toBe("cancelled");
+      expectSettlement(outcome, UPFRONT + 50_000, ASK_2 - 50_000);
+      expect(outcome.receipt.settlement!.charged).toBe(ask3.content.charged_if_declined_micro);
+    });
+
     it("ask 2 expiring 30 seconds after its deadline charges piece 1 only", async () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const h = await host();
