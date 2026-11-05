@@ -317,6 +317,33 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       -- job accepted before this column existed, which settles as one piece.
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pieces JSONB;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS settlement JSONB;
+
+      -- Whether a draw-backed terminal job's revenue was decided: booked into
+      -- the reporter outbox, or found to owe none. Terminal revenue recovery
+      -- books the rest. Rows that existed when the column arrived: completed
+      -- jobs were handed to the reporter in line (without awaiting its
+      -- enqueue, so a crash could lose one) and are marked rather than all
+      -- re-sent; jobs that ended any other way stay eligible, since a stored
+      -- terminal path once settled their finished pieces without booking them.
+      DO $migration$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'jobs'
+            AND column_name = 'revenue_report_enqueued'
+        ) THEN
+          ALTER TABLE jobs ADD COLUMN revenue_report_enqueued BOOLEAN NOT NULL DEFAULT false;
+          UPDATE jobs SET revenue_report_enqueued = true
+          WHERE status = 'completed' AND draw_id IS NOT NULL;
+        END IF;
+      END
+      $migration$;
+      -- listUnreportedTerminalRevenue's WHERE clause must imply this predicate.
+      CREATE INDEX IF NOT EXISTS idx_jobs_unreported_terminal_revenue
+        ON jobs (dvm_id, id)
+        WHERE revenue_report_enqueued = false
+          AND credit_id IS NOT NULL AND draw_id IS NOT NULL
+          AND status IN ('completed', 'failed', 'cancelled');
     `);
   }
 
@@ -787,6 +814,46 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       [dvmId, capabilities, afterJobId ?? null]
     );
     return rows.map(rowToRecord);
+  }
+
+  // Private so the public declaration is unchanged; JobManager's terminal
+  // revenue recovery reaches these two structurally.
+
+  /** Draw-backed terminal jobs whose revenue no funnel has decided, oldest id first. */
+  private async listUnreportedTerminalRevenue(args: {
+    dvmId: string;
+    capabilities: string[] | null;
+    terminalBeforeMs: number;
+    limit: number;
+    afterJobId?: string;
+  }): Promise<JobRecord[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM jobs
+       WHERE dvm_id = $1 AND revenue_report_enqueued = false
+         AND credit_id IS NOT NULL AND draw_id IS NOT NULL
+         AND status IN ('completed', 'failed', 'cancelled')
+         AND COALESCE(terminal_at_ms, last_activity_at) < $2
+         AND ($3::text[] IS NULL OR capability = ANY($3))
+         AND ($4::text IS NULL OR id > $4)
+       ORDER BY id LIMIT $5`,
+      [args.dvmId, args.terminalBeforeMs, args.capabilities, args.afterJobId ?? null, args.limit]
+    );
+    return rows.map(rowToRecord);
+  }
+
+  /**
+   * Mark a job's revenue decided. A booking that carried the job's declared
+   * cost also marks that cost revision reported, so cost recovery does not
+   * send it again as a zero-revenue event; a fresher revision stays eligible.
+   */
+  private async markRevenueReported(jobId: string, costRevision?: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE jobs SET revenue_report_enqueued = true,
+         cost_reported_revision = CASE WHEN $2::bigint IS NULL THEN cost_reported_revision
+           ELSE GREATEST(COALESCE(cost_reported_revision, -1), $2::bigint) END
+       WHERE id = $1`,
+      [jobId, costRevision ?? null]
+    );
   }
 
   /**
