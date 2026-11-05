@@ -150,6 +150,13 @@ const DEFAULT_PROCESSING_WATCHDOG_MS = 5 * 60_000;
 const TERMINAL_COST_RECOVERY_BATCH = 100;
 const TERMINAL_COST_RECOVERY_MAX_PAGES = 10;
 const TERMINAL_COST_RECOVERY_INTERVAL_MS = 30_000;
+const TERMINAL_REVENUE_RECOVERY_BATCH = 100;
+/**
+ * Recovery leaves a terminal job this long for its own terminal funnel to book,
+ * so the sweep does not race an in-flight in-line booking into a duplicate.
+ */
+const TERMINAL_REVENUE_RECOVERY_MIN_AGE_MS = 60_000;
+const TERMINAL_REVENUE_RECOVERY_WARNED_MAX = 10_000;
 
 /**
  * Default interval at which the JobManager bumps `last_activity_at` for its
@@ -609,6 +616,40 @@ type RevenueBookableJob = Pick<
   | "drawId"
 >;
 
+/**
+ * What one revenue decision came to. `booked` was handed to `onJobCompleted`;
+ * `enqueued` settles once it resolved (the reporter's durable insert) and the
+ * row was marked. `skipped` is final: nothing will ever be bookable. `deferred`
+ * may become bookable — the draw was unreadable or still pending, or no
+ * reporter is wired — so recovery looks at it again.
+ */
+type RevenueOutcome =
+  | { kind: "booked"; enqueued: Promise<void> }
+  | { kind: "skipped" }
+  | { kind: "deferred" };
+const SKIPPED: RevenueOutcome = { kind: "skipped" };
+const DEFERRED: RevenueOutcome = { kind: "deferred" };
+
+/**
+ * Postgres-only surface that finds draw-backed terminal jobs whose revenue was
+ * never decided. `PostgresJobStore` keeps these methods private so its public
+ * declaration stays unchanged; this manager reaches them structurally.
+ */
+interface RevenueRecoveryStore extends JobStore {
+  listUnreportedTerminalRevenue(args: {
+    dvmId: string;
+    capabilities: string[] | null;
+    terminalBeforeMs: number;
+    limit: number;
+    afterJobId?: string;
+  }): Promise<JobRecord[]>;
+  markRevenueReported(jobId: string, costRevision?: number): Promise<void>;
+}
+
+function isRevenueRecoveryStore(store: JobStore): store is RevenueRecoveryStore {
+  return "listUnreportedTerminalRevenue" in store && "markRevenueReported" in store;
+}
+
 /** Postgres-only surface that closes the terminal-row-to-cost-outbox crash window. */
 interface TerminalCostRecoveryStore extends JobStore {
   saveForDvm(record: JobRecord, dvmId: string): Promise<void>;
@@ -713,6 +754,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private sweepInFlight = false;
   private orphanSweepInFlight = false;
   private terminalCostRecoveryInFlight = false;
+  private terminalRevenueRecoveryInFlight = false;
+  private terminalRevenueRecoveryCursor?: string;
+  /** Rows recovery already warned about, so an undecided row warns once, not every pass. */
+  private readonly terminalRevenueRecoveryWarned = new Set<string>();
   private terminalCostRecoveryResumeAfter?: string;
   private jobRetentionSweepInFlight = false;
   private heartbeatInFlight = false;
@@ -924,7 +969,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // therefore retain an enqueue marker, and every live sibling retries the
     // bounded gap scan. createDVMServer also awaits one pass before boot
     // completes, so scale-to-zero restarts do not wait for this interval.
-    if (opts.dvmId && (opts.onJobCost || opts.onJobTerminal) && isTerminalCostRecoveryStore(this.jobStore)) {
+    if (opts.dvmId && (opts.onJobCost || opts.onJobTerminal || opts.onJobCompleted) && isTerminalCostRecoveryStore(this.jobStore)) {
       this.terminalCostRecoveryTimer = setInterval(() => {
         void this.recoverTerminalCosts().catch((_err: unknown) => {
           diagnosticConsole.error(
@@ -4281,8 +4326,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async finalizeTerminal(job: ServerJob): Promise<void> {
     await this.persistJob(job);
     await this.attachReceipt(job);
-    await this.reportJobCost(job);
+    // Book off the committed row, as the stored-terminal path and recovery do.
+    const record = await this.jobStore.get(job.id).catch(() => undefined);
+    await this.bookRevenueOrReportCost(record && isTerminal(record.status) ? record : job);
     await this.reportTerminalJob(job.id);
+  }
+
+  /**
+   * The terminal accounting after the draw is resolved: a settled draw is the
+   * revenue event, which also carries the declared cost; without one, the cost
+   * goes out on its own zero-revenue event.
+   */
+  private async bookRevenueOrReportCost(job: RevenueBookableJob): Promise<void> {
+    if (!(await this.bookRevenue(job))) await this.reportJobCost(job);
   }
 
   /**
@@ -4314,7 +4370,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const receipt = await this.issueReceiptForStoredJob(jobId);
     const record = await this.jobStore.get(jobId).catch(() => undefined);
     if (record && isTerminal(record.status)) {
-      await this.reportJobCost(record);
+      await this.bookRevenueOrReportCost(record);
       await this.reportTerminalJob(jobId);
     }
     return receipt;
@@ -4401,11 +4457,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // after a failure committed without a successful acknowledgement/read-back.
     if (!durable || !isTerminal(durable.status) || this.terminalFailures.has(job)) await this.persistJob(job);
     await this.attachReceipt(job);
-    // Every `false` that costs a revenue booking logs from inside
-    // `bookRevenue`; the return value also distinguishes the jobs whose
-    // declared cost needs its own zero-revenue event.
-    const booked = await this.bookRevenue(job);
-    if (!booked) await this.reportJobCost(job);
+    await this.bookRevenueOrReportCost(job);
     await this.reportTerminalJob(job.id);
     this.scheduleCleanup(job);
   }
@@ -4425,6 +4477,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const store = this.jobStore;
     const dvmId = this.opts.dvmId;
     await this.recoverTerminalReports();
+    // Before cost recovery: a recovered booking carries the job's cost and marks its revision.
+    await this.recoverTerminalRevenue().catch((_err: unknown) => {
+      diagnosticConsole.error({ level: "terminal_revenue_recovery_failed", error: undefined });
+    });
     if (!dvmId || !this.opts.onJobCost || !isTerminalCostRecoveryStore(store)) {
       return { examined: 0, queued: 0, complete: true };
     }
@@ -4478,6 +4534,73 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       return { examined, queued, complete: false };
     } finally {
       this.terminalCostRecoveryInFlight = false;
+    }
+  }
+
+  /**
+   * Book draw-backed terminal jobs whose revenue no terminal funnel decided:
+   * a crash between settling the draw and the reporter's enqueue, a reporter
+   * that rejected, a draw the reconciler settled after the funnel gave up, or
+   * a row left by an SDK whose stored-terminal paths never booked. Goes
+   * through `reportRevenue` off the stored row, the same path and the same
+   * columns as the in-line booking, so a duplicate of an in-line booking is
+   * byte-identical and the platform's `UNIQUE (rail, tx_hash)` dedupes it.
+   * The marker advances only after the reporter's enqueue resolves (or on a
+   * final skip), so a restart retries exactly the undecided rows.
+   */
+  private async recoverTerminalRevenue(): Promise<void> {
+    const store = this.jobStore;
+    const dvmId = this.opts.dvmId;
+    if (!dvmId || !this.opts.onJobCompleted || !this.opts.creditLedger || !isRevenueRecoveryStore(store)) return;
+    if (this.terminalRevenueRecoveryInFlight) return;
+    this.terminalRevenueRecoveryInFlight = true;
+    try {
+      const records = await store.listUnreportedTerminalRevenue({
+        dvmId,
+        capabilities: this.capabilityNames(),
+        terminalBeforeMs: Date.now() - TERMINAL_REVENUE_RECOVERY_MIN_AGE_MS,
+        limit: TERMINAL_REVENUE_RECOVERY_BATCH,
+        ...(this.terminalRevenueRecoveryCursor ? { afterJobId: this.terminalRevenueRecoveryCursor } : {}),
+      });
+      let booked = 0;
+      const nowMs = Date.now();
+      for (const record of records) {
+        // A pending draw is the terminal-draw reconciler's to settle, and that booking marks
+        // the row; until its grace has passed, reading the row again only repeats a warning.
+        const terminalAtMs = record.terminalAtMs ?? record.lastActivityAt;
+        if (nowMs - terminalAtMs < this.terminalDrawReconcileAgeMs) {
+          const draw = await this.opts.creditLedger
+            .getDraw({ creditId: record.creditId!, drawId: record.drawId! })
+            .catch(() => undefined);
+          if (draw?.status === "pending") continue;
+        }
+        const firstLook = !this.terminalRevenueRecoveryWarned.has(record.id);
+        const outcome = await this.reportRevenue(record, firstLook);
+        if (outcome.kind === "deferred") {
+          if (this.terminalRevenueRecoveryWarned.size >= TERMINAL_REVENUE_RECOVERY_WARNED_MAX) {
+            this.terminalRevenueRecoveryWarned.clear();
+          }
+          this.terminalRevenueRecoveryWarned.add(record.id);
+        } else {
+          this.terminalRevenueRecoveryWarned.delete(record.id);
+        }
+        if (outcome.kind !== "booked") continue;
+        // Its failure is already logged; the row stays unmarked for the next pass.
+        if (await outcome.enqueued.then(() => true, () => false)) booked++;
+      }
+      this.terminalRevenueRecoveryCursor =
+        records.length === TERMINAL_REVENUE_RECOVERY_BATCH ? records[records.length - 1].id : undefined;
+      if (booked > 0) {
+        diagnosticConsole.log({
+          level: "info",
+          event: "terminal_revenue_recovered",
+          dvmId,
+          examined: records.length,
+          booked,
+        });
+      }
+    } finally {
+      this.terminalRevenueRecoveryInFlight = false;
     }
   }
 
@@ -4555,7 +4678,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * Returns whether the report was handed to `onJobCompleted`, so a caller
    * that logs the booking says what actually happened rather than what it
    * assumed — the guards below still drop legitimate shapes (a free job, a
-   * DVM with no reporter). Every drop that costs a booking logs first.
+   * DVM with no reporter). Every drop of a terminal job that carries a draw
+   * logs a named `revenue_skipped_*` event first.
+   *
+   * On a store with a revenue marker, a booking marks the row only after
+   * `onJobCompleted` resolves (the reporter's durable enqueue), and a final
+   * skip marks it at once. A transient drop (draw unreadable, missing or still
+   * pending, no reporter wired) leaves the row for `recoverTerminalRevenue`.
    *
    * The rail check sits **below** the draw re-read, not in the entry guard
    * a settled draw the terminal can't report under is a real debit
@@ -4565,13 +4694,34 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * amount, and can distinguish the four causes — see its `reason` below.
    */
   private async bookRevenue(job: RevenueBookableJob): Promise<boolean> {
+    return (await this.reportRevenue(job)).kind === "booked";
+  }
+
+  private async reportRevenue(job: RevenueBookableJob, warnUnsettled = true): Promise<RevenueOutcome> {
+    const outcome = await this.revenueOutcome(job, warnUnsettled);
+    if (outcome.kind === "skipped" && job.creditId && job.drawId) await this.markRevenueReported(job.id);
+    return outcome;
+  }
+
+  private async revenueOutcome(job: RevenueBookableJob, warnUnsettled: boolean): Promise<RevenueOutcome> {
     const onJobCompleted = this.opts.onJobCompleted;
     const onRevenueSkippedNoRail = this.opts.onRevenueSkippedNoRail;
-    if (!onJobCompleted && !onRevenueSkippedNoRail) return false;
     // A draw that settled is revenue however its job ended: a job that did not complete can
     // still have been charged for the part it finished. Without a draw only completion earns.
-    const drawBacked = !!(job.creditId && job.drawId && this.opts.creditLedger);
-    if (job.status !== "completed" && !(drawBacked && isTerminal(job.status))) return false;
+    const hasDraw = !!(job.creditId && job.drawId);
+    if (!isTerminal(job.status) || (job.status !== "completed" && !hasDraw)) return SKIPPED;
+    if (!hasDraw && !onJobCompleted && !onRevenueSkippedNoRail) return SKIPPED;
+    const drawFields = { jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId };
+    if (job.status !== "completed" && deferredX402IntentId(job.creditId)) {
+      // An unfinished deferred-x402 job abandons its authorization unspent; no ledger draw exists.
+      diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "abandoned" });
+      return SKIPPED;
+    }
+    if (job.status !== "completed" && !this.opts.creditLedger) {
+      // Only a ledger can say whether this job's draw settled for its finished part.
+      diagnosticConsole.warn({ level: "warn", event: "revenue_skipped_no_ledger", ...drawFields });
+      return SKIPPED;
+    }
 
     let credit: Record<string, unknown> = {};
     // `null` = a legacy row written before recorded a rail.
@@ -4590,25 +4740,36 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let bookedNative = job.nativeAmount;
     if (job.creditId && job.drawId && this.opts.creditLedger) {
       const args = { creditId: job.creditId, drawId: job.drawId };
-      const draw = await this.opts.creditLedger.getDraw(args).catch(() => undefined);
-      // An unsettled draw on a job that did not complete was released: nothing was earned.
-      if (draw?.status !== "settled" && job.status !== "completed") return false;
+      let unreadable = false;
+      const draw = await this.opts.creditLedger.getDraw(args).catch(() => {
+        unreadable = true;
+        return undefined;
+      });
+      if (draw?.status === "released" && job.status !== "completed") {
+        // A released draw on a job that did not complete charged nothing: nothing was earned.
+        diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "released" });
+        return SKIPPED;
+      }
       if (draw?.status !== "settled") {
-        // `attachReceipt` above settles every completed job's draw, so getting
+        // Every terminal funnel resolves the draw before booking, so getting
         // here means that resolution failed (already logged loud as
-        // `credit_resolve_failed`). Booking an unsettled hold as revenue would
-        // recognise money the ledger still says is held — skip and say so.
-        diagnosticConsole.warn(
-          {
-            level: "warn",
-            event: "revenue_skipped_unsettled_draw",
-            jobId: job.id,
-            creditId: job.creditId,
-            drawId: job.drawId,
-            drawStatus: draw?.status ?? "missing",
-          }
-        );
-        return false;
+        // `credit_resolve_failed`) or the ledger could not be read. Booking an
+        // unsettled hold as revenue would recognise money the ledger still says
+        // is held — skip and say so.
+        const drawStatus = unreadable ? "unreadable" : draw?.status ?? "missing";
+        if (warnUnsettled) {
+          diagnosticConsole.warn(
+            {
+              level: "warn",
+              event: "revenue_skipped_unsettled_draw",
+              ...drawFields,
+              drawStatus,
+            }
+          );
+        }
+        // Only a released draw on a completed job is a final answer here. A pending, missing
+        // or unreadable draw may be a transient read or a resolution still to come.
+        return draw?.status === "released" ? SKIPPED : DEFERRED;
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
@@ -4625,8 +4786,28 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       };
     }
 
+    if (hasDraw && !onJobCompleted && !onRevenueSkippedNoRail) {
+      diagnosticConsole.log({ level: "info", event: "revenue_skipped_no_reporter", ...drawFields, drawAmountMicro });
+      return DEFERRED;
+    }
+
     if (job.paidMsats <= 0 && !(drawAmountMicro !== undefined && drawAmountMicro > 0 &&
-        typeof credit.creditCurrency === "string" && creditRail && isFundingRail(creditRail))) return false;
+        typeof credit.creditCurrency === "string" && creditRail && isFundingRail(creditRail))) {
+      if (hasDraw) {
+        // Nothing reportable: a zero-value draw, or one with no funding rail and no msats to
+        // book under. A positive amount here is a debit with no revenue event, so it warns.
+        const level = drawAmountMicro !== undefined && drawAmountMicro > 0 ? "warn" : "info";
+        diagnosticConsole[level]({
+          level,
+          event: "revenue_skipped_unbookable_draw",
+          ...drawFields,
+          drawAmountMicro,
+          creditRail: creditRail ?? null,
+          paidMsats: job.paidMsats,
+        });
+      }
+      return SKIPPED;
+    }
 
     if (!job.paymentRail) {
       // A job with no draw and no rail is a legitimately free/unpaid shape —
@@ -4690,13 +4871,22 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           });
         }
       }
-      return false;
+      return SKIPPED;
     }
 
-    if (!onJobCompleted) return false;
+    if (!onJobCompleted) {
+      if (!hasDraw) return SKIPPED;
+      diagnosticConsole.log({ level: "info", event: "revenue_skipped_no_reporter", ...drawFields, drawAmountMicro });
+      return DEFERRED;
+    }
 
-    Promise.resolve(
-      onJobCompleted({
+    // A booking that carries the job's declared cost has also reported that cost revision.
+    const costRevision =
+      job.costRevision ??
+      (job.costAmountMicro !== undefined && job.costCurrency !== undefined ? 0 : undefined);
+    let handed: Promise<void>;
+    try {
+      handed = Promise.resolve(onJobCompleted({
         dvmId: this.opts.dvmId ?? "",
         jobId: job.id,
         // Legacy Postgres rows surface a missing capability as `""`. Keep
@@ -4717,11 +4907,31 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           ? { cost: { amountMicro: job.costAmountMicro, currency: job.costCurrency } }
           : {}),
         ...credit,
-      })
-    ).catch((err: unknown) => {
+      }));
+    } catch (err) {
+      handed = Promise.reject(err);
+    }
+    const enqueued = handed.then(() =>
+      hasDraw ? this.markRevenueReported(job.id, costRevision) : undefined
+    );
+    enqueued.catch((err: unknown) => {
       diagnosticConsole.error(`[${job.id}] Revenue reporting failed:`, err);
     });
-    return true;
+    return { kind: "booked", enqueued };
+  }
+
+  /**
+   * Record that a draw-backed terminal job's revenue question is settled, on
+   * stores that keep the marker. A failed mark only costs a duplicate booking
+   * from recovery, which the platform's `UNIQUE (rail, tx_hash)` absorbs.
+   */
+  private async markRevenueReported(jobId: string, costRevision?: number): Promise<void> {
+    if (!isRevenueRecoveryStore(this.jobStore)) return;
+    try {
+      await this.jobStore.markRevenueReported(jobId, costRevision);
+    } catch (_err) {
+      diagnosticConsole.warn({ level: "warn", event: "revenue_report_mark_failed", jobId });
+    }
   }
 
   /** Schedule job removal from activeJobs after a delay so clients can still poll final status. */

@@ -385,6 +385,9 @@ export function pieceSettlementSuite(
         expect((await h.request(`/v1/job/${job.job_id}`, { method: "DELETE", token: job.job_token })).status).toBe(200);
       }
       expectSettlement(await h.settled(job), charged, released);
+      // Every ending books its settled draw once, at the charged amount.
+      await h.until(() => h.revenue.length > 0, "the revenue report");
+      expect(h.revenue).toEqual([expect.objectContaining({ jobId: job.job_id, drawId: job.drawId, drawAmountMicro: charged })]);
       expect(h.terminals.length).toBeGreaterThan(0);
       for (const report of h.terminals) {
         expect(report).toMatchObject({ heldMicro: charged + released, finishedPieceCount: finished });
@@ -439,6 +442,34 @@ export function pieceSettlementSuite(
       const outcome = await h.settled(job);
       expect(outcome.status).toBe("cancelled");
       expectSettlement(outcome, UPFRONT, 0);
+    });
+
+    it("an idle cancel after two paid pieces books the settled draw as revenue", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = await host();
+      const job = await h.submit("complete");
+      await h.awaitAsks(job, 1);
+      expect((await h.pay(job)).status).toBe(201);
+      await h.awaitAsks(job, 2);
+      const expiresAt = (await h.asks(job))[1].content.expires_at_ms as number;
+      vi.setSystemTime(expiresAt + ASK_EXPIRY_GRACE_MS);
+      await h.jm.cancelJobIdle(h.jm.activeJobs.get(job.job_id)!);
+      const outcome = await h.settled(job);
+      expect(outcome).toMatchObject({ status: "cancelled", receipt: { ended_by: "caller" } });
+      expectSettlement(outcome, UPFRONT + ASK_2, 0);
+      // Revenue is the settled draw, whichever terminal path settled it.
+      await h.until(() => h.revenue.length > 0, "the revenue report");
+      expect(h.revenue).toEqual([
+        expect.objectContaining({
+          jobId: job.job_id,
+          rail: "x402",
+          creditId: job.creditId,
+          drawId: job.drawId,
+          drawAmountMicro: UPFRONT + ASK_2,
+          creditCurrency: "usd",
+          settledAt: outcome.draw.resolvedAt,
+        }),
+      ]);
     });
 
     it("a cancel during piece 2 aborts the handler, charges pieces 1 and 2, and a later ask or completion changes nothing", async () => {
