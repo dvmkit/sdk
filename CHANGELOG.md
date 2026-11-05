@@ -81,6 +81,25 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.26.0](https://github.com/dvmkit/sdk/compare/v0.25.0...v0.26.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk:** Test contexts cache successful step results by default. Use a fresh context and cache for independent executions, and reuse a cache only for replay of the same job.
+
+### Features
+
+* **api:** enforce public signature release disclosures ([c4b3ad6](https://github.com/dvmkit/sdk/commit/c4b3ad6866e735bf1a12939fb7d2bd7428e02266))
+* **reports:** include paid-piece totals in terminal evidence ([28db581](https://github.com/dvmkit/sdk/commit/28db581817fcaa2e3e52c705cca34dd804215604))
+* **sdk:** support handler replay tests and typed capabilities ([0aa92c7](https://github.com/dvmkit/sdk/commit/0aa92c7589975b9e64d5efbba96c1d3cd430e1b0))
+
+
+### Bug Fixes
+
+* **credit:** book revenue for a credit-backed job that ends without completing ([#113](https://github.com/dvmkit/sdk/issues/113)) ([a8ef404](https://github.com/dvmkit/sdk/commit/a8ef404362cf94d383b65ed2e16606b986db3ab5))
+* **credit:** recover permanently refused card refunds ([7cb0319](https://github.com/dvmkit/sdk/commit/7cb0319813b761525310463d779b793fc09c294c))
+
 ## [0.25.0](https://github.com/dvmkit/sdk/compare/v0.24.0...v0.25.0) (2026-11-03)
 
 ### Breaking API changes
