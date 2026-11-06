@@ -30,6 +30,7 @@ import type { FxFetcher } from "../pricing/index";
 import { MemoryKVStore } from "../store";
 import type { CashuMode, DVMDescriptor, KVStore, PaymentMethod, ZodLike } from "../types";
 import { createDVMServer, revenueReporterBannerState, unknownRouteNotFound } from "./app";
+import type { PostgresKVStore } from "./postgres-kv-store";
 import type { PostgresTempoChargeStore } from "./tempo-charge-store";
 import type { ResolvedCashuOpts } from "./cashu-env";
 import { resolveCashuOptsFromEnv } from "./cashu-env";
@@ -297,6 +298,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
   let tempoSettlementReadiness: TempoSettlementReadiness | undefined;
   let processedPayments: ProcessedPaymentStore | undefined;
   let pgStreamStore: StreamableJobStore | undefined;
+  let hostKvStore: PostgresKVStore | undefined;
   let nodeServer: Server | undefined;
   let spanWriter: SpanWriter | undefined;
   let shutdownPromise: Promise<void> | undefined;
@@ -402,6 +404,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         const pgKvStore = new PostgresKVStore(pool);
         pendingInits.push(pgKvStore.init());
         store = pgKvStore;
+        hostKvStore = pgKvStore;
         kvBackend = "postgres";
       }
     }
@@ -1278,6 +1281,11 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     }
     if (pgStreamStore && isStreamableJobStore(pgStreamStore)) {
       await capture(() => pgStreamStore?.shutdownStreaming());
+    }
+    if (hostKvStore) {
+      const kvStore = hostKvStore;
+      hostKvStore = undefined;
+      await capture(() => kvStore.close());
     }
     if (pgPool && ownsPool) {
       const ownedPool = pgPool;

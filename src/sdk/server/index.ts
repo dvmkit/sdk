@@ -182,6 +182,8 @@ export { PostgresJobStore } from "./postgres-job-store";
 /** @stability experimental */
 export { PostgresKVStore } from "./postgres-kv-store";
 /** @stability experimental */
+export type { PostgresKVStoreOpts } from "./postgres-kv-store";
+/** @stability experimental */
 export type { PostgresReplayStoreOpts } from "./postgres-replay-store";
 /** @stability experimental */
 export { PostgresReplayStore } from "./postgres-replay-store";

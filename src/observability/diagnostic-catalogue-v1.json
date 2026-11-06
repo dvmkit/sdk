@@ -219,6 +219,7 @@
     "job_status_watch_subscribe_failed",
     "job_terminal_elsewhere",
     "kind",
+    "kv_expiry_sweep_failed",
     "kv_store_in_memory",
     "lightning.get_balance",
     "lightning.get_balance.result",

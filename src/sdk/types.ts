@@ -74,7 +74,12 @@ export interface Logger {
 export interface KVStore {
   /** Retrieve a value by key. Returns undefined if not found or expired. */
   get<T = unknown>(key: string): Promise<T | undefined>;
-  /** Store a value. Optionally set a TTL in seconds. */
+  /**
+   * Store a value. Optionally set a TTL in seconds; the built-in Postgres
+   * store deletes the entry within one minute after the TTL passes while a
+   * host is running, and a stopped or suspended service deletes it within one
+   * minute of its next start.
+   */
   set(key: string, value: unknown, opts?: { ttl?: number }): Promise<void>;
   delete(key: string): Promise<void>;
   /** List keys, optionally filtered by prefix. */
