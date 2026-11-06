@@ -87,6 +87,22 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.27.0](https://github.com/dvmkit/sdk/compare/v0.26.1...v0.27.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **kv:** a directly constructed PostgresKVStore runs a sweep timer from init() and must be closed with close() before its pool ends; otherwise each later sweep logs kv_expiry_sweep_failed.
+
+### Bug Fixes
+
+* **kv:** delete expired rows from the Postgres KV store ([#119](https://github.com/dvmkit/sdk/issues/119)) ([414718c](https://github.com/dvmkit/sdk/commit/414718cb08a8ba1b2c68aa339a966daa9b1c5dcd))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.26.1 ([#117](https://github.com/dvmkit/sdk/issues/117)) ([d7f85ce](https://github.com/dvmkit/sdk/commit/d7f85ce2a1ea363090a10d11af7bea6cd2573de8))
+
 ## [0.26.1](https://github.com/dvmkit/sdk/compare/v0.26.0...v0.26.1) (2026-11-05)
 
 
