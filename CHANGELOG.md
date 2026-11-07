@@ -89,6 +89,41 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.28.0](https://github.com/dvmkit/sdk/compare/v0.27.0...v0.28.0) (2026-11-07)
+
+### ⚠ BREAKING CHANGES
+
+* **x402:** `X402ExactSettlementAttempt["outcome"]` (`@dvmkit/sdk/server`) gains `"pending"`, recorded when a facilitator answers `settlement_pending`. Code that switches exhaustively over that union must handle the new value. No other public signature loses or narrows anything.
+* The public signature gate also flags these optional additions; existing code compiles unchanged: `x402.facilitatorTimeoutMs` on the x402 configuration (default 10000), which reaches `DVMConfig`, `configureDVM`, `DVMDescriptor`, `isConfiguredDVMDescriptor`, `serve`, `createDVMHost`, `DVMHost`, `DVMHostOpts`, `JobManager`, `JobManagerOpts`, `handleCreditRequest`, `CreditRouteDeps` and the x402 settlement server options; optional `X402ExactSettlementStore.expireUnused`, implemented by `MemoryX402ExactSettlementStore` and `PostgresX402ExactSettlementStore`; optional `isExactAuthorizationUnused` on the x402 settlement evidence readers; and optional `getBlock` on the evidence client. A custom store or evidence reader without the new methods leaves an expired, unused authorization unresolved rather than ending it unpaid.
+
+### Migrations
+
+None. No schema change; the new `"pending"` outcome and the `rejected` status written by `expireUnused` use existing text columns.
+
+### Compatibility requirements
+
+Unchanged: Node range and dependency floors are the same as 0.27.0.
+
+### dvmctl and platform prerequisites
+
+None. The Fly keepalive is active only when `FLY_APP_NAME` and `FLY_MACHINE_ID` are set and needs a resolvable Flycast address for the app; elsewhere it does nothing.
+
+
+### Features
+
+* **server:** add Fly keepalive during handler execution ([beb637c](https://github.com/dvmkit/sdk/commit/beb637c4b87cf3bd94462dc455c9ec04dd07444d))
+
+
+### Bug Fixes
+
+* handle signed-request errors across SDK installations ([d599d5a](https://github.com/dvmkit/sdk/commit/d599d5ad849f69fbba4d94c5cd29386aaeec2609))
+* **x402:** keep an unsigned job's settlement unknown until evidence resolves it ([7087478](https://github.com/dvmkit/sdk/commit/7087478eccb3909d998740cb04761ab833d2adf3))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.27.0 ([#120](https://github.com/dvmkit/sdk/issues/120)) ([9fdd561](https://github.com/dvmkit/sdk/commit/9fdd561a4b94cc042b43252c8a76d124312eae33))
+
 ## [0.27.0](https://github.com/dvmkit/sdk/compare/v0.26.1...v0.27.0) (2026-11-06)
 
 
