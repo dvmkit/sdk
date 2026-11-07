@@ -91,6 +91,23 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 ## [0.28.0](https://github.com/dvmkit/sdk/compare/v0.27.0...v0.28.0) (2026-11-07)
 
+### ⚠ BREAKING CHANGES
+
+* **x402:** `X402ExactSettlementAttempt["outcome"]` (`@dvmkit/sdk/server`) gains `"pending"`, recorded when a facilitator answers `settlement_pending`. Code that switches exhaustively over that union must handle the new value. No other public signature loses or narrows anything.
+* The public signature gate also flags these optional additions; existing code compiles unchanged: `x402.facilitatorTimeoutMs` on the x402 configuration (default 10000), which reaches `DVMConfig`, `configureDVM`, `DVMDescriptor`, `isConfiguredDVMDescriptor`, `serve`, `createDVMHost`, `DVMHost`, `DVMHostOpts`, `JobManager`, `JobManagerOpts`, `handleCreditRequest`, `CreditRouteDeps` and the x402 settlement server options; optional `X402ExactSettlementStore.expireUnused`, implemented by `MemoryX402ExactSettlementStore` and `PostgresX402ExactSettlementStore`; optional `isExactAuthorizationUnused` on the x402 settlement evidence readers; and optional `getBlock` on the evidence client. A custom store or evidence reader without the new methods leaves an expired, unused authorization unresolved rather than ending it unpaid.
+
+### Migrations
+
+None. No schema change; the new `"pending"` outcome and the `rejected` status written by `expireUnused` use existing text columns.
+
+### Compatibility requirements
+
+Unchanged: Node range and dependency floors are the same as 0.27.0.
+
+### dvmctl and platform prerequisites
+
+None. The Fly keepalive is active only when `FLY_APP_NAME` and `FLY_MACHINE_ID` are set and needs a resolvable Flycast address for the app; elsewhere it does nothing.
+
 
 ### Features
 
