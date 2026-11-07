@@ -320,8 +320,8 @@ export class X402ExactSettlementServer {
         };
       }
       // An attempt of ours may already have reached the facilitator when the
-      // intent is past `prepared`; a nonce the chain reports used is then
-      // plausibly our own settlement rather than someone else's spend.
+      // intent is past `prepared`; a refusal is then plausibly the echo of our
+      // own settlement rather than a verdict on an untouched authorization.
       let mayHaveSentBefore = intent.status !== "prepared";
       this.activeSubmissions.add(intentId);
       let submissionBlock: string | undefined;
@@ -409,10 +409,10 @@ export class X402ExactSettlementServer {
             transaction: settleResponse.transaction,
             settleResponse: settleResponse as unknown as Record<string, unknown>,
           });
-        } else if (
-          settlementMayHaveMoved(settleResponse) ||
-          (mayHaveSentBefore && nonceAlreadyUsed(settleResponse))
-        ) {
+        } else if (settlementMayHaveMoved(settleResponse) || mayHaveSentBefore) {
+          // After an earlier attempt of ours, any refusal can be the echo of that
+          // attempt having landed (a drained balance, a used nonce, a failed
+          // re-simulation), so chain evidence decides rather than the reply.
           intent = await this.opts.store.recordOutcome({
             dvmId: args.dvmId,
             intentId,
@@ -743,16 +743,6 @@ function receiptFromIntent(intent: X402ExactSettlementIntent, btcUsdRate: number
 
 function isSettlementPending(response: SettleResponse): boolean {
   return !response.success && response.errorReason === X402_SETTLEMENT_PENDING;
-}
-
-/**
- * The token contract refuses a nonce it has seen. For a first settle that is a
- * plain rejection; after an attempt that may have reached the chain it can be
- * that attempt's own success.
- */
-function nonceAlreadyUsed(response: SettleResponse): boolean {
-  const reason = response.errorReason?.toLowerCase() ?? "";
-  return reason.includes("nonce_already_used") || reason.includes("nonce already used");
 }
 
 function settlementMayHaveMoved(response: SettleResponse): boolean {

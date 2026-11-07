@@ -665,6 +665,54 @@ describe("unsigned x402 whose settlement outcome is not known", () => {
 
       expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
     });
+
+    it.each([
+      ["a drained balance", json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })],
+      [
+        "a failed re-simulation (400)",
+        json({ success: false, errorReason: "invalid_exact_evm_transaction_failed" }, 400),
+      ],
+    ])("settles when the resend is refused for %s and the chain shows our transfer", async (_name, refusal) => {
+      const r = rig(undefined, {
+        getBlockNumber: async () => 100n,
+        findExactPayment: async () => ({ transaction: TX, amount: String(PRICE_MICRO) }),
+      });
+      r.settleQueue.push(pending, refusal);
+      const { jobs, terminal } = withTerminal(r, r.settler);
+      const payment = await admit(r, authorization(60), "job-pending-refused");
+
+      await run(jobs, payment, "job-pending-refused");
+
+      expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("complete");
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("does not call the payment unpaid when the resend is refused for a drained balance and the chain is silent", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      r.settleQueue.push(
+        pending,
+        json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })
+      );
+      const payment = await admit(r, authorization(60), "job-pending-drained");
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+    });
+
+    it("does not call a retried settlement unpaid when an earlier attempt timed out and the retry is refused", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      const payment = await admit(r, authorization(60), "job-retry-refused");
+      const intentId = await strand(r, payment, "ambiguous");
+      r.settleQueue.push(json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" }));
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      expect(r.facilitatorCalls("/settle")).toBe(1);
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+    });
   });
 
   describe("a completed job whose process holds no signature", () => {
