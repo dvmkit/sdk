@@ -69,6 +69,7 @@ try {
   const declarations = countInstalledDeclarations(installedRoot, installedManifest);
   typecheckConsumer(consumer, "bundler");
   typecheckConsumer(consumer, "node16");
+  runSignedRequestCopies(consumer, archive);
   runExamples(consumer);
   runDrainRecovery(consumer);
   runTempoCreditLosses(consumer);
@@ -92,10 +93,27 @@ try {
 
   const shape = declarations.map((entry) => `${entry.export} ${entry.names.length}`).join(", ");
   console.log(
-    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, runnable public examples, persisted drain recovery, Tempo loss classification, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} rate-outage Cashu refusals, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
+    `consumer ok: exact install of ${manifest.name}@${manifest.version}, runtime imports (${runtime.join(", ")}), bundler and node16 type resolution, cross-install signed-request refusals, runnable public examples, persisted drain recovery, Tempo loss classification, completed credit history (${completedHistory.records} records, ${completedHistory.pages} pages, ${completedHistory.verifiedRefunds} offline verifications), signed content holds and export recipe, payment diagnostics (${paymentDiagnostics.cashuCases} rate-outage Cashu refusals, ${paymentDiagnostics.credentialCases} credential failures, SHA-256 ${paymentDiagnostics.sha256})${trustedSpanPersistence ? ", trusted span persistence" : ""}, ${total} declaration-level names (${shape})`
   );
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
+}
+
+/** @param {string} consumer @param {string} archive */
+function runSignedRequestCopies(consumer, archive) {
+  const project = join(consumer, "project");
+  mkdirSync(project);
+  writeFileSync(join(project, "package.json"), JSON.stringify({ private: true, type: "module" }));
+  npm(["install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund", archive], project);
+  for (const directory of [consumer, project]) {
+    cpSync(join(root, "scripts", "fixtures", "signed-request-copy.mjs"), join(directory, "signed-request-copy.mjs"));
+  }
+  const probe = join(consumer, "signed-request-copies.server.test.ts");
+  cpSync(join(root, "scripts", "fixtures", "signed-request-copies.server.test.ts"), probe);
+  execFileSync(process.execPath, ["--test", probe], {
+    cwd: consumer, encoding: "utf8", env: process.env,
+    stdio: ["ignore", "pipe", "pipe"], timeout: 30_000,
+  });
 }
 
 /** @param {string} consumer @param {string} archive */
