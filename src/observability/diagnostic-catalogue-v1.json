@@ -166,6 +166,7 @@
     "fleet_drift_check_failed",
     "fly_app_anomaly_check",
     "fly_app_anomaly_check_failed",
+    "fly_keepalive_failed",
     "fx-rate-refresh-cron.tick",
     "fx_rate_attempt_failed",
     "fx_rate_cold_start_failed",
