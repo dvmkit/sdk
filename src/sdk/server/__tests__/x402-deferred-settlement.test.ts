@@ -17,7 +17,11 @@ import {
   verifyUpfrontPayment,
 } from "../payment";
 import { deferredX402IntentId } from "../funding";
-import { InProcessDeferredX402Settler, X402ExactSettlementServer } from "../x402-exact-settlement";
+import {
+  InProcessDeferredX402Settler,
+  X402ExactSettlementServer,
+  type X402ExactSettlementEvidenceReader,
+} from "../x402-exact-settlement";
 import { MemoryX402ExactSettlementStore } from "../x402-exact-settlement-store";
 
 const DVM_ID = "dvm-deferred";
@@ -28,6 +32,7 @@ const RUNTIME_SECONDS = 10;
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
+  facilitatorTimeoutMs: 50,
   network: "eip155:8453",
   payTo: "0x1111111111111111111111111111111111111111",
 };
@@ -66,17 +71,31 @@ interface Rig {
   facilitatorCalls: (suffix: "/verify" | "/settle") => number;
   /** What the facilitator's /settle answers, changed in place with `answerSettle`. */
   settleBody: Record<string, unknown>;
+  /** One-shot /settle answers, consumed in order before `settleBody` applies. */
+  settleQueue: (() => Response | Promise<Response>)[];
+  /** Replaces every /settle answer once the queue is empty, when set. */
+  settleAnswer?: () => Response | Promise<Response>;
+  /** Replaces the /verify answer when set. */
+  verifyAnswer?: () => Response | Promise<Response>;
 }
 
-function rig(verifyGate?: Promise<void>): Rig {
+/** A /settle that never answers, like a facilitator that hung. */
+const hang = () => new Promise<Response>(() => undefined);
+
+function rig(verifyGate?: Promise<void>, evidence?: X402ExactSettlementEvidenceReader): Rig {
   const settleBody: Record<string, unknown> = { success: true, transaction: TX, network: X402.network };
   const ledger = new MemoryCreditLedger();
   const processedPayments = new MemoryProcessedPaymentStore();
   const store = new MemoryX402ExactSettlementStore();
-  const settlement = new X402ExactSettlementServer({ store });
+  const settlement = new X402ExactSettlementServer({ store, evidence });
+  const settleQueue: Rig["settleQueue"] = [];
+  const state: { verifyAnswer?: Rig["verifyAnswer"]; settleAnswer?: Rig["settleAnswer"] } = {};
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input);
     if (url.endsWith("/verify")) await verifyGate;
+    if (url.endsWith("/verify") && state.verifyAnswer) return state.verifyAnswer();
+    if (url.endsWith("/settle") && settleQueue.length > 0) return settleQueue.shift()!();
+    if (url.endsWith("/settle") && state.settleAnswer) return state.settleAnswer();
     const body = url.endsWith("/verify")
       ? { isValid: true }
       : url.endsWith("/settle")
@@ -103,6 +122,19 @@ function rig(verifyGate?: Promise<void>): Rig {
     settlement,
     settler,
     settleBody,
+    settleQueue,
+    get settleAnswer() {
+      return state.settleAnswer;
+    },
+    set settleAnswer(answer) {
+      state.settleAnswer = answer;
+    },
+    get verifyAnswer() {
+      return state.verifyAnswer;
+    },
+    set verifyAnswer(answer) {
+      state.verifyAnswer = answer;
+    },
     facilitatorCalls: (suffix) =>
       fetch.mock.calls.filter(([input]) => String(input).endsWith(suffix)).length,
   };
@@ -298,7 +330,7 @@ describe("unsigned x402 settled after the job", () => {
     jobs.shutdown();
   });
 
-  it("leaves a completed job unpaid, not settled, when this process lost the authorization", async () => {
+  it("leaves a completed job unresolved, not unpaid, while another machine may still hold the authorization", async () => {
     const r = rig();
     const payment = await admit(r, authorization(60), "job-restart");
     // A restarted process has the durable intent but not the bearer signature.
@@ -313,7 +345,9 @@ describe("unsigned x402 settled after the job", () => {
 
     expect(job.status).toBe("completed");
     expect(r.facilitatorCalls("/settle")).toBe(0);
-    expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("released");
+    // Releasing it here would stop the machine that holds the signature from collecting.
+    expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("prepared");
+    expect((await jobs.store.get("job-restart"))?.receipt).toBeUndefined();
     jobs.shutdown();
   });
 
@@ -485,6 +519,308 @@ describe("unsigned x402 settled after the job", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+});
+
+describe("unsigned x402 whose settlement outcome is not known", () => {
+  const PAYER = "0x5555555555555555555555555555555555555555";
+  const receiptIssuer = () => new ReceiptIssuer({ secret: "77".repeat(32), dvm: "test", dvmId: DVM_ID });
+  const json = (body: Record<string, unknown>, status = 200) => () =>
+    new Response(JSON.stringify({ network: X402.network, ...body }), { status });
+  const pending = json({ success: false, errorReason: "settlement_pending", transaction: TX }, 500);
+
+  /** A restarted process: it has the durable intent but not the bearer signature. */
+  const restarted = (r: Rig) =>
+    new InProcessDeferredX402Settler({
+      settlement: r.settlement,
+      dvmId: DVM_ID,
+      commit: (receipt, tx, effect) =>
+        repairX402ExactSettlementEffect({
+          effect,
+          paymentId: receipt.txHash ?? "",
+          ledger: r.ledger,
+          processedPayments: new MemoryProcessedPaymentStore(),
+          tx,
+        }),
+    });
+
+  /** Leave the intent the way a crashed or timed-out submission does. */
+  async function strand(r: Rig, payment: PaymentInfo, status: "ambiguous" | "settled") {
+    const intentId = deferredX402IntentId(payment.creditId)!;
+    await r.store.markSubmitting({ dvmId: DVM_ID, intentId, submissionBlock: "100" });
+    await r.store.recordOutcome(
+      status === "settled"
+        ? { dvmId: DVM_ID, intentId, status, outcome: "success", transaction: TX }
+        : { dvmId: DVM_ID, intentId, status, outcome: "timeout" }
+    );
+    return intentId;
+  }
+
+  function withTerminal(r: Rig, settler: InProcessDeferredX402Settler) {
+    const terminal = vi.fn(async (_info: unknown) => undefined);
+    const made = manager(r, (ctx) => ctx.complete("done"), RUNTIME_SECONDS, settler, {
+      receiptIssuer: receiptIssuer(),
+      onJobTerminal: terminal,
+    });
+    return { ...made, terminal };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe("facilitator timeouts", () => {
+    it("refuses admission when /verify hangs, and runs no work", async () => {
+      const r = rig();
+      r.verifyAnswer = hang;
+
+      const payment = await admit(r, authorization(60), "job-hung-verify");
+
+      expect(payment.error).toMatchObject({ status: 402 });
+      expect(payment.creditId).toBeUndefined();
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+      expect(await r.store.list({ dvmId: DVM_ID, limit: 10, includeResolved: true })).toHaveLength(0);
+    });
+
+    it("ends ambiguous, not rejected, when /settle hangs, and still lets the job's terminal work finish", async () => {
+      const r = rig();
+      r.settleAnswer = hang;
+      const { jobs, terminal } = withTerminal(r, r.settler);
+      const payment = await admit(r, authorization(60), "job-hung-settle");
+
+      // `run` returns only because the job's terminal work resolved despite the hang.
+      await run(jobs, payment, "job-hung-settle");
+
+      const intent = await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!);
+      expect(intent?.status).toBe("ambiguous");
+      expect(intent?.lastOutcome).toBe("timeout");
+      expect((await jobs.store.get("job-hung-settle"))?.receipt).toBeUndefined();
+      expect(terminal).not.toHaveBeenCalled();
+      jobs.shutdown();
+    });
+  });
+
+  describe("a settlement the facilitator reports as pending", () => {
+    it("keeps the hash, resends the identical payload once, and settles when the resend does", async () => {
+      const r = rig();
+      r.settleQueue.push(pending);
+      const { jobs, terminal } = withTerminal(r, r.settler);
+      const payment = await admit(r, authorization(60), "job-pending-ok");
+
+      await run(jobs, payment, "job-pending-ok");
+
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      expect(r.facilitatorCalls("/settle")).toBe(2);
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      const attempts = await r.store.attempts(DVM_ID, intentId);
+      expect(attempts.find((attempt) => attempt.outcome === "pending")?.transaction).toBe(TX);
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("stays ambiguous, never rejected, when the resend is still pending", async () => {
+      const r = rig();
+      r.settleQueue.push(pending, pending);
+      const payment = await admit(r, authorization(60), "job-pending-twice");
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      const intent = await r.store.get(DVM_ID, intentId);
+      expect(r.facilitatorCalls("/settle")).toBe(2);
+      expect(intent?.status).toBe("ambiguous");
+      expect(intent?.transaction).toBe(TX);
+    });
+
+    it("settles when the resend is told the nonce is used and the chain shows our transfer", async () => {
+      const r = rig(undefined, {
+        getBlockNumber: async () => 100n,
+        findExactPayment: async () => ({ transaction: TX, amount: String(PRICE_MICRO) }),
+      });
+      r.settleQueue.push(
+        pending,
+        json({ success: false, errorReason: "invalid_exact_evm_nonce_already_used" })
+      );
+      const { jobs, terminal } = withTerminal(r, r.settler);
+      const payment = await admit(r, authorization(60), "job-pending-nonce");
+
+      await run(jobs, payment, "job-pending-nonce");
+
+      expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("complete");
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("does not call the payment unpaid when the resend is told the nonce is used and the chain is silent", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      r.settleQueue.push(
+        pending,
+        json({ success: false, errorReason: "invalid_exact_evm_nonce_already_used" })
+      );
+      const payment = await admit(r, authorization(60), "job-pending-nonce-silent");
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+    });
+
+    it.each([
+      ["a drained balance", json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })],
+      [
+        "a failed re-simulation (400)",
+        json({ success: false, errorReason: "invalid_exact_evm_transaction_failed" }, 400),
+      ],
+    ])("settles when the resend is refused for %s and the chain shows our transfer", async (_name, refusal) => {
+      const r = rig(undefined, {
+        getBlockNumber: async () => 100n,
+        findExactPayment: async () => ({ transaction: TX, amount: String(PRICE_MICRO) }),
+      });
+      r.settleQueue.push(pending, refusal);
+      const { jobs, terminal } = withTerminal(r, r.settler);
+      const payment = await admit(r, authorization(60), "job-pending-refused");
+
+      await run(jobs, payment, "job-pending-refused");
+
+      expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("complete");
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("does not call the payment unpaid when the resend is refused for a drained balance and the chain is silent", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      r.settleQueue.push(
+        pending,
+        json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })
+      );
+      const payment = await admit(r, authorization(60), "job-pending-drained");
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+    });
+
+    it("does not call a retried settlement unpaid when an earlier attempt timed out and the retry is refused", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      const payment = await admit(r, authorization(60), "job-retry-refused");
+      const intentId = await strand(r, payment, "ambiguous");
+      r.settleQueue.push(json({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" }));
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow(/outcome unknown/);
+
+      expect(r.facilitatorCalls("/settle")).toBe(1);
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+    });
+  });
+
+  describe("a completed job whose process holds no signature", () => {
+    it("reports nothing for an ambiguous intent the chain cannot resolve", async () => {
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => undefined });
+      const payment = await admit(r, authorization(60), "job-lost-ambiguous");
+      const intentId = await strand(r, payment, "ambiguous");
+      const { jobs, terminal } = withTerminal(r, restarted(r));
+
+      await run(jobs, payment, "job-lost-ambiguous");
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+      expect((await jobs.store.get("job-lost-ambiguous"))?.receipt).toBeUndefined();
+      expect(terminal).not.toHaveBeenCalled();
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+      jobs.shutdown();
+    });
+
+    it("releases a prepared intent once its authorization has expired", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const r = rig();
+      const payment = await admit(r, authorization(30), "job-lost-expired");
+      const { jobs, terminal } = withTerminal(r, restarted(r));
+      vi.setSystemTime(Date.now() + 30_000);
+
+      await run(jobs, payment, "job-lost-expired");
+
+      expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("released");
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: false });
+      jobs.shutdown();
+    });
+
+    it("settles an ambiguous intent on a later read once the chain shows the transfer", async () => {
+      let found: { transaction: string; amount: string } | undefined;
+      const r = rig(undefined, { getBlockNumber: async () => 100n, findExactPayment: async () => found });
+      const payment = await admit(r, authorization(60), "job-lost-used");
+      const intentId = await strand(r, payment, "ambiguous");
+      const { jobs, terminal } = withTerminal(r, restarted(r));
+      await run(jobs, payment, "job-lost-used");
+      expect(terminal).not.toHaveBeenCalled();
+
+      found = { transaction: TX, amount: String(PRICE_MICRO) };
+      await jobs.ensureReceipt((await jobs.store.get("job-lost-used"))!);
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      expect((await jobs.store.get("job-lost-used"))?.receipt).toMatchObject({ paid: { rail: "x402" } });
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("finishes an intent that settled before the signature was lost instead of calling it unpaid", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-lost-settled");
+      const intentId = await strand(r, payment, "settled");
+      const { jobs, terminal } = withTerminal(r, restarted(r));
+
+      await run(jobs, payment, "job-lost-settled");
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: true });
+      jobs.shutdown();
+    });
+
+    it("calls an expired ambiguous intent unpaid only when the chain proves the authorization unused", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      let unused: () => Promise<boolean> = () => Promise.reject(new Error("rpc down"));
+      const r = rig(undefined, {
+        getBlockNumber: async () => 100n,
+        findExactPayment: async () => undefined,
+        isExactAuthorizationUnused: () => unused(),
+      });
+      const payment = await admit(r, authorization(30), "job-lost-unused");
+      const intentId = await strand(r, payment, "ambiguous");
+      const { jobs, terminal } = withTerminal(r, restarted(r));
+      vi.setSystemTime(Date.now() + 31_000);
+
+      await run(jobs, payment, "job-lost-unused");
+      // A failed chain read is not proof of anything.
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("ambiguous");
+      expect(terminal).not.toHaveBeenCalled();
+
+      unused = async () => true;
+      await jobs.ensureReceipt((await jobs.store.get("job-lost-unused"))!);
+
+      const intent = await r.store.get(DVM_ID, intentId);
+      expect(intent?.status).toBe("rejected");
+      expect(intent?.lastOutcome).toBe("authorization_expired_unused");
+      expect((await jobs.store.get("job-lost-unused"))?.receipt).toMatchObject({
+        paid: { msats: 0, rail: null },
+      });
+      expect(terminal.mock.calls[0]?.[0]).toMatchObject({ paid: false });
+      jobs.shutdown();
+    });
+  });
+
+  describe("a payer whose earlier authorization is unresolved", () => {
+    it("is refused until that authorization's expiry, and admitted again after", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const r = rig();
+      const first = await admit(r, authorization(30, undefined, PAYER), "job-busy-1");
+      await strand(r, first, "ambiguous");
+
+      const before = await admit(r, authorization(60, undefined, PAYER), "job-busy-2");
+      vi.setSystemTime(Date.now() + 31_000);
+      const after = await admit(r, authorization(60, undefined, PAYER), "job-busy-3");
+
+      expect(before.error).toMatchObject({ status: 429, body: { error: "x402_payer_busy" } });
+      expect(after.error).toBeUndefined();
     });
   });
 });

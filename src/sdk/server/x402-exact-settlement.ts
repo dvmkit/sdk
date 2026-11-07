@@ -5,6 +5,7 @@ import { createX402FacilitatorAuthHeaders } from "../../lib/x402/facilitator";
 import {
   settleWithFacilitator,
   verifyWithFacilitator,
+  X402_SETTLEMENT_PENDING,
 } from "../../lib/x402/facilitator-request";
 import {
   buildPaymentRequirements,
@@ -40,6 +41,11 @@ export interface X402ExactSettlementEvidenceReader {
   findExactPayment?(
     intent: X402ExactSettlementIntent
   ): Promise<X402ExactSettlementChainEvidence | undefined>;
+  /**
+   * Whether the authorization is proven dead: the chain is past its expiry and
+   * it was never used. Must be false whenever that cannot be established.
+   */
+  isExactAuthorizationUnused?(intent: X402ExactSettlementIntent): Promise<boolean>;
 }
 
 /** Result of accepting or recovering one exact x402 authorization. */
@@ -313,6 +319,10 @@ export class X402ExactSettlementServer {
           reason: intent.lastOutcome ?? "settlement_in_progress",
         };
       }
+      // An attempt of ours may already have reached the facilitator when the
+      // intent is past `prepared`; a refusal is then plausibly the echo of our
+      // own settlement rather than a verdict on an untouched authorization.
+      let mayHaveSentBefore = intent.status !== "prepared";
       this.activeSubmissions.add(intentId);
       let submissionBlock: string | undefined;
       try {
@@ -346,12 +356,31 @@ export class X402ExactSettlementServer {
       }
 
       try {
-        const settleResponse = await settleWithFacilitator(
-          payload,
-          requirements,
-          args.config,
-          createX402FacilitatorAuthHeaders(args.config)
-        );
+        const send = () =>
+          settleWithFacilitator(
+            payload,
+            requirements,
+            args.config,
+            createX402FacilitatorAuthHeaders(args.config)
+          );
+        let settleResponse = await send();
+        if (isSettlementPending(settleResponse)) {
+          mayHaveSentBefore = true;
+          // CDP answers a settlement that is still confirming as a failure
+          // carrying the transaction hash. Keep the hash as attempt evidence and
+          // ask once more with the identical payload: the nonce makes a second
+          // submission harmless, and the answer is usually final by then.
+          intent = await this.opts.store.recordOutcome({
+            dvmId: args.dvmId,
+            intentId,
+            status: "ambiguous",
+            outcome: "pending",
+            detail: X402_SETTLEMENT_PENDING,
+            transaction: settleResponse.transaction,
+            settleResponse: settleResponse as unknown as Record<string, unknown>,
+          });
+          settleResponse = await send();
+        }
         if (settleResponse.success && settleResponse.transaction) {
           intent = await this.opts.store.recordOutcome({
             dvmId: args.dvmId,
@@ -370,7 +399,20 @@ export class X402ExactSettlementServer {
             detail: "facilitator reported success without a transaction reference",
             settleResponse: settleResponse as unknown as Record<string, unknown>,
           });
-        } else if (settlementMayHaveMoved(settleResponse)) {
+        } else if (isSettlementPending(settleResponse)) {
+          intent = await this.opts.store.recordOutcome({
+            dvmId: args.dvmId,
+            intentId,
+            status: "ambiguous",
+            outcome: "pending",
+            detail: X402_SETTLEMENT_PENDING,
+            transaction: settleResponse.transaction,
+            settleResponse: settleResponse as unknown as Record<string, unknown>,
+          });
+        } else if (settlementMayHaveMoved(settleResponse) || mayHaveSentBefore) {
+          // After an earlier attempt of ours, any refusal can be the echo of that
+          // attempt having landed (a drained balance, a used nonce, a failed
+          // re-simulation), so chain evidence decides rather than the reply.
           intent = await this.opts.store.recordOutcome({
             dvmId: args.dvmId,
             intentId,
@@ -419,6 +461,86 @@ export class X402ExactSettlementServer {
       intent = recovered;
     }
     return this.finalize(intent, args.btcUsdRate, args.commit);
+  }
+
+  /**
+   * Resolve an intent this process holds no signature for, from stored state and
+   * chain evidence alone. Never sends anything to the facilitator and never
+   * reports an authorization unpaid while it may still settle: a `prepared` one
+   * may be held by another machine until it expires, and a submitted one is
+   * unpaid only once the chain proves it unused past expiry.
+   */
+  async resolveWithoutAuthorization(args: {
+    dvmId: string;
+    intentId: string;
+    commit: (
+      receipt: X402Receipt,
+      tx?: ProcessedPaymentQuerier,
+      effect?: X402ExactSettlementEffect
+    ) => Promise<unknown>;
+    nowMs?: number;
+  }): Promise<{ outcome: "settled" | "unpaid" } | { outcome: "unknown"; reason: string }> {
+    const { dvmId, intentId } = args;
+    const intent = await this.requiredIntent(dvmId, intentId);
+    switch (intent.status) {
+      case "complete":
+      case "local_committed":
+        return { outcome: "settled" };
+      case "released":
+      case "rejected":
+        return { outcome: "unpaid" };
+      case "settled":
+        await this.finalize(intent, 0, args.commit);
+        return { outcome: "settled" };
+      case "prepared": {
+        const validBeforeMs = Number(intent.validBefore) * 1000;
+        if (!Number.isFinite(validBeforeMs) || validBeforeMs > (args.nowMs ?? Date.now())) {
+          return { outcome: "unknown", reason: "authorization_held_elsewhere" };
+        }
+        const released = await this.opts.store.release({
+          dvmId,
+          intentId,
+          reason: "authorization_expired_unsubmitted",
+        });
+        return released
+          ? { outcome: "unpaid" }
+          : { outcome: "unknown", reason: "settlement_state_changed" };
+      }
+      default: {
+        const unknown = {
+          outcome: "unknown" as const,
+          reason: intent.lastOutcome ?? "settlement_outcome_unknown",
+        };
+        if (this.activeSubmissions.has(intentId)) return unknown;
+        const recovered = await this.recoverEvidence(intent);
+        if (recovered) {
+          await this.finalize(recovered, 0, args.commit);
+          return { outcome: "settled" };
+        }
+        if (await this.provenUnused(intent, args.nowMs ?? Date.now())) {
+          const expired = await this.opts.store.expireUnused?.({
+            dvmId,
+            intentId,
+            reason: "authorization_expired_unused",
+          });
+          if (expired) return { outcome: "unpaid" };
+        }
+        return unknown;
+      }
+    }
+  }
+
+  private async provenUnused(intent: X402ExactSettlementIntent, nowMs: number): Promise<boolean> {
+    const probe = this.opts.evidence?.isExactAuthorizationUnused;
+    const validBeforeMs = Number(intent.validBefore) * 1000;
+    // Wall-clock expiry is only a cheap gate before the chain read; the reader
+    // judges chain time itself.
+    if (!probe || !Number.isFinite(validBeforeMs) || validBeforeMs > nowMs) return false;
+    try {
+      return await probe.call(this.opts.evidence, intent);
+    } catch {
+      return false;
+    }
   }
 
   get(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent | undefined> {
@@ -619,6 +741,10 @@ function receiptFromIntent(intent: X402ExactSettlementIntent, btcUsdRate: number
   };
 }
 
+function isSettlementPending(response: SettleResponse): boolean {
+  return !response.success && response.errorReason === X402_SETTLEMENT_PENDING;
+}
+
 function settlementMayHaveMoved(response: SettleResponse): boolean {
   const reason = response.errorReason?.toLowerCase() ?? "";
   return (
@@ -665,8 +791,9 @@ export interface DeferredX402Settler {
 /**
  * Holds each verified authorization in this process and sends it to the
  * facilitator only when its job succeeds. The signature is a bearer
- * credential, so it is never persisted: a process that loses it can only
- * release the intent, leaving the payer unharmed and the work unpaid.
+ * credential, so it is never persisted: a process that loses it cannot settle
+ * the intent. It can only report what stored state and chain evidence prove,
+ * and otherwise leaves the outcome unknown for a later read to retry.
  */
 export class InProcessDeferredX402Settler implements DeferredX402Settler {
   private readonly held = new Map<string, HeldX402Authorization>();
@@ -703,8 +830,18 @@ export class InProcessDeferredX402Settler implements DeferredX402Settler {
     if (intent?.status === "released" || intent?.status === "rejected") return "unpaid";
     const held = this.held.get(intentId);
     if (!held) {
-      await settlement.release(dvmId, intentId, "authorization_unavailable");
-      return "unpaid";
+      if (!intent) return "unpaid";
+      // Another machine, or this one before a restart, may have submitted the
+      // authorization, so its stored state and the chain decide the outcome.
+      const resolved = await settlement.resolveWithoutAuthorization({
+        dvmId,
+        intentId,
+        commit: this.opts.commit,
+      });
+      if (resolved.outcome === "unknown") {
+        throw new Error(`x402 settlement ${intentId} outcome unknown: ${resolved.reason}`);
+      }
+      return resolved.outcome;
     }
     const result = await settlement.settlePrepared({
       dvmId,

@@ -47,6 +47,8 @@ export interface X402SettlementEvidenceClient {
   getBlockNumber(args?: { cacheTime?: number }): Promise<bigint>;
   getLogs(args: EvidenceLogQuery & { fromBlock: bigint; toBlock: bigint }): Promise<EvidenceLog[]>;
   getTransaction(args: { hash: Hex }): Promise<{ to: Address | null; input: Hex }>;
+  /** Latest block header; without it an authorization is never reported unused. */
+  getBlock?(args: { blockTag: "latest" }): Promise<{ number: bigint | null; timestamp: bigint }>;
 }
 
 const AUTHORIZATION_USED_EVENT = parseAbiItem(
@@ -68,6 +70,8 @@ const EXACT_SETTLEMENT_CALL_ABI = parseAbi([
   "function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,bytes signature)",
 ]);
 const LOG_CHUNK_SIZE = 10_000n;
+/** Chain time the latest block must be past `validBefore` before an unused authorization is called dead. */
+const UNUSED_PROOF_MARGIN_SECONDS = 60n;
 
 /** Where the reconciliation reader reads chain state from. */
 export interface X402SettlementEvidenceEndpoint {
@@ -115,6 +119,7 @@ export function createX402SettlementEvidenceReaderFromClient(
     getBlockNumber: () => client.getBlockNumber(),
     findAppliedSettlement: (intent) => findAppliedSettlement(client, intent),
     findExactPayment: (intent) => findExactPayment(client, intent),
+    isExactAuthorizationUnused: (intent) => isExactAuthorizationUnused(client, intent),
   };
 }
 
@@ -162,6 +167,41 @@ async function findExactPayment(
     }
   }
   return undefined;
+}
+
+/**
+ * True only when the chain itself is past the authorization's expiry and no
+ * `AuthorizationUsed` log for its nonce exists since submission. EIP-3009 rejects
+ * a transfer once `block.timestamp >= validBefore`, so an unused authorization
+ * past that point can never settle. Chain time, not wall-clock time, is judged so
+ * a lagging RPC cannot declare an authorization dead early; any failed read
+ * reports false because absence of evidence is not evidence of absence.
+ */
+async function isExactAuthorizationUnused(
+  client: X402SettlementEvidenceClient,
+  intent: X402ExactSettlementIntent
+): Promise<boolean> {
+  if (!client.getBlock || intent.submissionBlock === undefined) return false;
+  try {
+    const head = await client.getBlock({ blockTag: "latest" });
+    if (head.number === null) return false;
+    if (head.timestamp < BigInt(intent.validBefore) + UNUSED_PROOF_MARGIN_SECONDS) return false;
+    const fromBlock = BigInt(intent.submissionBlock);
+    if (fromBlock > head.number) return false;
+    const logs = await getLogsInChunks(
+      client,
+      {
+        address: getAddress(intent.asset),
+        event: AUTHORIZATION_USED_EVENT,
+        args: { authorizer: getAddress(intent.from), nonce: intent.nonce as Hex },
+      },
+      fromBlock,
+      head.number
+    );
+    return logs.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 async function findAppliedSettlement(

@@ -14,10 +14,52 @@ import type {
 } from "./spec";
 import type { X402Config } from "./types";
 
+/** Facilitator `errorReason` for a settlement that was submitted and has not confirmed yet. */
+export const X402_SETTLEMENT_PENDING = "settlement_pending";
+/** `invalidReason` of a verify that the facilitator did not answer in time. */
+export const FACILITATOR_TIMEOUT_REASON = "facilitator_timeout";
+/** Default bound on one facilitator call. */
+export const X402_DEFAULT_FACILITATOR_TIMEOUT_MS = 10_000;
+
+/** A facilitator call that did not complete within its bound; its effect, if any, is unknown. */
+export class X402FacilitatorTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`x402 facilitator did not answer within ${timeoutMs}ms`);
+    this.name = "X402FacilitatorTimeoutError";
+  }
+}
+
+/**
+ * Run one facilitator call under a deadline that also covers reading the
+ * response body. The timer is cleared however the call ends.
+ */
+async function withTimeout<T>(
+  config: Pick<X402Config, "facilitatorTimeoutMs">,
+  run: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const timeoutMs = config.facilitatorTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new X402FacilitatorTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+  const call = run(controller.signal);
+  // The deadline wins the race; the aborted call's own rejection is expected.
+  call.catch(() => undefined);
+  try {
+    return await Promise.race([call, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function verifyWithFacilitator(
   payload: PaymentPayload,
   requirements: PaymentRequirementsV1 | PaymentRequirementsV2,
-  config: Pick<X402Config, "facilitator" | "facilitatorAuth"> = {},
+  config: Pick<X402Config, "facilitator" | "facilitatorAuth" | "facilitatorTimeoutMs"> = {},
   createAuthHeaders:
     | FacilitatorConfig["createAuthHeaders"]
     | undefined = createX402FacilitatorAuthHeaders(config)
@@ -29,32 +71,43 @@ export async function verifyWithFacilitator(
     { facilitator_url: url },
     () => withPaymentStage("verifier", async () => {
       const authHeaders = (await createAuthHeaders?.())?.verify ?? {};
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders },
-        body: JSON.stringify({
-          x402Version: payload.x402Version,
-          paymentPayload: payload,
-          paymentRequirements: requirements,
-        }),
-      });
-      if (!res.ok) {
-        const rejection = await readFacilitatorRejection(res);
-        if (
-          rejection?.isValid === false &&
-          typeof rejection.invalidReason === "string" &&
-          rejection.invalidReason.length > 0
-        ) {
-          logRejected("verifier");
-          return rejection as unknown as VerifyResponse;
-        }
+      try {
+        return await withTimeout(config, async (signal) => {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...authHeaders },
+            body: JSON.stringify({
+              x402Version: payload.x402Version,
+              paymentPayload: payload,
+              paymentRequirements: requirements,
+            }),
+            signal,
+          });
+          if (!res.ok) {
+            const rejection = await readFacilitatorRejection(res, res.status === 400);
+            if (
+              rejection?.isValid === false &&
+              typeof rejection.invalidReason === "string" &&
+              rejection.invalidReason.length > 0
+            ) {
+              logRejected("verifier");
+              return rejection as unknown as VerifyResponse;
+            }
+            logRejected("verifier");
+            return { isValid: false, invalidReason: `facilitator_status_${res.status}` };
+          }
+          const data = (await res.json()) as VerifyResponse;
+          if (!data.isValid) logRejected("verifier");
+          callerLoggers.x402.info("x402.verify_with_facilitator.result", { is_valid: data.isValid });
+          return data;
+        });
+      } catch (err) {
+        // Verify moves no money, so a facilitator that does not answer in time
+        // refuses admission instead of holding the caller.
+        if (!(err instanceof X402FacilitatorTimeoutError)) throw err;
         logRejected("verifier");
-        return { isValid: false, invalidReason: `facilitator_status_${res.status}` };
+        return { isValid: false, invalidReason: FACILITATOR_TIMEOUT_REASON };
       }
-      const data = (await res.json()) as VerifyResponse;
-      if (!data.isValid) logRejected("verifier");
-      callerLoggers.x402.info("x402.verify_with_facilitator.result", { is_valid: data.isValid });
-      return data;
     })
   );
 }
@@ -62,7 +115,7 @@ export async function verifyWithFacilitator(
 export async function settleWithFacilitator(
   payload: PaymentPayload,
   requirements: PaymentRequirementsV1 | PaymentRequirementsV2,
-  config: Pick<X402Config, "facilitator" | "facilitatorAuth"> = {},
+  config: Pick<X402Config, "facilitator" | "facilitatorAuth" | "facilitatorTimeoutMs"> = {},
   createAuthHeaders:
     | FacilitatorConfig["createAuthHeaders"]
     | undefined = createX402FacilitatorAuthHeaders(config)
@@ -74,42 +127,51 @@ export async function settleWithFacilitator(
     { facilitator_url: url },
     () => withPaymentStage("broadcast", async () => {
       const authHeaders = (await createAuthHeaders?.())?.settle ?? {};
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders },
-        body: JSON.stringify({
-          x402Version: payload.x402Version,
-          paymentPayload: payload,
-          paymentRequirements: requirements,
-        }),
-      });
-      if (!res.ok) {
-        const rejection = await readFacilitatorRejection(res);
-        if (
-          rejection?.success === false &&
-          typeof rejection.errorReason === "string" &&
-          rejection.errorReason.length > 0
-        ) {
+      return withTimeout(config, async (signal) => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({
+            x402Version: payload.x402Version,
+            paymentPayload: payload,
+            paymentRequirements: requirements,
+          }),
+          signal,
+        });
+        if (!res.ok) {
+          // CDP answers a settlement that is still confirming with a 500, so the
+          // pending marker is read on any status; other rejections only on 400.
+          const rejection = await readFacilitatorRejection(res, true);
+          if (
+            rejection?.success === false &&
+            typeof rejection.errorReason === "string" &&
+            rejection.errorReason.length > 0 &&
+            (res.status === 400 || rejection.errorReason === X402_SETTLEMENT_PENDING)
+          ) {
+            if (rejection.errorReason !== X402_SETTLEMENT_PENDING) logRejected("broadcast");
+            return rejection as unknown as SettleResponse;
+          }
           logRejected("broadcast");
-          return rejection as unknown as SettleResponse;
+          return { success: false, errorReason: `facilitator_status_${res.status}` };
         }
-        logRejected("broadcast");
-        return { success: false, errorReason: `facilitator_status_${res.status}` };
-      }
-      const data = (await res.json()) as SettleResponse;
-      if (!data.success) logRejected("broadcast");
-      callerLoggers.x402.info("x402.settle_with_facilitator.result", {
-        success: data.success,
-        tx_hash: data.transaction,
+        const data = (await res.json()) as SettleResponse;
+        if (!data.success && data.errorReason !== X402_SETTLEMENT_PENDING) logRejected("broadcast");
+        callerLoggers.x402.info("x402.settle_with_facilitator.result", {
+          success: data.success,
+          tx_hash: data.transaction,
+        });
+        return data;
       });
-      return data;
     })
   );
 }
 
-async function readFacilitatorRejection(res: Response): Promise<Record<string, unknown> | null> {
+async function readFacilitatorRejection(
+  res: Response,
+  readBody: boolean
+): Promise<Record<string, unknown> | null> {
   // A 400 is the facilitator's normal transport for a structured payment rejection.
-  if (res.status !== 400) return null;
+  if (!readBody) return null;
   try {
     const body = (await res.json()) as unknown;
     return isRecord(body) ? body : null;

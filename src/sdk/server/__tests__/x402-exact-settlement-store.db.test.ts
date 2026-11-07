@@ -277,6 +277,57 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
       ).inserted
     ).toBe(true);
   });
+
+  it("stops counting a submitted or ambiguous authorization once it is past valid_before", async () => {
+    const options = { maxOutstandingPerPayer: 1 };
+    const submitted = { ...exactIntent("intent-submitting", undefined, PAYER_A, 1), validBefore: "1000" };
+    await store.claim(submitted, options);
+    await store.markSubmitting({ dvmId: DVM_ID, intentId: "intent-submitting" });
+    const ambiguous = exactIntent("intent-ambiguous", undefined, PAYER_B, 2);
+    await store.claim(ambiguous, options);
+    await store.markSubmitting({ dvmId: DVM_ID, intentId: "intent-ambiguous" });
+    await store.recordOutcome({
+      dvmId: DVM_ID,
+      intentId: "intent-ambiguous",
+      status: "ambiguous",
+      outcome: "timeout",
+    });
+
+    // The submitting row expired long ago; the ambiguous one can still settle.
+    expect(
+      (await store.claim(exactIntent("intent-next-a", undefined, PAYER_A, 3), options)).inserted
+    ).toBe(true);
+    await expect(
+      store.claim(exactIntent("intent-next-b", undefined, PAYER_B, 4), options)
+    ).rejects.toBeInstanceOf(X402ExactPayerLimitError);
+  });
+
+  it("retires only a submitted or ambiguous intent as unused, leaving release prepared-only", async () => {
+    await store.prepare(exactIntent("intent-prepared", undefined, PAYER_A, 1));
+    await store.prepare(exactIntent("intent-ambiguous", undefined, PAYER_A, 2));
+    await store.markSubmitting({ dvmId: DVM_ID, intentId: "intent-ambiguous" });
+    await store.recordOutcome({
+      dvmId: DVM_ID,
+      intentId: "intent-ambiguous",
+      status: "ambiguous",
+      outcome: "timeout",
+    });
+    await settledIntent(store, "intent-settled", undefined);
+    const expire = (intentId: string) =>
+      store.expireUnused?.({ dvmId: DVM_ID, intentId, reason: "authorization_expired_unused" });
+
+    expect(await expire("intent-prepared")).toBe(false);
+    expect(await expire("intent-settled")).toBe(false);
+    expect(await expire("intent-ambiguous")).toBe(true);
+    expect(await expire("intent-ambiguous")).toBe(false);
+
+    expect(await store.get(DVM_ID, "intent-ambiguous")).toMatchObject({
+      status: "rejected",
+      lastOutcome: "authorization_expired_unused",
+    });
+    expect((await store.get(DVM_ID, "intent-prepared"))?.status).toBe("prepared");
+    expect((await store.get(DVM_ID, "intent-settled"))?.status).toBe("settled");
+  });
 });
 
 async function settledIntent(
