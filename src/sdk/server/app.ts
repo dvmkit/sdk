@@ -216,7 +216,7 @@ import type {
   RevenueReporter,
 } from "./revenue-reporter";
 import type { CanonicalEnvelope } from "./signed-request";
-import { SignedRequestError, signedRequestInput } from "./signed-request";
+import { isSignedRequestError, SignedRequestError, signedRequestInput } from "./signed-request";
 import { carriesCreditFields, unsignedInputSchema } from "./unsigned-request";
 import {
   handleTempoCloseEvent,
@@ -2761,7 +2761,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             500
           );
         }
-        if (err instanceof SignedRequestError)
+        if (isSignedRequestError(err))
           return buildAuthErrorResponse(c, err, this.publicOrigin);
         throw err;
       }
@@ -3144,7 +3144,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         );
       }
     } catch (err) {
-      if (err instanceof SignedRequestError) return err;
+      if (isSignedRequestError(err)) return err;
       throw err;
     }
     return new SignedRequestError("signed request required", "signature_required");
@@ -3246,7 +3246,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           500
         );
       }
-      if (error instanceof SignedRequestError)
+      if (isSignedRequestError(error))
         return buildAuthErrorResponse(c, error, this.publicOrigin);
       throw error;
     }
@@ -3481,7 +3481,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             500
           );
         }
-        if (err instanceof SignedRequestError)
+        if (isSignedRequestError(err))
           return buildAuthErrorResponse(c, err, this.publicOrigin);
         throw err;
       }
@@ -3923,7 +3923,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           await this.descriptor.auth.recordReplay(authEnvelope);
         } catch (err) {
           if (
-            err instanceof SignedRequestError &&
+            isSignedRequestError(err) &&
             err.sub_reason === "replay_detected" &&
             exactAdmission?.replayed
           ) {
@@ -3932,7 +3932,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             // stored job id and request fingerprint make this a continuation;
             // prepare also reserved this full auth-envelope fingerprint to
             // this intent, so another exact payment cannot borrow the replay.
-          } else if (err instanceof SignedRequestError) {
+          } else if (isSignedRequestError(err)) {
             return buildAuthErrorResponse(c, err, this.publicOrigin);
           } else {
             throw err;
@@ -4786,7 +4786,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
         return c.json(result.response, 201);
       } catch (error) {
-        if (error instanceof SignedRequestError) return buildAuthErrorResponse(c, error, this.publicOrigin);
+        if (isSignedRequestError(error)) return buildAuthErrorResponse(c, error, this.publicOrigin);
         if (error instanceof BalancePaymentError) return c.json(error.body, error.status);
         throw error;
       }
@@ -4945,7 +4945,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     try {
       ({ job } = jm.reactivateJob(record));
     } catch (err) {
-      if (err instanceof SignedRequestError) {
+      if (isSignedRequestError(err)) {
         await jm.store
           .save({
             ...record,
@@ -5746,7 +5746,7 @@ class AuthAudienceError extends Error {
  * (unexpected) throws are rethrown to `dvm.request` and left uncoded here.
  */
 function authVerifyErrorCode(err: unknown): Record<string, unknown> | undefined {
-  return err instanceof AuthSchemaError || err instanceof SignedRequestError
+  return err instanceof AuthSchemaError || isSignedRequestError(err)
     ? { "error.code": "auth_error" }
     : undefined;
 }

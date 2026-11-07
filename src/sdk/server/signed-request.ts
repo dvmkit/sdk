@@ -169,6 +169,45 @@ export class SignedRequestError extends Error {
   }
 }
 
+/** SDK copies have different constructors; use the existing error contract at auth boundaries. */
+export function isSignedRequestError(error: unknown): error is SignedRequestError {
+  if (!(error instanceof Error) || error.name !== "SignedRequestError") return false;
+  const candidate = error as Partial<SignedRequestError>;
+  return candidate.code === "auth_error" &&
+    (candidate.sub_reason === "schema_invalid" ||
+      candidate.sub_reason === "signature_required" ||
+      candidate.sub_reason === "signature_invalid" ||
+      candidate.sub_reason === "timestamp_drift" ||
+      candidate.sub_reason === "replay_detected") &&
+    (candidate.issues === undefined ||
+      (Array.isArray(candidate.issues) && candidate.issues.every(isAuthIssue)));
+}
+
+// Validate every field the disclosure renderer reads before trusting a foreign issue list.
+function isAuthIssue(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const issue = value as Record<string, unknown>;
+  if (typeof issue.code !== "string" || typeof issue.message !== "string" ||
+    !Array.isArray(issue.path) || !issue.path.every(segment =>
+      typeof segment === "string" || typeof segment === "number" || typeof segment === "symbol")) {
+    return false;
+  }
+  const numeric = (item: unknown) => typeof item === "number" || typeof item === "bigint";
+  switch (issue.code) {
+    case "too_big": return numeric(issue.maximum);
+    case "too_small": return numeric(issue.minimum);
+    case "not_multiple_of": return numeric(issue.divisor);
+    case "invalid_type": return typeof issue.expected === "string";
+    case "invalid_format": return typeof issue.format === "string";
+    case "unrecognized_keys":
+      return Array.isArray(issue.keys) && issue.keys.every(key => typeof key === "string");
+    case "invalid_value":
+      return Array.isArray(issue.values) && issue.values.every(item =>
+        item === null || (typeof item !== "object" && typeof item !== "function"));
+    default: return true;
+  }
+}
+
 const DEFAULT_DRIFT_SECONDS = 5 * 60;
 const DEFAULT_ENVELOPE_FIELDS: readonly string[] = ["signature"];
 const DEFAULT_REPLAY_WINDOW_SECONDS = 10 * 60;

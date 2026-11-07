@@ -118,7 +118,7 @@ import type {
   JobTerminalReportPayload,
   RevenueSkippedNoRailPayload,
 } from "./revenue-reporter";
-import { type CanonicalEnvelope, SignedRequestError, signedRequestInput } from "./signed-request";
+import { type CanonicalEnvelope, isSignedRequestError, SignedRequestError, signedRequestInput } from "./signed-request";
 import { takesUnsignedPath, unsignedInputSchema } from "./unsigned-request";
 import {
   type AccumulatorMonitorHandle,
@@ -3147,7 +3147,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             level: "auth_reverify_failed",
             jobId: record.id,
             capability: record.capability,
-            sub_reason: err instanceof SignedRequestError ? err.sub_reason : "unknown",
+            sub_reason: isSignedRequestError(err) ? err.sub_reason : "unknown",
           }
         );
         throw err;

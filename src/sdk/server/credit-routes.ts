@@ -58,7 +58,7 @@ import type { StripeCreditRail } from "./stripe-credit";
 import { cardRefundSummary, runStripeDrain, usdFromCents } from "./stripe-drain-leg";
 import type { DVMAuthScheme } from "./secp256k1-auth";
 import type { CanonicalEnvelope } from "./signed-request";
-import { SignedRequestError } from "./signed-request";
+import { isSignedRequestError } from "./signed-request";
 import type { TempoDrainRail } from "./tempo-drain-leg";
 import { completeTempoChannelDrain, tempoCloseRefund } from "./tempo-drain-leg";
 import {
@@ -221,7 +221,7 @@ export async function handleCreditRequest(
     envelope = result.envelope;
     body = result.envelope as unknown as CreditRequest;
   } catch (err) {
-    if (err instanceof SignedRequestError) {
+    if (isSignedRequestError(err)) {
       return c.json(authErrorBody(err, { schemaUrl: CREDIT_SCHEMA_DOC_URL }), 401);
     }
     throw err;
@@ -2693,7 +2693,7 @@ async function burnNonce(
   try {
     await deps.auth?.recordReplay(envelope);
   } catch (err) {
-    if (err instanceof SignedRequestError) {
+    if (isSignedRequestError(err)) {
       return c.json(authErrorBody(err, { schemaUrl: CREDIT_SCHEMA_DOC_URL }), 401);
     }
     throw err;

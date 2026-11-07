@@ -14,6 +14,7 @@ import {
   carriesSignedEnvelope,
   createDefaultReplayStore,
   createSignedRequestVerifier,
+  isSignedRequestError,
   SignedRequestError,
 } from "./signed-request";
 
@@ -151,7 +152,7 @@ export function secp256k1Auth(opts: Secp256k1AuthOpts = {}): DVMAuthScheme {
         // Input violations keep precedence; only an absent envelope gets the
         // onboarding diagnostic. A partial envelope remains a signing failure.
         if (
-          err instanceof SignedRequestError && err.sub_reason === "schema_invalid" &&
+          isSignedRequestError(err) && err.sub_reason === "schema_invalid" &&
           !carriesSignedEnvelope(input) && callerInputIssues(err.issues).length === 0
         ) {
           throw new SignedRequestError("signed request required", "signature_required");
