@@ -361,4 +361,29 @@ describe("durable exact x402 settlement", () => {
       receipt: { txHash: TRANSACTION },
     });
   });
+
+  it("ends an upfront settlement ambiguous, not hung, when the facilitator stops answering /settle", async () => {
+    const store = new MemoryX402ExactSettlementStore();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("/verify")) return response({ isValid: true });
+      return new Promise<Response>(() => undefined);
+    });
+    const server = new X402ExactSettlementServer({ store, evidence: evidence() });
+    const commit = vi.fn(async (txHash: string) => txHash);
+
+    const result = await server.accept({
+      paymentHeader: header(),
+      config: { ...CONFIG, facilitatorTimeoutMs: 20 },
+      requiredUsdcMicro: 1000n,
+      resource: "/v1/credit",
+      btcUsdRate: 100_000,
+      dvmId: "dvm-1",
+      commit: async (receipt) => commit(receipt.txHash ?? ""),
+    });
+
+    expect(result).toMatchObject({ outcome: "ambiguous" });
+    expect(commit).not.toHaveBeenCalled();
+    const [intent] = await store.list({ dvmId: "dvm-1", limit: 1 });
+    expect(intent?.status).toBe("ambiguous");
+  });
 });

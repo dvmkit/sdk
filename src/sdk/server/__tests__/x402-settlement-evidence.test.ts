@@ -25,6 +25,46 @@ const EXACT_CALL_ABI = parseAbi([
   "function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)",
 ]);
 
+describe("exact authorization proven unused", () => {
+  const probe = (client: X402SettlementEvidenceClient) => {
+    const reader = createX402SettlementEvidenceReaderFromClient(client).isExactAuthorizationUnused;
+    if (!reader) throw new Error("exact unused-authorization probe is missing");
+    return reader;
+  };
+  const intent = { ...exactIntent(), validBefore: "1000" };
+  const chainAt = (timestamp: bigint, logs: ReturnType<typeof eventLog>[] = []) => ({
+    ...evidenceClient({ logs: { AuthorizationUsed: logs }, transactions: {} }),
+    getBlock: vi.fn(async () => ({ number: 25n, timestamp })),
+  });
+
+  it("is true once the chain is a minute past expiry with no use of the nonce since submission", async () => {
+    const client = chainAt(1060n);
+
+    await expect(probe(client)(intent)).resolves.toBe(true);
+    expect(client.getLogs).toHaveBeenCalledWith(
+      expect.objectContaining({ fromBlock: 10n, toBlock: 25n, args: { authorizer: intent.from, nonce: intent.nonce } })
+    );
+  });
+
+  it("is false while the chain's own clock could still accept the transfer", async () => {
+    await expect(probe(chainAt(1059n))(intent)).resolves.toBe(false);
+  });
+
+  it("is false when any use of the nonce is on chain, even by another transaction", async () => {
+    await expect(probe(chainAt(5000n, [eventLog(TRANSACTION_A)]))(intent)).resolves.toBe(false);
+  });
+
+  it("is false when a chain read fails or the client cannot read blocks", async () => {
+    const failing = chainAt(5000n);
+    vi.mocked(failing.getLogs).mockRejectedValue(new Error("rpc down"));
+    const blind = evidenceClient({ logs: {}, transactions: {} });
+
+    await expect(probe(failing)(intent)).resolves.toBe(false);
+    await expect(probe(blind)(intent)).resolves.toBe(false);
+    await expect(probe(chainAt(5000n))({ ...intent, submissionBlock: undefined })).resolves.toBe(false);
+  });
+});
+
 describe("x402 settlement chain evidence", () => {
   it("accepts exact-payment evidence only when the event and full authorization calldata match", async () => {
     const intent = exactIntent();

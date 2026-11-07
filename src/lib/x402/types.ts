@@ -119,6 +119,12 @@ export interface X402Config {
   /** Optional hosted-facilitator authentication. Omit for public facilitators such as x402.org. */
   facilitatorAuth?: X402FacilitatorAuth;
   /**
+   * Longest to wait for one facilitator `/verify` or `/settle` call. Defaults
+   * to 10000. A verify that times out refuses the payment; a settle that times
+   * out leaves the payment's outcome unknown, never rejected.
+   */
+  facilitatorTimeoutMs?: number;
+  /**
    * When true (default), the SDK includes x402 `PaymentRequirements` on the
    * 402 response body alongside MPP's `WWW-Authenticate: Payment` header so
    * x402-speaking agents (Coinbase reference client, thirdweb-ecosystem)

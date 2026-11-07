@@ -79,7 +79,7 @@ export interface X402ExactSettlementIntent extends X402ExactAuthorizationFacts {
 export interface X402ExactSettlementAttempt {
   id: string;
   intentId: string;
-  outcome: "submitting" | "success" | "rejected" | "timeout" | "missing_reference";
+  outcome: "submitting" | "success" | "rejected" | "timeout" | "missing_reference" | "pending";
   detail?: string;
   transaction?: string;
   createdAt: number;
@@ -135,6 +135,13 @@ export interface X402ExactSettlementStore {
    * submitted or settled authorization from being disowned.
    */
   release(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean>;
+  /**
+   * Retire a `submitting` or `ambiguous` intent whose authorization is proven
+   * unused past its expiry, so it can never settle. Returns false for any other
+   * status. Kept apart from {@link release}, which must not disown a submitted
+   * authorization. A store without it leaves such an intent unresolved.
+   */
+  expireUnused?(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean>;
   markAdmissionComplete(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent>;
   list(args: {
     dvmId: string;
@@ -243,7 +250,9 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
         const { rows } = await q.query<{ n: string }>(
           `SELECT count(*)::text AS n FROM x402_exact_settlement_intents
             WHERE dvm_id = $1 AND authorizer = $2
-              AND (status IN ('submitting', 'ambiguous')
+              AND ((status IN ('submitting', 'ambiguous')
+                    AND CASE WHEN valid_before ~ '^[0-9]+$'
+                         THEN valid_before::numeric > $3 ELSE true END)
                    OR (status = 'prepared' AND CASE WHEN valid_before ~ '^[0-9]+$'
                         THEN valid_before::numeric > $3 ELSE false END))`,
           [intent.dvmId, intent.from, Math.floor(now / 1000)]
@@ -500,6 +509,17 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
     return rowCount === 1;
   }
 
+  async expireUnused(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean> {
+    const now = Date.now();
+    const { rowCount } = await this.pool.query(
+      `UPDATE x402_exact_settlement_intents
+          SET status = 'rejected', last_outcome = $3, resolved_at = $4, updated_at = $4
+        WHERE dvm_id = $1 AND intent_id = $2 AND status IN ('submitting', 'ambiguous')`,
+      [args.dvmId, args.intentId, args.reason, now]
+    );
+    return rowCount === 1;
+  }
+
   async markAdmissionComplete(dvmId: string, intentId: string): Promise<X402ExactSettlementIntent> {
     const now = Date.now();
     const { rows } = await this.pool.query<X402ExactIntentRow>(
@@ -585,10 +605,14 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
       let outstanding = 0;
       for (const held of this.intents.values()) {
         if (held.dvmId !== intent.dvmId || held.from !== intent.from) continue;
+        // An authorization past its own expiry can no longer settle, whatever
+        // state its intent was left in. A non-numeric expiry is unknown, so an
+        // in-flight intent still counts while a prepared one does not.
+        const expiry = Number(held.validBefore);
+        const live = Number.isFinite(expiry) ? expiry > nowSeconds : undefined;
         if (
-          held.status === "submitting" ||
-          held.status === "ambiguous" ||
-          (held.status === "prepared" && Number(held.validBefore) > nowSeconds)
+          ((held.status === "submitting" || held.status === "ambiguous") && live !== false) ||
+          (held.status === "prepared" && live === true)
         ) {
           outstanding++;
         }
@@ -714,6 +738,23 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
     this.intents.set(key, {
       ...intent,
       status: "released",
+      lastOutcome: args.reason,
+      resolvedAt: now,
+      updatedAt: now,
+    });
+    return Promise.resolve(true);
+  }
+
+  expireUnused(args: { dvmId: string; intentId: string; reason: string }): Promise<boolean> {
+    const key = intentKey(args.dvmId, args.intentId);
+    const intent = this.intents.get(key);
+    if (intent?.status !== "submitting" && intent?.status !== "ambiguous") {
+      return Promise.resolve(false);
+    }
+    const now = Date.now();
+    this.intents.set(key, {
+      ...intent,
+      status: "rejected",
       lastOutcome: args.reason,
       resolvedAt: now,
       updatedAt: now,
