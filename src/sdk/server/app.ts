@@ -8,6 +8,7 @@ import { completeTempoChannelDrain } from "./tempo-drain-leg";
 import { installAdminContentRoutes } from "./admin-content";
 import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
+import { FLY_KEEPALIVE_PATH } from "./fly-keepalive";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
 import {
@@ -1397,6 +1398,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   private registerRoutes(): void {
+    this.app.get(FLY_KEEPALIVE_PATH, (c) => c.body(null, 204));
     const dvmSlug = this.descriptor.name;
     this.app.use("*", async (c, next) => {
       const raw = c.req.header("traceparent");

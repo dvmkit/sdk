@@ -1,4 +1,5 @@
 import { diagnosticConsole } from "../../observability/diagnostic-console";
+import { FLY_KEEPALIVE_PATH } from "./fly-keepalive";
 import { resolvePaymentMode, type PaymentMode, type PaidJobCompletion } from "./payment-mode";
 import { randomUUID } from "node:crypto";
 import { createDisposableCashuStore } from "./disposable-cashu-store";
@@ -278,6 +279,7 @@ interface MountEntry {
  */
 export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
   const app = new Hono();
+  app.get(FLY_KEEPALIVE_PATH, (c) => c.body(null, 204));
   app.use("*", clientCompatibilityMiddleware());
   const routeClientCompatibility =
     opts.wrapRouteClientCompatibility?.(requireClientCompatibility) ?? requireClientCompatibility;

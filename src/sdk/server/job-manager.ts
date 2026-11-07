@@ -1,5 +1,6 @@
 import { callerDeadline, hasCallerDeadline } from "./job";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
+import { acquireFlyKeepalive } from "./fly-keepalive";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
 import { randomBytes } from "node:crypto";
@@ -680,6 +681,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly descriptor: DVMDescriptor<State, InputSchema>;
   private readonly opts: JobManagerOpts;
   private readonly _activeJobs = new Map<string, ServerJob>();
+  private readonly runningHandlerReleases = new Set<() => void>();
   private readonly jobStore: JobStore;
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1277,14 +1279,23 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         onError(new Error(`Job exceeded its ${runtimeBound} second runtime limit`));
       }, runtimeBound * 1000).unref();
     }
+    const stopKeepalive = this.terminalPersistenceStopped
+      ? () => {}
+      : acquireFlyKeepalive(this.opts.env);
+    const release = (): void => {
+      stopKeepalive();
+      this.runningHandlerReleases.delete(release);
+    };
+    this.runningHandlerReleases.add(release);
     try {
       const result = loggers.isolate.span(
         "dvm.handler",
         { handler: "job", job_id: job.id, capability: job.capability },
         () => cap.onJob(sdkCtx)
       );
-      void result.catch(onError);
+      void result.catch(onError).finally(release);
     } catch (err) {
+      release();
       onError(err);
     }
   }
@@ -4949,6 +4960,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
   shutdown(): void {
     this.terminalPersistenceStopped = true;
+    for (const release of this.runningHandlerReleases) release();
     for (const [id] of this.idleTimers) {
       this.clearIdleTimer(id);
     }

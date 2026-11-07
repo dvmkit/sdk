@@ -1,5 +1,13 @@
 # Operating a DVM
 
+## Fly Machine autostop
+
+When both `FLY_APP_NAME` and `FLY_MACHINE_ID` are set, the SDK sends a pinned request to `http://<app>.flycast/_sdk/keepalive` every 15 seconds while a handler invocation remains unsettled. Mounted DVMs share the timer. It stops when the last handler settles, including before completed jobs leave their polling cleanup window, and on shutdown. An invocation awaiting caller input still counts; resumable waits are not provided by this feature.
+
+The unauthenticated keepalive route returns an empty 204 without database access or caller request accounting. Each request has a five-second timeout, requests never overlap, and failures leave jobs unchanged. The `fly_keepalive_failed` warning appears once per process; retries continue. If Flycast DNS resolution fails (`ENOTFOUND`), provide a resolvable Flycast address for the app before relying on this behavior.
+
+This is a best-effort aid for `auto_stop_machines = "suspend"` when the handler's Machine is the only one awake. It does not reliably protect a job when multiple Machines are awake, and Fly proxy behavior can change. Idle Machines can still scale to zero after handlers settle. Deployments needing stronger guarantees should configure their Machine lifecycle accordingly.
+
 ## Verified payments in development
 
 `serve()` returns a `paymentModes` snapshot describing whether each configured rail is verifying, unavailable, or absent. A priced development server skips verification only when it has no configured payment rail. Configuring an unusable rail fails closed instead of turning the request into a synthetic development payment.

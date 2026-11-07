@@ -171,6 +171,7 @@
       "src/sdk/server/credit-routes.ts",
       "src/sdk/server/dev-page.ts",
       "src/sdk/server/disposable-cashu-store.ts",
+      "src/sdk/server/fly-keepalive.ts",
       "src/sdk/server/funding-receipt.ts",
       "src/sdk/server/funding.ts",
       "src/sdk/server/host.ts",
@@ -22805,6 +22806,9 @@
           "module": "src/observability/diagnostic-console.ts"
         },
         {
+          "module": "src/sdk/server/fly-keepalive.ts"
+        },
+        {
           "module": "src/sdk/server/payment-mode.ts"
         },
         {
@@ -25493,6 +25497,30 @@
       ]
     },
     {
+      "module": "src/sdk/server/fly-keepalive.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Host-local handler liveness for Fly deployments, shared by mounted DVMs.",
+          "symbols": [
+            "FLY_KEEPALIVE_PATH",
+            "acquireFlyKeepalive"
+          ],
+          "consumerEvidence": [
+            "supported:./server#JobManager",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/observability/diagnostic-console.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/server/funding-receipt.ts",
       "allocations": [
         {
@@ -25672,6 +25700,9 @@
       "dependencies": [
         {
           "module": "src/observability/diagnostic-console.ts"
+        },
+        {
+          "module": "src/sdk/server/fly-keepalive.ts"
         },
         {
           "module": "src/sdk/server/payment-mode.ts"
@@ -27265,6 +27296,9 @@
         },
         {
           "module": "src/sdk/server/disposable-cashu-store.ts"
+        },
+        {
+          "module": "src/sdk/server/fly-keepalive.ts"
         },
         {
           "module": "src/sdk/server/funding.ts"
