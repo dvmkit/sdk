@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { LightningBackend } from "../../../lib/lightning-backend";
+import { diagnosticConsole } from "../../../observability/diagnostic-console";
 import type { Nip47Stub } from "../../../test-support/nip47-stub";
 import { startNip47Stub } from "../../../test-support/nip47-stub";
 import { closeNextNwcPublish } from "../../../test-support/nwc-publish-fault";
+import { configureDVM } from "../../configure";
+import { createDVMHost } from "../host";
+import { secp256k1Auth } from "../secp256k1-auth";
 import {
   LightningReceive,
   resolveInvoiceTtl,
@@ -35,6 +40,17 @@ async function triggerRecovery(receive: LightningReceive, wallet: Nip47Stub): Pr
   });
 }
 
+function receiveBackend(methods: string[]): LightningBackend {
+  const unused = vi.fn().mockRejectedValue(new Error("unexpected wallet operation"));
+  return {
+    getInfo: vi.fn().mockResolvedValue({ methods }),
+    getBalance: unused,
+    createInvoice: unused,
+    lookupInvoice: unused,
+    payInvoice: unused,
+  };
+}
+
 describe("receive-only credential validation", () => {
   it("accepts a receive-only connection", async () => {
     stub = await startNip47Stub({ methods: RECEIVE_ONLY });
@@ -61,31 +77,114 @@ describe("receive-only credential validation", () => {
     await expect(LightningReceive.create({ uri: stub.uri })).rejects.toThrow(/pay_keysend/);
   });
 
-  it("refuses a wallet that won't state its permitted methods", async () => {
+  it.each([false, true])("refuses a wallet that won't state its permitted methods (allowSpend=%s)", async (allowSpend) => {
     // An empty advertised method list is unverifiable authority; do not treat reachability as
     // permission validation.
     stub = await startNip47Stub({ methods: RECEIVE_ONLY, advertisedMethods: [] });
-    await expect(LightningReceive.create({ uri: stub.uri })).rejects.toThrow(
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend })).rejects.toThrow(
       /does not advertise which methods/
     );
   });
 
-  it("refuses a malformed permitted-method observation", async () => {
+  it.each([false, true])("refuses a malformed permitted-method observation (allowSpend=%s)", async (allowSpend) => {
     stub = await startNip47Stub({
       methods: RECEIVE_ONLY,
       advertisedMethods: ["get_info", 42] as unknown as string[]
     });
-    await expect(LightningReceive.create({ uri: stub.uri })).rejects.toThrow(/malformed/);
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend })).rejects.toThrow(/malformed/);
   });
 
-  it("refuses a connection that cannot look up its own invoices", async () => {
-    stub = await startNip47Stub({ methods: ["get_info", "get_balance", "make_invoice"] });
-    await expect(LightningReceive.create({ uri: stub.uri })).rejects.toThrow(/lookup_invoice/);
+  it.each([false, true])("refuses a connection that cannot look up its own invoices (allowSpend=%s)", async (allowSpend) => {
+    stub = await startNip47Stub({ methods: ["get_info", "get_balance", "make_invoice", ...(allowSpend ? ["pay_invoice"] : [])] });
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend })).rejects.toThrow(/lookup_invoice/);
   });
 
-  it("refuses a connection that cannot issue invoices", async () => {
-    stub = await startNip47Stub({ methods: ["get_info", "get_balance", "lookup_invoice"] });
-    await expect(LightningReceive.create({ uri: stub.uri })).rejects.toThrow(/make_invoice/);
+  it.each([false, true])("refuses a connection that cannot issue invoices (allowSpend=%s)", async (allowSpend) => {
+    stub = await startNip47Stub({ methods: ["get_info", "get_balance", "lookup_invoice", ...(allowSpend ? ["pay_invoice"] : [])] });
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend })).rejects.toThrow(/make_invoice/);
+  });
+
+  it.each([{}, ["make_invoice", "lookup_invoice", " "]])(
+    "refuses malformed method lists with the override enabled: %j",
+    async (advertisedMethods) => {
+      stub = await startNip47Stub({
+        methods: RECEIVE_ONLY,
+        advertisedMethods: advertisedMethods as string[]
+      });
+      await expect(LightningReceive.create({ uri: stub.uri, allowSpend: true }))
+        .rejects.toThrow(/malformed/);
+    }
+  );
+
+  it("refuses an absent permission list with the override enabled", async () => {
+    stub = await startNip47Stub({ methods: RECEIVE_ONLY, volunteerBudgetFields: { methods: undefined } });
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend: true }))
+      .rejects.toThrow(/does not advertise which methods/);
+  });
+
+  it("refuses an unreadable permission list with the override enabled", async () => {
+    stub = await startNip47Stub({ methods: RECEIVE_ONLY, restrictedMethods: ["get_info"] });
+    await expect(LightningReceive.create({ uri: stub.uri, allowSpend: true }))
+      .rejects.toThrow(/usable get_info permission observation/);
+  });
+
+  it("keeps the override through refresh and warns once without leaking wallet text", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stub = await startNip47Stub({
+      methods: [...RECEIVE_ONLY, "pay_invoice", "pay_keysend", "SENTINEL_SECRET"]
+    });
+    const receive = await LightningReceive.create({ uri: stub.uri, allowSpend: true });
+    expect(receive?.available()).toBe(true);
+    const warnings = () => warn.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+      .filter((entry) => entry.event === "lightning_receive_allow_spend_enabled");
+    expect(warnings()).toEqual([{
+      event: "lightning_receive_allow_spend_enabled",
+      level: "warn",
+      override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
+      excess_methods: ["pay_invoice", "pay_keysend", "unknown_method"]
+    }]);
+    expect(JSON.stringify(warnings())).not.toContain(stub.uri);
+    expect(JSON.stringify(warnings())).not.toContain("SENTINEL_SECRET");
+
+    stub.setFault({ mode: "relay-down" });
+    vi.setSystemTime(Date.now() + 60_001);
+    receive?.available();
+    await vi.waitFor(() => expect(receive?.available()).toBe(false));
+    stub.requests.length = 0;
+    await triggerRecovery(receive!, stub);
+    await vi.waitFor(() => expect(receive?.available()).toBe(true));
+    expect(warnings()).toHaveLength(1);
+  });
+
+  it("keeps a spend-capable injected backend available after refresh with the override", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const backend = receiveBackend([...RECEIVE_ONLY, "pay_invoice"]);
+    const receive = await LightningReceive.create({ backend, allowSpend: true });
+    if (!receive) throw new Error("test receive wallet was not constructed");
+
+    vi.setSystemTime(Date.now() + 60_001);
+    receive.available();
+    await vi.waitFor(() => {
+      expect(warn.mock.calls.map(([line]) => String(line)).join("\n"))
+        .toContain('"event":"lightning_receive_allow_spend_enabled"');
+    });
+    expect(receive.available()).toBe(true);
+    expect(backend.payInvoice).not.toHaveBeenCalled();
+  });
+
+  it("warns when spending authority is first observed after an unreachable boot", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stub = await startNip47Stub({ methods: [...RECEIVE_ONLY, "pay_invoice"] });
+    stub.setFault({ mode: "relay-down" });
+    const receive = await LightningReceive.create({ uri: stub.uri, allowSpend: true });
+    expect(receive?.available()).toBe(false);
+    await triggerRecovery(receive!, stub);
+    await vi.waitFor(() => expect(receive?.available()).toBe(true));
+    expect(warn.mock.calls.map(([line]) => String(line)).filter((line) =>
+      line.includes("lightning_receive_allow_spend_enabled"))).toHaveLength(1);
   });
 
   it("refuses a malformed URI with a copy-this-instead hint", async () => {
@@ -213,4 +312,73 @@ describe("invoice TTL", () => {
     expect(() => resolveInvoiceTtl(60)).toThrow(/at least/);
     expect(() => resolveInvoiceTtl(600)).not.toThrow();
   });
+});
+
+describe("host receive override environment", () => {
+  it.each([false, true])("preserves the receive-only banner and labels the override (allowSpend=%s)", async (allowSpend) => {
+    const log = vi.spyOn(diagnosticConsole, "log");
+    const host = createDVMHost({
+      devMode: true,
+      port: 0,
+      env: {},
+      lightningReceive: { backend: receiveBackend(RECEIVE_ONLY), allowSpend },
+    });
+    host.mount(configureDVM({
+      name: "receive-banner-test",
+      capability: "test",
+      onJob(ctx) { ctx.complete("ok"); },
+    }));
+    const server = await host.serve();
+    try {
+      const banner = log.mock.calls.flat().find((line) =>
+        typeof line === "string" && line.startsWith("  LN receive:")
+      );
+      expect(banner).toBe(allowSpend
+        ? "  LN receive:    NWC receive (reachable), spending permissions allowed (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)"
+        : "  LN receive:    receive-only NWC (reachable)"
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.each([undefined, "1", "yes", "TRUE", "true ", "true"])(
+    "enables spending authority only for exact true (value=%s)",
+    async (value) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      stub = await startNip47Stub({ methods: [...RECEIVE_ONLY, "pay_invoice"] });
+      const host = createDVMHost({
+        devMode: true,
+        port: 0,
+        mints: ["http://localhost:3338"],
+        env: {
+          DVMKIT_NWC_RECEIVE_URI: stub.uri,
+          ...(value === undefined ? {} : { DVMKIT_NWC_RECEIVE_ALLOW_SPEND: value })
+        }
+      });
+      host.mount(configureDVM({
+        name: "receive-override-test",
+        capability: "test",
+        price: "$0.10",
+        credit: { min: "$0.10", max: "$5.00" },
+        auth: secp256k1Auth(),
+        onJob(ctx) { ctx.complete("ok"); }
+      }));
+      if (value !== "true") {
+        await expect(host.serve()).rejects.toThrow(/pay_invoice[\s\S]*receive-only connection/);
+        return;
+      }
+      const server = await host.serve();
+      try {
+        const response = await fetch(`${server.url}/v1/info`);
+        const body = await response.json() as { credit?: { funding: string[] } };
+        expect(response.status).toBe(200);
+        expect(body.credit?.funding).toContain("lightning");
+        expect(warn.mock.calls.map(([line]) => String(line)).join("\n"))
+          .toContain('"override":"DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true"');
+      } finally {
+        await server.close();
+      }
+    }
+  );
 });

@@ -184,8 +184,9 @@ export interface DVMHostOpts {
   /**
    * Lightning receive leg for credit funding. Defaults to the
    * env-resolved `DVMKIT_NWC_RECEIVE_URI` /
-   * `DVMKIT_NWC_RECEIVE_INVOICE_TTL_SECONDS`. Pass `backend` to inject a
-   * wallet directly — a test seam that skips the connect-time probe, so
+   * `DVMKIT_NWC_RECEIVE_ALLOW_SPEND` / `DVMKIT_NWC_RECEIVE_INVOICE_TTL_SECONDS`.
+   * See `LightningReceiveConfig.allowSpend` for the accepted spending risk.
+   * Pass `backend` to inject a wallet directly — a test seam that skips the connect-time probe, so
    * production must always come through the URI.
    */
   lightningReceive?: LightningReceiveConfig;
@@ -521,6 +522,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     const lightningReceiveConfig: LightningReceiveConfig = {
       ...(opts.lightningReceive ?? {
         uri: envMaybe.DVMKIT_NWC_RECEIVE_URI,
+        allowSpend: envMaybe.DVMKIT_NWC_RECEIVE_ALLOW_SPEND === "true",
         invoiceTtlSeconds: parseInvoiceTtlEnv(envMaybe.DVMKIT_NWC_RECEIVE_INVOICE_TTL_SECONDS),
         fundingMinSats: parseFundingMinSatsEnv(envMaybe.DVMKIT_LIGHTNING_FUNDING_MIN_SATS),
       }),
@@ -1668,7 +1670,7 @@ function logBootSummary(s: BootSummary): void {
   diagnosticConsole.log(
     `  LN receive:    ${
       s.lightningReceive
-        ? `receive-only NWC (${s.lightningReceive.available() ? "reachable" : "unreachable — omitted from the funding menu"})`
+        ? `${s.lightningReceive.allowSpend ? "NWC receive" : "receive-only NWC"} (${s.lightningReceive.available() ? "reachable" : "unreachable — omitted from the funding menu"})${s.lightningReceive.allowSpend ? ", spending permissions allowed (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)" : ""}`
         : "(unconfigured)"
     }`
   );

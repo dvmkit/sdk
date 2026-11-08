@@ -38,6 +38,28 @@ Reusable x402 channels default to a 24-hour payer withdrawal grace (86400 second
 
 Public `/v1/*` routes enable CORS in production and development with `Access-Control-Allow-Origin: *`, no `Access-Control-Allow-Credentials`, and `X-Cashu` exposed so browser wallets can read the unpaid 402 payment request. Preflights allow the requested headers, including payment, signature, and job-token headers. Access still requires the route's signature, job token, or payment; cookies do not authorize these routes. Admin, internal, health, and development helper routes have no CORS headers.
 
+## Lightning-funded credit
+
+Set `DVMKIT_NWC_RECEIVE_URI` to an NWC connection that permits `make_invoice` and
+`lookup_invoice`. By default, the SDK refuses connections with spending or unknown
+permissions. It also refuses absent, malformed, or unreadable permission lists.
+
+Set `DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true` only when the DVM already holds a spend
+credential for the same wallet or the wallet cannot issue receive-only connections.
+Only the exact string `true` enables this override; unset, `1`, `yes`, and `TRUE`
+retain the default refusal. Programmatic hosts can use
+`lightningReceive: { uri, allowSpend: true }`, or pass `allowSpend: true` to
+`LightningReceive.create`. This accepts a credential that could let a compromised
+DVM spend wallet funds. The SDK still requires a readable method list containing
+both required receive methods, including after reconnection, and uses the connection
+only for receiving credit funding. When excess permissions are observed, one warning
+per receive connection names the enabled override and known excess methods;
+unrecognized methods appear as `unknown_method`. The URI and secret are never logged.
+
+`DVMKIT_NWC_RECEIVE_INVOICE_TTL_SECONDS` sets invoice lifetime (default 900, minimum
+600 seconds). `DVMKIT_LIGHTNING_FUNDING_MIN_SATS` sets the receive wallet's minimum
+funding amount in sats (default 2000).
+
 ## Card-funded credit
 
 Card payers must be in a region where Link supports connecting agents: the United States and Canada as of November 2026. Stripe's broader country availability does not establish support for this Link flow.

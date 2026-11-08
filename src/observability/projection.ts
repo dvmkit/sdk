@@ -32,6 +32,7 @@ const DATASETS = new Set<string>(catalogue.datasets);
 const LEVELS = new Set<string>(catalogue.levels);
 const STATUSES = new Set<string>(catalogue.statuses);
 const METHODS = new Set<string>(catalogue.methods);
+const NWC_EXCESS_METHODS = new Set<string>(catalogue.nwcExcessMethods);
 const RAILS = new Set<string>(catalogue.rails);
 const STAGES = new Set<string>(catalogue.stages);
 const HANDLERS = new Set<string>(catalogue.handlers);
@@ -363,6 +364,18 @@ function projectField(
       : undefined;
   if (closedEnum)
     return typeof value === "string" && closedEnum.has(value) ? value : undefined;
+  if (eventName === "lightning_receive_allow_spend_enabled") {
+    if (key === "override")
+      return value === "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true" ? value : undefined;
+    if (key === "excess_methods" && Array.isArray(value)) {
+      // Wallet-advertised strings are untrusted: only fixed protocol names may reach logs.
+      return [...new Set(ownDataEntries(value, 64)
+        .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
+        .map(([, method]) =>
+          typeof method === "string" && NWC_EXCESS_METHODS.has(method) ? method : "unknown_method"
+        ))];
+    }
+  }
   if (eventName !== undefined && CARD_REFUND_EVENTS.has(eventName)) {
     const projected = projectCardRefundField(key, value);
     if (projected !== undefined) return projected;

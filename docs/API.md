@@ -225,7 +225,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `JobStatus` | type | type-only | experimental | Exported declaration from the built public entry point. |
 | `JobStore` | interface | type-only | experimental | Exported declaration from the built public entry point. |
 | `JobTerminalReportPayload` | interface | type-only | experimental | Privacy-preserving terminal evidence; contains no caller or payment references. |
-| `LightningReceive` | class | runtime | experimental | Prepaid Lightning funding over a receive-safe NWC connection. |
+| `LightningReceive` | class | runtime | experimental | Prepaid Lightning funding over NWC, with receive-safe permissions required by default. |
 | `LightningReceiveConfig` | interface | type-only | experimental | Exported declaration from the built public entry point. |
 | `MemoryConsumedCredentialStore` | class | runtime | experimental | In-memory `ConsumedCredentialStore`. |
 | `MemoryConsumedCredentialStoreOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
