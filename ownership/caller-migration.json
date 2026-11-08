@@ -239,6 +239,7 @@
       "src/sdk/server/x402-settlement-evidence.ts",
       "src/sdk/server/x402-settlement-scheduler.ts",
       "src/sdk/server/zod-error.ts",
+      "src/sdk/signed-envelope-schema.ts",
       "src/sdk/step-cache.ts",
       "src/sdk/store.ts",
       "src/sdk/testing/index.ts",
@@ -20214,6 +20215,9 @@
         },
         {
           "module": "src/sdk/types.ts"
+        },
+        {
+          "module": "src/sdk/signed-envelope-schema.ts"
         }
       ]
     },
@@ -23041,6 +23045,9 @@
         },
         {
           "module": "src/sdk/server/late-payment.ts"
+        },
+        {
+          "module": "src/sdk/signed-envelope-schema.ts"
         }
       ]
     },
@@ -34578,6 +34585,31 @@
         }
       ],
       "dependencies": []
+    },
+    {
+      "module": "src/sdk/signed-envelope-schema.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Capability schema validation and signed-request diagnostics share envelope-field preservation checks without importing caller implementation.",
+          "symbols": [
+            "CAPABILITY_SIGNED_FIELDS",
+            "droppedSignedFields",
+            "missingSignedSchemaFields"
+          ],
+          "consumerEvidence": [
+            "supported:.#configureDVM",
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/types.ts"
+        }
+      ]
     },
     {
       "module": "src/sdk/step-cache.ts",

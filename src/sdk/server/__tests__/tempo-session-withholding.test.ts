@@ -98,7 +98,7 @@ async function startServer(observerHealthy: boolean | undefined) {
   const dvm = configureDVM({
     name: "tempo-withholding-test",
     capability: "do",
-    input: z.object({ text: z.string() }),
+    input: z.object({ text: z.string() }).passthrough(),
     price: "$0.01",
     onJob(ctx) {
       ctx.complete("done");
@@ -203,7 +203,7 @@ describe("tempo/session withholding on /v1/info", () => {
     const dvm = configureDVM({
       name: "tempo-settlement-withholding-test",
       capability: "do",
-      input: z.object({ text: z.string() }),
+      input: z.object({ text: z.string() }).passthrough(),
       price: "$0.01",
       onJob(ctx) {
         ctx.complete("done");
@@ -512,7 +512,7 @@ describe("declared Tempo session capability", () => {
     const dvm = configureDVM({
       name: "tempo-capability-test",
       capability: "do",
-      input: z.object({ text: z.string() }),
+      input: z.object({ text: z.string() }).passthrough(),
       price: "$0.01",
       onJob(ctx) {
         ctx.complete("done");

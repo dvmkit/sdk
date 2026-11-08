@@ -1,0 +1,9 @@
+{
+  "status": 500,
+  "body": {
+    "error": "auth_error",
+    "sub_reason": "schema_invalid",
+    "display": "Capability \"catalog\" input schema drops signed envelope fields: pubkey, signature, timestamp, nonce",
+    "hint": "The builder must preserve pubkey, signature, timestamp and nonce through input parsing. Declare these fields or use .passthrough() / z.looseObject(); ensure unions, pipes and transforms retain them."
+  }
+}

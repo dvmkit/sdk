@@ -49,6 +49,7 @@
     "caller_data_retention.swept",
     "caller_data_retention_failed",
     "capability_gap_alert_error",
+    "capability_schema_drops_signed_envelope",
     "cashu-mint-audit.tick",
     "cashu-mint-health-cron.tick",
     "cashu.get_wallet",

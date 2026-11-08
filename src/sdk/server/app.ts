@@ -8,6 +8,7 @@ import { completeTempoChannelDrain } from "./tempo-drain-leg";
 import { installAdminContentRoutes } from "./admin-content";
 import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
+import { droppedSignedFields } from "../signed-envelope-schema";
 import { FLY_KEEPALIVE_PATH } from "./fly-keepalive";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
@@ -57,6 +58,7 @@ import type {
 import { pinDimension, withTraceContext } from "../../observability/context";
 import { loggers } from "../../observability/loggers";
 import {
+  bindDiagnosticCapabilityAuthority,
   createDiagnosticCapabilityAuthority,
   type DiagnosticCapabilityAuthority,
 } from "../../observability/projection";
@@ -216,7 +218,7 @@ import type {
   RevenueReporter,
 } from "./revenue-reporter";
 import type { CanonicalEnvelope } from "./signed-request";
-import { isSignedRequestError, SignedRequestError, signedRequestInput } from "./signed-request";
+import { carriesSignedEnvelope, isSignedRequestError, SignedRequestError, signedRequestInput } from "./signed-request";
 import { carriesCreditFields, unsignedInputSchema } from "./unsigned-request";
 import {
   handleTempoCloseEvent,
@@ -2705,12 +2707,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Envelope-only errors defer to auth; missing structured input is a quote probe.
     let deferredInputError: unknown;
     try {
-      await loggers.isolate.span(
+      const parsedInput = await loggers.isolate.span(
         "dvm.input.validate",
         { capability: capabilityName, stage: "input" },
         () => this.jobManager.parseInput(body, capabilityName),
         { onError: () => ({ "error.code": "invalid_input" }) }
       );
+      const schemaError = this.droppedSignedEnvelopeResponse(c, body, parsedInput, capabilityName);
+      if (schemaError) return schemaError;
     } catch (err) {
       // A body carrying no structured input at all is a price probe, not a
       // schema violation: `dvm quote -d discover/search` (all three input flags
@@ -3161,6 +3165,30 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return issues !== undefined && callerInputIssues(issues).length === 0;
   }
 
+  private droppedSignedEnvelopeResponse(
+    c: Context<AppEnv>,
+    body: { input?: string; data?: unknown },
+    parsedInput: unknown,
+    capabilityName: string
+  ): Response | undefined {
+    if (!this.descriptor.auth || !isZodSchema(this.descriptor.capabilities[capabilityName].input)) return undefined;
+    const raw = signedRequestInput(body);
+    if (!carriesSignedEnvelope(raw)) return undefined;
+    const dropped = droppedSignedFields(raw, parsedInput);
+    if (dropped.length === 0) return undefined;
+    diagnosticConsole.error(bindDiagnosticCapabilityAuthority({
+      event: "capability_schema_drops_signed_envelope",
+      capability: capabilityName,
+      "error.code": "auth_error",
+    }, this.diagnosticCapabilityAuthority));
+    return c.json({
+      error: "auth_error",
+      sub_reason: "schema_invalid",
+      display: `Capability "${capabilityName}" input schema drops signed envelope fields: ${dropped.join(", ")}`,
+      hint: "The builder must preserve pubkey, signature, timestamp and nonce through input parsing. Declare these fields or use .passthrough() / z.looseObject(); ensure unions, pipes and transforms retain them.",
+    }, 500);
+  }
+
   /**
    * Mints to advertise to clients on `/v1/info` and `/v1/quote`. Filters the
    * configured list through the runtime health tracker. When every
@@ -3366,6 +3394,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         () => this.jobManager.parseInput(body, capabilityName, unsignedPaid),
         { onError: () => ({ "error.code": "invalid_input" }) }
       );
+      const schemaError = this.droppedSignedEnvelopeResponse(c, body, parsedInput, capabilityName);
+      if (schemaError) return schemaError;
     } catch (err) {
       if (unsignedPaid || !this.deferToAuthGate(err)) return this.invalidInputResponse(c, err);
       deferredInputError = err;

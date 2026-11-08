@@ -36,7 +36,9 @@ const stubFx: FxFetcher = {
   supportedCurrencies: () => ["usd"],
 };
 
-const schema = z.object({ pubkey: z.string(), signature: z.string() });
+const schema = z.object({
+  pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string(),
+});
 
 /** Advertises the channel scheme plus the authorizer boot demands, and records claims. */
 function claimingFacilitator(): FacilitatorClient {
