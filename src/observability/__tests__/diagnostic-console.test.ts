@@ -30,6 +30,27 @@ describe("diagnosticConsole", () => {
     });
   });
 
+  it("never invokes accessors while naming excess receive permissions", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const getter = vi.fn(() => "pay_keysend");
+    const methods = ["pay_invoice"];
+    Object.defineProperty(methods, "1", { enumerable: true, get: getter });
+
+    diagnosticConsole.warn({
+      event: "lightning_receive_allow_spend_enabled",
+      override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
+      spending_methods: methods,
+    });
+
+    expect(getter).not.toHaveBeenCalled();
+    expect(JSON.parse(String(warn.mock.calls[0]?.[0]))).toEqual({
+      event: "lightning_receive_allow_spend_enabled",
+      level: "warn",
+      override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
+      spending_methods: ["pay_invoice"],
+    });
+  });
+
   it("does not treat caller text as an event name", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 

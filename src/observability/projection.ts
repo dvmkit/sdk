@@ -363,6 +363,21 @@ function projectField(
       : undefined;
   if (closedEnum)
     return typeof value === "string" && closedEnum.has(value) ? value : undefined;
+  if (eventName === "lightning_receive_allow_spend_enabled") {
+    if (key === "override")
+      return value === "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true" ? value : undefined;
+    if (key === "spending_methods" && Array.isArray(value)) {
+      // Wallet-advertised strings are untrusted: only fixed protocol names may reach logs.
+      const known = new Set([
+        "pay_invoice", "pay_keysend", "multi_pay_invoice", "multi_pay_keysend", "sign_message",
+      ]);
+      return [...new Set(ownDataEntries(value, 64)
+        .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
+        .map(([, method]) =>
+          typeof method === "string" && known.has(method) ? method : "unknown_method"
+        ))];
+    }
+  }
   if (eventName !== undefined && CARD_REFUND_EVENTS.has(eventName)) {
     const projected = projectCardRefundField(key, value);
     if (projected !== undefined) return projected;

@@ -241,6 +241,7 @@
     "lightning_rail_health_stale_observation",
     "lightning_rail_health_staleness_ceiling",
     "lightning_rail_health_unavailable",
+    "lightning_receive_allow_spend_enabled",
     "lightning_receive_permission_refused",
     "lightning_receive_unreachable",
     "lightning_settlement_blocked",

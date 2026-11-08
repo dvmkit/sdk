@@ -1004,7 +1004,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "3cdae181e31956df67a4ea14bd9abf5414ab31bd6eba156cb94a202fc37a16e4"
+          "signature": "b0af40596f0b4b919baa333c8a3607fa7ca28c487a6e1635575b791b8d0fce93"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1120,7 +1120,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "8fe907eff8f85b505e55ded38aaf352a397daeb4e58ecfb4fb683f733799929c"
+          "signature": "5e69339b2535511192aac9476bf72ca5820f6cc462b9f60ef4979ba207d3d92b"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1188,7 +1188,7 @@
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "3c13927054d1ee863492742b8c99175887d1746d891d8da50107955a95ccfc7a"
+          "signature": "b14e695ab43f1385642d335fc50aba299137eca8964a9f555e80510881266ac8"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1212,7 +1212,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "b221286f5e64e202d8cc586b9a61e8f143abfdc36086ab49d2447dbee39a40dc"
+          "signature": "e4285c1003b345da184282559069f4b6d2f18390ff6bd9ea9aef830151c9c61e"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1324,11 +1324,11 @@
         },
         "LightningReceive": {
           "stability": "experimental",
-          "signature": "7631581261d652b36f5af5b251569bc851312b4d6816298d543090cf5f39631e"
+          "signature": "e1a45873145dae7e035d708492cd89102dbe70d93dcdb2219d1b46a87dbacea4"
         },
         "LightningReceiveConfig": {
           "stability": "experimental",
-          "signature": "7023b5eac8f4e6d2a834265cbc1f9f36a09b1f188303644559adf8b9fafcfe23"
+          "signature": "1676508e7f054e33770edc42a9af338b667ed756bf186f2021a068b450ebfaa8"
         },
         "MemoryConsumedCredentialStore": {
           "stability": "experimental",
@@ -1532,7 +1532,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "1caf18f8da0f9118f839ce1fc791b583a9425e8277ed40461add53e693136114"
+          "signature": "44c53f32b7b7e12e63189338301696c1dc14d1da03cc43eda934df7ef3023d59"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",

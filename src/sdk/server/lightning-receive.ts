@@ -15,10 +15,17 @@ import type { CreditDepositEnqueue } from "./revenue-reporter";
 
 export interface LightningReceiveConfig {
   /**
-   * Receive-only NWC connection URI (`DVMKIT_NWC_RECEIVE_URI`). Validated at
-   * boot: a connection that can *spend* is refused outright.
+   * NWC connection URI (`DVMKIT_NWC_RECEIVE_URI`). Validated at boot:
+   * spending authority is refused unless `allowSpend` is explicitly true.
    */
   uri?: string;
+  /**
+   * Accept excess NWC permissions (`DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true`). Use only
+   * when the DVM already holds a spend credential for the same wallet or the wallet
+   * cannot issue receive-only connections. A compromised DVM could spend wallet funds.
+   * Required receive methods and a readable method list are still enforced.
+   */
+  allowSpend?: boolean;
   /**
    * Pre-built backend, bypassing URI parsing and the connect-time probe. Test
    * seam only — production always goes through `uri` so the receive-only
@@ -115,8 +122,9 @@ function isTransportFailure(err: unknown): boolean {
 }
 
 /**
- * Prepaid Lightning funding over a receive-safe NWC connection. URI construction validates
- * the advertised method allowlist, refusing spending or unknown authority; the injected
+ * Prepaid Lightning funding over NWC, with receive-safe permissions required by default.
+ * `allowSpend` accepts excess authority explicitly; URI construction still validates the
+ * advertised method list and required receive methods. The injected
  * backend seam bypasses that probe. Receive-safe methods include invoice, read and
  * hold-invoice operations.
  *
@@ -131,11 +139,14 @@ export class LightningReceive {
   private health: LightningReceiveHealth;
   private checkedAtMs: number;
   private refreshing = false;
+  private spendOverrideWarned = false;
+  private readonly allowSpend: boolean;
   private permissionRefusal: ReceivePermissionError | undefined;
 
   private constructor(
     private readonly source: { conn?: NwcConnection; backend?: LightningBackend },
     opts: {
+      allowSpend?: boolean;
       invoiceTtlSeconds: number;
       fundingMinSats: number;
       health: LightningReceiveHealth;
@@ -143,6 +154,7 @@ export class LightningReceive {
       railHealth?: LightningRailHealth;
     }
   ) {
+    this.allowSpend = opts.allowSpend === true;
     this.invoiceTtlSeconds = opts.invoiceTtlSeconds;
     this.fundingMinSats = opts.fundingMinSats;
     this.health = opts.health;
@@ -189,13 +201,14 @@ export class LightningReceive {
     }
 
     let health: LightningReceiveHealth = "healthy";
+    let methods: string[] = [];
     try {
       const info = await withNwcPool(
         conn,
         (opts) => new NwcBackend(conn, opts).getInfo(),
         WALLET_TIMEOUT_MS
       );
-      validateReceiveMethods(info.methods);
+      methods = validateReceiveMethods(info.methods, config.allowSpend === true);
     } catch (err) {
       if (err instanceof ReceivePermissionError) throw err;
       if (!isTransportFailure(err)) throw receivePermissionProbeError(err);
@@ -204,16 +217,19 @@ export class LightningReceive {
     }
 
     await config.railHealth?.refresh?.();
-    return new LightningReceive(
+    const receive = new LightningReceive(
       { conn },
       {
         invoiceTtlSeconds,
         fundingMinSats,
         health,
+        allowSpend: config.allowSpend,
         nowMs: Date.now(),
         railHealth: config.railHealth,
       }
     );
+    receive.warnSpendOverride(methods);
+    return receive;
   }
 
   /**
@@ -589,12 +605,26 @@ export class LightningReceive {
     if (transitioned) warnReceiveUnreachable(err);
   }
 
+  private warnSpendOverride(methods: string[]): void {
+    if (!this.allowSpend || this.spendOverrideWarned) return;
+    const unsafe = methods.filter((method) => !RECEIVE_SAFE_METHODS.has(methodName(method)));
+    if (unsafe.length === 0) return;
+    this.spendOverrideWarned = true;
+    diagnosticConsole.warn({
+      level: "warn",
+      event: "lightning_receive_allow_spend_enabled",
+      override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
+      spending_methods: unsafe.map(methodName),
+    });
+  }
+
   private async refresh(): Promise<void> {
     if (this.refreshing) return;
     this.refreshing = true;
     try {
       const info = await this.withBackend((backend) => backend.getInfo(), WALLET_TIMEOUT_MS, false);
-      validateReceiveMethods(info.methods);
+      const methods = validateReceiveMethods(info.methods, this.allowSpend);
+      this.warnSpendOverride(methods);
       this.notePermissionsOk();
     } catch (err) {
       // Transport failures were already recorded by `withBackend`. Everything
@@ -626,7 +656,7 @@ class ReceivePermissionError extends Error {
   }
 }
 
-function validateReceiveMethods(value: unknown): string[] {
+function validateReceiveMethods(value: unknown, allowSpend = false): string[] {
   if (!Array.isArray(value)) {
     throw new ReceivePermissionError(
       "methods_malformed",
@@ -652,7 +682,7 @@ function validateReceiveMethods(value: unknown): string[] {
 
   const methods = value.map((method: string) => method.trim());
   const unsafe = methods.filter((method) => !RECEIVE_SAFE_METHODS.has(methodName(method)));
-  if (unsafe.length > 0) {
+  if (unsafe.length > 0 && !allowSpend) {
     throw new ReceivePermissionError(
       "unsafe_methods",
       `DVMKIT_NWC_RECEIVE_URI advertises methods that are not receive-safe: ${unsafe.join(", ")}. ` +
