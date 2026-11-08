@@ -1,5 +1,11 @@
 # Protocol notes
 
+## Capability schemas and signed envelopes
+
+When descriptor-level auth is configured, `configureDVM` rejects Zod object input schemas that omit any of `pubkey`, `signature`, `timestamp` and `nonce` unless their catchall is not `never`. Declare all four fields, use `.passthrough()`, or use `z.looseObject()` to preserve them. Strict object schemas must declare all four. The protocol-owned `auth_statement` is handled separately and need not appear in the capability schema.
+
+Unions, pipes, transforms and intersections are checked at request time. If a signed `POST /v1/quote` or `POST /v1/job` parses successfully but its schema removes supplied envelope fields, the server returns HTTP 500 `auth_error` with `sub_reason: "schema_invalid"`, names the capability and dropped fields, and logs `capability_schema_drops_signed_envelope`. The [portable response](../protocol-fixtures/auth-schema-invalid-v1.json) directs the builder to fix the schema. Callers should report this service configuration error; re-signing the request cannot fix it. Malformed caller envelopes and wrong signatures retain their existing HTTP 401 `signature_invalid` responses. No public export or storage migration changes are required.
+
 ## Missing request signatures
 
 An unsigned `POST /v1/job` or `POST /v1/quote` that requires authentication returns HTTP 401 `auth_error` with `sub_reason: "signature_required"`. The [portable response](../protocol-fixtures/signature-required-v1.json) includes a display explaining that signing is required and a hint with two ways to sign: run `npx @dvmkit/dvm-cli init`, then `dvm request`, or implement the domain-bound signing envelope from the [protocol guide](https://dvmkit.com/docs/protocol).

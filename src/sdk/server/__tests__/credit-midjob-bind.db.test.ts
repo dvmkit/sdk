@@ -567,7 +567,7 @@ describe.skipIf(!RUN)("the mid-job Tx C seam", () => {
       const dvm = configureDVM({
         name: "midjob-bind-credit",
         capability: "do",
-        input: z.object({ q: z.string() }),
+        input: z.object({ q: z.string() }).passthrough(),
         price: "$0.10" as const,
         credit: { min: "$0.01", max: "$5.00" },
         auth: secp256k1Auth(),

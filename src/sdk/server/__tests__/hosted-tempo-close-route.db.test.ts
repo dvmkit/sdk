@@ -368,7 +368,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     }) : ledger;
     const server = await createDVMServer(configureDVM({
       name: "hosted-tempo-close", capability: "echo", tag: "test", price: "$0.10",
-      input: z.object({ text: z.string() }),
+      input: z.object({ text: z.string() }).passthrough(),
       onJob(ctx) { ctx.complete("done"); },
       credit: { min: "$0.10", max: "$5.00" },
       auth: secp256k1Auth(),

@@ -1,5 +1,6 @@
 import { CAPABILITY_NAME_RE } from "../lib/wire-schema";
 import { resolveCashuConfig } from "./cashu-locktime";
+import { missingSignedSchemaFields } from "./signed-envelope-schema";
 import { type Currency, InvalidCurrencyError, validateCurrency } from "./pricing/currency";
 import { parseUsdPrice } from "./pricing/usd";
 import {
@@ -36,6 +37,18 @@ export function configureDVM<
   const tags = collectTags(config);
   const currency = resolvePricingCurrency(config.currency);
   const capabilities = buildCapabilityMap<State, InputSchema>(config, currency);
+  if (config.auth) {
+    for (const [name, cap] of Object.entries(capabilities)) {
+      if (!isZodSchema(cap.input)) continue;
+      const missing = missingSignedSchemaFields(cap.input);
+      if (missing?.length) {
+        throw new Error(
+          `configureDVM: capability "${name}" input schema must preserve signed envelope fields: ${missing.join(", ")}. ` +
+          "Declare these fields or use .passthrough() / z.looseObject() to retain them."
+        );
+      }
+    }
+  }
   const jobRetentionDays = resolveJobRetentionDays(config.jobRetentionDays);
 
   // Single-capability mirror: copy the only entry's input/state/price onto the
