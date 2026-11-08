@@ -334,7 +334,7 @@ describe("host receive override environment", () => {
         typeof line === "string" && line.startsWith("  LN receive:")
       );
       expect(banner).toBe(allowSpend
-        ? "  LN receive:    receive-only NWC (reachable), spend-capable (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)"
+        ? "  LN receive:    NWC receive (reachable), spending permissions allowed (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)"
         : "  LN receive:    receive-only NWC (reachable)"
       );
     } finally {
