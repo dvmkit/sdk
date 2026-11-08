@@ -140,7 +140,7 @@ export class LightningReceive {
   private checkedAtMs: number;
   private refreshing = false;
   private spendOverrideWarned = false;
-  private readonly allowSpend: boolean;
+  private readonly allowSpendEnabled: boolean;
   private permissionRefusal: ReceivePermissionError | undefined;
 
   private constructor(
@@ -154,12 +154,17 @@ export class LightningReceive {
       railHealth?: LightningRailHealth;
     }
   ) {
-    this.allowSpend = opts.allowSpend === true;
+    this.allowSpendEnabled = opts.allowSpend === true;
     this.invoiceTtlSeconds = opts.invoiceTtlSeconds;
     this.fundingMinSats = opts.fundingMinSats;
     this.health = opts.health;
     this.checkedAtMs = opts.nowMs;
     this.railHealth = opts.railHealth;
+  }
+
+  /** Whether excess NWC permissions were explicitly allowed for this connection. */
+  get allowSpend(): boolean {
+    return this.allowSpendEnabled;
   }
 
   private readonly railHealth: LightningRailHealth | undefined;
@@ -178,6 +183,7 @@ export class LightningReceive {
       return new LightningReceive(
         { backend: config.backend },
         {
+          allowSpend: config.allowSpend,
           invoiceTtlSeconds,
           fundingMinSats,
           health: "healthy",
@@ -614,7 +620,7 @@ export class LightningReceive {
       level: "warn",
       event: "lightning_receive_allow_spend_enabled",
       override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
-      spending_methods: unsafe.map(methodName),
+      excess_methods: unsafe.map(methodName),
     });
   }
 

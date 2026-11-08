@@ -1120,7 +1120,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "5e69339b2535511192aac9476bf72ca5820f6cc462b9f60ef4979ba207d3d92b"
+          "signature": "80e9224d11460f79950f976c3b4ac2869cabf4b843d11b3b3c28913a5a290ea5"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1212,7 +1212,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "e4285c1003b345da184282559069f4b6d2f18390ff6bd9ea9aef830151c9c61e"
+          "signature": "e03828e63a7692cba65474cb45a86e1d7fde0944b1b66e664c38e343efc6449d"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1324,7 +1324,7 @@
         },
         "LightningReceive": {
           "stability": "experimental",
-          "signature": "e1a45873145dae7e035d708492cd89102dbe70d93dcdb2219d1b46a87dbacea4"
+          "signature": "97834f04c6bdf1f51253020a6131459ac12e636e8a108eacc8593b36a714dba0"
         },
         "LightningReceiveConfig": {
           "stability": "experimental",

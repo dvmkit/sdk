@@ -966,6 +966,13 @@
     "HEAD",
     "OPTIONS"
   ],
+  "nwcExcessMethods": [
+    "pay_invoice",
+    "pay_keysend",
+    "multi_pay_invoice",
+    "multi_pay_keysend",
+    "sign_message"
+  ],
   "rails": [
     "cashu",
     "lightning",

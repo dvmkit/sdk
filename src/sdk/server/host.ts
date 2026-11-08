@@ -1670,7 +1670,7 @@ function logBootSummary(s: BootSummary): void {
   diagnosticConsole.log(
     `  LN receive:    ${
       s.lightningReceive
-        ? `NWC receive (${s.lightningReceive.available() ? "reachable" : "unreachable — omitted from the funding menu"})`
+        ? `receive-only NWC (${s.lightningReceive.available() ? "reachable" : "unreachable — omitted from the funding menu"})${s.lightningReceive.allowSpend ? ", spend-capable (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)" : ""}`
         : "(unconfigured)"
     }`
   );

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { LightningBackend } from "../../../lib/lightning-backend";
+import { diagnosticConsole } from "../../../observability/diagnostic-console";
 import type { Nip47Stub } from "../../../test-support/nip47-stub";
 import { startNip47Stub } from "../../../test-support/nip47-stub";
 import { closeNextNwcPublish } from "../../../test-support/nwc-publish-fault";
@@ -36,6 +38,17 @@ async function triggerRecovery(receive: LightningReceive, wallet: Nip47Stub): Pr
   await vi.waitFor(() => {
     expect(wallet.requests.filter((request) => request.method === "get_info")).toHaveLength(1);
   });
+}
+
+function receiveBackend(methods: string[]): LightningBackend {
+  const unused = vi.fn().mockRejectedValue(new Error("unexpected wallet operation"));
+  return {
+    getInfo: vi.fn().mockResolvedValue({ methods }),
+    getBalance: unused,
+    createInvoice: unused,
+    lookupInvoice: unused,
+    payInvoice: unused,
+  };
 }
 
 describe("receive-only credential validation", () => {
@@ -129,7 +142,7 @@ describe("receive-only credential validation", () => {
       event: "lightning_receive_allow_spend_enabled",
       level: "warn",
       override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
-      spending_methods: ["pay_invoice", "pay_keysend", "unknown_method"]
+      excess_methods: ["pay_invoice", "pay_keysend", "unknown_method"]
     }]);
     expect(JSON.stringify(warnings())).not.toContain(stub.uri);
     expect(JSON.stringify(warnings())).not.toContain("SENTINEL_SECRET");
@@ -142,6 +155,23 @@ describe("receive-only credential validation", () => {
     await triggerRecovery(receive!, stub);
     await vi.waitFor(() => expect(receive?.available()).toBe(true));
     expect(warnings()).toHaveLength(1);
+  });
+
+  it("keeps a spend-capable injected backend available after refresh with the override", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const backend = receiveBackend([...RECEIVE_ONLY, "pay_invoice"]);
+    const receive = await LightningReceive.create({ backend, allowSpend: true });
+    if (!receive) throw new Error("test receive wallet was not constructed");
+
+    vi.setSystemTime(Date.now() + 60_001);
+    receive.available();
+    await vi.waitFor(() => {
+      expect(warn.mock.calls.map(([line]) => String(line)).join("\n"))
+        .toContain('"event":"lightning_receive_allow_spend_enabled"');
+    });
+    expect(receive.available()).toBe(true);
+    expect(backend.payInvoice).not.toHaveBeenCalled();
   });
 
   it("warns when spending authority is first observed after an unreachable boot", async () => {
@@ -285,6 +315,33 @@ describe("invoice TTL", () => {
 });
 
 describe("host receive override environment", () => {
+  it.each([false, true])("preserves the receive-only banner and labels the override (allowSpend=%s)", async (allowSpend) => {
+    const log = vi.spyOn(diagnosticConsole, "log");
+    const host = createDVMHost({
+      devMode: true,
+      port: 0,
+      env: {},
+      lightningReceive: { backend: receiveBackend(RECEIVE_ONLY), allowSpend },
+    });
+    host.mount(configureDVM({
+      name: "receive-banner-test",
+      capability: "test",
+      onJob(ctx) { ctx.complete("ok"); },
+    }));
+    const server = await host.serve();
+    try {
+      const banner = log.mock.calls.flat().find((line) =>
+        typeof line === "string" && line.startsWith("  LN receive:")
+      );
+      expect(banner).toBe(allowSpend
+        ? "  LN receive:    receive-only NWC (reachable), spend-capable (DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true)"
+        : "  LN receive:    receive-only NWC (reachable)"
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
   it.each([undefined, "1", "yes", "TRUE", "true ", "true"])(
     "enables spending authority only for exact true (value=%s)",
     async (value) => {

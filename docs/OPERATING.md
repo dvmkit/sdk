@@ -53,7 +53,7 @@ retain the default refusal. Programmatic hosts can use
 DVM spend wallet funds. The SDK still requires a readable method list containing
 both required receive methods, including after reconnection, and uses the connection
 only for receiving credit funding. When excess permissions are observed, one warning
-per receive connection names the enabled override and known spending methods;
+per receive connection names the enabled override and known excess methods;
 unrecognized methods appear as `unknown_method`. The URI and secret are never logged.
 
 `DVMKIT_NWC_RECEIVE_INVOICE_TTL_SECONDS` sets invoice lifetime (default 900, minimum

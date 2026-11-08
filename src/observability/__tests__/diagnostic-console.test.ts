@@ -33,13 +33,13 @@ describe("diagnosticConsole", () => {
   it("never invokes accessors while naming excess receive permissions", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const getter = vi.fn(() => "pay_keysend");
-    const methods = ["pay_invoice"];
-    Object.defineProperty(methods, "1", { enumerable: true, get: getter });
+    const methods = ["pay_invoice", "sign_message", "SENTINEL_SECRET"];
+    Object.defineProperty(methods, "3", { enumerable: true, get: getter });
 
     diagnosticConsole.warn({
       event: "lightning_receive_allow_spend_enabled",
       override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
-      spending_methods: methods,
+      excess_methods: methods,
     });
 
     expect(getter).not.toHaveBeenCalled();
@@ -47,7 +47,7 @@ describe("diagnosticConsole", () => {
       event: "lightning_receive_allow_spend_enabled",
       level: "warn",
       override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
-      spending_methods: ["pay_invoice"],
+      excess_methods: ["pay_invoice", "sign_message", "unknown_method"],
     });
   });
 
