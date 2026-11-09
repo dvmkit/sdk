@@ -243,6 +243,7 @@
     "lightning_rail_health_unavailable",
     "lightning_receive_allow_spend_enabled",
     "lightning_receive_permission_refused",
+    "lightning_receive_probe_failed",
     "lightning_receive_unreachable",
     "lightning_settlement_blocked",
     "lightning_settlement_check_failed",
