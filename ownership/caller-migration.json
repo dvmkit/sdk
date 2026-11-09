@@ -108,6 +108,7 @@
       "src/lib/x402/asset.ts",
       "src/lib/x402/batch-abi.ts",
       "src/lib/x402/batch-client.ts",
+      "src/lib/x402/bazaar.ts",
       "src/lib/x402/channel-rpc.ts",
       "src/lib/x402/channel-store.ts",
       "src/lib/x402/client.ts",
@@ -135,6 +136,7 @@
       "src/observability/stdout-sink.ts",
       "src/observability/types.ts",
       "src/observability/with-span.ts",
+      "src/sdk/capability-channels.ts",
       "src/sdk/cashu-locktime.ts",
       "src/sdk/configure.ts",
       "src/sdk/env.ts",
@@ -13368,6 +13370,48 @@
       ]
     },
     {
+      "module": "src/lib/x402/bazaar.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "x402 channel listings build the Bazaar discovery declaration and its boot-time limits without importing caller implementation.",
+          "symbols": [
+            "BuildX402DiscoveryOpts",
+            "X402BazaarExtension",
+            "X402Discovery",
+            "X402_CHANNEL_PATH_PREFIX",
+            "X402_ICON_URL_MAX",
+            "X402_LISTING_DESCRIPTION_MAX",
+            "X402_PAYMENT_REQUIRED_MAX_BYTES",
+            "X402_SERVICE_NAME_MAX",
+            "X402_TAGS_MAX",
+            "X402_TAG_MAX",
+            "assertPaymentRequiredFits",
+            "assertX402Listing",
+            "buildX402Discovery",
+            "encodedPaymentRequiredBytes",
+            "x402BodySchema",
+            "x402ChannelPath"
+          ],
+          "consumerEvidence": [
+            "supported:.#configureDVM"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/signed-envelope-schema.ts"
+        },
+        {
+          "module": "src/sdk/types.ts"
+        },
+        {
+          "module": "src/lib/x402/spec.ts"
+        }
+      ]
+    },
+    {
       "module": "src/lib/x402/channel-rpc.ts",
       "allocations": [
         {
@@ -20171,6 +20215,28 @@
       ]
     },
     {
+      "module": "src/sdk/capability-channels.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "The per-channel capability lookup serves the x402 channel route and capability discovery without importing caller implementation.",
+          "symbols": [
+            "ChannelCapabilityMaps",
+            "capabilityForChannel"
+          ],
+          "consumerEvidence": [
+            "supported:.#configureDVM"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/types.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/cashu-locktime.ts",
       "allocations": [],
       "dependencies": [
@@ -20218,6 +20284,15 @@
         },
         {
           "module": "src/sdk/signed-envelope-schema.ts"
+        },
+        {
+          "module": "src/lib/x402/bazaar.ts"
+        },
+        {
+          "module": "src/lib/x402/spec.ts"
+        },
+        {
+          "module": "src/lib/x402/types.ts"
         }
       ]
     },
