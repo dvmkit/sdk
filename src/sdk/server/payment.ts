@@ -15,6 +15,7 @@ import { msatsToUsdc } from "../../lib/payment-amounts";
 import type { MessageType, MppxCredential } from "../../lib/messages/types";
 import { TEMPO_SESSION_UPDATED_REASON } from "../../lib/payment-rails/tempo-wire";
 import type { FundingReceipt } from "../../lib/receipt";
+import { withX402Discovery, type X402Discovery } from "../../lib/x402/bazaar";
 import {
   buildPaymentRequirements,
   decodePayment,
@@ -24,9 +25,11 @@ import {
   paymentRequiredV2FromV1,
   type PaymentRequirements,
   type PaymentRequirementsV2,
+  X402_BATCH_SETTLEMENT_RESOURCE,
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_V1_VERSION,
   X402_VERSION,
+  type X402ServerDeclaration,
 } from "../../lib/x402/spec";
 import type {
   X402Config,
@@ -295,6 +298,13 @@ export interface UpfrontPaymentOpts {
    * `accepts` array for x402 dual-serve.
    */
   x402Resource?: string;
+  /**
+   * A listed x402 route capability's catalog listing: its resource and
+   * discovery extension. Sent to the facilitator in place of whatever the
+   * caller's payment carried; absent, the facilitator gets the resource this
+   * server's own 402 names and no extensions.
+   */
+  x402Discovery?: X402ServerDeclaration;
   /** Either the structured credential object or its serialized `Authorization: Payment <…>` value. */
   mppCredential?: MppxCredential | string;
   mpp?: MppxServer;
@@ -973,6 +983,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     x402Payment,
     x402Config,
     x402Resource,
+    x402Discovery,
     mppCredential,
     mpp,
     resourcePath,
@@ -1416,6 +1427,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           config: x402Config,
           requiredUsdcMicro,
           resource: x402Resource ?? "/v1/job",
+          declaration: x402Discovery,
           btcUsdRate: rate ?? 0,
           exactVersions: x402ExactVersions,
           dvmId: opts.dvmId ?? "",
@@ -1431,6 +1443,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           config: x402Config,
           requiredUsdcMicro,
           resource: x402Resource ?? "/v1/job",
+          declaration: x402Discovery,
           btcUsdRate: rate ?? 0,
           exactVersions: x402ExactVersions,
           dvmId: opts.dvmId ?? "",
@@ -1446,7 +1459,8 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         requiredUsdcMicro,
         x402Resource ?? "/v1/job",
         rate ?? 0,
-        x402ExactVersions
+        x402ExactVersions,
+        ...(x402Discovery ? [x402Discovery] : [])
       ));
       if (receipt.verified) {
         // Value the settlement against the figure the 402 advertised, in the
@@ -2810,9 +2824,11 @@ export function buildPaymentErrorResponse(
   x402Requirements?: PaymentRequirements[],
   status?: number,
   x402V2Requirements?: PaymentRequirementsV2[],
-  x402V2Resource = "/v1/credit",
+  x402V2Resource = X402_BATCH_SETTLEMENT_RESOURCE,
   x402ExactVersions: X402ExactVersionSupport = { v1: true, v2: true },
-  x402ErrorCode?: string
+  x402ErrorCode?: string,
+  /** A listed x402 route capability's resource and extension, for the v2 declaration only. */
+  x402Discovery?: X402Discovery
 ): Response {
   const headers = new Headers({ "Content-Type": "application/json" });
   let mergedBody = body;
@@ -2849,10 +2865,7 @@ export function buildPaymentErrorResponse(
           };
     headers.set(
       "PAYMENT-REQUIRED",
-      encodePaymentRequiredHeader({
-        ...envelope,
-        accepts,
-      })
+      encodePaymentRequiredHeader(withX402Discovery({ ...envelope, accepts }, x402Discovery))
     );
   }
   if (hasMpp) {
@@ -5401,6 +5414,7 @@ async function acceptDurableExactUpfront(args: {
   config: X402Config;
   requiredUsdcMicro: bigint;
   resource: string;
+  declaration?: X402ServerDeclaration;
   btcUsdRate: number;
   exactVersions: X402ExactVersionSupport;
   dvmId: string;
@@ -5444,6 +5458,7 @@ async function acceptDurableExactUpfront(args: {
     config: args.config,
     requiredUsdcMicro: args.requiredUsdcMicro,
     resource: args.resource,
+    declaration: args.declaration,
     btcUsdRate: args.btcUsdRate,
     exactVersions: args.exactVersions,
     dvmId: args.dvmId,
@@ -5545,6 +5560,7 @@ async function acceptDeferredExactUpfront(args: {
   config: X402Config;
   requiredUsdcMicro: bigint;
   resource: string;
+  declaration?: X402ServerDeclaration;
   btcUsdRate: number;
   exactVersions: X402ExactVersionSupport;
   dvmId: string;
@@ -5589,6 +5605,7 @@ async function acceptDeferredExactUpfront(args: {
     config: args.config,
     requiredUsdcMicro: args.requiredUsdcMicro,
     resource: args.resource,
+    declaration: args.declaration,
     exactVersions: args.exactVersions,
     dvmId: args.dvmId,
     effect: exactSettlementEffect(ctx, { paidMsats, fundedMicro, nativeAmount: authorizedUsdcMicro }),

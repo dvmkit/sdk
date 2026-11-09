@@ -1,0 +1,60 @@
+{
+  "description": "GET /v1/info lists capabilities offered on the x402 channel under x402_capabilities, apart from the dvmkit-protocol capabilities map, because one name may be a different definition on each channel. Each entry is the capabilities entry shape, with input_schema the route's flat body (no signed-request fields), plus url: the POST route a stock x402 client pays at, the public origin, then the host's mount prefix, then /v1/x402/<name>. The key is omitted when no capability is offered on x402. This example is a DVM mounted at mountPrefix behind origin with a /v1/job fetch ($0.05) and an x402-only fetch ($0.016).",
+  "origin": "https://dvm.example.com",
+  "mountPrefix": "/feed",
+  "urlTemplate": "{origin}{mountPrefix}/v1/x402/{capability}",
+  "info": {
+    "capabilities": {
+      "fetch": {
+        "description": "Fetch a page and its links.",
+        "input_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "url",
+            "depth"
+          ]
+        },
+        "pricing": {
+          "max": {
+            "amount": 0.05,
+            "currency": "usd"
+          }
+        }
+      }
+    },
+    "x402_capabilities": {
+      "fetch": {
+        "url": "https://dvm.example.com/feed/v1/x402/fetch",
+        "description": "Fetch one page.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        },
+        "pricing": {
+          "max": {
+            "amount": 0.016,
+            "currency": "usd"
+          }
+        }
+      }
+    }
+  }
+}

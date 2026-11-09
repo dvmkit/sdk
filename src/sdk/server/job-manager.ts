@@ -1051,8 +1051,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * Returns `undefined` for dynamic-priced capabilities and for unknown
    * names (the route handler validates the name before invoking this).
    */
-  currentPricingMax(capability: string): { amount: number; currency: string } | undefined {
-    const cap = this.getCapability(capability);
+  currentPricingMax(
+    capability: string,
+    channel: CapabilityChannel = "job"
+  ): { amount: number; currency: string } | undefined {
+    const cap = this.getCapability(capability, channel);
     if (!cap) return undefined;
     return resolvePricingMax(cap.price);
   }

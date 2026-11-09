@@ -12,6 +12,7 @@ import type { Pool, PoolClient, PoolConfig } from "pg";
 
 import { applyRetryToPool } from "../../lib/pg-retry";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
+import { X402_BATCH_SETTLEMENT_RESOURCE } from "../../lib/x402/spec";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence, type HostedFundingReservation } from "./hosting-cleanup-fence";
 
@@ -701,8 +702,10 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
 
   /** Persist the reconciliation identity, refreshing a prepared retry's transient reservation. */
   async prepareSettlement(
-    intent: X402SettlementIdentity, hostingFunding?: HostedFundingReservation
+    identity: X402SettlementIdentity, hostingFunding?: HostedFundingReservation
   ): Promise<X402SettlementIntent> {
+    // Stored and compared in the same form every stored row is read in.
+    const intent = { ...identity, payload: withBatchSettlementResource(identity.payload) };
     const settlements = await this.settlementWriter();
     const insert = (q: X402ChannelQuerier) => q.query(
       `INSERT INTO x402_batch_settlements (
@@ -781,7 +784,8 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
           intent.channelBefore,
           intent.pendingId ?? null,
           stored.paymentId,
-          stored.payload,
+          // The row as stored, which may predate withBatchSettlementResource.
+          rows[0]!.payment_payload,
         ]
       );
       if (refreshed.rows[0]) return toSettlementIntent(refreshed.rows[0]);
@@ -1364,6 +1368,18 @@ async function relayLockHolder(
   }
 }
 
+/**
+ * A reusable-channel payload as it is sent to a facilitator and stored: the
+ * caller's `extensions` dropped and `resource` set to the server's own, since
+ * the facilitator, and through it a catalog, reads both. Rows stored before
+ * the server did this are read through it too, so their retries still match
+ * and their recovery resends carry the server's values.
+ */
+export function withBatchSettlementResource(payload: PaymentPayload): PaymentPayload {
+  const { extensions: _extensions, ...rest } = payload;
+  return { ...rest, resource: { url: X402_BATCH_SETTLEMENT_RESOURCE } };
+}
+
 function describeHolder(holder: X402RelayLockHolder): string {
   const parts = [`pid ${String(holder.pid)}`];
   if (holder.applicationName) parts.push(holder.applicationName);
@@ -1391,7 +1407,7 @@ function toSettlementIntent(row: X402SettlementRow): X402SettlementIntent {
     operation: row.operation,
     effectId: row.effect_id,
     paymentId: row.payment_id,
-    payload: row.payment_payload,
+    payload: withBatchSettlementResource(row.payment_payload),
     requirements: row.payment_requirements,
     channelBefore: row.channel_before,
     ...(row.channel_at_submission ? { channelAtSubmission: row.channel_at_submission } : {}),

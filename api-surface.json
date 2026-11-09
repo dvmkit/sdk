@@ -114,6 +114,16 @@
       "fixture": "protocol-fixtures/x402-route-v1.json",
       "path": "POST /v1/x402/{capability}",
       "behavior": "capabilities offered on the x402 channel take one unsigned x402 request each, with the definition's input as the flat JSON body; an unpaid request is quoted from its body, and on a listed capability an empty or invalid unpaid body is quoted from listing.example; an invalid paid body, signed-request fields or any other payment rail answer 400 before verification; a paid request answers once within the capability's maxRuntimeSeconds plus the facilitator timeout from arrival: 200 charged with messages when their serialized UTF-8 array is at most 1048576 bytes, 500 or 503 not_charged, 402 not_charged with PAYMENT-RESPONSE success false, or 202 payment_pending with charge_outcome unknown and Retry-After; every response carries DVM-Job-Identity-V1"
+    },
+    "x402Listing": {
+      "fixture": "protocol-fixtures/x402-listing-v1.json",
+      "path": "POST /v1/x402/{capability}",
+      "behavior": "a capability listed on the x402 channel declares, on its route's v2 PAYMENT-REQUIRED only, a resource whose url is the public origin, then the host's mount prefix, then /v1/x402/{capability}, or listing.resourceUrl when set, with the listing's description, mimeType application/json and any serviceName, tags and iconUrl, plus an extensions.bazaar that upstream validateDiscoveryExtension accepts with method POST and bodyType json; the v1 JSON body and an unlisted capability carry neither; every payload the server sends a facilitator on verify or settle carries the server's resource and extensions in place of the caller's, on the route, /v1/job deferred and upfront exact, /v1/credit, mid-job top-ups and reusable-channel payments, whose resource is /v1/credit; a facilitator's EXTENSION-RESPONSES header is logged and never returned; the route's PAYMENT-RESPONSE carries only success, transaction, network, payer and an errorReason of at most 128 characters"
+    },
+    "x402Info": {
+      "fixture": "protocol-fixtures/x402-info-v1.json",
+      "path": "GET /v1/info",
+      "behavior": "capabilities offered on the x402 channel are listed under x402_capabilities, keyed by published name, apart from the unchanged dvmkit-protocol capabilities map; each entry is the capabilities entry shape with the route's flat body schema as input_schema, the x402 definition's price, and url, the route address including the host's mount prefix; the key is omitted when no capability is offered on x402"
     }
   },
   "exports": [
@@ -1024,7 +1034,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "8b1bd96a7a67b2c5bf00c8c90f2e02c4196efb490535a8ada6e48e6ce34a80e9"
+          "signature": "91d8e2c5b118bb4e67ac5d2be05eb9db0e25dabe144f40dce2f5e91234aa0343"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1048,11 +1058,11 @@
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "3b29533d2b5fc7054585472b5a6cdbc89f0d3f0950b8f3e153a48308355d66f9"
+          "signature": "e8e6feb9451936c72ff628577943ffcb5d3d7dad31e85326bc3fe4fee246dbe0"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "923ea312dba9b688460e2800575db136aecb4026c595dd0182da796f12f17c2e"
+          "signature": "38729447cc63cbb02694696b7fb11f02dc9f4684040c117532bd5acb97450410"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1140,7 +1150,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "eaa6e1ca0e53090a11665d9f0dd979d7e9ccfdaeed81ec8404a7cfdfbd7da2b8"
+          "signature": "dc7495dd1abd9cc42b00ddd99b725e27c7f3bbefaf5c1cc510b264ef691ce435"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1208,7 +1218,7 @@
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "7b9f053c8feea829b994f3de8b2a2e25e9824afb67caa075f44519a840081bca"
+          "signature": "69454d11d0bb77422e42d8a866e5461edac935e8a00c5f76e829ef41dec8fae0"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1232,7 +1242,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "3efbe0f74a649e5a0671af18998734c386cc7fe1ffd281327a6d9f874ed7ae9d"
+          "signature": "89516bddd3d781eda38f7044b21acbe26071b101d5fed2ddd09e5112f0204edf"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1312,11 +1322,11 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "d4cdb00825e91dea6b6176c20a63acfb03cb72376885bf04f17af9a94c469a3d"
+          "signature": "720a5b8d9afa4e0c8a4c29672bb056b10ba38b11eb538b19f92128fc2dd5fa5c"
         },
         "JobManagerOpts": {
           "stability": "experimental",
-          "signature": "ae2f9a9fe928cd7803b4452ea1c31ffeb4f2b11fd18e61471a63be0a966426c4"
+          "signature": "ee3699d9582b239575c543ca3628900b17910412fd65c2bcb2b84c8638a00091"
         },
         "JobPiece": {
           "stability": "experimental",
@@ -1456,7 +1466,7 @@
         },
         "PostgresX402ChannelStorage": {
           "stability": "experimental",
-          "signature": "6f72c7ad23c446d81869088064d25219152401efc039337905ee80390465ee0b"
+          "signature": "55b00b4b687014b8cee8d00f2e0e33fe1f722c41ed3c027439cc98af1ee7a4ee"
         },
         "PostgresX402ExactSettlementStore": {
           "stability": "experimental",
@@ -1552,7 +1562,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "6977120b4516d8faeb7e921052529cdc7df10014db91723a4c356f36a593f9ba"
+          "signature": "3c7a9d55a5293852fb6f10cb0fb536a07ddead5134cbd4f3172ad1119518502b"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
@@ -1796,7 +1806,7 @@
         },
         "X402ExactSettlementServer": {
           "stability": "experimental",
-          "signature": "a64e67825e91175f90fca57fe9f48659d8c8cee638ddb2775051f53395063d6b"
+          "signature": "c2764f6243cea075c5f6fac168c78f6e60f692299a16c640e5ede4e0899ab06e"
         },
         "X402ExactSettlementServerOpts": {
           "stability": "experimental",

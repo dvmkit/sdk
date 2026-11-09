@@ -39,6 +39,8 @@ export function assertX402RoutesServable(
     x402Config: X402Config | undefined;
     paymentMethods: readonly PaymentMethod[] | undefined;
     publicOrigin: string | undefined;
+    /** Path a host mounted the server under; see {@link x402RouteUrl}. */
+    mountPrefix: string;
     devMode: boolean | undefined;
   }
 ): void {
@@ -73,6 +75,7 @@ export function assertX402RoutesServable(
       input: def.input,
       x402Config,
       publicOrigin: server.publicOrigin ?? X402_SIZE_CHECK_ORIGIN,
+      mountPrefix: server.mountPrefix,
       requiredUsdcMicro: price ? BigInt(price.amountMicro) : X402_SIZE_CHECK_AMOUNT,
       maxTimeoutSeconds:
         def.maxRuntimeSeconds !== undefined
@@ -89,6 +92,50 @@ export function assertX402RoutesServable(
       "the description, example, outputExample or input schema, or the public origin (DVMKIT_PUBLIC_URL)"
     );
   }
+}
+
+/**
+ * Why a server that boots would still refuse every payment on its x402 route,
+ * each with the diagnostic event a devMode server logs for it instead of
+ * refusing to start: a pricing currency x402 cannot charge, dual-serve turned
+ * off, so no 402 would offer x402 at all, or no durable exact-settlement
+ * store to hold deferred authorizations, so every route request answers 503
+ * `x402_not_offered`.
+ */
+export function x402RouteUnpayableReasons(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  descriptor: Pick<DVMDescriptor<any, any>, "x402Capabilities">,
+  server: { durableSettlement: boolean; pricingCurrency: string; dualServe: boolean }
+): { event: string; message: string }[] {
+  const first = Object.values(descriptor.x402Capabilities ?? {})[0];
+  if (!first) return [];
+  const at = `createDVMServer: capability "${first.name}" is offered on x402 but`;
+  const reasons: { event: string; message: string }[] = [];
+  if (server.pricingCurrency !== "usd") {
+    reasons.push({
+      event: "x402_route_currency_unsupported",
+      message:
+        `${at} this DVM prices in ${JSON.stringify(server.pricingCurrency)}, and x402 charges only a USD price; ` +
+        "price in USD or stop offering the capability on x402",
+    });
+  }
+  if (!server.dualServe) {
+    reasons.push({
+      event: "x402_route_dual_serve_off",
+      message:
+        `${at} x402.dualServe is false, so no 402 would offer x402 payment; ` +
+        "remove dualServe: false or stop offering the capability on x402",
+    });
+  }
+  if (!server.durableSettlement) {
+    reasons.push({
+      event: "x402_route_settlement_store_missing",
+      message:
+        `${at} the server has no durable x402 settlement store, so every route request would answer 503 ` +
+        "x402_not_offered; give the server a Postgres database (DATABASE_URL or the host's database option)",
+    });
+  }
+  return reasons;
 }
 
 /** The route body as received: nothing, bytes that are not JSON, or a JSON value. */
@@ -178,12 +225,36 @@ export function classifyX402RouteOutcome(args: {
 export function chargedSettleResponse(
   intent: Pick<X402ExactSettlementIntent, "transaction" | "network" | "settleResponse">
 ): SettleResponse {
-  const stored = (intent.settleResponse ?? {}) as Partial<SettleResponse>;
+  const stored = callerSettleResponse(intent.settleResponse);
   return {
     ...stored,
     success: true,
-    transaction: stored.transaction ?? intent.transaction ?? "",
-    network: stored.network ?? intent.network,
+    transaction: stored.transaction || intent.transaction || "",
+    ...((stored.network ?? intent.network) !== undefined && { network: stored.network ?? intent.network }),
+  };
+}
+
+/**
+ * The part of a facilitator's settle answer a caller may see in
+ * `PAYMENT-RESPONSE`: `success`, `transaction`, `network`, `payer` and a
+ * bounded `errorReason`. Anything else the facilitator sent, such as an
+ * `errorMessage` or `extensions`, stays server-side, and an overlong value is
+ * dropped, so a facilitator answer cannot grow the response header.
+ */
+export function callerSettleResponse(answer: unknown): SettleResponse {
+  const body = answer !== null && typeof answer === "object" ? (answer as Record<string, unknown>) : {};
+  const payer = boundedToken(body.payer);
+  const network = boundedToken(body.network);
+  const errorReason =
+    typeof body.errorReason === "string"
+      ? body.errorReason.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, SETTLE_ERROR_REASON_MAX)
+      : "";
+  return {
+    success: body.success === true,
+    transaction: boundedToken(body.transaction) ?? "",
+    ...(network !== undefined && { network }),
+    ...(payer !== undefined && { payer }),
+    ...(errorReason !== "" && { errorReason }),
   };
 }
 
@@ -225,3 +296,13 @@ export const X402_ROUTE_COPY = {
 /** Why the runtime-bound row answered a job that completed too late to settle. */
 export const SETTLE_WINDOW_CLOSED_REASON =
   "The job finished too late in this request's time budget for its payment to settle.";
+
+// A transaction hash, CAIP-2 network or payer address is far shorter; a longer
+// value is not one of them.
+const SETTLE_TOKEN_MAX = 128;
+// Long enough for any error code a facilitator or the SDK names.
+const SETTLE_ERROR_REASON_MAX = 128;
+
+function boundedToken(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= SETTLE_TOKEN_MAX && /^[\x21-\x7e]*$/.test(value) ? value : undefined;
+}

@@ -8,6 +8,9 @@ import {
   decodePayment,
   encodeSettleResponseHeader,
   exactEvmAuthorization,
+  withServerDeclaration,
+  x402DeclarationFor,
+  type X402ServerDeclaration,
 } from "./spec";
 import type { X402Config, X402ExactVersionSupport, X402Receipt } from "./types";
 
@@ -36,7 +39,12 @@ export async function verifyX402Payment(
   requiredUsdcMicro: bigint,
   resource: string,
   btcUsdRate: number,
-  exactVersions: X402ExactVersionSupport = { v1: true, v2: true }
+  exactVersions: X402ExactVersionSupport = { v1: true, v2: true },
+  /**
+   * Sent to the facilitator in place of the caller's resource and extensions;
+   * by default the resource the server's own 402 names, with no extensions.
+   */
+  declaration?: X402ServerDeclaration
 ): Promise<X402Receipt> {
   return callerLoggers.x402.span(
     "x402.verify_payment",
@@ -66,6 +74,10 @@ export async function verifyX402Payment(
         payload.x402Version === 1
           ? buildPaymentRequirements({ ...requirementOpts, version: 1 })
           : buildPaymentRequirements({ ...requirementOpts, version: 2 });
+      payload = withServerDeclaration(
+        payload,
+        declaration ?? x402DeclarationFor(buildPaymentRequirements({ ...requirementOpts, version: 1 }))
+      );
       const createAuthHeaders = createX402FacilitatorAuthHeaders(config);
 
       const verifyRes = await verifyWithFacilitator(

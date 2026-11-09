@@ -725,8 +725,10 @@ export interface X402Listing {
   iconUrl?: string;
   /**
    * Absolute URL catalogs index for this capability. Defaults to the DVM's
-   * public origin followed by `/v1/x402/<name>`; set it only when the
-   * capability is reached at another address, such as behind a proxy.
+   * public origin, then the host's mount prefix, if any, then
+   * `/v1/x402/<name>`; set it only when the capability is reached at another
+   * address, such as behind a proxy. Payment stays bound to the route's own
+   * address either way.
    */
   resourceUrl?: string;
 }

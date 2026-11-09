@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { extractDiscoveryInfo, validateDiscoveryExtension } from "@x402/extensions/bazaar";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -5,6 +7,15 @@ import { z } from "zod";
 import { buildX402Discovery, x402BodySchema } from "../bazaar";
 
 const ORIGIN = "https://dvm.example.com";
+const listingFixture = JSON.parse(
+  readFileSync(new URL("../../../../protocol-fixtures/x402-listing-v1.json", import.meta.url), "utf8")
+) as {
+  name: string;
+  origin: string;
+  mountPrefix: string;
+  listing: Parameters<typeof buildX402Discovery>[0]["listing"];
+  paymentRequired: ReturnType<typeof buildX402Discovery>;
+};
 
 /** A paid retry as a stock client sends it: the 402's resource and extensions echoed back. */
 function paidRetry(discovery: ReturnType<typeof buildX402Discovery>) {
@@ -170,6 +181,18 @@ describe("x402 bazaar discovery", () => {
       input: z.object({ url: z.string(), since: z.date().optional() }),
       publicOrigin: ORIGIN,
     });
+    expect(validateDiscoveryExtension(discovery.extensions.bazaar as never)).toEqual({ valid: true });
+  });
+
+  it("declares the resource and bazaar extension the listing fixture fixes, at the route under the mount prefix", () => {
+    const discovery = buildX402Discovery({
+      name: listingFixture.name,
+      listing: listingFixture.listing,
+      input: z.object({ url: z.string().url(), pubkey: z.string().optional() }),
+      publicOrigin: listingFixture.origin,
+      mountPrefix: listingFixture.mountPrefix,
+    });
+    expect(discovery).toEqual(listingFixture.paymentRequired);
     expect(validateDiscoveryExtension(discovery.extensions.bazaar as never)).toEqual({ valid: true });
   });
 

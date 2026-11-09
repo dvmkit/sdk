@@ -16,6 +16,7 @@ import { isTestMintUrl } from "../../lib/mints";
 import { resolveRpcOverride } from "../../lib/payment-rails/rpc";
 import { applyRetryToPool } from "../../lib/pg-retry";
 import { generateEphemeralReceiptKey, receiptPubkeyFromSecret } from "../../lib/receipt-key";
+import { x402MountPrefix } from "../../lib/x402/bazaar";
 import { validateX402Env } from "../../lib/x402/env";
 import { assertSupportedX402Network } from "../../lib/x402/networks";
 import {
@@ -1039,6 +1040,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       } = await createDVMServer(descriptor, {
         env,
         store,
+        mountPrefix: x402MountPrefix(entry.prefix),
         mints: effectiveMints,
         jobStore,
         devMode: opts.devMode,

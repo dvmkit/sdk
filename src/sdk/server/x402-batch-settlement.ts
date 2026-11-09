@@ -60,6 +60,7 @@ import {
   X402SettlementRaceError,
   type X402SettlementStatus,
   type X402SettlementWriteOff,
+  withBatchSettlementResource,
 } from "./x402-channel-store";
 import { createX402SelfRelay } from "./x402-self-relay";
 import {
@@ -740,7 +741,10 @@ export async function createX402BatchSettlementServer(
     }) {
       let payload: PaymentPayload;
       try {
-        payload = decodeBatchPayment(args.paymentHeader);
+        // The facilitator, and through it a catalog, reads the payload's
+        // `resource` and `extensions`, so the caller's never travel: the
+        // stored intent and every recovery resend carry the server's own.
+        payload = withBatchSettlementResource(decodeBatchPayment(args.paymentHeader));
       } catch {
         return {
           ok: false as const,

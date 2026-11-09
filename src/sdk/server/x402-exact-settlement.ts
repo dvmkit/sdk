@@ -16,6 +16,9 @@ import {
   type PaymentRequirementsV1,
   type PaymentRequirementsV2,
   type SettleResponse,
+  withServerDeclaration,
+  x402DeclarationFor,
+  type X402ServerDeclaration,
 } from "../../lib/x402/spec";
 import type { X402Config, X402ExactVersionSupport, X402Receipt } from "../../lib/x402/types";
 import type { ProcessedPaymentQuerier } from "./processed-payment-store";
@@ -84,6 +87,8 @@ export class X402ExactSettlementServer {
     config: X402Config;
     requiredUsdcMicro: bigint;
     resource: string;
+    /** Sent to the facilitator in place of the caller's; see {@link decodeAndDescribe}. */
+    declaration?: X402ServerDeclaration;
     btcUsdRate: number;
     exactVersions?: X402ExactVersionSupport;
     dvmId: string;
@@ -143,6 +148,8 @@ export class X402ExactSettlementServer {
     config: X402Config;
     requiredUsdcMicro: bigint;
     resource: string;
+    /** Sent to the facilitator in place of the caller's; see {@link decodeAndDescribe}. */
+    declaration?: X402ServerDeclaration;
     exactVersions?: X402ExactVersionSupport;
     dvmId: string;
     effect: X402ExactSettlementEffect;
@@ -660,11 +667,18 @@ export class X402ExactSettlementEvidenceMissingError extends Error {
   }
 }
 
+/**
+ * The payload decoded from `paymentHeader`, with the server's declaration in
+ * place of whatever resource and extensions the caller sent (by default the
+ * resource its own 402 names for `resource`, and no extensions). Held
+ * authorizations keep this payload, so a later settlement sends it too.
+ */
 function decodeAndDescribe(args: {
   paymentHeader: string;
   config: X402Config;
   requiredUsdcMicro: bigint;
   resource: string;
+  declaration?: X402ServerDeclaration;
   exactVersions?: X402ExactVersionSupport;
   maxTimeoutSeconds?: number;
 }):
@@ -695,6 +709,10 @@ function decodeAndDescribe(args: {
     payload.x402Version === 1
       ? buildPaymentRequirements({ ...requirementOpts, version: 1 })
       : buildPaymentRequirements({ ...requirementOpts, version: 2 });
+  payload = withServerDeclaration(
+    payload,
+    args.declaration ?? x402DeclarationFor(buildPaymentRequirements({ ...requirementOpts, version: 1 }))
+  );
   const auth = exactEvmAuthorization(payload);
   const facts: X402ExactAuthorizationFacts = {
     network: requirements.network,

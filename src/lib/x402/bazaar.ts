@@ -87,6 +87,24 @@ export function x402ChannelPath(name: string): string {
 }
 
 /**
+ * Address of a capability's x402 route: the public origin, then the path a
+ * host mounted the server under (`""` at the root), then the route's path.
+ */
+export function x402RouteUrl(publicOrigin: string, mountPrefix: string, name: string): string {
+  return `${publicOrigin.replace(/\/+$/, "")}${mountPrefix}${x402ChannelPath(name)}`;
+}
+
+/**
+ * The mount prefix a route path's base names, less one trailing slash, which
+ * is what Hono drops when it joins a mount to its routes: a root mount `/`
+ * serves `/v1/...`, `/feed/` serves `/feed/v1/...`, and `/feed//` serves
+ * `/feed//v1/...`.
+ */
+export function x402MountPrefix(base: string | undefined): string {
+  return (base ?? "").replace(/\/$/, "");
+}
+
+/**
  * The flat JSON Schema an x402 caller's request body must satisfy: the
  * capability's Zod input schema in input mode, without the signed-request
  * fields, which an unsigned x402 caller never sends.
@@ -124,13 +142,15 @@ export interface BuildX402DiscoveryOpts {
   input: unknown;
   /** Public origin, such as `https://dvm.example.com`, used when `listing.resourceUrl` is unset. */
   publicOrigin: string;
+  /** Path the host mounted the server under, such as `/feed`; see {@link x402RouteUrl}. */
+  mountPrefix?: string;
 }
 
 /** Build the resource object and bazaar extension for one listed capability. */
 export function buildX402Discovery(opts: BuildX402DiscoveryOpts): X402Discovery {
   const { listing } = opts;
   const body = nestBodySchema(listing.inputSchema ?? x402BodySchema(opts.input));
-  const url = listing.resourceUrl ?? `${opts.publicOrigin.replace(/\/+$/, "")}${x402ChannelPath(opts.name)}`;
+  const url = listing.resourceUrl ?? x402RouteUrl(opts.publicOrigin, opts.mountPrefix ?? "", opts.name);
   const resource: ResourceInfo = {
     url,
     description: listing.description,
@@ -195,6 +215,8 @@ export interface X402ChannelPaymentRequiredOpts {
   input: unknown;
   x402Config: X402Config;
   publicOrigin: string;
+  /** See {@link BuildX402DiscoveryOpts.mountPrefix}. */
+  mountPrefix?: string;
   requiredUsdcMicro: bigint;
   maxTimeoutSeconds: number;
   error: string;
@@ -207,21 +229,32 @@ export interface X402ChannelPaymentRequiredOpts {
  * listing's resource and discovery extension.
  */
 export function x402ChannelPaymentRequired(opts: X402ChannelPaymentRequiredOpts): PaymentRequiredV2 {
+  const mountPrefix = opts.mountPrefix ?? "";
   const discovery =
     opts.listing &&
-    buildX402Discovery({ name: opts.name, listing: opts.listing, input: opts.input, publicOrigin: opts.publicOrigin });
+    buildX402Discovery({ name: opts.name, listing: opts.listing, input: opts.input, publicOrigin: opts.publicOrigin, mountPrefix });
   const required = paymentRequiredV2FromV1(
     [
       buildPaymentRequirements({
         x402Config: opts.x402Config,
         requiredUsdcMicro: opts.requiredUsdcMicro,
-        resource: discovery?.resource.url ?? `${opts.publicOrigin.replace(/\/+$/, "")}${x402ChannelPath(opts.name)}`,
+        // Payment is bound to the route's own address, even when the listing
+        // names another resourceUrl for the catalog.
+        resource: x402RouteUrl(opts.publicOrigin, mountPrefix, opts.name),
         maxTimeoutSeconds: opts.maxTimeoutSeconds,
         version: X402_V1_VERSION,
       }),
     ],
     opts.error
   );
+  return withX402Discovery(required, discovery);
+}
+
+/**
+ * `required` with a listing's resource and discovery extension, or unchanged
+ * without one. The one place a listing reaches a `PAYMENT-REQUIRED`.
+ */
+export function withX402Discovery(required: PaymentRequiredV2, discovery: X402Discovery | undefined): PaymentRequiredV2 {
   if (!discovery) return required;
   return { ...required, resource: discovery.resource, extensions: { ...required.extensions, ...discovery.extensions } };
 }

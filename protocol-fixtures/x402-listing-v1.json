@@ -1,0 +1,122 @@
+{
+  "description": "The catalog listing a listed x402 channel capability declares on its route's 402: the v2 PAYMENT-REQUIRED carries this resource and extensions.bazaar, the v1 JSON body carries neither, and every payload the server forwards to a facilitator carries the server's resource and extensions in place of the caller's. The listing below is the capability's channels.x402.listing; its input is a URL string field plus the optional signed-request field pubkey, which the published body schema leaves out.",
+  "name": "fetch",
+  "origin": "https://dvm.example.com",
+  "mountPrefix": "/feed",
+  "urlTemplate": "{origin}{mountPrefix}/v1/x402/{name}, or listing.resourceUrl when set",
+  "listing": {
+    "description": "Fetch one page and return its text.",
+    "example": {
+      "url": "https://example.com"
+    },
+    "outputExample": {
+      "text": "Example Domain"
+    },
+    "serviceName": "Page fetch",
+    "tags": [
+      "web",
+      "scrape"
+    ],
+    "iconUrl": "https://dvm.example.com/icon.png"
+  },
+  "paymentRequired": {
+    "resource": {
+      "url": "https://dvm.example.com/feed/v1/x402/fetch",
+      "description": "Fetch one page and return its text.",
+      "mimeType": "application/json",
+      "serviceName": "Page fetch",
+      "tags": [
+        "web",
+        "scrape"
+      ],
+      "iconUrl": "https://dvm.example.com/icon.png"
+    },
+    "extensions": {
+      "bazaar": {
+        "info": {
+          "input": {
+            "type": "http",
+            "method": "POST",
+            "bodyType": "json",
+            "body": {
+              "url": "https://example.com"
+            }
+          },
+          "output": {
+            "type": "json",
+            "example": {
+              "text": "Example Domain"
+            }
+          }
+        },
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "http"
+                },
+                "method": {
+                  "type": "string",
+                  "enum": [
+                    "POST"
+                  ]
+                },
+                "bodyType": {
+                  "type": "string",
+                  "enum": [
+                    "json"
+                  ]
+                },
+                "body": {
+                  "type": "object",
+                  "properties": {
+                    "url": {
+                      "type": "string",
+                      "format": "uri"
+                    }
+                  },
+                  "required": [
+                    "url"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "method",
+                "bodyType",
+                "body"
+              ],
+              "additionalProperties": false
+            },
+            "output": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "example": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    }
+  },
+  "v1BodyOmits": [
+    "resource",
+    "extensions"
+  ]
+}

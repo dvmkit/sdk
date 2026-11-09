@@ -39,6 +39,12 @@ export const X402_EXACT_SCHEME = "exact";
  */
 export const X402_BATCH_SETTLEMENT_SCHEME = "batch-settlement";
 
+/**
+ * The resource a reusable-channel (`batch-settlement`) `PAYMENT-REQUIRED`
+ * declares: such channels are opened and refunded only through `/v1/credit`.
+ */
+export const X402_BATCH_SETTLEMENT_RESOURCE = "/v1/credit";
+
 export { X402_DEFAULT_FACILITATOR };
 
 /**
@@ -270,11 +276,7 @@ export function paymentRequiredV2FromV1(
   return {
     x402Version: X402_VERSION,
     ...(error ? { error } : {}),
-    resource: {
-      url: first.resource,
-      ...(first.description ? { description: first.description } : {}),
-      ...(first.mimeType ? { mimeType: first.mimeType } : {}),
-    },
+    resource: resourceInfoFromV1(first),
     accepts: requirements.map((requirement) => {
       const network = x402NetworkBySlug(requirement.network)?.caip2 ?? requirement.network;
       const usdcContract = usdcContractByCaip2(network);
@@ -297,6 +299,41 @@ export function paymentRequiredV2FromV1(
       };
     }),
     extensions: {},
+  };
+}
+
+/**
+ * The resource and extensions a server declares for one payment. A payment
+ * forwarded to a facilitator carries these, never the caller's: a catalog
+ * lists a resource from the payload the facilitator receives.
+ */
+export interface X402ServerDeclaration {
+  resource: ResourceInfo;
+  extensions?: Record<string, unknown>;
+}
+
+/** The declaration of a `PAYMENT-REQUIRED` built from `requirement` with no listing. */
+export function x402DeclarationFor(requirement: PaymentRequirementsV1): X402ServerDeclaration {
+  return { resource: resourceInfoFromV1(requirement) };
+}
+
+/**
+ * `payload` as it is forwarded to a facilitator: a v2 payload carries the
+ * server's resource and its extensions, when it declares any, in place of the
+ * caller's, and a v1 payload, whose schema has neither field, carries neither.
+ * Every other top-level key is forwarded as the caller sent it.
+ */
+export function withServerDeclaration(payload: PaymentPayload, declaration: X402ServerDeclaration): PaymentPayload {
+  const { resource: _resource, extensions: _extensions, ...rest } = payload as PaymentPayload & {
+    resource?: unknown;
+    extensions?: unknown;
+  };
+  if (payload.x402Version !== X402_VERSION) return rest as PaymentPayloadV1;
+  const extensions = declaration.extensions;
+  return {
+    ...(rest as Omit<PaymentPayloadV2, "resource" | "extensions">),
+    resource: declaration.resource,
+    ...(extensions && Object.keys(extensions).length > 0 ? { extensions } : {}),
   };
 }
 
@@ -464,6 +501,14 @@ function paymentRequirementExtra(
     ...(version === X402_VERSION ? { assetTransferMethod: "eip3009" } : {}),
     name: network.domainName,
     version: network.domainVersion,
+  };
+}
+
+function resourceInfoFromV1(requirement: PaymentRequirementsV1): ResourceInfo {
+  return {
+    url: requirement.resource,
+    ...(requirement.description ? { description: requirement.description } : {}),
+    ...(requirement.mimeType ? { mimeType: requirement.mimeType } : {}),
   };
 }
 

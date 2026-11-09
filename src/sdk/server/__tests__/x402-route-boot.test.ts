@@ -23,15 +23,19 @@ const listing: X402Listing = {
 // A hostname at the DNS limit: 253 characters in labels of at most 63.
 const LONG_ORIGIN = `https://${["a", "b", "c"].map((c) => c.repeat(63)).join(".")}.${"d".repeat(57)}.example`;
 
-function dvm(outputBytes: number, paymentMethods?: ("cashu" | "x402")[]) {
+function dvm(outputBytes: number, paymentMethods?: ("cashu" | "x402")[], extra: { currency?: "eur"; x402?: typeof x402 & { dualServe?: boolean } } = {}) {
   return configureDVM({
     name: "boot-check",
-    x402,
+    x402: extra.x402 ?? x402,
+    ...(extra.currency && { currency: extra.currency }),
     ...(paymentMethods && { paymentMethods }),
     capabilities: {
       fetch: {
         input: z.object({ url: z.string() }),
-        price: "$0.01",
+        // A static price is a USD literal, so another currency is quoted.
+        ...(extra.currency
+          ? { onQuote: { schema: z.object({}), handler: async () => ({ upfront: { amount: 0.01, currency: extra.currency! }, description: "One cent." }) } }
+          : { price: "$0.01" }),
         maxRuntimeSeconds: 5,
         channels: { job: false, x402: { listing: { ...listing, outputExample: { text: "x".repeat(outputBytes) } } } },
         onJob(ctx) {
@@ -51,8 +55,43 @@ function configures(outputBytes: number): boolean {
   }
 }
 
-function boot(descriptor: ReturnType<typeof dvm>, env: Record<string, string> = {}, devMode?: boolean) {
-  return createDVMServer(descriptor, { env, store: new MemoryKVStore(), x402, fxFetcher: createFxFetcher(), devMode });
+function boot(
+  descriptor: ReturnType<typeof dvm>,
+  env: Record<string, string> = {},
+  devMode?: boolean,
+  extra: { mountPrefix?: string; x402?: typeof x402 & { dualServe?: boolean } } = {}
+) {
+  return createDVMServer(descriptor, {
+    env,
+    store: new MemoryKVStore(),
+    x402: extra.x402 ?? x402,
+    fxFetcher: createFxFetcher({ currencies: ["usd", "eur"] }),
+    devMode,
+    ...(extra.mountPrefix !== undefined && { mountPrefix: extra.mountPrefix }),
+  });
+}
+
+/** The largest `outputExample` a listing configures with at its 100-character stand-in host. */
+function largestConfigurable(): number {
+  let lo = 0;
+  let hi = 8192;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (configures(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Events the server logged at warn, as they reach the log after projection. */
+function warnedEvents(): string[] {
+  return vi.mocked(console.warn).mock.calls.flatMap(([line]) => {
+    try {
+      return [(JSON.parse(String(line)) as { event: string }).event];
+    } catch {
+      return [];
+    }
+  });
 }
 
 beforeEach(() => {
@@ -68,20 +107,55 @@ afterEach(() => {
 
 describe("x402 route boot checks", () => {
   it("refuses to start when the public origin pushes a listing's challenge past the size limit", async () => {
-    let lo = 0;
-    let hi = 8192;
-    while (lo + 1 < hi) {
-      const mid = (lo + hi) >> 1;
-      if (configures(mid)) lo = mid;
-      else hi = mid;
-    }
-    // The largest listing configuration accepts at its 100-character stand-in host.
-    const descriptor = dvm(lo);
+    const descriptor = dvm(largestConfigurable());
 
     await expect(boot(descriptor, { DVMKIT_PUBLIC_URL: LONG_ORIGIN })).rejects.toThrow(
       /capability "fetch" channels\.x402\.listing makes the encoded PAYMENT-REQUIRED header \d+ bytes, over the 7168-byte limit.*DVMKIT_PUBLIC_URL/
     );
-    await expect(boot(descriptor, { DVMKIT_PUBLIC_URL: "https://dvm.example.com" })).resolves.toBeDefined();
+    await expect(boot(descriptor, { DVMKIT_PUBLIC_URL: "https://dvm.example.com" }, true)).resolves.toBeDefined();
+  });
+
+  it("measures the challenge at the host's mount prefix, which lands in the listed resource", async () => {
+    const descriptor = dvm(largestConfigurable());
+    const env = { DVMKIT_PUBLIC_URL: "https://dvm.example.com" };
+    await expect(boot(descriptor, env, true, { mountPrefix: "/feed" })).resolves.toBeDefined();
+    await expect(boot(descriptor, env, true, { mountPrefix: `/${"p".repeat(300)}` })).rejects.toThrow(
+      /capability "fetch" channels\.x402\.listing makes the encoded PAYMENT-REQUIRED header \d+ bytes, over the 7168-byte limit/
+    );
+  });
+
+  it("measures the challenge at a host mount's prefix", async () => {
+    const host = createDVMHost({ devMode: true, port: 0, env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" }, x402, fx: createFxFetcher() });
+    host.mount(dvm(largestConfigurable()), { prefix: `/${"p".repeat(300)}` });
+    await expect(host.serve()).rejects.toThrow(/over the 7168-byte limit/);
+  });
+
+  it("refuses to start outside devMode without durable exact settlement, and warns in devMode, since every route request would answer 503", async () => {
+    const env = { DVMKIT_PUBLIC_URL: "https://dvm.example.com" };
+    await expect(boot(dvm(0), env)).rejects.toThrow(
+      /capability "fetch" is offered on x402 but the server has no durable x402 settlement store/
+    );
+    await expect(boot(dvm(0), env, true)).resolves.toBeDefined();
+    expect(warnedEvents()).toContain("x402_route_settlement_store_missing");
+  });
+
+  it("refuses to start, or warns in devMode, when the DVM prices in a currency x402 cannot charge", async () => {
+    const env = { DVMKIT_PUBLIC_URL: "https://dvm.example.com" };
+    await expect(boot(dvm(0, undefined, { currency: "eur" }), env)).rejects.toThrow(
+      /capability "fetch" is offered on x402 but this DVM prices in "eur"/
+    );
+    await expect(boot(dvm(0, undefined, { currency: "eur" }), env, true)).resolves.toBeDefined();
+    expect(warnedEvents()).toContain("x402_route_currency_unsupported");
+  });
+
+  it("refuses to start, or warns in devMode, when x402 dual-serve is off, so no 402 would offer x402", async () => {
+    const env = { DVMKIT_PUBLIC_URL: "https://dvm.example.com" };
+    const off = { ...x402, dualServe: false };
+    await expect(boot(dvm(0, undefined, { x402: off }), env, false, { x402: off })).rejects.toThrow(
+      /capability "fetch" is offered on x402 but x402\.dualServe is false/
+    );
+    await expect(boot(dvm(0, undefined, { x402: off }), env, true, { x402: off })).resolves.toBeDefined();
+    expect(warnedEvents()).toContain("x402_route_dual_serve_off");
   });
 
   it("refuses to start when the host's payment methods leave out x402", async () => {

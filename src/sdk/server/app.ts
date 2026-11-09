@@ -44,15 +44,22 @@ import {
   type SignedRequestDomain,
 } from "../../lib/signed-request-statement";
 import { parseTraceparent } from "../../lib/traceparent";
-import type { V1InfoCapability, V1InfoResponse } from "../../lib/transport/types";
+import type { V1InfoCapability, V1InfoResponse, V1InfoX402Capability } from "../../lib/transport/types";
 import {
   encodeSettleResponseHeader,
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_EXACT_SCHEME,
-  type SettleResponse,
 } from "../../lib/x402/spec";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
-import { X402_CHANNEL_PATH_PREFIX, x402ChannelPath } from "../../lib/x402/bazaar";
+import {
+  buildX402Discovery,
+  X402_CHANNEL_PATH_PREFIX,
+  x402ChannelPath,
+  x402BodySchema,
+  type X402Discovery,
+  x402MountPrefix,
+  x402RouteUrl,
+} from "../../lib/x402/bazaar";
 import { X402_DEFAULT_FACILITATOR_TIMEOUT_MS } from "../../lib/x402/facilitator-request";
 import type {
   X402Config,
@@ -80,6 +87,7 @@ import {
   validateCurrency,
 } from "../pricing/index";
 import type {
+  CapabilityChannel,
   CapabilityDescriptor,
   CashuMode,
   DVMDescriptor,
@@ -246,6 +254,7 @@ import {
 import {
   assertX402RoutesServable,
   authorizationUnavailableSettleResponse,
+  callerSettleResponse,
   chargedSettleResponse,
   classifyX402RouteOutcome,
   parseX402RouteBody,
@@ -253,6 +262,7 @@ import {
   signedFieldsIn,
   X402_ROUTE_COPY,
   x402RouteBudget,
+  x402RouteUnpayableReasons,
   type X402RouteRow,
 } from "./x402-route";
 import { PostgresX402ExactSettlementStore } from "./x402-exact-settlement-store";
@@ -345,6 +355,12 @@ export interface SDKServerOpts {
   /** Payment methods this DVM accepts. Default: derived from configured rails — adds "cashu" when `mints` is set, "x402" when `x402` is set, "tempo" when `tempo` is set. */
   paymentMethods?: PaymentMethod[];
   x402?: X402Config;
+  /**
+   * Path a host mounts this server under, such as `/feed`, or `""` at the
+   * root. Boot checks size the x402 route's challenge at the address it will
+   * name; requests read their own mount from the route.
+   */
+  mountPrefix?: string;
   /** Live facilitator capability gate. Hosts wire this after probing `/supported`. */
   x402FacilitatorHealth?: X402FacilitatorHealthLike;
   /** MPP multi-rail payment handle (built via `createMppFromOpts`). */
@@ -1129,9 +1145,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
   constructor(descriptor: DVMDescriptor<State, InputSchema>, opts: InternalSDKServerOpts) {
     this.descriptor = descriptor;
-    this.diagnosticCapabilityAuthority = createDiagnosticCapabilityAuthority(
-      Object.keys(descriptor.capabilities),
-    );
+    // Both channels' names: an x402-only capability is attributed too.
+    this.diagnosticCapabilityAuthority = createDiagnosticCapabilityAuthority([
+      ...Object.keys(descriptor.capabilities),
+      ...Object.keys(descriptor.x402Capabilities ?? {}),
+    ]);
     this.pricingCurrency = (descriptor.currency as string | undefined) ?? "usd";
     this.opts = opts;
     assertCardMinimumWithinCreditMax(opts.stripeCredit, descriptor.credit);
@@ -1167,6 +1185,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       x402Config: opts.x402,
       paymentMethods: opts.paymentMethods,
       publicOrigin: this.publicOrigin,
+      mountPrefix: x402MountPrefix(opts.mountPrefix),
       devMode: opts.devMode,
     });
     if (!this.publicOrigin && Object.keys(descriptor.x402Capabilities ?? {}).length > 0) {
@@ -1240,6 +1259,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             },
           })
         : undefined;
+    for (const reason of x402RouteUnpayableReasons(descriptor, {
+      durableSettlement: this.deferredX402 !== undefined,
+      pricingCurrency: this.pricingCurrency,
+      dualServe: opts.x402?.dualServe ?? true,
+    })) {
+      if (!opts.devMode) throw new Error(reason.message);
+      diagnosticConsole.warn({ level: "warn", event: reason.event });
+    }
     this.jobManager = new JobManager(descriptor, {
       deferredX402: this.deferredX402,
       receiptIssuer: this.receiptIssuer,
@@ -2594,6 +2621,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (credit) info.credit = toCreditTerms(credit);
     if (this.opts.mints) info.mints = this.advertisedMints();
     info.capabilities = this.renderCapabilities();
+    const x402Capabilities = this.renderX402Capabilities(c);
+    if (x402Capabilities) info.x402_capabilities = x402Capabilities;
     info.payment = { methods: this.resolvePaymentMethods() };
     if (info.payment.methods.includes("x402") && this.opts.x402 && this.x402Support()?.available) {
       info.x402 = {
@@ -2677,40 +2706,66 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private renderCapabilities(): Record<string, V1InfoCapability> {
     const out: Record<string, V1InfoCapability> = {};
-    for (const [name, cap] of Object.entries(this.descriptor.capabilities)) {
-      const entry: V1InfoCapability = {};
-      if (cap.description) entry.description = cap.description;
-      if (cap.input && isZodSchema(cap.input)) {
-        // emit input-mode JSON Schema so `.default()` fields stay out
-        // of `required` and the advertised contract matches what the server's
-        // Zod safeParse/parse actually accepts. Output mode (the Zod 4 default)
-        // marks defaulted fields as required because they're guaranteed to be
-        // present *after* parsing — wrong story for an input-receiving surface.
-        entry.input_schema = toJSONSchema(cap.input as z.ZodType, { io: "input" });
-      }
-      // builder-supplied example payload. The CLI prefers this over
-      // schema-derived placeholders so cross-field refinements (e.g. narrate's
-      // text-XOR-dialogue) get a runnable `--data` value instead of `'{}'`.
-      if (cap.example !== undefined) entry.example = cap.example as Record<string, unknown>;
-      let pricing: V1InfoCapability["pricing"];
-      if (cap.onQuote?.schema) {
-        const qs = cap.onQuote.schema;
-        pricing = {
-          quote: {
-            schema: isZodSchema(qs) ? toJSONSchema(qs as z.ZodType, { io: "input" }) : qs,
-          },
-        };
-      } else {
-        const max = this.jobManager.currentPricingMax(name);
-        if (max) pricing = { max };
-      }
-      // Published verbatim: the construction-time check already holds every
-      // entry to the limits independent clients parse, so nothing is rewritten.
-      if (cap.rates) pricing = { ...pricing, rates: cap.rates };
-      if (pricing) entry.pricing = pricing;
-      out[name] = entry;
-    }
+    for (const [name, cap] of Object.entries(this.descriptor.capabilities)) out[name] = this.renderCapability(name, cap, "job");
     return out;
+  }
+
+  /**
+   * The x402 channel's capabilities, apart from {@link renderCapabilities}
+   * because a name may mean a different definition there. Each names its own
+   * route at this mount, the address its payments name.
+   */
+  private renderX402Capabilities(c: Context<AppEnv>): Record<string, V1InfoX402Capability> | undefined {
+    const caps = Object.entries(this.descriptor.x402Capabilities ?? {});
+    if (caps.length === 0) return undefined;
+    const origin = this.publicOrigin ?? new URL(c.req.url).origin;
+    const prefix = mountPrefix(c);
+    return Object.fromEntries(
+      caps.map(([name, cap]) => [name, { url: x402RouteUrl(origin, prefix, name), ...this.renderCapability(name, cap, "x402") }])
+    );
+  }
+
+  private renderCapability(
+    name: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cap: CapabilityDescriptor<any, any>,
+    channel: CapabilityChannel
+  ): V1InfoCapability {
+    const entry: V1InfoCapability = {};
+    if (cap.description) entry.description = cap.description;
+    if (channel === "x402") {
+      // The route's body: the input without the signed-request fields an
+      // unsigned x402 caller never sends.
+      if (cap.input && isZodSchema(cap.input)) entry.input_schema = x402BodySchema(cap.input);
+    } else if (cap.input && isZodSchema(cap.input)) {
+      // emit input-mode JSON Schema so `.default()` fields stay out
+      // of `required` and the advertised contract matches what the server's
+      // Zod safeParse/parse actually accepts. Output mode (the Zod 4 default)
+      // marks defaulted fields as required because they're guaranteed to be
+      // present *after* parsing — wrong story for an input-receiving surface.
+      entry.input_schema = toJSONSchema(cap.input as z.ZodType, { io: "input" });
+    }
+    // builder-supplied example payload. The CLI prefers this over
+    // schema-derived placeholders so cross-field refinements (e.g. narrate's
+    // text-XOR-dialogue) get a runnable `--data` value instead of `'{}'`.
+    if (cap.example !== undefined) entry.example = cap.example as Record<string, unknown>;
+    let pricing: V1InfoCapability["pricing"];
+    if (cap.onQuote?.schema) {
+      const qs = cap.onQuote.schema;
+      pricing = {
+        quote: {
+          schema: isZodSchema(qs) ? toJSONSchema(qs as z.ZodType, { io: "input" }) : qs,
+        },
+      };
+    } else {
+      const max = this.jobManager.currentPricingMax(name, channel);
+      if (max) pricing = { max };
+    }
+    // Published verbatim: the construction-time check already holds every
+    // entry to the limits independent clients parse, so nothing is rewritten.
+    if (cap.rates) pricing = { ...pricing, rates: cap.rates };
+    if (pricing) entry.pricing = pricing;
+    return entry;
   }
 
   private async handleQuote(c: Context<AppEnv>): Promise<Response> {
@@ -3165,7 +3220,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!intentId || !this.x402ExactSettlement) return undefined;
     const intent = await this.x402ExactSettlement.get(this.opts.dvmId ?? "", intentId);
     return intent?.status === "complete" && intent.settleResponse
-      ? encodeSettleResponseHeader(intent.settleResponse as unknown as SettleResponse)
+      ? encodeSettleResponseHeader(callerSettleResponse(intent.settleResponse))
       : undefined;
   }
 
@@ -3373,6 +3428,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const name = c.req.param("capability") ?? "";
     const cap = capabilityForChannel(this.descriptor, name, "x402");
     const prefix = mountPrefix(c);
+    // Pinned once the name resolves, so every answer the route gives a known
+    // capability, refusals included, is attributed to it and its channel.
+    if (cap) {
+      pinDimension("capability", name);
+      pinDimension("channel", "x402");
+    }
     const schemaUrl = `${this.publicOrigin ?? new URL(c.req.url).origin}${prefix}/v1/info`;
     if (!cap) {
       return c.json(
@@ -3457,10 +3518,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
     }
     const settleTimeoutMs = this.opts.x402?.facilitatorTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
+    const origin = this.publicOrigin ?? new URL(c.req.url).origin;
+    const listing = cap.channels.x402?.listing;
     return this.handleCreateJob(c, false, {
       name,
       cap,
       mountPrefix: prefix,
+      resource: x402RouteUrl(origin, prefix, name),
+      discovery: listing && buildX402Discovery({ name, listing, input: cap.input, publicOrigin: origin, mountPrefix: prefix }),
       submitted: request.submitted,
       parsedInput: request.parsedInput,
       x402Deferred,
@@ -3546,6 +3611,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // and every downstream span carry the same capability. Missing/unknown
     // requests return above and remain honestly unattributed.
     pinDimension("capability", capabilityName);
+    pinDimension("channel", route ? "x402" : "job");
     const cap = route?.cap ?? this.descriptor.capabilities[capabilityName];
 
     // Input validation runs first so dynamic-priced capabilities (those that
@@ -3940,7 +4006,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           ? x402RouteRailOpts(
               await this.railVerifyOpts(c),
               { ...route.x402Deferred, settleByMs: route.settleByMs },
-              `${this.publicOrigin ?? new URL(c.req.url).origin}${route.mountPrefix}${x402ChannelPath(route.name)}`
+              route.resource,
+              route.discovery
             )
           : unsignedPaid
             ? unsignedRailOpts(await this.railVerifyOpts(c), this.unsignedX402(cap))
@@ -4077,7 +4144,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 err.detail.x402V2Requirements,
                 undefined,
                 this.x402Support()?.exact,
-                err.detail.x402ErrorCode
+                err.detail.x402ErrorCode,
+                route?.discovery
               );
               if (err.detail.cashuPaymentRequest) {
                 response.headers.set("X-Cashu", err.detail.cashuPaymentRequest);
@@ -4746,7 +4814,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       const answer =
         row === "settlement_refused" && intent?.settleResponse
-          ? (intent.settleResponse as unknown as SettleResponse)
+          ? callerSettleResponse(intent.settleResponse)
           : row === "settlement_refused"
             ? { success: false, errorReason: intent?.lastOutcome ?? "settle_failed", transaction: "", network: intent?.network }
             : authorizationUnavailableSettleResponse(intent?.network);
@@ -5918,9 +5986,16 @@ function unsignedRailOpts(
 function x402RouteRailOpts(
   opts: UpfrontPaymentOpts,
   x402Deferred: NonNullable<UpfrontPaymentOpts["x402Deferred"]>,
-  resource: string
+  resource: string,
+  discovery: X402Discovery | undefined
 ): UpfrontPaymentOpts {
-  return { ...unsignedRailOpts(opts, x402Deferred), cashuToken: undefined, mints: undefined, x402Resource: resource };
+  return {
+    ...unsignedRailOpts(opts, x402Deferred),
+    cashuToken: undefined,
+    mints: undefined,
+    x402Resource: resource,
+    x402Discovery: discovery,
+  };
 }
 
 /** Whether `work` settles within `ms`, without waiting longer. */
@@ -5955,6 +6030,10 @@ interface X402RouteSubmit {
   cap: CapabilityDescriptor<any, any>;
   /** See {@link mountPrefix}. */
   mountPrefix: string;
+  /** The capability's route address, which every payment names; see {@link x402RouteUrl}. */
+  resource: string;
+  /** The listing's resource and extension, when the capability is listed. */
+  discovery?: X402Discovery;
   /** The route body, as `data` for a structured input or raw `input` text otherwise. */
   submitted: { data?: unknown; input?: string };
   parsedInput: unknown;
@@ -5971,8 +6050,7 @@ interface X402RouteSubmit {
  * change the addresses the server names.
  */
 function mountPrefix(c: Context<AppEnv>): string {
-  const base = baseRoutePath(c);
-  return base === "/" ? "" : base;
+  return x402MountPrefix(baseRoutePath(c));
 }
 
 /** A route body that is no JSON value at all, so no schema can judge it. */

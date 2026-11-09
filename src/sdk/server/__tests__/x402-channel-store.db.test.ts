@@ -648,6 +648,42 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     ).resolves.toMatchObject({ payload: winner.value.payload, status: "prepared" });
   });
 
+  it("refreshes an expired prepared deposit whose row predates the server's resource", async () => {
+    const requirements = settlementRequirements();
+    const identity = {
+      settlementId: "settlement-legacy-expired-authorization",
+      channelId: CHANNEL_ID,
+      operation: "fund" as const,
+      effectId: "credit:fund-legacy-expired-authorization",
+      paymentId: `${CHANNEL_ID}:deposit:legacy-expired-authorization`,
+      requirements,
+      channelBefore: channel(),
+      pendingId: "pending-legacy-expired-authorization",
+    };
+    const expired = settlementDepositPayload(requirements, "1", "0xlegacy-expired");
+    await storage.prepareSettlement({ ...identity, payload: expired });
+    // As a server that forwarded the caller's resource and extensions stored it.
+    await pool.query("UPDATE x402_batch_settlements SET payment_payload = $1 WHERE settlement_id = $2", [
+      { ...expired, resource: { url: "https://attacker.example/listing" }, extensions: {} },
+      identity.settlementId,
+    ]);
+
+    const refreshed = {
+      paymentId: `${CHANNEL_ID}:deposit:legacy-refresh`,
+      payload: settlementDepositPayload(
+        requirements,
+        String(Math.floor(Date.now() / 1_000) + 3_600),
+        "0xlegacy-refresh",
+        `0x${"69".repeat(32)}`
+      ),
+    };
+    await expect(storage.prepareSettlement({ ...identity, ...refreshed })).resolves.toMatchObject({
+      status: "prepared",
+      paymentId: refreshed.paymentId,
+      payload: { ...refreshed.payload, resource: { url: "/v1/credit" } },
+    });
+  });
+
   it("rejects unexpired and structurally changed prepared deposit authorizations", async () => {
     const requirements = settlementRequirements();
     const validBefore = String(Math.floor(Date.now() / 1_000) + 3_600);
@@ -911,6 +947,375 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       await server.stop();
     }
   });
+
+  it("stores and resends the server's resource, never the caller's, through a crash and its recovery", async () => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    let liveBalance = 0n;
+    const sent: PaymentPayload[] = [];
+    const facilitator: FacilitatorClient = {
+      getSupported: vi.fn(async () => ({
+        kinds: [{ x402Version: 2, scheme: "batch-settlement", network: NETWORK }],
+        extensions: [],
+        signers: {},
+      })),
+      verify: vi.fn(async (payload: PaymentPayload): Promise<VerifyResponse> => {
+        sent.push(payload);
+        const raw = payload.payload as { channelConfig: { payer: string }; voucher: { channelId: string } };
+        return {
+          isValid: true,
+          payer: raw.channelConfig.payer,
+          extra: { channelId: raw.voucher.channelId, balance: liveBalance.toString(), totalClaimed: "0", withdrawRequestedAt: 0, refundNonce: "0" },
+        };
+      }),
+      settle: vi.fn(async (payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> => {
+        sent.push(payload);
+        const raw = payload.payload as { channelConfig: { payer: string }; voucher: { channelId: string }; deposit: { amount: string } };
+        liveBalance += BigInt(raw.deposit.amount);
+        return {
+          success: true,
+          transaction: "0xdeposit",
+          network: requirements.network,
+          payer: raw.channelConfig.payer,
+          amount: raw.deposit.amount,
+          extra: {
+            channelState: { channelId: raw.voucher.channelId, balance: liveBalance.toString(), totalClaimed: "0", withdrawRequestedAt: 0, refundNonce: "0" },
+          },
+        };
+      }),
+    };
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK,
+      payTo: receiver.address,
+      db: pool,
+      earnedNative: earnedNothing,
+      config: { facilitatorClient: facilitator, receiverAuthorizerSigner: receiver, autoSettlement: false },
+      settlementEvidenceReader: {
+        getBlockNumber: async () => 100n,
+        findAppliedSettlement: vi.fn(async () =>
+          liveBalance === 1000n ? { transaction: `0x${"67".repeat(32)}`, amount: "1000" } : undefined
+        ),
+      },
+    });
+    const [built] = await server.buildRequirements("100");
+    const requirements = built as PaymentRequirements;
+    const channelConfig: Channel["channelConfig"] = {
+      payer: payer.address,
+      payerAuthorizer: payer.address,
+      receiver: receiver.address,
+      receiverAuthorizer: receiver.address,
+      token: requirements.asset as `0x${string}`,
+      withdrawDelay: 86_400,
+      salt: generatePrivateKey(),
+    };
+    const deposit = await createBatchSettlementEIP3009DepositPayload(payer, 2, requirements, channelConfig, "1000", "100");
+    const paymentHeader = Buffer.from(
+      JSON.stringify({
+        ...deposit,
+        accepted: requirements,
+        resource: { url: "https://attacker.example/listing", description: "Planted text." },
+        extensions: { bazaar: { info: {}, schema: {} } },
+      })
+    ).toString("base64");
+    const persist = vi
+      .spyOn(PostgresX402ChannelStorage.prototype, "recordSettlementResponse")
+      .mockRejectedValueOnce(new Error("simulated crash before settlement response persistence"));
+    try {
+      const fund = { paymentHeader, amount: "100", operation: "fund" as const, effectId: "forged-credit:fund-1" };
+      await expect(server.accept({ ...fund, commit: async () => "first-attempt" })).rejects.toThrow("simulated crash");
+      const stored = await storage.getSettlement("fund", fund.effectId);
+      expect(stored?.payload.resource).toEqual({ url: "/v1/credit" });
+      expect(stored?.payload).not.toHaveProperty("extensions");
+      const beforeRecovery = sent.length;
+      await expect(server.accept({ ...fund, commit: async () => "recovered" })).resolves.toMatchObject({ ok: true });
+      expect(sent.length).toBeGreaterThan(beforeRecovery);
+      for (const payload of sent) {
+        expect(payload.resource).toEqual({ url: "/v1/credit" });
+        expect(payload).not.toHaveProperty("extensions");
+      }
+    } finally {
+      persist.mockRestore();
+      await server.stop();
+    }
+  });
+
+  // A row recorded before the server replaced the caller's resource holds what
+  // the client echoed. The caller's identical retry must still match it, and
+  // what recovery sends the facilitator must still be the server's.
+  it.each(["prepared", "submitting", "settled"] as const)(
+    "recovers a %s deposit recorded with the caller's resource and extensions before the upgrade",
+    async (stage) => {
+      const payer = privateKeyToAccount(generatePrivateKey());
+      const receiver = privateKeyToAccount(generatePrivateKey());
+      let liveBalance = 0n;
+      let recording = false;
+      const sent: PaymentPayload[] = [];
+      const facilitator: FacilitatorClient = {
+        getSupported: vi.fn(async () => ({
+          kinds: [{ x402Version: 2, scheme: "batch-settlement", network: NETWORK }],
+          extensions: [],
+          signers: {},
+        })),
+        verify: vi.fn(async (payload: PaymentPayload): Promise<VerifyResponse> => {
+          if (recording) sent.push(payload);
+          const raw = payload.payload as { channelConfig: { payer: string }; voucher: { channelId: string } };
+          return {
+            isValid: true,
+            payer: raw.channelConfig.payer,
+            extra: { channelId: raw.voucher.channelId, balance: liveBalance.toString(), totalClaimed: "0", withdrawRequestedAt: 0, refundNonce: "0" },
+          };
+        }),
+        settle: vi.fn(async (payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> => {
+          if (recording) sent.push(payload);
+          const raw = payload.payload as { channelConfig: { payer: string }; voucher: { channelId: string }; deposit: { amount: string } };
+          liveBalance += BigInt(raw.deposit.amount);
+          return {
+            success: true,
+            transaction: "0xdeposit",
+            network: requirements.network,
+            payer: raw.channelConfig.payer,
+            amount: raw.deposit.amount,
+            extra: {
+              channelState: { channelId: raw.voucher.channelId, balance: liveBalance.toString(), totalClaimed: "0", withdrawRequestedAt: 0, refundNonce: "0" },
+            },
+          };
+        }),
+      };
+      const server = await createX402BatchSettlementServer({
+        network: NETWORK,
+        payTo: receiver.address,
+        db: pool,
+        earnedNative: earnedNothing,
+        config: { facilitatorClient: facilitator, receiverAuthorizerSigner: receiver, autoSettlement: false },
+        settlementEvidenceReader: {
+          getBlockNumber: async () => 100n,
+          findAppliedSettlement: vi.fn(async () =>
+            liveBalance === 1000n ? { transaction: `0x${"68".repeat(32)}`, amount: "1000" } : undefined
+          ),
+        },
+      });
+      const [built] = await server.buildRequirements("100");
+      const requirements = built as PaymentRequirements;
+      const channelConfig: Channel["channelConfig"] = {
+        payer: payer.address,
+        payerAuthorizer: payer.address,
+        receiver: receiver.address,
+        receiverAuthorizer: receiver.address,
+        token: requirements.asset as `0x${string}`,
+        withdrawDelay: 86_400,
+        salt: generatePrivateKey(),
+      };
+      const deposit = await createBatchSettlementEIP3009DepositPayload(payer, 2, requirements, channelConfig, "1000", "100");
+      const sentByClient = {
+        ...deposit,
+        accepted: requirements,
+        resource: { url: "https://attacker.example/listing", description: "Planted text." },
+        extensions: {},
+      };
+      const paymentHeader = Buffer.from(JSON.stringify(sentByClient)).toString("base64");
+      const effectId = `legacy-${stage}:fund-1`;
+      const crash =
+        stage === "prepared"
+          ? vi.spyOn(PostgresX402ChannelStorage.prototype, "markSettlementSubmitting").mockRejectedValueOnce(new Error("simulated crash"))
+          : stage === "submitting"
+            ? vi.spyOn(PostgresX402ChannelStorage.prototype, "recordSettlementResponse").mockRejectedValueOnce(new Error("simulated crash"))
+            : vi.spyOn(PostgresX402ChannelStorage.prototype, "completeSettlement").mockRejectedValueOnce(new Error("simulated crash"));
+      try {
+        await expect(
+          server.accept({
+            paymentHeader,
+            amount: "100",
+            operation: "fund",
+            effectId,
+            commit: async () => "first-attempt",
+          })
+        ).rejects.toThrow("simulated crash");
+        expect(await storage.getSettlement("fund", effectId)).toMatchObject({ status: stage });
+        // Store the payload as the server did before it replaced the caller's values.
+        await pool.query("UPDATE x402_batch_settlements SET payment_payload = $1 WHERE operation = 'fund' AND effect_id = $2", [
+          sentByClient,
+          effectId,
+        ]);
+        recording = true;
+        await expect(
+          server.accept({ paymentHeader, amount: "100", operation: "fund", effectId, commit: async () => "recovered" })
+        ).resolves.toMatchObject({ ok: true, value: { committed: "recovered" } });
+        // A prepared deposit is settled again and a submitting one is checked
+        // against the facilitator; a settled one may finish from its record alone.
+        if (stage !== "settled") expect(sent.length).toBeGreaterThan(0);
+        for (const payload of sent) {
+          expect(payload.resource).toEqual({ url: "/v1/credit" });
+          expect(payload).not.toHaveProperty("extensions");
+        }
+      } finally {
+        crash.mockRestore();
+        await server.stop();
+      }
+    }
+  );
+
+  it.each(["prepared", "submitting", "settled"] as const)(
+    "recovers a %s refund recorded with the caller's resource and extensions before the upgrade",
+    async (stage) => {
+      const payer = privateKeyToAccount(generatePrivateKey());
+      const receiver = privateKeyToAccount(generatePrivateKey());
+      let liveBalance = 0n;
+      let totalClaimed = 0n;
+      let recording = false;
+      const sent: PaymentPayload[] = [];
+      const facilitator: FacilitatorClient = {
+        getSupported: vi.fn(async () => ({
+          kinds: [{ x402Version: 2, scheme: "batch-settlement", network: NETWORK }],
+          extensions: [],
+          signers: {},
+        })),
+        verify: vi.fn(async (payload: PaymentPayload): Promise<VerifyResponse> => {
+          if (recording) sent.push(payload);
+          const raw = payload.payload as { channelConfig: { payer: string }; voucher: { channelId: string } };
+          return {
+            isValid: true,
+            payer: raw.channelConfig.payer,
+            extra: {
+              channelId: raw.voucher.channelId,
+              balance: liveBalance.toString(),
+              totalClaimed: totalClaimed.toString(),
+              withdrawRequestedAt: 0,
+              refundNonce: "0",
+            },
+          };
+        }),
+        settle: vi.fn(async (payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> => {
+          if (recording) sent.push(payload);
+          const raw = payload.payload as {
+            type: string;
+            channelConfig: { payer: string };
+            voucher: { channelId: string };
+            deposit?: { amount: string };
+            amount?: string;
+            claims?: { totalClaimed: string }[];
+          };
+          if (raw.type === "deposit") liveBalance = BigInt(raw.deposit?.amount ?? "0");
+          if (raw.type === "refund") {
+            totalClaimed = (raw.claims ?? []).reduce(
+              (max, claim) => (BigInt(claim.totalClaimed) > max ? BigInt(claim.totalClaimed) : max),
+              totalClaimed
+            );
+            liveBalance -= BigInt(raw.amount ?? "0");
+          }
+          return {
+            success: true,
+            transaction: `0x${raw.type}`,
+            network: requirements.network,
+            payer: raw.channelConfig.payer,
+            amount: raw.type === "refund" ? raw.amount : raw.deposit?.amount,
+            extra: {
+              channelState: {
+                channelId: raw.voucher.channelId,
+                balance: liveBalance.toString(),
+                totalClaimed: totalClaimed.toString(),
+                withdrawRequestedAt: 0,
+                refundNonce: raw.type === "refund" ? "1" : "0",
+              },
+            },
+          };
+        }),
+      };
+      const server = await createX402BatchSettlementServer({
+        network: NETWORK,
+        payTo: receiver.address,
+        db: pool,
+        earnedNative: earnedNothing,
+        config: { facilitatorClient: facilitator, receiverAuthorizerSigner: receiver, autoSettlement: false },
+        settlementEvidenceReader: {
+          getBlockNumber: async () => 100n,
+          findAppliedSettlement: vi.fn(async () =>
+            liveBalance === 0n ? { transaction: "0xrefund", amount: "100" } : undefined
+          ),
+        },
+      });
+      const [fundBuilt] = await server.buildRequirements("100");
+      const fundRequirements = fundBuilt as PaymentRequirements;
+      const channelConfig: Channel["channelConfig"] = {
+        payer: payer.address,
+        payerAuthorizer: payer.address,
+        receiver: receiver.address,
+        receiverAuthorizer: receiver.address,
+        token: fundRequirements.asset as `0x${string}`,
+        withdrawDelay: 86_400,
+        salt: generatePrivateKey(),
+      };
+      const channelId = computeChannelId(channelConfig, NETWORK);
+      const deposit = await createBatchSettlementEIP3009DepositPayload(payer, 2, fundRequirements, channelConfig, "100", "100");
+      const creditId = `legacy-refund-${stage}`;
+      await expect(
+        server.accept({
+          paymentHeader: encodeHeader(deposit, fundRequirements),
+          amount: "100",
+          operation: "fund",
+          effectId: `${creditId}:fund-1`,
+          commit: async () => "funded",
+        })
+      ).resolves.toMatchObject({ ok: true });
+
+      const [refundBuilt] = await server.buildRequirements("0");
+      const refundRequirements = refundBuilt as PaymentRequirements;
+      const refundVoucher = await signVoucher(payer, channelId, "0", NETWORK);
+      const sentByClient = {
+        x402Version: 2,
+        accepted: refundRequirements,
+        resource: { url: "https://attacker.example/listing", description: "Planted text." },
+        payload: { type: "refund", channelConfig, voucher: refundVoucher },
+        extensions: {},
+      };
+      const refund = {
+        paymentHeader: Buffer.from(JSON.stringify(sentByClient)).toString("base64"),
+        amount: "0",
+        operation: "refund" as const,
+        expectedChannelId: channelId,
+        effectId: `${creditId}:drain-1`,
+        refundBoundNative: 100,
+      };
+      const crash =
+        stage === "submitting"
+          ? vi.spyOn(PostgresX402ChannelStorage.prototype, "recordSettlementResponse").mockRejectedValueOnce(new Error("simulated crash"))
+          : stage === "settled"
+            ? vi.spyOn(PostgresX402ChannelStorage.prototype, "completeSettlement").mockRejectedValueOnce(new Error("simulated crash"))
+            : undefined;
+      try {
+        await expect(
+          server.accept({
+            ...refund,
+            commit: async () => {
+              // A refund's ledger leg commits before its submission, so a
+              // failed commit is what leaves it prepared.
+              if (stage === "prepared") throw new Error("simulated crash");
+              return "first-attempt";
+            },
+          })
+        ).rejects.toThrow("simulated crash");
+        expect(await storage.getSettlement("refund", refund.effectId)).toMatchObject({ status: stage });
+        // Store the payload as the server did before it replaced the caller's values.
+        await pool.query("UPDATE x402_batch_settlements SET payment_payload = $1 WHERE operation = 'refund' AND effect_id = $2", [
+          sentByClient,
+          refund.effectId,
+        ]);
+        recording = true;
+        await expect(server.accept({ ...refund, commit: async () => "drained" })).resolves.toMatchObject({
+          ok: true,
+          value: { committed: "drained" },
+        });
+        expect(await storage.getSettlement("refund", refund.effectId)).toMatchObject({ status: "complete" });
+        if (stage === "prepared") expect(sent.length).toBeGreaterThan(0);
+        for (const payload of sent) {
+          expect(payload.resource).toEqual({ url: "/v1/credit" });
+          expect(payload).not.toHaveProperty("extensions");
+        }
+      } finally {
+        crash?.mockRestore();
+        await server.stop();
+      }
+    }
+  );
 
   it("reconciles a mined deposit when the facilitator reports a post-submit failure", async () => {
     const receiver = privateKeyToAccount(generatePrivateKey());
