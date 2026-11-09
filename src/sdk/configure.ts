@@ -393,9 +393,6 @@ function assertX402ChannelDefinition(
     );
   }
   const x402Config = config.x402;
-  if (!x402Config) {
-    throw new Error(`${at} is offered on x402 but the DVM has no x402 configuration; set DVMConfig.x402`);
-  }
   if (config.paymentMethods !== undefined && !config.paymentMethods.includes("x402")) {
     throw new Error(
       `${at} is offered on x402 but paymentMethods (${JSON.stringify(config.paymentMethods)}) ` +
@@ -427,8 +424,9 @@ function assertX402ChannelDefinition(
       );
     }
   }
-  // The server reruns this at boot with its public origin, the route's own
-  // timeout and a fixed price; see `assertX402RoutesServable` in server/app.ts.
+  // A host may supply the rail later. Only sizing needs it here; the server
+  // reruns sizing at boot with its resolved rail, public origin and timeout.
+  if (!x402Config) return;
   assertPaymentRequiredFits(
     label,
     x402ChannelPaymentRequired({

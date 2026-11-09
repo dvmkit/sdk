@@ -106,6 +106,25 @@ afterEach(() => {
 });
 
 describe("x402 route boot checks", () => {
+  it("refuses a descriptor whose x402 rail was never wired", async () => {
+    const descriptor = configureDVM({
+      name: "missing-rail",
+      capabilities: {
+        fetch: {
+          channels: { job: false, x402: {} },
+          price: "$0.01",
+          maxRuntimeSeconds: 5,
+          onJob(ctx) { ctx.complete("done"); },
+        },
+      },
+    });
+    await expect(createDVMServer(descriptor, {
+      env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" },
+      store: new MemoryKVStore(),
+      devMode: true,
+    })).rejects.toThrow("server has no x402 configuration");
+  });
+
   it("refuses to start when the public origin pushes a listing's challenge past the size limit", async () => {
     const descriptor = dvm(largestConfigurable());
 

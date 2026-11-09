@@ -224,13 +224,9 @@ describe("capability channels", () => {
     expect(capabilityForChannel(dvm, "fetch", "x402")?.name).toBe("fetch");
   });
 
-  it("requires maxRuntimeSeconds and x402 configuration on the x402 channel", () => {
+  it("requires maxRuntimeSeconds on the x402 channel", () => {
     expect(() => withX402({ maxRuntimeSeconds: undefined }))
       .toThrow('capability "fetch" is offered on x402 and must set maxRuntimeSeconds (1 to 600)');
-    expect(() => configureDVM({
-      name: "example",
-      capabilities: { fetch: { channels: { job: true, x402: {} }, price: "$0.01", maxRuntimeSeconds: 5, onJob } },
-    })).toThrow('capability "fetch" is offered on x402 but the DVM has no x402 configuration');
   });
 
   it("refuses a listing on a capability not offered on x402", () => {
