@@ -1,0 +1,79 @@
+{
+  "description": "POST /v1/x402/{capability} answers a paid stock x402 request in the same response, charged only when the job completes and its deferred authorization settles. Each row names the status, the body fields that are fixed, the fields that must be present or absent, and the headers that must be set.",
+  "path": "/v1/x402/{capability}",
+  "identityHeader": "DVM-Job-Identity-V1",
+  "maxMessagesBytes": 1048576,
+  "exposedHeaders": ["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "Retry-After"],
+  "charged": {
+    "status": 200,
+    "body": { "status": "completed", "charge_outcome": "charged" },
+    "requiredFields": ["job_id", "job_token", "messages", "payload_in"],
+    "headers": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "DVM-Job-Identity-V1"],
+    "settleResponse": { "success": true },
+    "overCap": {
+      "body": { "status": "completed", "charge_outcome": "charged", "payload_in": "messages" },
+      "requiredFields": ["job_id", "job_token"],
+      "omittedFields": ["messages"]
+    }
+  },
+  "handlerFailed": {
+    "status": 500,
+    "body": { "status": "failed", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "reason", "display", "hint"],
+    "omittedFields": ["job_token", "messages"],
+    "headers": ["DVM-Job-Identity-V1"],
+    "absentHeaders": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
+  },
+  "runtimeBound": {
+    "status": 503,
+    "body": { "status": "failed", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "reason", "display", "hint"],
+    "omittedFields": ["job_token", "messages"],
+    "headers": ["DVM-Job-Identity-V1"],
+    "absentHeaders": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
+  },
+  "settleWindowClosed": {
+    "description": "The job finished, but too late in the request's time budget for its payment to settle, so the result is withheld.",
+    "status": 503,
+    "body": { "status": "failed", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "reason", "display", "hint"],
+    "omittedFields": ["job_token", "messages"],
+    "headers": ["DVM-Job-Identity-V1"],
+    "absentHeaders": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
+  },
+  "settlementRefused": {
+    "status": 402,
+    "body": { "error": "x402_settlement_refused", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "display", "hint"],
+    "omittedFields": ["job_token", "messages", "summary"],
+    "headers": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "DVM-Job-Identity-V1"],
+    "settleResponse": { "success": false }
+  },
+  "authorizationLost": {
+    "defensive": "A fail-safe: the process serving a request holds its authorization until settlement resolves it, so no request in the reference suite reaches this row. It answers an authorization lost some other way.",
+    "status": 402,
+    "body": { "error": "authorization_unavailable", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "display", "hint"],
+    "omittedFields": ["job_token", "messages", "summary"],
+    "headers": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "DVM-Job-Identity-V1"],
+    "settleResponse": { "success": false, "errorReason": "authorization_unavailable" }
+  },
+  "unknown": {
+    "status": 202,
+    "body": {
+      "status": "processing",
+      "content_available": false,
+      "content_withheld": "payment_pending",
+      "charge_outcome": "unknown"
+    },
+    "requiredFields": ["job_id", "job_token", "hint"],
+    "omittedFields": ["messages", "summary"],
+    "headers": ["Retry-After", "DVM-Job-Identity-V1"]
+  },
+  "payerBusy": {
+    "status": 429,
+    "body": { "error": "x402_payer_busy" },
+    "requiredFields": ["hint"],
+    "headers": ["Retry-After"]
+  }
+}

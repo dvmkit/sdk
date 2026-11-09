@@ -28,6 +28,7 @@ import type { FxFetcher, FxRateSnapshot } from "../pricing/index";
 import { fiatToSatsCeil, fxRateFor, parseUsdPrice, roundUsd } from "../pricing/index";
 import { StepCache } from "../step-cache";
 import type {
+  CapabilityChannel,
   CapabilityDescriptor,
   CashuMode,
   DVMDescriptor,
@@ -38,6 +39,7 @@ import type {
   ZodLike,
 } from "../types";
 import { isZodSchema } from "../types";
+import { capabilityForChannel } from "../capability-channels";
 import type { CreditRail, DrawPool } from "./context";
 import { buildContext } from "./context";
 import {
@@ -394,6 +396,8 @@ export interface JobManagerOpts {
     jobId: string;
     /** Dispatched capability. Omitted only for legacy persisted jobs that predate dispatch. */
     capability?: string;
+    /** `"x402"` for a job admitted on the x402 channel; omitted for the dvmkit protocol. */
+    channel?: "x402";
     paidMsats: number;
     paymentMint?: string;
     rail: string;
@@ -431,6 +435,8 @@ export interface JobManagerOpts {
     dvmId: string;
     jobId: string;
     capability: string;
+    /** `"x402"` for a job admitted on the x402 channel; omitted for the dvmkit protocol. */
+    channel?: "x402";
     paidMsats: number;
     rail: string;
     reason: "worker_died_mid_job" | "stale_no_terminal_status";
@@ -602,6 +608,7 @@ type RevenueBookableJob = Pick<
   JobRecord,
   | "id"
   | "capability"
+  | "channel"
   | "status"
   | "paidMsats"
   | "paymentMint"
@@ -1004,12 +1011,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     return this.opts.receiptIssuer !== undefined && isReceiptIssuingStore(this.jobStore);
   }
 
-  hasCapability(name: string): boolean {
-    return Object.prototype.hasOwnProperty.call(this.descriptor.capabilities, name);
+  hasCapability(name: string, channel: CapabilityChannel = "job"): boolean {
+    return this.getCapability(name, channel) !== undefined;
   }
 
+  /**
+   * Every capability name this DVM dispatches, on either channel. Store
+   * sweeps scope rows by name, so an x402-only name must be included or its
+   * jobs would never be reaped, retained or reported.
+   */
   capabilityNames(): string[] {
-    return Object.keys(this.descriptor.capabilities);
+    return [...new Set([
+      ...Object.keys(this.descriptor.capabilities),
+      ...Object.keys(this.descriptor.x402Capabilities ?? {}),
+    ])];
   }
 
   /**
@@ -1020,8 +1035,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * `onQuote`) — the caller falls back to `computeDynamicPrice` in that path.
    * A caller that already holds the snapshot it prices at passes it as `fx`.
    */
-  async currentPriceMsats(capability: string, fx?: FxRateSnapshot): Promise<number | undefined> {
-    const cap = this.requireCapability(capability);
+  async currentPriceMsats(
+    capability: string,
+    fx?: FxRateSnapshot,
+    channel: CapabilityChannel = "job"
+  ): Promise<number | undefined> {
+    const cap = this.requireCapability(capability, channel);
     if (cap.price === undefined) return undefined;
     return resolveStaticPriceMsats(cap.price, fx ?? (await this.opts.fxFetcher.fetch()));
   }
@@ -1065,9 +1084,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   parseInput(
     body: { input?: string; data?: unknown },
     capability: string,
-    unsigned = false
+    unsigned = false,
+    channel: CapabilityChannel = "job"
   ): unknown {
-    const cap = this.requireCapability(capability);
+    const cap = this.requireCapability(capability, channel);
     const rawSchema: unknown = cap.input;
     if (!rawSchema || !isZodSchema(rawSchema)) return body.input ?? "";
     const schema = unsigned ? unsignedInputSchema(rawSchema) : rawSchema;
@@ -1099,11 +1119,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * reaching this with an unknown name is a programmer error.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private requireCapability(name: string): CapabilityDescriptor<any, any> {
-    const cap = this.getCapability(name);
+  private requireCapability(name: string, channel: CapabilityChannel = "job"): CapabilityDescriptor<any, any> {
+    const cap = this.getCapability(name, channel);
     if (!cap) {
       throw new Error(
-        `JobManager: capability "${name}" is not defined on descriptor "${this.descriptor.name}"`
+        `JobManager: capability "${name}" is not defined on ${channel === "job" ? "" : `the ${channel} channel of `}descriptor "${this.descriptor.name}"`
       );
     }
     return cap;
@@ -1117,9 +1137,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * here instead of re-casting inline.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private getCapability(name: string): CapabilityDescriptor<any, any> | undefined {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return this.descriptor.capabilities[name] as CapabilityDescriptor<any, any> | undefined;
+  private getCapability(name: string, channel: CapabilityChannel = "job"): CapabilityDescriptor<any, any> | undefined {
+    return capabilityForChannel(this.descriptor, name, channel);
   }
 
   /**
@@ -1159,15 +1178,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
        * record the job it pays for.
        */
       jobId?: string;
+      /** Channel the job was admitted on; omitted for the dvmkit protocol. */
+      channel?: CapabilityChannel;
     }
   ): ServerJob {
-    const cap = this.requireCapability(capability);
+    const channel = provenance?.channel === "job" ? undefined : provenance?.channel;
+    const cap = this.requireCapability(capability, channel);
     const id = provenance?.jobId ?? this.allocateJobId();
     const now = Date.now();
     const job: ServerJob = {
       id,
       tags: this.descriptor.tags,
       capability,
+      ...(channel !== undefined && { channel }),
       input: body.input,
       params: body.params ?? {},
       requesterId,
@@ -1226,7 +1249,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job: ServerJob,
     parsedInput: unknown
   ): SDKJobContext<State, ResolvedInput<InputSchema>> {
-    const auth = deriveAuthFromParsedInput(this.descriptor, parsedInput);
+    const auth = deriveAuthFromParsedInput(this.descriptor, parsedInput, job.channel);
     const sdkCtx = buildContext(job, { ...this.buildContextOpts(job), parsedInput, auth });
     job.sdkCtx = sdkCtx;
     return sdkCtx as SDKJobContext<State, ResolvedInput<InputSchema>>;
@@ -1237,7 +1260,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // persisted before its capability was deleted from the descriptor would
     // land here with no matching entry. Fail it explicitly rather than letting
     // a NoMethodError leak out of onJob.
-    const cap = this.getCapability(job.capability);
+    const cap = this.getCapability(job.capability, job.channel);
     const onError = (err: unknown): void => {
       if (isTerminal(job.status)) return;
       job.replayProviderSkip = 0; // stop suppressing so cancel message emits
@@ -1273,11 +1296,26 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // checked at admission, so the job must be over before it lapses.
     const runtimeBound = deferredX402IntentId(job.creditId) ? cap.maxRuntimeSeconds : undefined;
     if (runtimeBound !== undefined) {
-      setTimeout(() => {
+      const boundMs = runtimeBound * 1000;
+      const limitMs = job.handlerDeadlineMs === undefined
+        ? boundMs
+        : Math.min(boundMs, job.handlerDeadlineMs - Date.now());
+      const stop = (reason: string): void => {
         if (isTerminal(job.status)) return;
+        job.runtimeLimitExceeded = true;
         job.abort.abort();
-        onError(new Error(`Job exceeded its ${runtimeBound} second runtime limit`));
-      }, runtimeBound * 1000).unref();
+        onError(new Error(reason));
+      };
+      if (limitMs <= 0) {
+        stop(`The request's ${runtimeBound} second time budget was spent before the job could start`);
+        return;
+      }
+      setTimeout(
+        () => stop(limitMs < boundMs
+          ? `Job ran out of its request's ${runtimeBound} second time budget`
+          : `Job exceeded its ${runtimeBound} second runtime limit`),
+        limitMs
+      ).unref();
     }
     const stopKeepalive = this.terminalPersistenceStopped
       ? () => {}
@@ -1405,7 +1443,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
   private async dispatchMessageNow(job: ServerJob, type: MessageType, content: unknown): Promise<void> {
     const ctx = job.sdkCtx;
-    const cap = this.getCapability(job.capability);
+    const cap = this.getCapability(job.capability, job.channel);
 
     if (type === "response") {
       const rc = content as ResponseContent;
@@ -1761,7 +1799,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // that does network I/O must not hold the abort back. Like the
     // local path (`dispatchMessage`), it runs against an already-terminal job,
     // so its `ctx` emits are no-op warnings.
-    const cap = this.getCapability(job.capability);
+    const cap = this.getCapability(job.capability, job.channel);
     if (durable.status === "cancelled" && cap?.onCancel && job.sdkCtx) {
       const ctx = job.sdkCtx;
       const onCancel = cap.onCancel;
@@ -2298,6 +2336,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
                   dvmId: this.opts.dvmId ?? "",
                   jobId: record.id,
                   capability: record.capability,
+                  ...reportedChannel(record),
                   paidMsats: record.paidMsats,
                   rail: record.paymentRail,
                   reason,
@@ -3119,11 +3158,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // `input` still takes the signed branch and is refused. A writer who can
     // also clear both columns can still downgrade a row to an anonymous job:
     // rows carry no integrity marker that would detect that.
+    // x402-channel callers are always unsigned, whatever the DVM's auth.
     const unsigned =
-      record.authRequestPath === undefined &&
-      record.requesterPubkey === undefined &&
-      this.unsignedPaidInput({ input: record.input }, record.capability);
-    const parsedInput = this.parseInput({ input: record.input }, record.capability, unsigned);
+      record.channel === "x402" ||
+      (record.authRequestPath === undefined &&
+        record.requesterPubkey === undefined &&
+        this.unsignedPaidInput({ input: record.input }, record.capability));
+    const parsedInput = this.parseInput({ input: record.input }, record.capability, unsigned, record.channel);
 
     if (this.descriptor.auth && !unsigned) {
       const cap = this.requireCapability(record.capability);
@@ -3161,7 +3202,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     this.wireMessageAppender(job);
     this.watchDurableStatus(job);
 
-    const auth = deriveAuthFromParsedInput(this.descriptor, parsedInput);
+    const auth = deriveAuthFromParsedInput(this.descriptor, parsedInput, record.channel);
     const sdkCtx = buildContext(job, { ...this.buildContextOpts(job), parsedInput, auth });
     job.sdkCtx = sdkCtx;
     return { job, sdkCtx: sdkCtx };
@@ -4418,7 +4459,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         ? (!unpaid && record.status === "completed" ? 1 : 0)
         : record.pieces?.filter((piece) => piece.state === "finished").length;
       await callback({
-        dvmId, jobId: record.id, capability: record.capability, outcome: record.status,
+        dvmId, jobId: record.id, capability: record.capability, ...reportedChannel(record), outcome: record.status,
         endedBy: record.status === "completed" ? null : record.endedBy ?? "provider",
         paid: !unpaid && (record.paidMsats > 0 || (record.nativeAmount ?? 0) > 0 || !!record.drawId),
         acceptedAtMs: record.createdAt,
@@ -4633,6 +4674,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       dvmId: this.opts.dvmId ?? "",
       jobId: job.id,
       ...(job.capability ? { capability: job.capability } : {}),
+      ...reportedChannel(job),
       outcome: job.status,
       costRevision,
       cost:
@@ -4903,6 +4945,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         // Legacy Postgres rows surface a missing capability as `""`. Keep
         // that absence distinct from every real capability name on the wire.
         ...(job.capability ? { capability: job.capability } : {}),
+        ...reportedChannel(job),
         paidMsats: bookedMsats,
         paymentMint: job.paymentMint,
         rail: job.paymentRail,
@@ -5225,6 +5268,15 @@ function resolveStaticPriceMsats(price: PriceValue, fx: FxRateSnapshot): number 
 }
 
 /**
+ * The channel a report names alongside its capability. Names are unique only
+ * within a channel, so an x402 `fetch` and a dvmkit-protocol `fetch` report
+ * apart; dvmkit-protocol reports stay byte-identical to their earlier shape.
+ */
+function reportedChannel(job: { channel?: CapabilityChannel }): { channel?: "x402" } {
+  return job.channel === "x402" ? { channel: "x402" } : {};
+}
+
+/**
  * Derive `ctx.auth` from a parsed input when the descriptor declares an auth
  * scheme. The envelope fields (pubkey/signature/timestamp/nonce)
  * are part of the capability's Zod schema, so the parsed input already
@@ -5239,9 +5291,11 @@ function resolveStaticPriceMsats(price: PriceValue, fx: FxRateSnapshot): number 
 function deriveAuthFromParsedInput(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   descriptor: DVMDescriptor<any, any>,
-  parsedInput: unknown
+  parsedInput: unknown,
+  channel: CapabilityChannel | undefined
 ): { pubkey: string; envelope: CanonicalEnvelope & Record<string, unknown> } | undefined {
-  if (!descriptor.auth) return undefined;
+  // An x402 caller is never authenticated, so no input field can name one.
+  if (!descriptor.auth || channel === "x402") return undefined;
   if (parsedInput === null || typeof parsedInput !== "object") return undefined;
   const env = parsedInput as CanonicalEnvelope & Record<string, unknown>;
   if (typeof env.pubkey !== "string") return undefined;

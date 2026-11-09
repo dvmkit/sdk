@@ -23123,6 +23123,15 @@
         },
         {
           "module": "src/sdk/signed-envelope-schema.ts"
+        },
+        {
+          "module": "src/lib/x402/bazaar.ts"
+        },
+        {
+          "module": "src/lib/x402/facilitator-request.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-route.ts"
         }
       ]
     },
@@ -35356,7 +35365,8 @@
           "reason": "The server waits for an accepted unsigned Cashu job response through durable status notifications or local job events.",
           "symbols": [
             "waitForInlineResult",
-            "inlineResultMessages"
+            "inlineResultMessages",
+            "boundedResultMessages"
           ],
           "consumerEvidence": [
             "supported:./server#createDVMHost",
@@ -35373,6 +35383,49 @@
         },
         {
           "module": "src/lib/messages/types.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/x402-route.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "The server answers a paid x402 channel request in one response: it screens and budgets the request and maps the settled job to its response row.",
+          "symbols": [
+            "SETTLE_WINDOW_CLOSED_REASON",
+            "X402RouteBody",
+            "X402RouteRow",
+            "X402_ROUTE_COPY",
+            "X402_ROUTE_SIGNED_FIELDS",
+            "authorizationUnavailableSettleResponse",
+            "classifyX402RouteOutcome",
+            "parseX402RouteBody",
+            "signedFieldsIn",
+            "x402RouteBudget"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/x402/spec.ts"
+        },
+        {
+          "module": "src/sdk/signed-envelope-schema.ts"
+        },
+        {
+          "module": "src/sdk/server/job-store.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-exact-settlement.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-exact-settlement-store.ts"
         }
       ]
     },

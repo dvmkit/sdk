@@ -9,7 +9,15 @@ import { toJSONSchema, type z } from "zod";
 
 import { CAPABILITY_SIGNED_FIELDS } from "../../sdk/signed-envelope-schema";
 import type { X402Listing } from "../../sdk/types";
-import { encodePaymentRequiredHeader, type PaymentRequiredV2, type ResourceInfo } from "./spec";
+import {
+  buildPaymentRequirements,
+  encodePaymentRequiredHeader,
+  paymentRequiredV2FromV1,
+  type PaymentRequiredV2,
+  type ResourceInfo,
+  X402_V1_VERSION,
+} from "./spec";
+import type { X402Config } from "./types";
 
 /** Path prefix of the x402 channel route; the capability name follows it. */
 export const X402_CHANNEL_PATH_PREFIX = "/v1/x402/";
@@ -168,6 +176,56 @@ export function buildX402Discovery(opts: BuildX402DiscoveryOpts): X402Discovery 
   return { resource, extensions: { bazaar } };
 }
 
+/**
+ * Stand-ins for the parts of an x402 channel challenge unknown when it is
+ * checked: an origin longer than typical public origins, the largest unsigned
+ * 64-bit amount, a four-digit timeout and an `error` longer than any the
+ * payment path writes on a 402.
+ */
+export const X402_SIZE_CHECK_ORIGIN = `https://${"x".repeat(100)}.example.com`;
+export const X402_SIZE_CHECK_AMOUNT = 18_446_744_073_709_551_615n;
+export const X402_SIZE_CHECK_TIMEOUT_SECONDS = 3600;
+export const X402_SIZE_CHECK_ERROR = "x".repeat(256);
+
+/** What one x402 channel challenge is built from. */
+export interface X402ChannelPaymentRequiredOpts {
+  name: string;
+  listing: X402Listing | undefined;
+  /** The definition's input schema; see {@link BuildX402DiscoveryOpts.input}. */
+  input: unknown;
+  x402Config: X402Config;
+  publicOrigin: string;
+  requiredUsdcMicro: bigint;
+  maxTimeoutSeconds: number;
+  error: string;
+}
+
+/**
+ * The `PAYMENT-REQUIRED` challenge for one capability on the x402 channel,
+ * built the way the payment path builds it: the exact scheme on the
+ * configured network, v1 requirements lifted to v2, and, when listed, the
+ * listing's resource and discovery extension.
+ */
+export function x402ChannelPaymentRequired(opts: X402ChannelPaymentRequiredOpts): PaymentRequiredV2 {
+  const discovery =
+    opts.listing &&
+    buildX402Discovery({ name: opts.name, listing: opts.listing, input: opts.input, publicOrigin: opts.publicOrigin });
+  const required = paymentRequiredV2FromV1(
+    [
+      buildPaymentRequirements({
+        x402Config: opts.x402Config,
+        requiredUsdcMicro: opts.requiredUsdcMicro,
+        resource: discovery?.resource.url ?? `${opts.publicOrigin.replace(/\/+$/, "")}${x402ChannelPath(opts.name)}`,
+        maxTimeoutSeconds: opts.maxTimeoutSeconds,
+        version: X402_V1_VERSION,
+      }),
+    ],
+    opts.error
+  );
+  if (!discovery) return required;
+  return { ...required, resource: discovery.resource, extensions: { ...required.extensions, ...discovery.extensions } };
+}
+
 /** Encoded size, in bytes, of a `PAYMENT-REQUIRED` header carrying `required`. */
 export function encodedPaymentRequiredBytes(required: PaymentRequiredV2): number {
   return encodePaymentRequiredHeader(required).length;
@@ -175,15 +233,20 @@ export function encodedPaymentRequiredBytes(required: PaymentRequiredV2): number
 
 /**
  * Throw when `required` would encode to a `PAYMENT-REQUIRED` header over the
- * limit. `label` names the capability, such as `capability "fetch"`.
+ * limit. `label` names the capability, such as `capability "fetch"`;
+ * `remedy` names what the builder can shorten.
  */
-export function assertPaymentRequiredFits(label: string, required: PaymentRequiredV2): void {
+export function assertPaymentRequiredFits(
+  label: string,
+  required: PaymentRequiredV2,
+  remedy = "the description, example, outputExample or input schema"
+): void {
   const bytes = encodedPaymentRequiredBytes(required);
   if (bytes > X402_PAYMENT_REQUIRED_MAX_BYTES) {
     throw new Error(
       `${label} channels.x402.listing makes the encoded PAYMENT-REQUIRED header ${bytes} bytes, ` +
         `over the ${X402_PAYMENT_REQUIRED_MAX_BYTES}-byte limit (8 KiB less 1 KiB for the paid ` +
-        "retry's PAYMENT-SIGNATURE echo); shorten the description, example, outputExample or input schema"
+        `retry's PAYMENT-SIGNATURE echo); shorten ${remedy}`
     );
   }
 }

@@ -9,6 +9,7 @@ import { ListenChannel } from "../../lib/listen-channel";
 import type { Message } from "../../lib/messages/types";
 import type { JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
+import type { CapabilityChannel } from "../types";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import { JobEndedError } from "./job-store";
@@ -318,6 +319,11 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pieces JSONB;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS settlement JSONB;
 
+      -- The channel a job was admitted on; NULL is the dvmkit protocol, which
+      -- every row written before channels existed was. Capability names are
+      -- unique only within a channel, so dispatch reads both columns.
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS channel TEXT;
+
       -- Whether a draw-backed terminal job's revenue was decided: booked into
       -- the reporter outbox, or found to owe none. Terminal revenue recovery
       -- books the rest. Rows that existed when the column arrived: completed
@@ -583,8 +589,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         request_fingerprint, requester_pubkey, request_id, credit_id, draw_id,
         pending_payment_fiat_micro, pending_payment_fiat_currency, auth_request_path,
         funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment,
-        pieces
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53)
+        pieces, channel
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53,$54)
       ON CONFLICT (id) DO UPDATE SET
         terminal_at_ms = COALESCE(jobs.terminal_at_ms, EXCLUDED.terminal_at_ms),
         ended_by = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.ended_by ELSE EXCLUDED.ended_by END,
@@ -727,6 +733,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         record.upfrontPayment ? JSON.stringify(record.upfrontPayment) : null,
         // INSERT-only: after insert the transactional paths own the piece list.
         record.pieces ? JSON.stringify(record.pieces) : null,
+        // INSERT-only: a job never changes channel.
+        record.channel ?? null,
       ]
     );
     let rowCount: number | null;
@@ -1966,6 +1974,7 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     // here. Fall back to "" so reactivation lookups surface a clear
     // "unknown capability" error rather than crashing on a typed read.
     capability: (row.capability ?? "") as string,
+    ...(row.channel != null && { channel: row.channel as CapabilityChannel }),
     input: row.input as string,
     params: row.params as Record<string, string>,
     requesterId: row.requester_id as string,

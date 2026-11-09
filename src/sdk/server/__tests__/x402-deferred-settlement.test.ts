@@ -145,12 +145,12 @@ function answerSettle(r: Rig, body: Record<string, unknown>): void {
   Object.assign(r.settleBody, { network: X402.network }, body);
 }
 
-function admit(r: Rig, header: string | undefined, jobId: string): Promise<PaymentInfo & { error?: { status: number; body: Record<string, unknown>; x402Requirements?: { maxTimeoutSeconds: number }[] } }> {
+function admit(r: Rig, header: string | undefined, jobId: string, settleByMs?: number): Promise<PaymentInfo & { error?: { status: number; body: Record<string, unknown>; x402Requirements?: { maxTimeoutSeconds: number }[] } }> {
   return verifyUpfrontPayment({
     x402Payment: header,
     x402Config: X402,
     x402ExactSettlement: r.settlement,
-    x402Deferred: { maxRuntimeSeconds: RUNTIME_SECONDS, settler: r.settler },
+    x402Deferred: { maxRuntimeSeconds: RUNTIME_SECONDS, settler: r.settler, ...(settleByMs !== undefined && { settleByMs }) },
     requiredMsats: PRICE_MSATS,
     priceFiat: { currency: "usd", amountMicro: PRICE_MICRO },
     creditLedger: r.ledger,
@@ -684,6 +684,62 @@ describe("unsigned x402 whose settlement outcome is not known", () => {
       expect(terminal).not.toHaveBeenCalled();
       jobs.shutdown();
     });
+  });
+
+  describe("a settle window that has closed", () => {
+    it("releases an authorization never sent, without calling the facilitator", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-unsent", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      expect(await r.settler.settle(intentId)).toBe("unpaid");
+
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+      expect(await r.store.get(DVM_ID, intentId)).toMatchObject({ status: "released", lastOutcome: "settle_window_closed" });
+    });
+
+    it("settles, not reports unpaid, when a concurrent attempt claimed the intent before the release", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-raced", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      const release = r.store.release.bind(r.store);
+      vi.spyOn(r.store, "release").mockImplementation(async (args) => {
+        // Another attempt, past its own window check, marks the intent submitting first.
+        await r.store.markSubmitting({ dvmId: DVM_ID, intentId, submissionBlock: "100" });
+        return release(args);
+      });
+
+      expect(await r.settler.settle(intentId)).toBe("settled");
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+    });
+
+    it("keeps the authorization when the release is not recorded, so a retry can release it", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-unrecorded", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      vi.spyOn(r.store, "release").mockRejectedValueOnce(new Error("database unavailable"));
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow("database unavailable");
+      expect(r.settler.holds(intentId)).toBe(true);
+
+      expect(await r.settler.settle(intentId)).toBe("unpaid");
+      expect(r.settler.holds(intentId)).toBe(false);
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+    });
+
+    it.each(["ambiguous", "settled"] as const)(
+      "still settles an authorization already submitted (%s), since money may have moved",
+      async (status) => {
+        const r = rig();
+        const payment = await admit(r, authorization(60), `job-window-${status}`, Date.now() - 1);
+        const intentId = await strand(r, payment, status);
+
+        expect(await r.settler.settle(intentId)).toBe("settled");
+
+        expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      }
+    );
   });
 
   describe("a settlement the facilitator reports as pending", () => {

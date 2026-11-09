@@ -4,7 +4,7 @@ import type { ProofLike } from "@cashu/cashu-ts";
 import type { Message, MessageType } from "../../lib/messages/types";
 import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
-import type { FundingMethod } from "../types";
+import type { CapabilityChannel, FundingMethod } from "../types";
 import type { CreditSnapshot } from "./credit-ledger";
 import type { JobPiece, JobSettlement, PieceEnding } from "./pieces";
 
@@ -25,6 +25,13 @@ export interface JobRecord {
    * so reactivation on another machine routes to the same handler.
    */
   capability: string;
+  /**
+   * Channel the job was admitted on: `"x402"` for `POST /v1/x402/<capability>`.
+   * Absent means the dvmkit protocol, as on every job admitted before channels
+   * existed. Names are unique only within a channel, so `capability` names a
+   * definition only together with this. Written at insert and never changed.
+   */
+  channel?: CapabilityChannel;
   input: string;
   params: Record<string, string>;
   requesterId: string;

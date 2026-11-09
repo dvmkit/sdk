@@ -23,6 +23,8 @@ export interface RevenueReportPayload {
    * dispatch; absence must not be rewritten as a capability name.
    */
   capability?: string;
+  /** `"x402"` for a job admitted on the x402 channel, whose capability names are separate from the dvmkit protocol's; omitted for the dvmkit protocol. */
+  channel?: "x402";
   /** Total amount paid by the caller in millisatoshis, across all credits that satisfied the job. */
   paidMsats: number;
   /** Cashu mint URL from which the payment tokens were issued. Set only for the `cashu` rail; omitted for all other rails. */
@@ -112,6 +114,8 @@ export interface JobTerminalReportPayload {
   dvmId: string;
   jobId: string;
   capability: string;
+  /** `"x402"` for a job admitted on the x402 channel, whose capability names are separate from the dvmkit protocol's; omitted for the dvmkit protocol. */
+  channel?: "x402";
   outcome: "completed" | "failed" | "cancelled";
   endedBy: "caller" | "provider" | null;
   paid: boolean;
@@ -155,6 +159,8 @@ export interface JobCostReportPayload {
   jobId: string;
   /** Capability selected by dispatch; absent only on legacy persisted jobs. */
   capability?: string;
+  /** `"x402"` for a job admitted on the x402 channel, whose capability names are separate from the dvmkit protocol's; omitted for the dvmkit protocol. */
+  channel?: "x402";
   /** Terminal outcome that explains why this event carries no revenue. */
   outcome: "completed" | "failed" | "cancelled";
   /**
@@ -457,6 +463,8 @@ export interface PaidJobDeathPayload {
   dvmId: string;
   jobId: string;
   capability: string;
+  /** `"x402"` for a job admitted on the x402 channel, whose capability names are separate from the dvmkit protocol's; omitted for the dvmkit protocol. */
+  channel?: "x402";
   /** Amount of the released credit draw in millisatoshis. */
   paidMsats: number;
   /** Payment rail of the released draw (`"cashu"`, `"tempo"`, `"x402"`). */

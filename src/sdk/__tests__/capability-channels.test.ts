@@ -214,12 +214,14 @@ describe("capability channels", () => {
     expect(booted.tags).toEqual(["web"]);
   });
 
-  it("refuses a DVM offered only on x402 as a current limitation", () => {
-    expect(() => configureDVM({
+  it("configures a DVM offered only on x402, with no dvmkit-protocol capability", () => {
+    const dvm = configureDVM({
       name: "example",
       x402,
       capabilities: { fetch: { channels: { job: false, x402: {} }, price: "$0.01", maxRuntimeSeconds: 5, onJob } },
-    })).toThrow("A DVM offered only on x402 is not supported yet; this is a current limitation of the SDK.");
+    });
+    expect(dvm.capabilities).toEqual({});
+    expect(capabilityForChannel(dvm, "fetch", "x402")?.name).toBe("fetch");
   });
 
   it("requires maxRuntimeSeconds and x402 configuration on the x402 channel", () => {

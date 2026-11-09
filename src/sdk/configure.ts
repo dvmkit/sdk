@@ -1,6 +1,13 @@
 import { CAPABILITY_NAME_RE } from "../lib/wire-schema";
-import { assertPaymentRequiredFits, assertX402Listing, buildX402Discovery } from "../lib/x402/bazaar";
-import { buildPaymentRequirements, paymentRequiredV2FromV1, X402_V1_VERSION } from "../lib/x402/spec";
+import {
+  assertPaymentRequiredFits,
+  assertX402Listing,
+  X402_SIZE_CHECK_AMOUNT,
+  X402_SIZE_CHECK_ERROR,
+  X402_SIZE_CHECK_ORIGIN,
+  X402_SIZE_CHECK_TIMEOUT_SECONDS,
+  x402ChannelPaymentRequired,
+} from "../lib/x402/bazaar";
 import { resolveCashuConfig } from "./cashu-locktime";
 import { CAPABILITY_SIGNED_FIELDS, missingSignedSchemaFields } from "./signed-envelope-schema";
 import { type Currency, InvalidCurrencyError, validateCurrency } from "./pricing/currency";
@@ -345,10 +352,7 @@ function deepFreeze<T>(value: T): T {
 /**
  * Split definitions into the dvmkit-protocol map, which `/v1/job` and
  * `/v1/info` read unchanged, and the x402 map. Names are unique within each.
- *
- * A DVM must still offer at least one definition on the dvmkit protocol:
- * x402-only DVMs are a current limitation, refused until the host serves an
- * empty dvmkit-protocol capability map.
+ * Either map may be empty, since every definition offers at least one channel.
  */
 function partitionByChannel(definitions: CapabilityDefinition[]): {
   capabilities: Record<string, CapabilityDefinition>;
@@ -370,25 +374,8 @@ function partitionByChannel(definitions: CapabilityDefinition[]): {
     if (entry.def.channels.job) place(capabilities, entry, "the dvmkit protocol");
     if (entry.def.channels.x402) place(x402, entry, "the x402 channel");
   }
-  if (Object.keys(capabilities).length === 0) {
-    throw new Error(
-      "configureDVM: at least one capability must be offered on the dvmkit protocol " +
-        "(leave channels unset or set channels.job: true). A DVM offered only on x402 is not " +
-        "supported yet; this is a current limitation of the SDK."
-    );
-  }
   return { capabilities, x402Capabilities: x402 };
 }
-
-/**
- * Stand-ins for the parts of the x402 challenge that are unknown before the
- * server starts: an origin longer than typical public origins, the largest
- * unsigned 64-bit amount, a four-digit timeout and an `error` longer than any
- * the payment path writes on a 402.
- */
-const SIZE_CHECK_ORIGIN = `https://${"x".repeat(100)}.example.com`;
-const SIZE_CHECK_AMOUNT = 18_446_744_073_709_551_615n;
-const SIZE_CHECK_ERROR = "x".repeat(256);
 
 /** Boot checks for one definition offered on the x402 channel. */
 function assertX402ChannelDefinition(
@@ -440,26 +427,21 @@ function assertX402ChannelDefinition(
       );
     }
   }
-  const discovery = buildX402Discovery({ name: def.name, listing, input: def.input, publicOrigin: SIZE_CHECK_ORIGIN });
-  // The x402 channel's 402 offers the exact scheme on the configured network,
-  // built the way the payment path builds it: v1 requirements lifted to v2.
-  const required = paymentRequiredV2FromV1(
-    [
-      buildPaymentRequirements({
-        x402Config,
-        requiredUsdcMicro: SIZE_CHECK_AMOUNT,
-        resource: discovery.resource.url,
-        maxTimeoutSeconds: 3600,
-        version: X402_V1_VERSION,
-      }),
-    ],
-    SIZE_CHECK_ERROR
+  // The server reruns this at boot with its public origin, the route's own
+  // timeout and a fixed price; see `assertX402RoutesServable` in server/app.ts.
+  assertPaymentRequiredFits(
+    label,
+    x402ChannelPaymentRequired({
+      name: def.name,
+      listing,
+      input: def.input,
+      x402Config,
+      publicOrigin: X402_SIZE_CHECK_ORIGIN,
+      requiredUsdcMicro: X402_SIZE_CHECK_AMOUNT,
+      maxTimeoutSeconds: X402_SIZE_CHECK_TIMEOUT_SECONDS,
+      error: X402_SIZE_CHECK_ERROR,
+    })
   );
-  assertPaymentRequiredFits(label, {
-    ...required,
-    resource: discovery.resource,
-    extensions: { ...required.extensions, ...discovery.extensions },
-  });
 }
 
 /**

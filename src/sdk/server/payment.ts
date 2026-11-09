@@ -281,7 +281,12 @@ export interface UpfrontPaymentOpts {
    * send it for settlement only when the job succeeds. Requires
    * {@link x402ExactSettlement} and a credit ledger.
    */
-  x402Deferred?: { maxRuntimeSeconds: number; settler: DeferredX402Settler };
+  x402Deferred?: {
+    maxRuntimeSeconds: number;
+    settler: DeferredX402Settler;
+    /** Passed to the held authorization; see `HeldX402Authorization.settleByMs`. */
+    settleByMs?: number;
+  };
   /** Reusable channel acceptor. Only consulted for fund-only `/v1/credit` requests. */
   x402BatchSettlement?: X402BatchSettlementServer;
   /**
@@ -5601,9 +5606,14 @@ async function acceptDeferredExactUpfront(args: {
     );
   }
   if (prepared.outcome === "authorization_too_short") {
+    // The caller chose `validBefore`, and the message becomes the challenge's
+    // `error`, so only a plausible Unix time is echoed back.
+    const until = /^\d{1,16}$/.test(prepared.validBefore)
+      ? `valid until ${prepared.validBefore}`
+      : "with a validBefore that is not a usable Unix time";
     return refuse(
       paymentErrorBody("payment_authorization_too_short", {
-        message: `x402 authorization valid until ${prepared.validBefore} is shorter than the ${window.minValidSeconds} seconds this job needs.`,
+        message: `x402 authorization ${until} is shorter than the ${window.minValidSeconds} seconds this job needs.`,
         extra: { required_valid_seconds: window.minValidSeconds },
       })
     );
@@ -5623,6 +5633,7 @@ async function acceptDeferredExactUpfront(args: {
     config: args.config,
     btcUsdRate: args.btcUsdRate,
     validBeforeMs: prepared.validBeforeMs,
+    ...(args.deferred.settleByMs !== undefined && { settleByMs: args.deferred.settleByMs }),
   });
   return {
     paidMsats,

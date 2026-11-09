@@ -764,9 +764,8 @@ export interface X402ChannelConfig {
  * - `{ job: false, x402: {} }` — the x402 channel only.
  * - `{ job: true, x402: {} }` — both, served by this one definition.
  *
- * A DVM must offer at least one definition on the dvmkit protocol. A DVM
- * offered only on x402 is a current limitation of this SDK version and fails
- * configuration.
+ * A DVM may offer every definition on x402 alone; its `/v1/job` then serves
+ * no capability.
  */
 export interface CapabilityChannels {
   /** The dvmkit protocol: `/v1/info`, `/v1/quote` and `/v1/job`. */
@@ -1190,7 +1189,8 @@ export interface DVMDescriptor<
    * keyed by published name. The `/v1/job` runtime operates on this map:
    * single-capability DVMs have one entry keyed by `config.capability`;
    * multi-capability DVMs have one entry per dvmkit-protocol definition in
-   * `config.capabilities`.
+   * `config.capabilities`. Empty when every definition is offered on x402
+   * alone.
    *
    * Typed as `<any, any>` so consumers can pass a typed test context to
    * `descriptor.capabilities[name].onJob(ctx)` without re-casting — the

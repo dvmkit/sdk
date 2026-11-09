@@ -262,9 +262,8 @@ export class X402ExactSettlementServer {
   }): Promise<X402ExactAcceptance<T>> {
     const { intentId, payload, requirements } = args;
     let intent = await this.requiredIntent(args.dvmId, intentId);
-    if (intent.status === "released") {
-      return { outcome: "rejected", intentId, reason: intent.lastOutcome ?? "released" };
-    }
+    const refused = givenUp(intent);
+    if (refused) return refused;
     if (intent.status === "complete") {
       return {
         outcome: "accepted",
@@ -284,9 +283,6 @@ export class X402ExactSettlementServer {
         admissionPending: true,
         effect: intent.effect,
       };
-    }
-    if (intent.status === "rejected") {
-      return { outcome: "rejected", intentId, reason: intent.lastOutcome ?? "settle_failed" };
     }
     if (intent.status === "submitting" || intent.status === "ambiguous") {
       const recovered = await this.recoverEvidence(intent);
@@ -345,6 +341,10 @@ export class X402ExactSettlementServer {
       if (!claimed) {
         this.activeSubmissions.delete(intentId);
         intent = await this.requiredIntent(args.dvmId, intentId);
+        // Released or refused while the bookmark was read: this attempt sent
+        // nothing, and the stored outcome stands.
+        const lost = givenUp(intent);
+        if (lost) return lost;
         const recovered = await this.recoverEvidence(intent);
         return recovered
           ? this.finalize(recovered, args.btcUsdRate, args.commit)
@@ -726,6 +726,19 @@ function decodeAndDescribe(args: {
   };
 }
 
+/** The refusal an intent already given up stands for: released unsent, or refused by the facilitator. */
+function givenUp(
+  intent: X402ExactSettlementIntent
+): { outcome: "rejected"; intentId: string; reason: string } | undefined {
+  if (intent.status === "released") {
+    return { outcome: "rejected", intentId: intent.id, reason: intent.lastOutcome ?? "released" };
+  }
+  if (intent.status === "rejected") {
+    return { outcome: "rejected", intentId: intent.id, reason: intent.lastOutcome ?? "settle_failed" };
+  }
+  return undefined;
+}
+
 function receiptFromIntent(intent: X402ExactSettlementIntent, btcUsdRate: number): X402Receipt {
   const amountUsdcMicro = Number.parseInt(intent.value, 10);
   const response = (intent.settleResponse ?? {
@@ -770,7 +783,20 @@ export interface HeldX402Authorization {
   config: X402Config;
   btcUsdRate: number;
   validBeforeMs: number;
+  /**
+   * Latest time, in epoch milliseconds, a settlement may start. A caller
+   * waiting in the paying request is answered by a deadline; a settlement
+   * started later could finish after that answer and charge a caller who was
+   * told the job failed, so past this the authorization is released unsent.
+   */
+  settleByMs?: number;
 }
+
+/**
+ * Release reason recorded when a job finished too late in its request's time
+ * budget for a settlement to complete; see `HeldX402Authorization.settleByMs`.
+ */
+export const DEFERRED_X402_SETTLE_WINDOW_CLOSED = "settle_window_closed";
 
 /** How a finished job's deferred authorization ended. */
 export type DeferredX402Outcome = "settled" | "unpaid";
@@ -784,8 +810,12 @@ export interface DeferredX402Settler {
    * unknown, so the caller retries.
    */
   settle(intentId: string): Promise<DeferredX402Outcome>;
-  /** Give up the authorization without sending it to the facilitator. */
-  release(intentId: string, reason: string): Promise<void>;
+  /**
+   * Give up the authorization without sending it to the facilitator. Resolves
+   * false when the intent is no longer `prepared`, such as when a settlement
+   * claimed it first.
+   */
+  release(intentId: string, reason: string): Promise<boolean>;
 }
 
 /**
@@ -843,6 +873,18 @@ export class InProcessDeferredX402Settler implements DeferredX402Settler {
       }
       return resolved.outcome;
     }
+    // Only an authorization never sent can be released: once one was
+    // submitted, money may have moved, and a retry must reach the facilitator.
+    // A release that loses to a concurrent submission falls through, so that
+    // submission's outcome decides.
+    if (
+      intent?.status === "prepared" &&
+      held.settleByMs !== undefined &&
+      Date.now() > held.settleByMs &&
+      (await this.release(intentId, DEFERRED_X402_SETTLE_WINDOW_CLOSED))
+    ) {
+      return "unpaid";
+    }
     const result = await settlement.settlePrepared({
       dvmId,
       intentId,
@@ -859,9 +901,17 @@ export class InProcessDeferredX402Settler implements DeferredX402Settler {
     return result.outcome === "accepted" ? "settled" : "unpaid";
   }
 
-  async release(intentId: string, reason: string): Promise<void> {
-    this.held.delete(intentId);
-    await this.opts.settlement.release(this.opts.dvmId, intentId, reason);
+  async release(intentId: string, reason: string): Promise<boolean> {
+    // The hold goes only once the store records the release, so a failed
+    // write leaves the authorization for a retry to release or settle.
+    const released = await this.opts.settlement.release(this.opts.dvmId, intentId, reason);
+    if (released) this.held.delete(intentId);
+    return released;
+  }
+
+  /** Whether this process still holds the intent's authorization, so it alone could settle it. */
+  holds(intentId: string): boolean {
+    return this.held.has(intentId);
   }
 }
 
