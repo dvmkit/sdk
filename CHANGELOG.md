@@ -109,6 +109,33 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.30.0](https://github.com/dvmkit/sdk/compare/v0.29.0...v0.30.0) (2026-11-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* declare capability channels and x402 Bazaar listings
+* **server:** a `name` or `channels` key on a capability entry, previously ignored, now takes effect, so it either changes the capability's published name or fails configuration with a message naming the field.
+* **x402:** bound every caller-facing settle response and cap the x402 deadline at the gateway's limit
+* **server:** processX402BatchResponseForWallet requires channelId, and processX402BatchResponse drops the answer's channel state when no channel was passed or recorded by createX402BatchPayment.
+
+### Features
+
+* declare capability channels and x402 Bazaar listings ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **server:** answer a paid x402 request at POST /v1/x402/&lt;capability&gt; in one response ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **server:** list x402 capabilities in discovery catalogs and own every facilitator payload ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+
+
+### Bug Fixes
+
+* **server:** refuse interactive asks on deferred x402 jobs and reserve x402d credit ids ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **x402:** bound every caller-facing settle response and cap the x402 deadline at the gateway's limit ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+
+
+### Miscellaneous Chores
+
+* **api:** record the job type's handler deadline in the declaration surface ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+
 ## [0.29.0](https://github.com/dvmkit/sdk/compare/v0.28.0...v0.29.0) (2026-11-08)
 
 ### ⚠ BREAKING CHANGES
