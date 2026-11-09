@@ -28,6 +28,13 @@ const ROUTE_TEMPLATES = [...catalogue.routeTemplates].sort(
   compareRouteTemplates,
 );
 const ERROR_CODES = new Set<string>(catalogue.errorCodes);
+const POSTGRES_ERROR_CODES = new Set<string>(catalogue.postgresErrorCodes);
+const POSTGRES_ERROR_EVENTS = new Set([
+  "job_messages_listen_lost",
+  "job_messages_listen_connect_failed",
+  "postgres_pool_error",
+  "postgres_client_error",
+]);
 const DATASETS = new Set<string>(catalogue.datasets);
 const LEVELS = new Set<string>(catalogue.levels);
 const STATUSES = new Set<string>(catalogue.statuses);
@@ -464,7 +471,8 @@ function projectField(
     return typeof value === "string" && DATASETS.has(value) ? value : undefined;
   if (key === "error.code" || key === "error_code" || key === "code") {
     if (typeof value !== "string") return undefined;
-    return ERROR_CODES.has(value)
+    return ERROR_CODES.has(value) ||
+      (eventName !== undefined && POSTGRES_ERROR_EVENTS.has(eventName) && POSTGRES_ERROR_CODES.has(value))
       ? value
       : key === "error.code" || key === "error_code"
         ? "unknown_error"

@@ -17,6 +17,8 @@ export interface ListenChannelOpts {
    * `attempt` is the failed attempt's index (0-based).
    */
   onReconnectFailed?: (attempt: number, err: unknown) => void;
+  /** Fired after LISTEN succeeds following a loss or failed connection attempt. */
+  onRestored?: (downtimeMs: number) => void;
   /** Override the default `[1s, 4s, 15s, 30s]` backoff schedule. Min length 1. */
   backoffMs?: readonly number[];
 }
@@ -27,8 +29,8 @@ export interface ListenChannelOpts {
  * Holds one pool client open for the channel's lifetime. On disconnect the
  * client is released with the error and a fresh client is acquired according
  * to `backoffMs`. The signal is an optimisation, not a correctness gate —
- * callers should still have a fallback (TTL cache, periodic poll) for the
- * window during which the listen connection is down.
+ * callers should recover the gap through onRestored or another fallback
+ * (TTL cache, periodic poll).
  *
  * Router invalidation and live span streams share these backoff/reconnect
  * semantics.
@@ -38,6 +40,7 @@ export class ListenChannel {
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  private disconnectedAt: number | null = null;
   private readonly backoffMs: readonly number[];
 
   constructor(
@@ -60,6 +63,8 @@ export class ListenChannel {
   /** Release the LISTEN client and cancel any pending reconnect. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.disconnectedAt = null;
+    this.reconnectAttempt = 0;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -171,10 +176,17 @@ export class ListenChannel {
       if (notification.channel !== this.opts.channel) return;
       this.opts.onNotification(notification.payload);
     });
+
+    if (this.disconnectedAt !== null) {
+      const downtimeMs = Math.max(0, Date.now() - this.disconnectedAt);
+      this.disconnectedAt = null;
+      this.opts.onRestored?.(downtimeMs);
+    }
   }
 
   private scheduleReconnect(): void {
     if (this.stopped) return;
+    this.disconnectedAt ??= Date.now();
     if (this.reconnectTimer) return;
     const idx = Math.min(this.reconnectAttempt, this.backoffMs.length - 1);
     const delay = this.backoffMs[idx];

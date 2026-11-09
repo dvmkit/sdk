@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 
 import { ListenChannel } from "../../lib/listen-channel";
+import { postgresErrorCode } from "../../lib/pg-retry";
 import type { Message } from "../../lib/messages/types";
 import type { JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
@@ -1718,22 +1719,27 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       onNotification: (payload) => {
         this.dispatch(payload);
       },
-      onLost: (_err) => {
+      onLost: (err) => {
         diagnosticConsole.warn(
           {
             level: "job_messages_listen_lost",
-            error: undefined,
+            error_code: postgresErrorCode(err),
           }
         );
       },
-      onReconnectFailed: (attempt, _err) => {
+      onReconnectFailed: (attempt, err) => {
         diagnosticConsole.warn(
           {
             level: "job_messages_listen_connect_failed",
             attempt,
-            error: undefined,
+            error_code: postgresErrorCode(err),
           }
         );
+      },
+      onRestored: (downtimeMs) => {
+        diagnosticConsole.info({ event: "job_messages_listen_restored", elapsed_ms: downtimeMs });
+        const jobIds = new Set([...this.messageSubscribers.keys(), ...this.notifySubscribers.keys()]);
+        for (const jobId of jobIds) this.dispatch(jobId);
       },
     });
     await this.listenChannel.start();

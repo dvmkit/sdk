@@ -62,6 +62,21 @@ describe("diagnosticConsole", () => {
     });
   });
 
+  it.each(["57P01", "08006", "ECONNRESET", "ETIMEDOUT"])(
+    "retains connection code %s only on Postgres connection events",
+    (code) => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      for (const event of ["postgres_client_error", "postgres_pool_error", "job_messages_listen_lost", "job_messages_listen_connect_failed"]) {
+        emitDiagnostic("error", event, { error_code: code, error: "SENTINEL_SECRET" });
+        expect(JSON.parse(String(error.mock.calls.at(-1)?.[0]))).toEqual({ event, level: "error", error_code: code });
+      }
+      emitDiagnostic("error", "admin_lock_state_unavailable", { error_code: code });
+      expect(JSON.parse(String(error.mock.calls.at(-1)?.[0]))).toEqual({
+        event: "admin_lock_state_unavailable", level: "error", error_code: "unknown_error",
+      });
+    },
+  );
+
   it("retains amended static events and approved lowercase/numeric aliases", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
