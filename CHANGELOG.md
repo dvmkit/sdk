@@ -113,6 +113,17 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.31.0](https://github.com/dvmkit/sdk/compare/v0.30.0...v0.31.0) (2026-11-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** LightningReceive gains ensureFresh(), and the railHealth option of LightningReceiveConfig gains an optional ensureFresh(). Both are additive; declarations that reference these types change signature with them.
+
+### Bug Fixes
+
+* **server:** keep Lightning in the credit funding menu after the DVM has been idle ([#130](https://github.com/dvmkit/sdk/issues/130)) ([56100d3](https://github.com/dvmkit/sdk/commit/56100d3bedbbd8775e54e542263d2c684f31bebc))
+
 ## [0.30.0](https://github.com/dvmkit/sdk/compare/v0.29.0...v0.30.0) (2026-11-09)
 
 
