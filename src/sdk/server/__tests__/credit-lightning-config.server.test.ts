@@ -219,27 +219,32 @@ describe("receive-only credential validation", () => {
     expect(stub.requests).toHaveLength(0);
   });
 
-  it("logs one unreachable event when a healthy connection's refresh fails", async () => {
+  it("logs one unreachable event when a healthy connection's refreshes keep failing", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     stub = await startNip47Stub({ methods: RECEIVE_ONLY });
     const receive = await LightningReceive.create({ uri: stub.uri });
     if (!receive) throw new Error("test receive wallet was not constructed");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const logged = (event: string) =>
+      warn.mock.calls.filter(([line]) => String(line).includes(event));
 
     stub.setFault({ mode: "relay-down" });
     vi.setSystemTime(Date.now() + 60_001);
     expect(receive.available()).toBe(true);
     receive.available();
     await vi.waitFor(() => {
-      expect(
-        warn.mock.calls.filter(([line]) => String(line).includes("lightning_receive_unreachable"))
-      ).toHaveLength(1);
+      expect(logged("lightning_receive_probe_failed")).toHaveLength(1);
+    });
+
+    // One failed probe is a strike, not an outage; the next read sends the confirming probe.
+    expect(receive.available()).toBe(true);
+    receive.available();
+    await vi.waitFor(() => {
+      expect(logged("lightning_receive_unreachable")).toHaveLength(1);
     });
 
     expect(receive.available()).toBe(false);
-    expect(
-      warn.mock.calls.filter(([line]) => String(line).includes("lightning_receive_unreachable"))
-    ).toHaveLength(1);
+    expect(logged("lightning_receive_unreachable")).toHaveLength(1);
   });
 
   it("keeps a spend-capable recovery unavailable and emits an operator-safe reason", async () => {

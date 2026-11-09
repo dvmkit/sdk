@@ -2404,8 +2404,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   ): Promise<CreditMenu | undefined> {
     // Same reason as `/v1/info`: `creditMppMethods()` withholds
     // `tempo/session` on an unconfirmed observer, so the confirmation has to
-    // have been attempted before the menu is built rather than after.
-    await this.ensureTempoSessionHealth();
+    // have been attempted before the menu is built rather than after. Lightning
+    // health aged out by an idle spell gets the same bounded chance, in parallel
+    // so the two waits share one worst case.
+    await Promise.all([
+      this.ensureTempoSessionHealth(),
+      this.opts.lightningReceive?.ensureFresh(),
+    ]);
     const mppSplit = this.creditMppSplit();
     const menu = await buildCreditMenu({
       runtime: "container",

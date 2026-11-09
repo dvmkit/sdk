@@ -69,6 +69,15 @@ export const MIN_INVOICE_TTL_SECONDS = 600;
 const HEALTH_TTL_MS = 60_000;
 
 /**
+ * Longest a funding menu waits for stale Lightning health before answering from the cache.
+ * It matches the Tempo observer's probe ceiling, so the menu's parallel waits share one worst
+ * case, and sits under {@link WALLET_TIMEOUT_MS}: a healthy wallet answers `get_info` in well
+ * under a second including relay connection, while a hung one falls back here instead of
+ * holding the request for the full wallet deadline.
+ */
+export const LIGHTNING_HEALTH_WAIT_MS = 2_000;
+
+/**
  * Wallet deadline in milliseconds. These operations run on caller requests; an unreachable
  * wallet should not consume the ordinary long wallet timeout.
  */
@@ -138,7 +147,10 @@ export class LightningReceive {
 
   private health: LightningReceiveHealth;
   private checkedAtMs: number;
-  private refreshing = false;
+  private refreshInFlight: Promise<void> | undefined;
+  /** A healthy receive's first probe transport failure, waiting for the next probe to confirm it. */
+  private probeStrike = false;
+  private freshness: { settled: Promise<void>; deadlineMs: number } | undefined;
   private spendOverrideWarned = false;
   private readonly allowSpendEnabled: boolean;
   private permissionRefusal: ReceivePermissionError | undefined;
@@ -245,6 +257,46 @@ export class LightningReceive {
   available(): boolean {
     if (Date.now() - this.checkedAtMs > HEALTH_TTL_MS) void this.refresh();
     return this.health === "healthy" && (this.railHealth?.available() ?? true);
+  }
+
+  /**
+   * Give stale negative health one bounded chance to recover before a funding menu reads
+   * {@link available}. Waits on the wallet probe only when an unreachable observation is past
+   * its TTL, and on the rail-health source only when it offers a refresh that could restore it;
+   * a stale healthy answer is served as is and revalidated in the background. Concurrent
+   * callers share one refresh and one deadline, so no caller waits longer than
+   * {@link LIGHTNING_HEALTH_WAIT_MS}; past it, the refresh continues and the cache answers.
+   */
+  async ensureFresh(): Promise<void> {
+    let round = this.freshness;
+    if (!round) {
+      const waits: Promise<void>[] = [];
+      const probing =
+        this.health === "unreachable" && Date.now() - this.checkedAtMs > HEALTH_TTL_MS;
+      if (probing) waits.push(this.refresh());
+      // The rail signal can change the answer only when the wallet is, or may become, healthy;
+      // a refused or freshly unreachable wallet withholds Lightning whatever the rail says.
+      const rail = this.health === "healthy" || probing ? this.railFreshness() : undefined;
+      if (rail) waits.push(rail);
+      if (waits.length === 0) return;
+      const settled = Promise.allSettled(waits).then(() => undefined);
+      const started = { settled, deadlineMs: Date.now() + LIGHTNING_HEALTH_WAIT_MS };
+      this.freshness = started;
+      void settled.then(() => {
+        if (this.freshness === started) this.freshness = undefined;
+      });
+      round = started;
+    }
+    await settleWithin(round.settled, round.deadlineMs - Date.now());
+  }
+
+  /** A rail-health hook that throws offers nothing to wait on rather than failing the menu. */
+  private railFreshness(): Promise<void> | undefined {
+    try {
+      return this.railHealth?.ensureFresh?.();
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -545,10 +597,14 @@ export class LightningReceive {
     return PERMANENT_SETTLE_FAILURES.has(err.code) ? err.code : undefined;
   }
 
+  /**
+   * Run one wallet operation. An invoice operation's outcome updates health directly; a
+   * permission probe's outcome is classified by {@link refresh}.
+   */
   private async withBackend<T>(
     fn: (backend: LightningBackend) => Promise<T>,
     timeoutMs?: number,
-    recordSuccess = true
+    probe = false
   ): Promise<T> {
     try {
       let result: T;
@@ -561,20 +617,22 @@ export class LightningReceive {
         // relay sockets instead of reconnecting per lookup.
         result = await withNwcPool(conn, (opts) => fn(new NwcBackend(conn, opts)), timeoutMs);
       }
-      if (recordSuccess) this.noteOperationOk();
+      if (!probe) this.noteOperationOk();
       return result;
     } catch (err) {
-      this.noteFailure(err);
+      if (!probe) this.noteFailure(err);
       throw err;
     }
   }
 
   private noteOperationOk(): void {
+    this.probeStrike = false;
     if (this.health !== "healthy") return;
     this.checkedAtMs = Date.now();
   }
 
   private notePermissionsOk(): void {
+    this.probeStrike = false;
     this.health = "healthy";
     this.permissionRefusal = undefined;
     this.checkedAtMs = Date.now();
@@ -582,6 +640,7 @@ export class LightningReceive {
 
   private notePermissionRefused(refusal: ReceivePermissionError): void {
     const previous = this.permissionRefusal;
+    this.probeStrike = false;
     this.health = "permission_refused";
     this.permissionRefusal = refusal;
     this.checkedAtMs = Date.now();
@@ -599,11 +658,12 @@ export class LightningReceive {
   }
 
   /**
-   * Only a *transport* failure from an ordinary invoice operation is a health
-   * signal. Permission-probe refusals are classified by {@link refresh}.
+   * Only a *transport* failure is a health signal. One from an invoice operation marks the
+   * rail unreachable at once; permission-probe outcomes are classified by {@link refresh}.
    */
   private noteFailure(err: unknown): void {
     if (!isTransportFailure(err)) return;
+    this.probeStrike = false;
     const transitioned = this.health !== "unreachable";
     this.health = "unreachable";
     this.permissionRefusal = undefined;
@@ -624,25 +684,51 @@ export class LightningReceive {
     });
   }
 
-  private async refresh(): Promise<void> {
-    if (this.refreshing) return;
-    this.refreshing = true;
+  private refresh(): Promise<void> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    const probe = this.probeOnce().finally(() => {
+      if (this.refreshInFlight === probe) this.refreshInFlight = undefined;
+    });
+    this.refreshInFlight = probe;
+    return probe;
+  }
+
+  private async probeOnce(): Promise<void> {
     try {
-      const info = await this.withBackend((backend) => backend.getInfo(), WALLET_TIMEOUT_MS, false);
+      const info = await this.withBackend((backend) => backend.getInfo(), WALLET_TIMEOUT_MS, true);
       const methods = validateReceiveMethods(info.methods, this.allowSpend);
       this.warnSpendOverride(methods);
       this.notePermissionsOk();
     } catch (err) {
-      // Transport failures were already recorded by `withBackend`. Everything
-      // else is a successful contact that failed to prove receive-only scope.
-      if (!isTransportFailure(err)) {
-        this.notePermissionRefused(
-          err instanceof ReceivePermissionError ? err : receivePermissionProbeError(err)
-        );
+      if (isTransportFailure(err)) {
+        this.noteProbeTransportFailure(err);
+        return;
       }
-    } finally {
-      this.refreshing = false;
+      // Anything else is a successful contact that failed to prove receive-only scope.
+      this.notePermissionRefused(
+        err instanceof ReceivePermissionError ? err : receivePermissionProbeError(err)
+      );
     }
+  }
+
+  /**
+   * A healthy receive stays advertised through one background probe's transport failure:
+   * after a long idle the first `get_info` can time out on relay reconnection while the next
+   * answers promptly, and dropping the rail on it withholds Lightning for a full TTL. The
+   * second consecutive failure marks it unreachable. `checkedAtMs` is left stale after the
+   * first, so the next caller's {@link available} sends the confirming probe at once rather
+   * than a TTL later. Any successful probe or invoice operation clears the strike.
+   */
+  private noteProbeTransportFailure(err: unknown): void {
+    if (this.health === "healthy" && !this.probeStrike) {
+      this.probeStrike = true;
+      diagnosticConsole.warn({
+        level: "warn",
+        event: "lightning_receive_probe_failed",
+      });
+      return;
+    }
+    this.noteFailure(err);
   }
 }
 
@@ -732,6 +818,22 @@ function receivePermissionHint(): string {
     "connection that permits get_info, get_balance, make_invoice and lookup_invoice without any " +
     "payment capability."
   );
+}
+
+/** Resolve when `promise` settles or after `ms`, whichever is first, leaving no timer behind. */
+async function settleWithin(promise: Promise<void>, ms: number): Promise<void> {
+  if (ms <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function methodName(method: string): string {
