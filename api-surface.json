@@ -1024,7 +1024,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "bd83604f790d875d966cae54286755e4f97d269bf55e3bcef1d300d81dff1052"
+          "signature": "8b1bd96a7a67b2c5bf00c8c90f2e02c4196efb490535a8ada6e48e6ce34a80e9"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1140,7 +1140,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "520681274ec6482b593ce31cab71b9305a35d3cd7d918fdcddc00dd60576f7c0"
+          "signature": "eaa6e1ca0e53090a11665d9f0dd979d7e9ccfdaeed81ec8404a7cfdfbd7da2b8"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1208,7 +1208,7 @@
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "40a888942e7ce82733d07f8776d25e44f4c9097a4800d952fdd0f1dee432989a"
+          "signature": "7b9f053c8feea829b994f3de8b2a2e25e9824afb67caa075f44519a840081bca"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1232,7 +1232,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "9affbfa52a529b2fd28b7f6709dad018d69ebb6d89e5844a083b522eadc1377d"
+          "signature": "3efbe0f74a649e5a0671af18998734c386cc7fe1ffd281327a6d9f874ed7ae9d"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1312,11 +1312,11 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "ad0d6d0aa8758c21e4c8f98506f10690781e151dfa53b83de7c77ea6386adea9"
+          "signature": "d4cdb00825e91dea6b6176c20a63acfb03cb72376885bf04f17af9a94c469a3d"
         },
         "JobManagerOpts": {
           "stability": "experimental",
-          "signature": "87a82d2604c57ecbd291af749aacfb2126504bae63c7e2b858dc61cd424c1ec6"
+          "signature": "ae2f9a9fe928cd7803b4452ea1c31ffeb4f2b11fd18e61471a63be0a966426c4"
         },
         "JobPiece": {
           "stability": "experimental",
@@ -1552,7 +1552,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "e48a80de384ebcbaa9ecdc59830f747e9d453070369e928aa861cdc7478fd402"
+          "signature": "6977120b4516d8faeb7e921052529cdc7df10014db91723a4c356f36a593f9ba"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
