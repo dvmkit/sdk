@@ -93,6 +93,23 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 ## [0.29.0](https://github.com/dvmkit/sdk/compare/v0.28.0...v0.29.0) (2026-11-08)
 
+### ⚠ BREAKING CHANGES
+
+* **auth:** `configureDVM` now rejects, at configuration time, an authenticated capability whose object input schema omits the signed-envelope fields. A DVM with such a schema stops booting instead of answering callers with a signature error. Wrapped schemas that strip supplied fields return a builder-facing HTTP 500 `auth_error`.
+* The public signature gate also flags these optional additions; existing code compiles unchanged: `lightning.allowSpend` on the Lightning receive configuration (default false, also read from `DVMKIT_NWC_RECEIVE_ALLOW_SPEND`) and the `LightningReceive.allowSpend` getter, which reach `DVMConfig`, `configureDVM`, `DVMDescriptor`, `isConfiguredDVMDescriptor`, `serve`, `createDVMHost`, `DVMHost`, `DVMHostOpts`, `JobManager`, `JobManagerOpts`, `handleCreditRequest`, `CreditRouteDeps`, `LightningReceive` and `LightningReceiveConfig`. The x402 settlement names the gate also lists (`createX402BatchSettlementServer`, `CreateX402BatchSettlementServerOpts`, `MemoryX402ExactSettlementStore`, `PostgresX402ExactSettlementStore`, `X402ExactSettlementAttempt`, `X402ExactSettlementEvidenceReader`, `X402ExactSettlementServer`, `X402ExactSettlementServerOpts`, `X402ExactSettlementStore` and `X402SettlementEvidenceReader`) carry the 0.28.0 changes disclosed there; 0.29.0 does not change them.
+
+### Migrations
+
+None. No schema change.
+
+### Compatibility requirements
+
+Unchanged: Node range and dependency floors are the same as 0.28.0.
+
+### dvmctl and platform prerequisites
+
+None. A spend-capable receive connection is refused at boot unless the builder sets `DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true`.
+
 
 ### Features
 
