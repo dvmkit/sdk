@@ -81,7 +81,7 @@ function fundAndDraw(h: Harness, drawId: string) {
   });
 }
 
-function pureDraw(h: Harness, drawId: string) {
+function pureDraw(h: Harness, drawId: string, creditId = "c1") {
   return verifyUpfrontPayment({
     requiredMsats: PRICE_MSATS,
     fxFetcher: warmFetcher(),
@@ -91,7 +91,7 @@ function pureDraw(h: Harness, drawId: string) {
     callerPubkey: CALLER,
     dvmId: DVM_ID,
     jobId: `job-${drawId}`,
-    creditEnvelope: { creditId: "c1", drawId },
+    creditEnvelope: { creditId, drawId },
   });
 }
 
@@ -195,6 +195,15 @@ describe("fund and draw in one request", () => {
       credit_id: "c1", draw_id: "d2",
     });
     expect(second.paymentTxHash).toBe(drawSettlementRef(DVM_ID, "c1", "d2"));
+  });
+
+  it("refuses a signed draw that names a nonexistent deferred-settlement credit", async () => {
+    const h = harness();
+    const creditId = "x402d:caller-chosen";
+    const result = await pureDraw(h, "d1", creditId);
+    expect(result.error?.body.error).toBe("credit_id_unavailable");
+    expect(await h.ledger.get(creditId)).toBeUndefined();
+    expect(await h.ledger.getDraw({ creditId, drawId: "d1" })).toBeUndefined();
   });
 
   it("reports the committed pooled value even when the current price has a different msat value", async () => {

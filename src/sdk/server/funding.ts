@@ -364,23 +364,25 @@ export function deferredX402IntentId(creditId: string | undefined): string | und
 
 /**
  * Id prefixes the SERVER derives: `imp:` for an implicit N=1 funding,
- * `fnd:` for a `/v1/credit` top-up that names no credit.
+ * `fnd:` for a `/v1/credit` top-up that names no credit, and
+ * `x402d:` for an unsigned authorization pending job success.
  */
-const DERIVED_CREDIT_ID_PREFIXES = ["imp:", "fnd:"];
+const DERIVED_CREDIT_ID_PREFIXES = ["imp:", "fnd:", DEFERRED_ID_PREFIX];
 
 /**
- * Whether a credit id sits in a namespace the server derives — which a caller
- * may **reference** but must never **create**.
+ * Whether a credit id sits in a reserved namespace. A caller may reference an
+ * existing `imp:` or `fnd:` credit it owns, but may never create one. An
+ * `x402d:` id marks an authorization intent and is not reusable credit.
  *
- * Both namespaces are computable by a third party: `imp:` from the rail's
- * payment id, `fnd:` from `(pubkey, fund_id)`. `CreditLedger.fund` INSERTs at
+ * `imp:` and `fnd:` are computable by a third party from the rail payment id
+ * and `(pubkey, fund_id)`. `CreditLedger.fund` INSERTs at
  * whatever id it is handed, so without this rule anyone could pre-open a
  * credit at an id the server would later derive for someone else. The victim's
  * top-up then settles on the rail before `fund` refuses with `caller_mismatch`
  * they pay and hold nothing. Keeping creation server-side means a derived id
  * is only ever owned by the caller it was derived for.
  *
- * Referencing stays open, and has to: the id of a credit opened this way is
+ * Referencing `imp:` and `fnd:` stays open: the id of a credit opened this way is
  * handed back to its owner, and naming it is how a later top-up stacks onto it
  * or a job draws from it.
  */

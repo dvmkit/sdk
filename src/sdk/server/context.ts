@@ -362,6 +362,11 @@ export function buildContext(
     },
     sendMessage: (type, content) => {
       if (terminated("sendMessage")) return;
+      if ((type === "prompt" || type === "payment-request") && deferredX402IntentId(job.creditId)) {
+        throw new Error(
+          `ctx.sendMessage("${type}") is unavailable: this job was paid by an x402 authorization that settles only when it succeeds`
+        );
+      }
       if (type === "payment-request" && typeof content.amount_msats === "number") job.pendingPaymentMsats = content.amount_msats;
       // Any payment-request finishes the piece in progress, in its Tx A and here.
       if (type === "payment-request" && job.pieces) job.pieces = finishRunningPiece(job.pieces);
@@ -380,6 +385,11 @@ export function buildContext(
       // nothing will settle.
       if (terminated("prompt")) {
         return Promise.reject(new JobCancelledError(`Job already ${job.status}`));
+      }
+      if (deferredX402IntentId(job.creditId)) {
+        return Promise.reject(
+          new Error("ctx.prompt is unavailable: this job was paid by an x402 authorization that settles only when it succeeds")
+        );
       }
       job.status = "awaiting-input";
       captureReplayPrompts();

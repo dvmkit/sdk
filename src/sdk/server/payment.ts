@@ -2569,7 +2569,7 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
   credit_id_unavailable: {
     display:
       "The service can't use that prepaid-balance id. Nothing was charged and no balance changed.",
-    hint: "Omit credit_id and let the service pick one, or retry with a fresh fund_id. Ids starting imp: or fnd: are derived by the service — reference one it already gave you, never open a new one.",
+    hint: "Omit credit_id and let the service pick one, or retry with a fresh fund_id. Ids starting imp: or fnd: are derived by the service — reference one it already gave you, never open a new one. The x402d: prefix is reserved for pending x402 authorizations, not reusable credit.",
     retryable: true,
   },
   draw_conflict: {
