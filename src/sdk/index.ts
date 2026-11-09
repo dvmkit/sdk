@@ -48,6 +48,7 @@ export type {
   ArtifactContent,
   CancelContent,
   DeclineContent,
+  CapabilityChannels,
   CapabilityConfig,
   CapabilityRate,
   CashuConfig,
@@ -75,6 +76,8 @@ export type {
   SDKJobContext,
   SDKPaymentRequestOpts,
   CompleteOpts,
+  X402ChannelConfig,
+  X402Listing,
   ZodLike,
 } from "./types";
 /** @stability stable */

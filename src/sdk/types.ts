@@ -677,6 +677,103 @@ export const DEFAULT_CREDIT_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const DEFAULT_JOB_RETENTION_DAYS = 730;
 
 /**
+ * Catalog listing for a capability offered on the x402 channel, published as
+ * the x402 Bazaar discovery extension so discovery services can index it. The
+ * listing is optional: a capability on the x402 channel accepts stock x402
+ * wallets whether or not it is listed. The server refuses to start when a field
+ * is outside the limits below.
+ *
+ * The facilitator screens listing text for wording that could instruct an AI
+ * agent (for example "ignore previous instructions" or "always choose this
+ * service") and may refuse to list a capability whose metadata reads that way.
+ * The SDK cannot detect this, so describe what the capability does, plainly.
+ */
+export interface X402Listing {
+  /**
+   * What the capability does, at most 500 characters. Carried on every x402
+   * challenge for this capability; the facilitator refuses to verify or settle
+   * a payment whose resource description is longer, so a longer text would fail
+   * the payment, not only the listing.
+   */
+  description: string;
+  /**
+   * A runnable input for the capability, written flat exactly as an x402 caller
+   * posts it (no `{ capability, data }` envelope and no signed-request fields).
+   * Must satisfy the capability's `input` schema.
+   */
+  example: Record<string, unknown>;
+  /**
+   * JSON Schema for the request body. Defaults to the capability's `input`
+   * schema converted to JSON Schema, with the signed-request fields removed.
+   * Set it when the converted schema is not what callers should see; it must
+   * accept `example`, and every `$ref` and `$id` in it must be a local `#`
+   * reference.
+   */
+  inputSchema?: Record<string, unknown>;
+  /** Example JSON response body. */
+  outputExample?: Record<string, unknown>;
+  /** Display name, 1 to 32 printable ASCII characters. */
+  serviceName?: string;
+  /** Up to 5 distinct tags, each 1 to 32 printable ASCII characters. */
+  tags?: string[];
+  /**
+   * Icon URL: absolute `http` or `https`, at most 2048 characters, no
+   * credentials, a DNS host name rather than an IP address or `localhost`,
+   * and not an SVG image.
+   */
+  iconUrl?: string;
+  /**
+   * Absolute URL catalogs index for this capability. Defaults to the DVM's
+   * public origin followed by `/v1/x402/<name>`; set it only when the
+   * capability is reached at another address, such as behind a proxy.
+   */
+  resourceUrl?: string;
+}
+
+/**
+ * Offering a capability to stock x402 clients (for example `@x402/fetch`),
+ * which pay and call it in a single unsigned `POST /v1/x402/<name>` whose body
+ * is the capability input itself.
+ *
+ * The capability must set `maxRuntimeSeconds`: the payment is verified before
+ * the handler runs and settled after it finishes, inside the one request. A
+ * host typically fits machine wake-up, the runtime bound and the settlement
+ * timeout (10 seconds by default) within a roughly 28-second request deadline,
+ * so keep the bound short.
+ */
+export interface X402ChannelConfig {
+  /** Optional catalog listing. See {@link X402Listing}. */
+  listing?: X402Listing;
+}
+
+/**
+ * Channels a capability definition is offered on. Leaving
+ * `CapabilityConfig.channels` unset offers the capability on the dvmkit
+ * protocol only. Once `channels` is set, only the channels it names are
+ * offered, and it must name at least one:
+ *
+ * - `{ job: true }` — the dvmkit protocol only (the same as leaving it unset).
+ * - `{ x402: {} }` — the x402 channel only.
+ * - `{ job: true, x402: {} }` — both, served by this one definition.
+ */
+export interface CapabilityChannels {
+  /** The dvmkit protocol: `/v1/info`, `/v1/quote` and `/v1/job`. */
+  job?: boolean;
+  /** Stock x402 clients at `POST /v1/x402/<name>`. See {@link X402ChannelConfig}. */
+  x402?: X402ChannelConfig;
+}
+
+/** Channel name accepted by the capability lookup. */
+export type CapabilityChannel = "job" | "x402";
+
+/** The channels a configured capability definition is offered on. */
+export interface ResolvedCapabilityChannels {
+  readonly job: boolean;
+  /** Present iff the definition is offered on the x402 channel. */
+  readonly x402?: X402ChannelConfig;
+}
+
+/**
  * Per-capability configuration for the multi-capability shape.
  * Each capability is an independent unit a caller pays for: its own input
  * schema, pricing, handler, and (optional) message handlers. DVM-level
@@ -688,6 +785,25 @@ export interface CapabilityConfig<
   InputSchema extends ZodLike | undefined = undefined,
   QuoteData = Record<string, unknown>,
 > {
+  /**
+   * Published capability name. Defaults to this entry's key in
+   * `capabilities`. Names are unique within a channel, so two entries may share
+   * a name when they are offered on different channels: for example a `fetch`
+   * on the dvmkit protocol and a separate, bounded `fetch` offered only on x402
+   * with its own input, handler and price.
+   */
+  name?: string;
+  /**
+   * Channels this definition is offered on. Unset means the dvmkit protocol
+   * only. See {@link CapabilityChannels}.
+   *
+   * A definition offered on x402 takes unsigned callers only, so the
+   * signed-request fields (`pubkey`, `signature`, `timestamp`, `nonce`) are
+   * never part of its x402 input. On a DVM with `auth`, a definition offered on
+   * both channels still declares them for `/v1/job`, as optional fields or by
+   * preserving unknown fields, so an unsigned x402 body also parses.
+   */
+  channels?: CapabilityChannels;
   /** Human-readable description surfaced on `/v1/info`. */
   description?: string;
   /** Zod schema for structured job input. When set, ctx.input is parsed and typed. */
@@ -727,6 +843,7 @@ export interface CapabilityConfig<
    * and Postgres: the payment is verified before the job and settled only if
    * it succeeds, so the bound also sets how long an authorization must stay
    * valid. Leave it unset for long, multi-step or metered capabilities.
+   * Required on a capability offered on the x402 channel.
    */
   maxRuntimeSeconds?: number;
   /** Handle a newly submitted job for this capability (required). */
@@ -766,8 +883,10 @@ export interface CapabilityDescriptor<
   State = unknown,
   InputSchema extends ZodLike | undefined = undefined,
 > {
-  /** Capability name (the key in `capabilities[…]`). */
+  /** Published capability name: `CapabilityConfig.name`, or else its key in `capabilities[…]`. */
   readonly name: string;
+  /** Channels this definition is offered on. */
+  readonly channels: ResolvedCapabilityChannels;
   /** Human-readable description; empty string when not provided. */
   readonly description: string;
   /** Zod schema for structured job input. */
@@ -965,6 +1084,8 @@ export interface DVMConfig<
   rates?: CapabilityRate[];
   /** Runtime bound in seconds. Flat shape only — see `CapabilityConfig.maxRuntimeSeconds`. */
   maxRuntimeSeconds?: number;
+  /** Channels the capability is offered on. Flat shape only — see `CapabilityConfig.channels`. */
+  channels?: CapabilityChannels;
   /** Payment methods this DVM accepts. Default: derived from configured rails — adds "cashu" when `mints` is set, "x402" when `x402` is set, "tempo" when `tempo` is set. */
   paymentMethods?: PaymentMethod[];
   /** x402 stablecoin payment configuration (provider-side). */
@@ -1053,10 +1174,11 @@ export interface DVMDescriptor<
   /** Reference to the original DVMConfig (handler functions, quote config, etc.). */
   readonly config: DVMConfig<State, InputSchema>;
   /**
-   * Desugared per-capability descriptors. The SDK runtime always
-   * operates on this map: single-capability DVMs have one entry keyed by
-   * `config.capability`; multi-capability DVMs have N entries with the
-   * names declared in `config.capabilities`.
+   * Desugared per-capability descriptors offered on the dvmkit protocol,
+   * keyed by published name. The `/v1/job` runtime operates on this map:
+   * single-capability DVMs have one entry keyed by `config.capability`;
+   * multi-capability DVMs have one entry per dvmkit-protocol definition in
+   * `config.capabilities`.
    *
    * Typed as `<any, any>` so consumers can pass a typed test context to
    * `descriptor.capabilities[name].onJob(ctx)` without re-casting — the
@@ -1065,6 +1187,14 @@ export interface DVMDescriptor<
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly capabilities: Record<string, CapabilityDescriptor<any, any>>;
+  /**
+   * Definitions offered on the x402 channel, keyed by published name. A
+   * definition offered on both channels is the same object in both maps.
+   * `capabilities` above holds only the dvmkit-protocol definitions. Absent
+   * when no definition is offered on x402.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  readonly x402Capabilities?: Record<string, CapabilityDescriptor<any, any>>;
   /** Payment methods this DVM accepts. */
   readonly paymentMethods?: PaymentMethod[];
   /** x402 stablecoin payment configuration. */
