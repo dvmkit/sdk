@@ -20,6 +20,7 @@ import {
   buildPaymentRequirements,
   decodePayment,
   encodePaymentRequiredHeader,
+  encodeSettleResponseHeader,
   exactEvmAuthorization,
   type PaymentRequiredV2,
   paymentRequiredV2FromV1,
@@ -1340,9 +1341,9 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           paymentTxHash: accepted.value.funding.paymentId,
           nativeAmount: requiredUsdcMicro,
           nativeAsset: "usdc",
-          x402SettleResponseHeader: Buffer.from(JSON.stringify(accepted.value.settlement)).toString(
-            "base64"
-          ),
+          x402SettleResponseHeader: encodeSettleResponseHeader(accepted.value.settlement, {
+            channelId: accepted.value.funding.channelId,
+          }),
         },
         ledgerCtx,
         credited

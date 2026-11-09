@@ -306,6 +306,27 @@ describe("verifyX402Payment", () => {
     }
   });
 
+  it("puts only the allowed, bounded settle fields into the caller's PAYMENT-RESPONSE", async () => {
+    vi.mocked(settleWithFacilitator).mockResolvedValue({
+      ...settled({ network: "eip155:84532", payer: "0xfrom" }),
+      errorMessage: "facilitator-internal diagnostic",
+      extensions: { trace: "x".repeat(9_000) },
+      padding: "y".repeat(4_000),
+    } as SettleResponse);
+
+    const result = await verifyX402Payment(paymentHeader("1000000"), CONFIG, 1_000_000n, RESOURCE, RATE);
+
+    expect(result.verified).toBe(true);
+    const header = result.settleResponseHeader ?? "";
+    expect(JSON.parse(Buffer.from(header, "base64").toString("utf8"))).toEqual({
+      success: true,
+      transaction: "0xtxhash123",
+      network: "eip155:84532",
+      payer: "0xfrom",
+    });
+    expect(header.length).toBeLessThan(512);
+  });
+
   it("converts a large micro-unit amount to finite proportional millisatoshis", async () => {
     // A large on-chain value must still produce a finite, proportional credit —
     // a silent NaN/truncation here would under- or over-credit real USDC.

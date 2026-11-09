@@ -183,3 +183,55 @@ describe("x402 route boot checks", () => {
     expect(warned).toHaveLength(1);
   });
 });
+
+// The capability's deadline is its 5 s runtime bound plus the facilitator timeout.
+describe("DVMKIT_X402_RESPONSE_LIMIT_MS", () => {
+  const PUBLIC = { DVMKIT_PUBLIC_URL: "https://dvm.example.com" };
+
+  it("refuses to start when a capability's deadline, default facilitator timeout included, exceeds the limit", async () => {
+    const refused = boot(dvm(0), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: "14999" });
+    await expect(refused).rejects.toThrow(
+      'capability "fetch" is offered on x402 with maxRuntimeSeconds 5 and a 10000 ms facilitator timeout, ' +
+        "so a paid request can take 15000 ms to answer, over DVMKIT_X402_RESPONSE_LIMIT_MS (14999 ms)"
+    );
+    await expect(refused).rejects.toThrow(/or offer the capability on the job channel only/);
+  });
+
+  it("counts the configured facilitator timeout, not the default", async () => {
+    const quick = { ...x402, facilitatorTimeoutMs: 2_000 };
+    await expect(
+      boot(dvm(0, undefined, { x402: quick }), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: "6999" }, false, { x402: quick })
+    ).rejects.toThrow("a 2000 ms facilitator timeout, so a paid request can take 7000 ms to answer");
+  });
+
+  it("passes a deadline exactly at the limit", async () => {
+    // Past this check, boot stops at the next one: no durable settlement store.
+    await expect(boot(dvm(0), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: "15000" })).rejects.toThrow(
+      /no durable x402 settlement store/
+    );
+    await expect(boot(dvm(0), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: "15000" }, true)).resolves.toBeDefined();
+    expect(warnedEvents()).not.toContain("x402_route_response_limit_exceeded");
+  });
+
+  it("checks nothing when unset", async () => {
+    await expect(boot(dvm(0), PUBLIC)).rejects.toThrow(/no durable x402 settlement store/);
+    await expect(boot(dvm(0), PUBLIC, true)).resolves.toBeDefined();
+    expect(warnedEvents()).not.toContain("x402_route_response_limit_exceeded");
+  });
+
+  it("warns instead of refusing in devMode", async () => {
+    await expect(boot(dvm(0), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: "14999" }, true)).resolves.toBeDefined();
+    expect(warnedEvents()).toContain("x402_route_response_limit_exceeded");
+  });
+
+  it.each(["0", "-1", "abc", "1.5", "15000ms", " 15000", "1e4", "99999999999999999999"])(
+    "refuses to start on the invalid value %j, in devMode too",
+    async (value) => {
+      for (const devMode of [false, true]) {
+        await expect(boot(dvm(0), { ...PUBLIC, DVMKIT_X402_RESPONSE_LIMIT_MS: value }, devMode)).rejects.toThrow(
+          "DVMKIT_X402_RESPONSE_LIMIT_MS is " + JSON.stringify(value) + ", not a positive whole number of milliseconds"
+        );
+      }
+    }
+  );
+});

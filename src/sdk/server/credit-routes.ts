@@ -1379,7 +1379,10 @@ async function handleX402ChannelDrain(
         accepted.reason
       );
     }
-    c.header("PAYMENT-RESPONSE", encodeSettleResponseHeader(accepted.value.settlement));
+    c.header(
+      "PAYMENT-RESPONSE",
+      encodeSettleResponseHeader(accepted.value.settlement, { channelId: accepted.value.funding.channelId })
+    );
     const result = accepted.value.committed;
     let record = result.drain;
     if (deps.receiptIssuer && !result.replayed) {

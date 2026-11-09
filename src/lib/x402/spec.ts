@@ -1,6 +1,7 @@
 /** Wire compatibility requires independent v1 and v2 reference-client checks. */
 import { X402_DEFAULT_FACILITATOR } from "./constants";
 import { x402NetworkByCaip2, x402NetworkBySlug } from "./networks";
+import { callerSettleResponse } from "./settle-response";
 import type { X402Config } from "./types";
 
 /** Current x402 protocol version preferred by dvmkit clients and servers. */
@@ -144,7 +145,7 @@ export interface VerifyResponse {
   payer?: string;
 }
 
-/** Facilitator `/settle` response — what we base64 into `X-PAYMENT-RESPONSE`. */
+/** Facilitator `/settle` response; a caller sees only `callerSettleResponse`'s projection of it. */
 export interface SettleResponse {
   success: boolean;
   errorReason?: string;
@@ -153,6 +154,15 @@ export interface SettleResponse {
   network?: string;
   amount?: string;
   extensions?: Record<string, unknown>;
+  extra?: { channelState?: SettleResponseChannelState };
+}
+
+/** Batch-settlement channel state echoed to the payer; amounts are uint256 decimal strings. */
+export interface SettleResponseChannelState {
+  channelId: string;
+  balance?: string;
+  totalClaimed?: string;
+  chargedCumulativeAmount?: string;
 }
 
 /**
@@ -428,12 +438,14 @@ export function exactEvmAuthorization(payload: PaymentPayload): ExactEvmPayloadA
 }
 
 /**
- * Encode a `SettleResponse` for the `X-PAYMENT-RESPONSE` header that the
- * server emits on a 2xx after a successful settlement (per the
- * x402 spec).
+ * Encode a facilitator's settle answer for the `PAYMENT-RESPONSE` and
+ * `X-PAYMENT-RESPONSE` headers. Only `callerSettleResponse`'s bounded
+ * allow-list is encoded, so no caller can send a raw facilitator body; a
+ * batch-settlement answer passes its voucher's `channelId` to keep the channel
+ * state its client reads back.
  */
-export function encodeSettleResponseHeader(response: SettleResponse): string {
-  return Buffer.from(JSON.stringify(response), "utf-8").toString("base64");
+export function encodeSettleResponseHeader(answer: unknown, options: { channelId?: string } = {}): string {
+  return Buffer.from(JSON.stringify(callerSettleResponse(answer, options)), "utf-8").toString("base64");
 }
 
 type PaymentSchemeDecoder = (parsed: Record<string, unknown>) => PaymentPayload;

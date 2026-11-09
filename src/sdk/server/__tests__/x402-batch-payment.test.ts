@@ -81,7 +81,9 @@ function batchServer(
   // What the chain paid, when a test needs it to disagree with the debit. The
   // settlement is recorded outside the ledger transaction, so a short one is the
   // payout-floor wedge: money on chain, nothing booked here.
-  settledAmount = "250000"
+  settledAmount = "250000",
+  // Further fields the facilitator's settle answer carries.
+  settleExtra: Record<string, unknown> = {}
 ): X402BatchSettlementServer {
   return {
     buildRequirements: vi.fn(async () => [REQUIREMENT]),
@@ -106,6 +108,7 @@ function batchServer(
         transaction: "0xrefund",
         network: "eip155:84532" as const,
         amount: settledAmount,
+        ...settleExtra,
       };
       if (args.complete) committed = await args.complete(settlement, committed);
       return {
@@ -1035,5 +1038,138 @@ describe("x402 batch-settlement credit drain refusals", () => {
     expect(batch.accept).toHaveBeenCalledWith(
       expect.objectContaining({ expectedChannelId: CHANNEL_ID })
     );
+  });
+});
+
+describe("x402 batch-settlement PAYMENT-RESPONSE", () => {
+  const CHANNEL_STATE = {
+    channelId: CHANNEL_ID,
+    balance: "1000000",
+    totalClaimed: "0",
+    chargedCumulativeAmount: "250000",
+  };
+  const LEAKY = {
+    errorMessage: "facilitator-internal diagnostic",
+    extensions: { trace: "x".repeat(9_000) },
+    padding: "y".repeat(4_000),
+  };
+
+  const LEAKY_CHANNEL_EXTRA = {
+    channelState: { ...CHANNEL_STATE, withdrawRequestedAt: 0, refundNonce: "0", note: "z".repeat(4_000) },
+    chargedAmount: "250000",
+    trace: "x".repeat(4_000),
+  };
+
+  function decodedHeader(header: string | null | undefined): Record<string, unknown> {
+    expect((header ?? "").length).toBeLessThan(1_024);
+    return JSON.parse(Buffer.from(header ?? "", "base64").toString("utf8")) as Record<string, unknown>;
+  }
+
+  function decoded(response: Response): Record<string, unknown> {
+    return decodedHeader(response.headers.get("PAYMENT-RESPONSE"));
+  }
+
+  // `/v1/credit` copies this header into its funding response verbatim.
+  it("keeps a well-formed channel state and nothing else the facilitator sent on funding", async () => {
+    const result = await verifyUpfrontPayment({
+      requiredMsats: 25_000,
+      x402Payment: HEADER,
+      x402Config: { network: "eip155:84532", payTo: REQUIREMENT.payTo, batchSettlement: {} },
+      x402BatchSettlement: batchServer(undefined, "250000", { ...LEAKY, extra: LEAKY_CHANNEL_EXTRA }),
+      fxFetcher: downFx(),
+      priceFiat: { currency: "usd", amountMicro: 250_000 },
+      callerPubkey: "aa".repeat(32),
+      dvmId: "dvm-batch-funding",
+      creditLedger: new MemoryCreditLedger(),
+      processedPayments: new MemoryProcessedPaymentStore(),
+      fundOnly: { creditId: "credit-1", fundId: "fund-1", commitment: fundingCommitment(HEADER) },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(decodedHeader(result.x402SettleResponseHeader)).toEqual({
+      success: true,
+      transaction: "0xrefund",
+      network: "eip155:84532",
+      extra: { channelState: CHANNEL_STATE },
+    });
+  });
+
+  it("keeps a well-formed channel state and nothing else the facilitator sent on a drain", async () => {
+    const batch = batchServer(undefined, "250000", { ...LEAKY, extra: LEAKY_CHANNEL_EXTRA });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await drainRequest(app);
+
+    expect(response.status).toBe(200);
+    expect(decoded(response)).toEqual({
+      success: true,
+      transaction: "0xrefund",
+      network: "eip155:84532",
+      extra: { channelState: CHANNEL_STATE },
+    });
+  });
+
+  it("keeps the largest uint256 amounts and matches the channel id in either case", async () => {
+    const max = (2n ** 256n - 1n).toString();
+    const channelState = { channelId: CHANNEL_ID.toUpperCase().replace("0X", "0x"), balance: max, totalClaimed: max, chargedCumulativeAmount: max };
+    const batch = batchServer(undefined, "250000", { extra: { channelState } });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await drainRequest(app);
+
+    expect(decoded(response)).toEqual({
+      success: true,
+      transaction: "0xrefund",
+      network: "eip155:84532",
+      extra: { channelState },
+    });
+  });
+
+  it("drops a funding answer's channel state that names another channel", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const result = await verifyUpfrontPayment({
+      requiredMsats: 25_000,
+      x402Payment: HEADER,
+      x402Config: { network: "eip155:84532", payTo: REQUIREMENT.payTo, batchSettlement: {} },
+      x402BatchSettlement: batchServer(undefined, "250000", {
+        extra: { channelState: { ...CHANNEL_STATE, channelId: `0x${"cd".repeat(32)}` } },
+      }),
+      fxFetcher: downFx(),
+      priceFiat: { currency: "usd", amountMicro: 250_000 },
+      callerPubkey: "aa".repeat(32),
+      dvmId: "dvm-batch-funding",
+      creditLedger: new MemoryCreditLedger(),
+      processedPayments: new MemoryProcessedPaymentStore(),
+      fundOnly: { creditId: "credit-1", fundId: "fund-1", commitment: fundingCommitment(HEADER) },
+    });
+
+    expect(decodedHeader(result.x402SettleResponseHeader)).toEqual({
+      success: true,
+      transaction: "0xrefund",
+      network: "eip155:84532",
+    });
+    expect(warn.mock.calls.flat().join(" ")).toContain("x402_settle_channel_state_dropped");
+    warn.mockRestore();
+  });
+
+  it.each([
+    ["an oversized amount", { ...CHANNEL_STATE, balance: "9".repeat(5_000) }],
+    ["a non-numeric amount", { ...CHANNEL_STATE, totalClaimed: "lots" }],
+    ["a malformed channel id", { ...CHANNEL_STATE, channelId: "0xnot-a-channel" }],
+    ["no channel id", { balance: "1000000" }],
+    ["a non-object", "channel-state"],
+    ["another channel's id", { ...CHANNEL_STATE, channelId: `0x${"cd".repeat(32)}` }],
+    ["an amount just past uint256", { ...CHANNEL_STATE, chargedCumulativeAmount: (2n ** 256n).toString() }],
+  ])("drops a channel state with %s and keeps the standard fields", async (_case, channelState) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const batch = batchServer(undefined, "250000", { extra: { channelState } });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await drainRequest(app);
+
+    expect(response.status).toBe(200);
+    expect(decoded(response)).toEqual({ success: true, transaction: "0xrefund", network: "eip155:84532" });
+    expect(warn.mock.calls.flat().join(" ")).toContain("x402_settle_channel_state_dropped");
+    warn.mockRestore();
   });
 });

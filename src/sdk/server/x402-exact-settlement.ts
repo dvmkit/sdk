@@ -759,10 +759,7 @@ function givenUp(
 
 function receiptFromIntent(intent: X402ExactSettlementIntent, btcUsdRate: number): X402Receipt {
   const amountUsdcMicro = Number.parseInt(intent.value, 10);
-  const response = (intent.settleResponse ?? {
-    success: true,
-    transaction: intent.transaction,
-  }) as unknown as SettleResponse;
+  const response = intent.settleResponse ?? { success: true, transaction: intent.transaction };
   return {
     verified: true,
     amountMsats: btcUsdRate > 0 ? usdcToMsats(amountUsdcMicro / 1e6, btcUsdRate) : 0,

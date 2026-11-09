@@ -254,9 +254,9 @@ import {
 import {
   assertX402RoutesServable,
   authorizationUnavailableSettleResponse,
-  callerSettleResponse,
   chargedSettleResponse,
   classifyX402RouteOutcome,
+  parseX402ResponseLimitMs,
   parseX402RouteBody,
   SETTLE_WINDOW_CLOSED_REASON,
   signedFieldsIn,
@@ -1187,6 +1187,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       publicOrigin: this.publicOrigin,
       mountPrefix: x402MountPrefix(opts.mountPrefix),
       devMode: opts.devMode,
+      responseLimitMs: parseX402ResponseLimitMs(opts.env.DVMKIT_X402_RESPONSE_LIMIT_MS),
     });
     if (!this.publicOrigin && Object.keys(descriptor.x402Capabilities ?? {}).length > 0) {
       // Only devMode boots so: each x402 route payment then names the
@@ -3220,7 +3221,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!intentId || !this.x402ExactSettlement) return undefined;
     const intent = await this.x402ExactSettlement.get(this.opts.dvmId ?? "", intentId);
     return intent?.status === "complete" && intent.settleResponse
-      ? encodeSettleResponseHeader(callerSettleResponse(intent.settleResponse))
+      ? encodeSettleResponseHeader(intent.settleResponse)
       : undefined;
   }
 
@@ -4814,7 +4815,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       const answer =
         row === "settlement_refused" && intent?.settleResponse
-          ? callerSettleResponse(intent.settleResponse)
+          ? intent.settleResponse
           : row === "settlement_refused"
             ? { success: false, errorReason: intent?.lastOutcome ?? "settle_failed", transaction: "", network: intent?.network }
             : authorizationUnavailableSettleResponse(intent?.network);

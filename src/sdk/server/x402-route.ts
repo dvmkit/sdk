@@ -6,10 +6,13 @@ import {
   X402_SIZE_CHECK_TIMEOUT_SECONDS,
   x402ChannelPaymentRequired,
 } from "../../lib/x402/bazaar";
+import { X402_DEFAULT_FACILITATOR_TIMEOUT_MS } from "../../lib/x402/facilitator-request";
+import { callerSettleResponse } from "../../lib/x402/settle-response";
 import type { SettleResponse } from "../../lib/x402/spec";
 import type { X402Config } from "../../lib/x402/types";
+import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { CAPABILITY_SIGNED_FIELDS } from "../signed-envelope-schema";
-import type { DVMDescriptor, PaymentMethod } from "../types";
+import type { CapabilityDescriptor, DVMDescriptor, PaymentMethod } from "../types";
 import { deferredX402Window, priceFiatMicro } from "./funding";
 import type { JobStatus } from "./job-store";
 import { DEFERRED_X402_SETTLE_WINDOW_CLOSED } from "./x402-exact-settlement";
@@ -42,6 +45,8 @@ export function assertX402RoutesServable(
     /** Path a host mounted the server under; see {@link x402RouteUrl}. */
     mountPrefix: string;
     devMode: boolean | undefined;
+    /** `DVMKIT_X402_RESPONSE_LIMIT_MS`, parsed by {@link parseX402ResponseLimitMs}. */
+    responseLimitMs?: number;
   }
 ): void {
   const definitions = Object.values(descriptor.x402Capabilities ?? {});
@@ -67,6 +72,9 @@ export function assertX402RoutesServable(
         "this DVM at, such as https://dvm.example.com, since each x402 payment names that address as its resource"
     );
   }
+  if (server.responseLimitMs !== undefined) {
+    assertX402DeadlinesFit(definitions, x402Config, server.responseLimitMs, server.devMode);
+  }
   for (const def of definitions) {
     const price = typeof def.price === "string" ? priceFiatMicro({ price: def.price }) : undefined;
     const required = x402ChannelPaymentRequired({
@@ -90,6 +98,52 @@ export function assertX402RoutesServable(
       `createDVMServer: capability "${def.name}"`,
       required,
       "the description, example, outputExample or input schema, or the public origin (DVMKIT_PUBLIC_URL)"
+    );
+  }
+}
+
+/**
+ * `DVMKIT_X402_RESPONSE_LIMIT_MS`: the longest a gateway in front of this
+ * server waits for response headers, less any margin the operator keeps.
+ * Unset means no limit is checked; any other value must be a positive integer.
+ */
+export function parseX402ResponseLimitMs(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const limit = /^[1-9]\d*$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(limit)) {
+    throw new Error(
+      `createDVMServer: DVMKIT_X402_RESPONSE_LIMIT_MS is ${JSON.stringify(value)}, not a positive whole number of ` +
+        "milliseconds; set it to how long the gateway in front of this DVM waits for response headers, or unset it"
+    );
+  }
+  return limit;
+}
+
+// A paid route request answers once, at its deadline: the runtime bound plus the
+// facilitator timeout. A gateway that gives up first answers 504 while the job
+// may still finish and settle, so the caller pays without receiving the result
+// or the job token that reads it.
+function assertX402DeadlinesFit(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  definitions: CapabilityDescriptor<any, any>[],
+  x402Config: X402Config,
+  limitMs: number,
+  devMode: boolean | undefined
+): void {
+  const facilitatorTimeoutMs = x402Config.facilitatorTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
+  for (const def of definitions) {
+    if (def.maxRuntimeSeconds === undefined) continue;
+    const deadlineMs = def.maxRuntimeSeconds * 1000 + facilitatorTimeoutMs;
+    if (deadlineMs <= limitMs) continue;
+    if (devMode) {
+      diagnosticConsole.warn({ level: "warn", event: "x402_route_response_limit_exceeded" });
+      continue;
+    }
+    throw new Error(
+      `createDVMServer: capability "${def.name}" is offered on x402 with maxRuntimeSeconds ${def.maxRuntimeSeconds} ` +
+        `and a ${facilitatorTimeoutMs} ms facilitator timeout, so a paid request can take ${deadlineMs} ms to answer, ` +
+        `over DVMKIT_X402_RESPONSE_LIMIT_MS (${limitMs} ms); lower maxRuntimeSeconds or the x402 facilitatorTimeoutMs ` +
+        "until the two fit within the limit, or offer the capability on the job channel only"
     );
   }
 }
@@ -234,30 +288,6 @@ export function chargedSettleResponse(
   };
 }
 
-/**
- * The part of a facilitator's settle answer a caller may see in
- * `PAYMENT-RESPONSE`: `success`, `transaction`, `network`, `payer` and a
- * bounded `errorReason`. Anything else the facilitator sent, such as an
- * `errorMessage` or `extensions`, stays server-side, and an overlong value is
- * dropped, so a facilitator answer cannot grow the response header.
- */
-export function callerSettleResponse(answer: unknown): SettleResponse {
-  const body = answer !== null && typeof answer === "object" ? (answer as Record<string, unknown>) : {};
-  const payer = boundedToken(body.payer);
-  const network = boundedToken(body.network);
-  const errorReason =
-    typeof body.errorReason === "string"
-      ? body.errorReason.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, SETTLE_ERROR_REASON_MAX)
-      : "";
-  return {
-    success: body.success === true,
-    transaction: boundedToken(body.transaction) ?? "",
-    ...(network !== undefined && { network }),
-    ...(payer !== undefined && { payer }),
-    ...(errorReason !== "" && { errorReason }),
-  };
-}
-
 /** Synthesized when the authorization was never sent, so no facilitator answered. */
 export function authorizationUnavailableSettleResponse(network: string | undefined): SettleResponse {
   return {
@@ -297,12 +327,3 @@ export const X402_ROUTE_COPY = {
 export const SETTLE_WINDOW_CLOSED_REASON =
   "The job finished too late in this request's time budget for its payment to settle.";
 
-// A transaction hash, CAIP-2 network or payer address is far shorter; a longer
-// value is not one of them.
-const SETTLE_TOKEN_MAX = 128;
-// Long enough for any error code a facilitator or the SDK names.
-const SETTLE_ERROR_REASON_MAX = 128;
-
-function boundedToken(value: unknown): string | undefined {
-  return typeof value === "string" && value.length <= SETTLE_TOKEN_MAX && /^[\x21-\x7e]*$/.test(value) ? value : undefined;
-}
