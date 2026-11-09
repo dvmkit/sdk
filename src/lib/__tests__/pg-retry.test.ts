@@ -441,12 +441,24 @@ describe("applyRetryToPool", () => {
     });
   });
 
-  it("registers pool.on('error') handler", () => {
+  it.each([
+    ["ECONNRESET", "ECONNRESET"],
+    ["57P01", "57P01"],
+    ["SENTINEL_SECRET", "unknown_error"],
+    [undefined, "unknown_error"],
+  ])("guards pool errors with a redacted code (%s)", (code, expected) => {
     const onMock = vi.fn();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const pool = makePool(async () => ({ rows: [] }));
     (pool as unknown as Record<string, unknown>).on = onMock;
     applyRetryToPool(pool, "test");
     expect(onMock).toHaveBeenCalledWith("error", expect.any(Function));
+    const handler = onMock.mock.calls[0][1] as (error: Error) => void;
+    handler(Object.assign(new Error("SENTINEL_SECRET postgres://user:secret@example.com/database"), { code }));
+    expect(errorSpy).toHaveBeenCalledWith(JSON.stringify({
+      event: "postgres_pool_error", level: "error", error_code: expected,
+    }));
+    errorSpy.mockRestore();
   });
 
   it("sets the pool startup application name from the retry label", () => {
@@ -477,8 +489,9 @@ describe("applyRetryToPool", () => {
     const client = (await pool.connect()) as unknown as EventEmitter;
 
     expect(client).toBe(fakeClient);
-    expect(() => client.emit("error", new Error("Connection terminated unexpectedly"))).not.toThrow();
-    expect(errorSpy).toHaveBeenCalledWith('{"event":"diagnostic.message","level":"error"}');
+    const error = Object.assign(new Error("SENTINEL_SECRET postgres://user:secret@example.com/database"), { code: "ECONNRESET" });
+    expect(() => client.emit("error", error)).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith('{"event":"postgres_client_error","level":"error","error_code":"ECONNRESET"}');
     errorSpy.mockRestore();
   });
 

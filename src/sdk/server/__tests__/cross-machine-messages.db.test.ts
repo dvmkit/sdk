@@ -23,7 +23,7 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
   let store: PostgresJobStore;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: DATABASE_URL });
+    pool = new pg.Pool({ connectionString: DATABASE_URL, application_name: "sdk-message-streaming-test" });
     store = new PostgresJobStore(pool);
     await store.init();
     await store.initStreaming();
@@ -387,7 +387,7 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     unsub2();
   });
 
-  it("subscribeMessages stays usable after the listen client is forcibly disconnected", async () => {
+  it("catches up gap messages and notifications after a forced LISTEN disconnect", async () => {
     await ensureJob("job-7");
 
     const received: Message[] = [];
@@ -398,34 +398,65 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     // A separate pool simulates the cross-machine writer.
     const writerPool = new pg.Pool({ connectionString: DATABASE_URL });
     const writerStore = new PostgresJobStore(writerPool);
+    const notify = vi.fn();
+    const notifyOnly = vi.fn();
+    let unsubscribeNotify: () => void = () => undefined;
+    let unsubscribeNotifyOnly: () => void = () => undefined;
+    let releaseReconnect: () => void = () => undefined;
+    const reconnectGate = new Promise<void>(resolve => { releaseReconnect = resolve; });
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    let restoreConnect: () => void = () => undefined;
 
     try {
       await writerStore.appendOutgoing("job-7", outgoing("text", { text: "pre-drop" }));
       await waitFor(() => received.length >= 1);
       expect(received).toHaveLength(1);
+      unsubscribeNotify = await store.subscribeNotifications("job-7", notify);
+      unsubscribeNotifyOnly = await store.subscribeNotifications("notify-only", notifyOnly);
 
-      // Forcibly drop the store's LISTEN connection from the DB side. The
-      // ListenChannel reconnect loop should pick it up and resume dispatch.
-      //
-      // `pg_stat_activity` is cluster-wide, so without the `datname` filter this
-      // also kills the LISTEN backends of a concurrent worktree's test run and of
-      // the local dev stack — the same collateral damage per-worktree
-      // DBs exist to prevent.
-      await writerPool.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-          WHERE datname = current_database()
-            AND query LIKE '%LISTEN job_messages%' AND state = 'idle'`
+      const { rows } = await writerPool.query<{ pid: number }>(
+        `SELECT pid FROM pg_stat_activity WHERE datname = current_database()
+          AND application_name = 'sdk-message-streaming-test'
+          AND query = 'LISTEN job_messages' AND state = 'idle'`
       );
+      expect(rows).toHaveLength(1);
+      // Hold only the reconnect checkout; ordinary pool.query calls stay real.
+      const connect = pool.connect.bind(pool);
+      const reconnectSpy = vi.spyOn(pool, "connect").mockImplementationOnce(async () => {
+        await reconnectGate;
+        return connect();
+      });
+      restoreConnect = () => reconnectSpy.mockRestore();
+      await writerPool.query("SELECT pg_terminate_backend($1)", [rows[0].pid]);
+      await waitFor(() => reconnectSpy.mock.calls.length === 1, 5000);
 
-      // Allow the channel to reconnect (1s initial backoff + buffer).
-      await new Promise((r) => setTimeout(r, 1500));
+      await writerStore.appendOutgoing("job-7", outgoing("text", { text: "during-gap" }));
+      await writerPool.query("SELECT pg_notify('job_messages', $1)", ["notify-only"]);
+      expect(received).toHaveLength(1);
+      expect(notify).not.toHaveBeenCalled();
+      expect(notifyOnly).not.toHaveBeenCalled();
 
-      await writerStore.appendOutgoing("job-7", outgoing("text", { text: "post-drop" }));
+      releaseReconnect();
       await waitFor(() => received.length >= 2, 5000);
-      expect(received).toHaveLength(2);
-      expect((received[1].content as { text: string }).text).toBe("post-drop");
+      expect(received.map(message => (message.content as { text: string }).text)).toEqual(["pre-drop", "during-gap"]);
+      expect(notify).toHaveBeenCalledOnce();
+      expect(notifyOnly).toHaveBeenCalledOnce();
+      expect(info.mock.calls.map(([line]) => JSON.parse(String(line)) as unknown)).toContainEqual({
+        event: "job_messages_listen_restored", level: "info", elapsed_ms: expect.any(Number),
+      });
+
+      await writerPool.query("SELECT pg_notify('job_messages', $1)", ["job-7"]);
+      await writerStore.appendOutgoing("job-7", outgoing("text", { text: "post-drop" }));
+      await waitFor(() => received.length >= 3, 5000);
+      expect(received.map(message => (message.content as { text: string }).text)).toEqual(["pre-drop", "during-gap", "post-drop"]);
+      expect(new Set(received.map(message => message.seq)).size).toBe(3);
     } finally {
+      releaseReconnect();
+      restoreConnect();
+      info.mockRestore();
       unsub();
+      unsubscribeNotify();
+      unsubscribeNotifyOnly();
       await writerPool.end();
     }
   });

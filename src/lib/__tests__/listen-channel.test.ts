@@ -22,11 +22,17 @@ class FakeClient extends EventEmitter {
 /** Hold LISTEN pending so a socket failure can precede its query response. */
 class StallingClient extends FakeClient {
   private rejectQuery: ((err: unknown) => void) | null = null;
+  private resolveQuery: (() => void) | null = null;
   override query(sql: string): Promise<void> {
     this.queries.push(sql);
-    return new Promise((_resolve, reject) => {
+    if (!sql.startsWith("LISTEN ")) return Promise.resolve();
+    return new Promise((resolve, reject) => {
       this.rejectQuery = reject;
+      this.resolveQuery = resolve;
     });
+  }
+  finishListen(): void {
+    this.resolveQuery?.();
   }
   /** Simulate an unexpected socket reset during the in-flight LISTEN: pg emits
    * 'error' on the client and rejects the active query. */
@@ -91,21 +97,26 @@ describe("ListenChannel", () => {
 
     const seen: (string | undefined)[] = [];
     const lost: Error[] = [];
+    const restored: number[] = [];
     const ch = new ListenChannel(asPool(pool), {
       channel: "tcase",
       backoffMs: [10],
       onNotification: (payload) => seen.push(payload),
       onLost: (err) => err && lost.push(err),
+      onRestored: (downtimeMs: number) => restored.push(downtimeMs),
     });
     await ch.start();
+    expect(restored).toEqual([]);
 
     first.emit("error", new Error("conn reset"));
+    first.emit("end");
     expect(lost.map((e) => e.message)).toEqual(["conn reset"]);
     expect(first.released).toBe(true);
 
     await vi.advanceTimersByTimeAsync(20);
     expect(pool.connects).toBe(2);
     expect(second.queries).toEqual(["LISTEN tcase"]);
+    expect(restored).toEqual([10]);
 
     second.emit("notification", { channel: "tcase", payload: "post-reconnect" });
     expect(seen).toEqual(["post-reconnect"]);
@@ -119,11 +130,13 @@ describe("ListenChannel", () => {
     pool.enqueue(recover);
 
     const fails: { attempt: number; err: unknown }[] = [];
+    const restored: number[] = [];
     const ch = new ListenChannel(asPool(pool), {
       channel: "tcase",
       backoffMs: [10, 20, 30],
       onNotification: () => undefined,
       onReconnectFailed: (attempt, err) => fails.push({ attempt, err }),
+      onRestored: (downtimeMs: number) => restored.push(downtimeMs),
     });
     await ch.start();
     expect(fails).toHaveLength(1);
@@ -132,10 +145,12 @@ describe("ListenChannel", () => {
     await vi.advanceTimersByTimeAsync(15);
     expect(fails).toHaveLength(2);
     expect(fails[1].attempt).toBe(1);
+    expect(restored).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(35);
     expect(pool.connects).toBe(3);
     expect(recover.queries).toEqual(["LISTEN tcase"]);
+    expect(restored).toEqual([30]);
 
     await ch.stop();
     expect(recover.released).toBe(true);
@@ -145,10 +160,12 @@ describe("ListenChannel", () => {
     const pool = new FakePool();
     const client = new FakeClient();
     pool.enqueue(client);
+    const restored = vi.fn();
     const ch = new ListenChannel(asPool(pool), {
       channel: "tcase",
       backoffMs: [10],
       onNotification: () => undefined,
+      onRestored: restored,
     });
     await ch.start();
 
@@ -158,6 +175,36 @@ describe("ListenChannel", () => {
     pool.enqueue(new FakeClient());
     await vi.advanceTimersByTimeAsync(50);
     expect(pool.connects).toBe(1);
+    expect(restored).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("restores only after LISTEN succeeds, unless stopped (%s)", async (stop) => {
+    const pool = new FakePool();
+    const first = new FakeClient();
+    const stalled = new StallingClient();
+    pool.enqueue(first);
+    pool.enqueue(stalled);
+    const restored = vi.fn();
+    const ch = new ListenChannel(asPool(pool), {
+      channel: "tcase", backoffMs: [10],
+      onNotification: () => undefined, onRestored: restored,
+    });
+    await ch.start();
+    first.emit("end");
+    await vi.advanceTimersByTimeAsync(30);
+    expect(stalled.queries).toEqual(["LISTEN tcase"]);
+    expect(restored).not.toHaveBeenCalled();
+
+    if (stop) await ch.stop();
+    stalled.finishListen();
+    await vi.advanceTimersByTimeAsync(0);
+    if (stop) {
+      expect(restored).not.toHaveBeenCalled();
+      expect(stalled.released).toBe(true);
+    } else {
+      expect(restored).toHaveBeenCalledExactlyOnceWith(30);
+    }
+    await ch.stop();
   });
 
   it("does not crash when the socket dies during the LISTEN query, and reconnects", async () => {

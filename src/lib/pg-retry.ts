@@ -93,8 +93,8 @@ export function applyRetryToPool(pool: Pool, label = "pg-pool"): void {
   // SET/RESET cycle. Settlement pools override the inherited host label here.
   pool.options.application_name = formatPostgresApplicationName(label);
 
-  pool.on("error", (_err: Error) => {
-    diagnosticConsole.error();
+  pool.on("error", (err: Error) => {
+    diagnosticConsole.error({ event: "postgres_pool_error", error_code: postgresErrorCode(err) });
   });
 
   type AnyPool = Record<string, (...args: unknown[]) => Promise<unknown>>;
@@ -273,9 +273,23 @@ function guardCheckedOutClient(client: unknown, _label: string): void {
   const emitter = client as { on?: (event: string, cb: (err: Error) => void) => void };
   if (typeof emitter.on !== "function" || guardedClients.has(client)) return;
   guardedClients.add(client);
-  emitter.on("error", (_err: Error) => {
-    diagnosticConsole.error();
+  emitter.on("error", (err: Error) => {
+    diagnosticConsole.error({ event: "postgres_client_error", error_code: postgresErrorCode(err) });
   });
+}
+
+/** Extract only the code for diagnostic projection; never stringify a database error. */
+export function postgresErrorCode(error: unknown): string {
+  try {
+    if (error !== null && typeof error === "object") {
+      const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+      const code: unknown = descriptor && "value" in descriptor ? descriptor.value : undefined;
+      if (typeof code === "string") return code;
+    }
+  } catch {
+    // Untrusted error objects may reject property inspection.
+  }
+  return "unknown_error";
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
