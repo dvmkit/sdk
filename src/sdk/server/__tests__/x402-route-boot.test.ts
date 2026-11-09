@@ -118,11 +118,14 @@ describe("x402 route boot checks", () => {
         },
       },
     });
-    await expect(createDVMServer(descriptor, {
+    const options = {
       env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" },
       store: new MemoryKVStore(),
       devMode: true,
-    })).rejects.toThrow("server has no x402 configuration");
+    };
+    const guidance = "server has no x402 configuration; pass the x402 option to createDVMServer";
+    await expect(createDVMServer(descriptor, options)).rejects.toThrow(guidance);
+    await expect(createDVMServer(dvm(0), options)).rejects.toThrow(guidance);
   });
 
   it("refuses to start when the public origin pushes a listing's challenge past the size limit", async () => {
