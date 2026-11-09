@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.27.0",
+  "version": "0.31.0",
   "storeContracts": {
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean }",
@@ -109,6 +109,21 @@
       ],
       "unit": "integer micro-units of the job credit's currency",
       "behavior": "each payment buys the next piece of work and a piece finishes at the next payment-request or completion; every ending charges finished pieces, a caller cancel also charges the running piece, and failure, decline and expiry release it; decline answers 201 or 409 no_open_ask; receipt credit.amount is the charged amount"
+    },
+    "x402Route": {
+      "fixture": "protocol-fixtures/x402-route-v1.json",
+      "path": "POST /v1/x402/{capability}",
+      "behavior": "capabilities offered on the x402 channel take one unsigned x402 request each, with the definition's input as the flat JSON body; an unpaid request is quoted from its body, and on a listed capability an empty or invalid unpaid body is quoted from listing.example; an invalid paid body, signed-request fields or any other payment rail answer 400 before verification; a paid request answers once within the capability's maxRuntimeSeconds plus the facilitator timeout from arrival: 200 charged with messages when their serialized UTF-8 array is at most 1048576 bytes, 500 or 503 not_charged, 402 not_charged with PAYMENT-RESPONSE success false, or 202 payment_pending with charge_outcome unknown and Retry-After; every response carries DVM-Job-Identity-V1"
+    },
+    "x402Listing": {
+      "fixture": "protocol-fixtures/x402-listing-v1.json",
+      "path": "POST /v1/x402/{capability}",
+      "behavior": "a capability listed on the x402 channel declares, on its route's v2 PAYMENT-REQUIRED only, a resource whose url is the public origin, then the host's mount prefix, then /v1/x402/{capability}, or listing.resourceUrl when set, with the listing's description, mimeType application/json and any serviceName, tags and iconUrl, plus an extensions.bazaar that upstream validateDiscoveryExtension accepts with method POST and bodyType json; the v1 JSON body and an unlisted capability carry neither; every payload the server sends a facilitator on verify or settle carries the server's resource and extensions in place of the caller's, on the route, /v1/job deferred and upfront exact, /v1/credit, mid-job top-ups and reusable-channel payments, whose resource is /v1/credit; a facilitator's EXTENSION-RESPONSES header is logged and never returned; the route's PAYMENT-RESPONSE carries only success, transaction, network, payer and an errorReason of at most 128 characters"
+    },
+    "x402Info": {
+      "fixture": "protocol-fixtures/x402-info-v1.json",
+      "path": "GET /v1/info",
+      "behavior": "capabilities offered on the x402 channel are listed under x402_capabilities, keyed by published name, apart from the unchanged dvmkit-protocol capabilities map; each entry is the capabilities entry shape with the route's flat body schema as input_schema, the x402 definition's price, and url, the route address including the host's mount prefix; the key is omitted when no capability is offered on x402"
     }
   },
   "exports": [
@@ -120,6 +135,7 @@
         "ArtifactContent",
         "CancelContent",
         "CanonicalEnvelope",
+        "CapabilityChannels",
         "CapabilityConfig",
         "CapabilityRate",
         "CashuConfig",
@@ -187,6 +203,8 @@
         "UnsupportedCurrencyError",
         "Upfront",
         "UpfrontPayment",
+        "X402ChannelConfig",
+        "X402Listing",
         "ZodLike",
         "assertSafeUrl",
         "buildUpfront",
@@ -235,9 +253,13 @@
           "stability": "stable",
           "signature": "57df426186ce09bdd3fc3ed79e625582b40db3715881a14727e94540d0759247"
         },
+        "CapabilityChannels": {
+          "stability": "stable",
+          "signature": "23df939044d9ca8abb515ddfe63bebbeb50f52c1f42ddc8da8d093c052200cbe"
+        },
         "CapabilityConfig": {
           "stability": "stable",
-          "signature": "52167de961cfa1282f81de0b92efb9edbb64b461077d3c5eb9e6a931d7c20851"
+          "signature": "c9249f101188c8ae053e6117aa8abae6e4dc6fc7525d1824d7b73967fdba7fdd"
         },
         "CapabilityRate": {
           "stability": "stable",
@@ -253,7 +275,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "f8ec0fbc18a5067a20130f9b7f36f12747e9692058be315f59ed4fcdb76c2e4b"
+          "signature": "8f5912634723a2f7d40fba40388b31ae1bcb4d06efe2936cb9da00ee74da7dea"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -317,15 +339,15 @@
         },
         "defineCapability": {
           "stability": "stable",
-          "signature": "7da81c3977885a77ea5382892dad1d84631eb00bc5bc7c4239d7de6d87a3841a"
+          "signature": "574edfdf0cd574a60e83eaa15e1f7f1a5982a022da7a75ea4f3462f013e33e37"
         },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "dc752c2bca7c93b25083b30862160b52284675b1d2c2327f1f52180c40e4f91a"
+          "signature": "dab505abc615fcb8f09491c581fda6f4e891f4939a14809fc8955a559eb5b025"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "5efdf7a3ecd279e44ec129533f67743a95a10edc1de1d1ff92ba2b6202ff60a8"
+          "signature": "7f8032286ec5fa4a81497a21359b1c0183eeea0056352fec32c6ac75e87fbbea"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -389,7 +411,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "925c2fb4ee4cdc884a7ff16eedbc89ca2af87c139146bee23d38bc48a1a26809"
+          "signature": "f1b6163b55f3b48423f31d3dad5c563a929fb7d2c3011391caa1f34c5e008c06"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -401,7 +423,7 @@
         },
         "JobRecord": {
           "stability": "stable",
-          "signature": "fe60995924e38082ea2a80133e012ae0c002d13206bcc3801c846c39302e1269"
+          "signature": "8b48626546da8a50eeb444b29a8231ab55d32bca0b24af85a048668a220a85b1"
         },
         "JobStatus": {
           "stability": "stable",
@@ -409,7 +431,7 @@
         },
         "JobStore": {
           "stability": "stable",
-          "signature": "d249663e1509b4348dd6bd428ddb06590fd835c7ad81a68430a08fcade07c5e2"
+          "signature": "e5ee2e2a3ac57dadc71a42a6768119b99caf32eb4a1061e6e49f0f1758f2f617"
         },
         "KVStore": {
           "stability": "stable",
@@ -575,6 +597,14 @@
           "stability": "stable",
           "signature": "8442d91d7a727c8b8ea927ea7e98410a2ecb6cbdd02cc2442f42c223ac69b870"
         },
+        "X402ChannelConfig": {
+          "stability": "stable",
+          "signature": "71c050650d4add68aa1fbb14fc0d4e9ba7fb4536b8982c643c57bb08f6c1077c"
+        },
+        "X402Listing": {
+          "stability": "stable",
+          "signature": "5e81b209c8743e590b8685c8867f4723e52a0a31e0d902b7419b0035af9ef7fa"
+        },
         "z": {
           "stability": "stable",
           "signature": "a33b8d3e03864e271044c3246a8aeecc92933a422acd7680ff8db950eb672030"
@@ -604,7 +634,7 @@
         },
         "MemoryJobStore": {
           "stability": "stable",
-          "signature": "b89878f9372067f6ccc244c695ef7e9cb0ce6ae8d0da52c8dc2716b39c986e40"
+          "signature": "73ce4cb05b2cb6387a2e882e3f5afffae52548cbc583c2c85395515218059871"
         },
         "RecordedMessage": {
           "stability": "stable",
@@ -884,7 +914,7 @@
         },
         "baselineContentExpiry": {
           "stability": "experimental",
-          "signature": "fb9dac3f29cb4fdddd6c3e079b1af51ee2326dcc3bbd208186440320351b0382"
+          "signature": "7c924e3a6a3695616124d6558d413ce424ae21540517968def345285c0a873e5"
         },
         "BitcoinDepositLiability": {
           "stability": "experimental",
@@ -996,15 +1026,15 @@
         },
         "ContentHoldStore": {
           "stability": "experimental",
-          "signature": "c18a5695074bfb7dd7f6af2c231bad0b7037e67c8cd79597ef6d887afc95b5b0"
+          "signature": "9b505dd67cbfb87b5d12d3ccb645b831e87b5f5a64036a6518f32165bb7b4ac8"
         },
         "contentMetadata": {
           "stability": "experimental",
-          "signature": "b32c986b342e95c229cdb50509d7a28bca3c8375d3aa9cf35a54e33d08d933b9"
+          "signature": "ac36041c1044b26b5fed6ec0798b0846ba33871cc57a056f88e0c95c3e8376f4"
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "37e0c305de52e123ea6af565a596f3c9b5f1d18642cc1920105cd6c69bc36dc1"
+          "signature": "75f1a58b10fc1af96c158ba0db3dc9a557d784ad5e106a56d013cac23f1e2a56"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1028,11 +1058,11 @@
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "9ebaa35da1333c4ea94c43b44c82bd29ca55c140d35ffe31fbbda65cc185addb"
+          "signature": "e8e6feb9451936c72ff628577943ffcb5d3d7dad31e85326bc3fe4fee246dbe0"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "83debaa34b945dcb67cc57eda81543e33d7cacc9de279731fcb9fb414edda431"
+          "signature": "38729447cc63cbb02694696b7fb11f02dc9f4684040c117532bd5acb97450410"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1120,7 +1150,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "c3b9141db8c8f75caf97fc0cfe871a037837fbe4edff7ad2fe7f37e42c5ecc2e"
+          "signature": "1a9fe2dee9f44b58afb585b60c93095d3ba3828a48a91f853ff247656fa9d229"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1184,11 +1214,11 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "88a0d19926f283d359ccfa27d95ae5015c5a1e250cafcc68ef39f573b86cb1ca"
+          "signature": "9ab0107e16e902a55dd8ef49b705185bb1d941da13296d50e5c7ee234ee9f072"
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "d28d07bcc969c60016dc45e12f7fddb98e98423a34bdd46b858cfbf634891f9d"
+          "signature": "3769324dc7e522ad227ae6c7980ca76704abdef60cfae1d033062a1cc3c36a85"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1212,7 +1242,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "2052634f2b5cf5de54bb989a1277f14cb1c708d2f31399ed464277cf865a86ef"
+          "signature": "faa318f4a6372aa46125393915aead09f189dde8db0737f0719fd3ddf2ca9a57"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1252,11 +1282,11 @@
         },
         "installAdminContentRoutes": {
           "stability": "experimental",
-          "signature": "99409c98a849642ade359e82040b72be877b89899f9e3c6f6df3970a46a69481"
+          "signature": "b802031655c912ce0241d64fe0e0f78c2f1534b6c1c81383c21a3e7a872b2bb1"
         },
         "InstallAdminContentRoutesOpts": {
           "stability": "experimental",
-          "signature": "e1b9060b67d476f28bcee6c038229b60788a7ec0ce8c3387efb912af1662e6a0"
+          "signature": "70a7fe10549ab6a023b6b703e5ea41373adf5269d2913cd9feafa1e26288d8ef"
         },
         "InvoiceReconciliation": {
           "stability": "experimental",
@@ -1272,11 +1302,11 @@
         },
         "isContentHoldStore": {
           "stability": "experimental",
-          "signature": "ff07aea44a6c1268c3834651412ca1a7b0f0eed0b2189feac091a6e61b450b65"
+          "signature": "886153d4ca70560fddee008ce91becc6f261f89605578e04bfbba102cc484431"
         },
         "isStreamableJobStore": {
           "stability": "experimental",
-          "signature": "64576b17ca70a9701cac23db4d67c67248e181d148b4aeff98e46cc5a05029e8"
+          "signature": "5b6bd782757ce1f6cbaa84931f3e68d1dea0da63c498d3065f54f29abfbfbc23"
         },
         "JobContentMetadata": {
           "stability": "experimental",
@@ -1284,7 +1314,7 @@
         },
         "JobCostReportPayload": {
           "stability": "experimental",
-          "signature": "df96142237265ae72e55e638f798b5d203387a1018764837f3799c394b729e02"
+          "signature": "8ff12f99c675d263a98d8d3066ae4e944defb43ebbdb76a43f90fffab29f3604"
         },
         "JobEndedError": {
           "stability": "experimental",
@@ -1292,11 +1322,11 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "629c54425088a3a9402e1b08c8a3c3891ab47a74bbffa11cc8850081274aa099"
+          "signature": "720a5b8d9afa4e0c8a4c29672bb056b10ba38b11eb538b19f92128fc2dd5fa5c"
         },
         "JobManagerOpts": {
           "stability": "experimental",
-          "signature": "21f57eccb750f58cb8580ad99c69847b75f518072b5431f7056f4640e634c8be"
+          "signature": "ee3699d9582b239575c543ca3628900b17910412fd65c2bcb2b84c8638a00091"
         },
         "JobPiece": {
           "stability": "experimental",
@@ -1304,7 +1334,7 @@
         },
         "JobRecord": {
           "stability": "experimental",
-          "signature": "fe60995924e38082ea2a80133e012ae0c002d13206bcc3801c846c39302e1269"
+          "signature": "8b48626546da8a50eeb444b29a8231ab55d32bca0b24af85a048668a220a85b1"
         },
         "JobSettlement": {
           "stability": "experimental",
@@ -1316,19 +1346,19 @@
         },
         "JobStore": {
           "stability": "experimental",
-          "signature": "d249663e1509b4348dd6bd428ddb06590fd835c7ad81a68430a08fcade07c5e2"
+          "signature": "e5ee2e2a3ac57dadc71a42a6768119b99caf32eb4a1061e6e49f0f1758f2f617"
         },
         "JobTerminalReportPayload": {
           "stability": "experimental",
-          "signature": "319b5afc083fd85956eb4e16874e0ce1cb19927fcf37d7d11779b018b5675f37"
+          "signature": "41845ecfd26bf818d8086f91179cda36028664ec4ce6392075eaaf30c8e137a6"
         },
         "LightningReceive": {
           "stability": "experimental",
-          "signature": "7631581261d652b36f5af5b251569bc851312b4d6816298d543090cf5f39631e"
+          "signature": "a9ca3091d0346b35f8ece35a0c1e3f7cd23cf3f7e12a066f6232fe175d33a3ea"
         },
         "LightningReceiveConfig": {
           "stability": "experimental",
-          "signature": "7023b5eac8f4e6d2a834265cbc1f9f36a09b1f188303644559adf8b9fafcfe23"
+          "signature": "732dacbcb05298ad8f008cfa3e59ca92cdc202a47a5faecb481a0972766360bf"
         },
         "MemoryConsumedCredentialStore": {
           "stability": "experimental",
@@ -1348,7 +1378,7 @@
         },
         "MemoryX402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "b4b4c67fd3d8713495be4a882ccf59fd3acf1ec0579332c1f57ee147e7184588"
+          "signature": "0d208972573e2801028da5c0011cff28639911b546b82839b807f3d4a338b79c"
         },
         "MIN_INVOICE_TTL_SECONDS": {
           "stability": "experimental",
@@ -1412,7 +1442,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "c2aed0f1f204d84e8d5a2df4508d989fb7fea88c0d7ce0a1061df27c22b5703f"
+          "signature": "83a860dd3c97c074624589ffa5e831de43c571c10f3237b17b0b087c8cf0060a"
         },
         "PostgresKVStore": {
           "stability": "experimental",
@@ -1436,11 +1466,11 @@
         },
         "PostgresX402ChannelStorage": {
           "stability": "experimental",
-          "signature": "6f72c7ad23c446d81869088064d25219152401efc039337905ee80390465ee0b"
+          "signature": "55b00b4b687014b8cee8d00f2e0e33fe1f722c41ed3c027439cc98af1ee7a4ee"
         },
         "PostgresX402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "110f6f37500d71ab7850c6f16d2e00532c0c01fb21f3ee35bcc171085a0bea55"
+          "signature": "eb7244a21f42b73da6be7fca5b32067698311965d7d12a64d1ab6a221f59bf09"
         },
         "PriceFiat": {
           "stability": "experimental",
@@ -1532,7 +1562,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "030f4c4abad83cca1bbd89b3e60a2a5e9617bee4e9d6614ff7a8e6ba43354574"
+          "signature": "7eef6de1b74c6622fb99397e80e250de5d808fb790c129ac94a6fd8a9b40bfea"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
@@ -1612,7 +1642,7 @@
         },
         "StreamableJobStore": {
           "stability": "experimental",
-          "signature": "3d413bbbf222a0381e619566a017aed82744f13cf91ccb26debed05e51d642cb"
+          "signature": "16ef557813d02373c569f9340306d7b2bca238aa5ca6c4702b6cd894d552f324"
         },
         "stripCreditEnvelope": {
           "stability": "experimental",
@@ -1748,7 +1778,7 @@
         },
         "X402ExactSettlementAttempt": {
           "stability": "experimental",
-          "signature": "f202bb20d3fe0d50e98948452bb2f66eec433972f09b40074f48b933a1de265f"
+          "signature": "b22b418a969db6aa84c3f62b33e1f39a429111088ac043f2fbf01058a84a9d27"
         },
         "X402ExactSettlementChainEvidence": {
           "stability": "experimental",
@@ -1764,7 +1794,7 @@
         },
         "X402ExactSettlementEvidenceReader": {
           "stability": "experimental",
-          "signature": "e4df2224e8b23b7f35010e2b8066aed2ac479ea4c4f9423bccd8a9185d38f080"
+          "signature": "a1dfe4b8da5efdc083d0b187ca5816570357b9f9fe46af2dcbade692a8509bc1"
         },
         "X402ExactSettlementIntent": {
           "stability": "experimental",
@@ -1776,11 +1806,11 @@
         },
         "X402ExactSettlementServer": {
           "stability": "experimental",
-          "signature": "664763946156d4cec64573dd1a8cfc412283305b94e0aade4bdc9210a48578ca"
+          "signature": "c2764f6243cea075c5f6fac168c78f6e60f692299a16c640e5ede4e0899ab06e"
         },
         "X402ExactSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "5ab60c3e53fc43de60f7bb512ca32f05a55205f25bdbd74ac9ae5ff3f3e24b5f"
+          "signature": "9d3d302a7d6aceee54dc71d0e8159f0ae33741c70933ef69277362c65b435a37"
         },
         "X402ExactSettlementStatus": {
           "stability": "experimental",
@@ -1788,7 +1818,7 @@
         },
         "X402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "57df1ebfeaacbbe1fb286488636e088532981f57b2f17f644c841500eb175ceb"
+          "signature": "5076384e21dfa02455e2a718a9ec98535080c8becbef49c6f13260f3b9d00cbf"
         },
         "X402RelayLockHolder": {
           "stability": "experimental",
@@ -1808,7 +1838,7 @@
         },
         "X402SettlementEvidenceReader": {
           "stability": "experimental",
-          "signature": "3a8e8ce9bb89734d94d4cbf09545a98108a5c71e141130779103aea75b3b5e1f"
+          "signature": "04c4baf99eb94de50cb8f8b60c34a3ecc069804c45722ac1fb33973565cd3d80"
         },
         "X402SettlementSubmissionError": {
           "stability": "experimental",
