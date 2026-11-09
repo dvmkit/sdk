@@ -91,10 +91,10 @@ describe("Postgres streaming recovery", () => {
     ["57P01", "57P01"],
     ["ECONNRESET", "ECONNRESET"],
     [undefined, "unknown_error"],
-    ["postgres://user:secret@db.example.com/database", "unknown_error"],
+    ["postgres://user:secret@example.com/database", "unknown_error"],
     ["X".repeat(1000), "unknown_error"],
   ])("logs only approved codes on loss and failed reconnect (%s)", async (code, expected) => {
-    const error = Object.assign(new Error("SENTINEL_SECRET postgres://user:secret@db.example.com/database"), { code });
+    const error = Object.assign(new Error("SENTINEL_SECRET postgres://user:secret@example.com/database"), { code });
     const first = new ListenClient();
     const connect = vi.fn().mockResolvedValueOnce(first).mockRejectedValue(error);
     const store = new PostgresJobStore({ connect } as unknown as Pool);
