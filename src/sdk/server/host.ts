@@ -491,8 +491,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     // paid calls at `mint_health_pending` until its first probe lands. Nothing
     // to await here; the port binds without waiting on the mint probe.
 
-    // The descriptor-level x402 is resolved per-mount below (since cast etc.
-    // can mount multiple descriptors). Host-level x402 (the opts.x402) wins.
+    // Host options take precedence over environment defaults. Each mount
+    // prefers its descriptor's x402 configuration over this host fallback.
     const rawX402Base = opts.x402 ?? buildX402FromEnv(envMaybe);
     const x402Base = rawX402Base ? normalizeX402Config(rawX402Base) : undefined;
     // Dual-serve is a default-true opt-out: unset (or anything but "false")

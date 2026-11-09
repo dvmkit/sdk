@@ -55,7 +55,10 @@ export function assertX402RoutesServable(
   const at = `createDVMServer: capability "${first.name}" is offered on x402`;
   const { x402Config, paymentMethods } = server;
   if (!x402Config) {
-    throw new Error(`${at} but the server has no x402 configuration; set DVMConfig.x402 or the host's x402 option`);
+    throw new Error(
+      `${at} but the server has no x402 configuration; pass the x402 option to createDVMServer, ` +
+        "or supply an x402 rail through createDVMHost's options, environment, or mounted DVM"
+    );
   }
   if (paymentMethods !== undefined && !paymentMethods.includes("x402")) {
     throw new Error(

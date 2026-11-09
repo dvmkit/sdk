@@ -224,13 +224,30 @@ describe("capability channels", () => {
     expect(capabilityForChannel(dvm, "fetch", "x402")?.name).toBe("fetch");
   });
 
-  it("requires maxRuntimeSeconds and x402 configuration on the x402 channel", () => {
+  it("requires maxRuntimeSeconds on the x402 channel", () => {
     expect(() => withX402({ maxRuntimeSeconds: undefined }))
       .toThrow('capability "fetch" is offered on x402 and must set maxRuntimeSeconds (1 to 600)');
+  });
+
+  it("validates price and listing examples before a host supplies the x402 rail", () => {
+    const definition = {
+      channels: { job: false, x402: {} },
+      maxRuntimeSeconds: 5,
+      onJob,
+    };
+    expect(() => configureDVM({ name: "example", capabilities: { fetch: definition } }))
+      .toThrow('capability "fetch" is offered on x402 but is free');
     expect(() => configureDVM({
       name: "example",
-      capabilities: { fetch: { channels: { job: true, x402: {} }, price: "$0.01", maxRuntimeSeconds: 5, onJob } },
-    })).toThrow('capability "fetch" is offered on x402 but the DVM has no x402 configuration');
+      capabilities: {
+        fetch: {
+          ...definition,
+          price: "$0.01",
+          input: z.object({ url: z.string().url() }),
+          channels: { job: false, x402: { listing: { ...scrapeListing, example: { url: "not a url" } } } },
+        },
+      },
+    })).toThrow(/capability "fetch" channels\.x402\.listing\.example does not satisfy its input schema.*url/);
   });
 
   it("refuses a listing on a capability not offered on x402", () => {
