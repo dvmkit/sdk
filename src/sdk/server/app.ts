@@ -2911,7 +2911,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             { onError: () => ({ "error.code": "invalid_quote_data" }) }
           );
         } catch (err) {
-          const schemaUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+          const schemaUrl = infoSchemaUrl(c.req.url, mountPrefix(c), this.publicOrigin);
           const { message, hint } =
             err instanceof z.ZodError
               ? humanizeZodError(err, { schemaUrl })
@@ -3052,7 +3052,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   ): { name: string } | { error: Response } {
     // The dvmkit protocol's names only: an x402-only name is not one `/v1/job` serves.
     const known = Object.keys(this.descriptor.capabilities);
-    const infoUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+    const infoUrl = infoSchemaUrl(c.req.url, mountPrefix(c), this.publicOrigin);
     const x402Only =
       known.length === 0
         ? `This DVM offers its capabilities to x402 clients only: send the request to POST ${mountPrefix(c)}${X402_CHANNEL_PATH_PREFIX}<capability>. See ${infoUrl}.`
@@ -3098,7 +3098,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     try {
       return { body: await c.req.json<T>() };
     } catch {
-      const infoUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+      const infoUrl = infoSchemaUrl(c.req.url, mountPrefix(c), this.publicOrigin);
       return {
         error: c.json(
           {
@@ -3118,7 +3118,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    * and `message` carry the same relayable explanation.
    */
   private invalidInputResponse(c: Context<AppEnv>, err: unknown): Response {
-    const schemaUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+    const schemaUrl = infoSchemaUrl(c.req.url, mountPrefix(c), this.publicOrigin);
     const issues = zodIssuesOf(err);
     if (issues) {
       // Render the caller's half alone when there is one, so a body that is
@@ -3440,7 +3440,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       pinDimension("capability", name);
       pinDimension("channel", "x402");
     }
-    const schemaUrl = `${this.publicOrigin ?? new URL(c.req.url).origin}${prefix}/v1/info`;
+    const schemaUrl = infoSchemaUrl(c.req.url, prefix, this.publicOrigin);
     if (!cap) {
       return c.json(
         {
@@ -5349,7 +5349,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         if (open) return this.paymentInProgressResponse(c);
         throw error;
       }
-      const infoUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+      const infoUrl = infoSchemaUrl(c.req.url, mountPrefix(c), this.publicOrigin);
       return c.json(
         {
           error: "unknown_capability",
@@ -6282,7 +6282,7 @@ function buildAuthErrorResponse(
   err: SignedRequestError,
   publicOrigin: string | undefined
 ): Response {
-  return c.json(authErrorBody(err, { schemaUrl: infoSchemaUrl(c.req.url, publicOrigin) }), 401);
+  return c.json(authErrorBody(err, { schemaUrl: infoSchemaUrl(c.req.url, mountPrefix(c), publicOrigin) }), 401);
 }
 
 /**

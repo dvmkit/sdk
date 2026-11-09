@@ -73,13 +73,11 @@ export function authErrorBody(
  * This DVM's own `/v1/info`, absolute — the schema pointer an input-shape hint
  * carries when the offending schema is one `/v1/info` publishes.
  *
- * Lives beside {@link authErrorBody} rather than in `app.ts` because both the
- * app routes and the credit routes build this envelope, and a second copy is
- * how the two would drift. Takes the request URL rather than a Hono context so
- * the module stays free of the app's types.
+ * Takes the route's normalized mount prefix and request URL rather than a
+ * Hono context so the module stays free of the app's types.
  */
-export function infoSchemaUrl(requestUrl: string, publicOrigin?: string): string {
-  return `${publicOrigin ?? new URL(requestUrl).origin}/v1/info`;
+export function infoSchemaUrl(requestUrl: string, mountPrefix: string, publicOrigin?: string): string {
+  return `${publicOrigin ?? new URL(requestUrl).origin}${mountPrefix}/v1/info`;
 }
 
 /**

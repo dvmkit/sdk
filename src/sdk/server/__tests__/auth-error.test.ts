@@ -77,7 +77,7 @@ describe("authErrorBody — input violations are disclosed, signing failures are
       "https://dvmkit--transcribe.example.com/deployment/path/"
     );
     const body = authErrorBody(err, {
-      schemaUrl: infoSchemaUrl("http://request.example/v1/job", publicOrigin),
+      schemaUrl: infoSchemaUrl("http://request.example/v1/job", "", publicOrigin),
     });
 
     expect(body.error).toBe("auth_error");
