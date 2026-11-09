@@ -1,4 +1,4 @@
-import { inlineResultMessages, waitForInlineResult } from "./inline-result-wait";
+import { boundedResultMessages, inlineResultMessages, waitForInlineResult } from "./inline-result-wait";
 import { upfrontPaymentFromDraw } from "./upfront-payment";
 import { withJobReadAvailability } from "./job-read-response";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
@@ -9,6 +9,7 @@ import { installAdminContentRoutes } from "./admin-content";
 import { contentMetadata, isContentHoldStore } from "./content-retention";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { droppedSignedFields } from "../signed-envelope-schema";
+import { capabilityForChannel } from "../capability-channels";
 import { FLY_KEEPALIVE_PATH } from "./fly-keepalive";
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
@@ -23,6 +24,7 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { cors } from "hono/cors";
+import { baseRoutePath } from "hono/route";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { Pool } from "pg";
@@ -42,14 +44,23 @@ import {
   type SignedRequestDomain,
 } from "../../lib/signed-request-statement";
 import { parseTraceparent } from "../../lib/traceparent";
-import type { V1InfoCapability, V1InfoResponse } from "../../lib/transport/types";
+import type { V1InfoCapability, V1InfoResponse, V1InfoX402Capability } from "../../lib/transport/types";
 import {
   encodeSettleResponseHeader,
   X402_BATCH_SETTLEMENT_SCHEME,
   X402_EXACT_SCHEME,
-  type SettleResponse,
 } from "../../lib/x402/spec";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
+import {
+  buildX402Discovery,
+  X402_CHANNEL_PATH_PREFIX,
+  x402ChannelPath,
+  x402BodySchema,
+  type X402Discovery,
+  x402MountPrefix,
+  x402RouteUrl,
+} from "../../lib/x402/bazaar";
+import { X402_DEFAULT_FACILITATOR_TIMEOUT_MS } from "../../lib/x402/facilitator-request";
 import type {
   X402Config,
   X402SelfRelayBalanceObservation,
@@ -76,6 +87,7 @@ import {
   validateCurrency,
 } from "../pricing/index";
 import type {
+  CapabilityChannel,
   CapabilityDescriptor,
   CashuMode,
   DVMDescriptor,
@@ -234,7 +246,25 @@ import {
   type X402BatchSettlementServer,
 } from "./x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "./x402-channel-store";
-import { InProcessDeferredX402Settler, X402ExactSettlementServer } from "./x402-exact-settlement";
+import {
+  DEFERRED_X402_SETTLE_WINDOW_CLOSED,
+  InProcessDeferredX402Settler,
+  X402ExactSettlementServer,
+} from "./x402-exact-settlement";
+import {
+  assertX402RoutesServable,
+  authorizationUnavailableSettleResponse,
+  chargedSettleResponse,
+  classifyX402RouteOutcome,
+  parseX402ResponseLimitMs,
+  parseX402RouteBody,
+  SETTLE_WINDOW_CLOSED_REASON,
+  signedFieldsIn,
+  X402_ROUTE_COPY,
+  x402RouteBudget,
+  x402RouteUnpayableReasons,
+  type X402RouteRow,
+} from "./x402-route";
 import { PostgresX402ExactSettlementStore } from "./x402-exact-settlement-store";
 import {
   configuredX402FacilitatorSupport,
@@ -325,6 +355,12 @@ export interface SDKServerOpts {
   /** Payment methods this DVM accepts. Default: derived from configured rails — adds "cashu" when `mints` is set, "x402" when `x402` is set, "tempo" when `tempo` is set. */
   paymentMethods?: PaymentMethod[];
   x402?: X402Config;
+  /**
+   * Path a host mounts this server under, such as `/feed`, or `""` at the
+   * root. Boot checks size the x402 route's challenge at the address it will
+   * name; requests read their own mount from the route.
+   */
+  mountPrefix?: string;
   /** Live facilitator capability gate. Hosts wire this after probing `/supported`. */
   x402FacilitatorHealth?: X402FacilitatorHealthLike;
   /** MPP multi-rail payment handle (built via `createMppFromOpts`). */
@@ -1109,9 +1145,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
   constructor(descriptor: DVMDescriptor<State, InputSchema>, opts: InternalSDKServerOpts) {
     this.descriptor = descriptor;
-    this.diagnosticCapabilityAuthority = createDiagnosticCapabilityAuthority(
-      Object.keys(descriptor.capabilities),
-    );
+    // Both channels' names: an x402-only capability is attributed too.
+    this.diagnosticCapabilityAuthority = createDiagnosticCapabilityAuthority([
+      ...Object.keys(descriptor.capabilities),
+      ...Object.keys(descriptor.x402Capabilities ?? {}),
+    ]);
     this.pricingCurrency = (descriptor.currency as string | undefined) ?? "usd";
     this.opts = opts;
     assertCardMinimumWithinCreditMax(opts.stripeCredit, descriptor.credit);
@@ -1143,6 +1181,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
     }
     assertCapabilityRates(descriptor.capabilities);
+    assertX402RoutesServable(descriptor, {
+      x402Config: opts.x402,
+      paymentMethods: opts.paymentMethods,
+      publicOrigin: this.publicOrigin,
+      mountPrefix: x402MountPrefix(opts.mountPrefix),
+      devMode: opts.devMode,
+      responseLimitMs: parseX402ResponseLimitMs(opts.env.DVMKIT_X402_RESPONSE_LIMIT_MS),
+    });
+    if (!this.publicOrigin && Object.keys(descriptor.x402Capabilities ?? {}).length > 0) {
+      // Only devMode boots so: each x402 route payment then names the
+      // request's own origin as its resource.
+      diagnosticConsole.warn({ level: "warn", event: "x402_route_origin_from_request" });
+    }
     // runtime mint-health tracker. Drive `/v1/info` filtering and
     // receive-time gating. Caller-supplied trackers (test seam, or a single
     // shared tracker across multiple sub-DVMs in one process) are used as-is;
@@ -1209,6 +1260,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             },
           })
         : undefined;
+    for (const reason of x402RouteUnpayableReasons(descriptor, {
+      durableSettlement: this.deferredX402 !== undefined,
+      pricingCurrency: this.pricingCurrency,
+      dualServe: opts.x402?.dualServe ?? true,
+    })) {
+      if (!opts.devMode) throw new Error(reason.message);
+      diagnosticConsole.warn({ level: "warn", event: reason.event });
+    }
     this.jobManager = new JobManager(descriptor, {
       deferredX402: this.deferredX402,
       receiptIssuer: this.receiptIssuer,
@@ -1530,7 +1589,21 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
     // Public routes use explicit signatures, job tokens, or payments, not cookies.
     // Browser wallets need the 402's X-Cashu header in production as well as dev.
-    this.app.use("/v1/*", cors({ origin: "*", credentials: false, exposeHeaders: ["X-Cashu"] }));
+    // The x402 route takes x402 only, and a browser x402 client reads its
+    // payment headers and when to retry. One middleware picks per path because
+    // a second cors middleware on the same path would overwrite the first's
+    // exposed headers on every non-preflight response.
+    const jobCors = cors({ origin: "*", credentials: false, exposeHeaders: ["X-Cashu"] });
+    const x402Cors = cors({
+      origin: "*",
+      credentials: false,
+      exposeHeaders: ["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE", "Retry-After"],
+    });
+    this.app.use("/v1/*", (c, next) =>
+      c.req.path.slice(mountPrefix(c).length).startsWith(X402_CHANNEL_PATH_PREFIX)
+        ? x402Cors(c, next)
+        : jobCors(c, next)
+    );
     if (this.opts.devMode) {
       this.app.get("/_dev", (c) => c.html(devPageHtml(this.descriptor.name)));
       this.app.all("/_proxy/*", (c) => this.handleProxy(c));
@@ -1541,6 +1614,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     this.app.get("/v1/info", (c) => this.handleInfo(c));
     this.app.post("/v1/quote", (c) => this.handleQuote(c));
     this.app.post("/v1/job", (c) => this.handleCreateJob(c));
+    // `:capability` decodes the segment as the router does when it reads the name.
+    this.app.post(`${X402_CHANNEL_PATH_PREFIX}:capability`, (c) => this.handleX402Route(c));
     if (this.opts.hostingControlInstance) {
       this.app.post("/_hosting/control", (c) => this.handleHostingCommand(c, false));
       this.app.post("/_hosting/status", (c) => this.handleHostingCommand(c, true));
@@ -2547,6 +2622,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (credit) info.credit = toCreditTerms(credit);
     if (this.opts.mints) info.mints = this.advertisedMints();
     info.capabilities = this.renderCapabilities();
+    const x402Capabilities = this.renderX402Capabilities(c);
+    if (x402Capabilities) info.x402_capabilities = x402Capabilities;
     info.payment = { methods: this.resolvePaymentMethods() };
     if (info.payment.methods.includes("x402") && this.opts.x402 && this.x402Support()?.available) {
       info.x402 = {
@@ -2630,40 +2707,66 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private renderCapabilities(): Record<string, V1InfoCapability> {
     const out: Record<string, V1InfoCapability> = {};
-    for (const [name, cap] of Object.entries(this.descriptor.capabilities)) {
-      const entry: V1InfoCapability = {};
-      if (cap.description) entry.description = cap.description;
-      if (cap.input && isZodSchema(cap.input)) {
-        // emit input-mode JSON Schema so `.default()` fields stay out
-        // of `required` and the advertised contract matches what the server's
-        // Zod safeParse/parse actually accepts. Output mode (the Zod 4 default)
-        // marks defaulted fields as required because they're guaranteed to be
-        // present *after* parsing — wrong story for an input-receiving surface.
-        entry.input_schema = toJSONSchema(cap.input as z.ZodType, { io: "input" });
-      }
-      // builder-supplied example payload. The CLI prefers this over
-      // schema-derived placeholders so cross-field refinements (e.g. narrate's
-      // text-XOR-dialogue) get a runnable `--data` value instead of `'{}'`.
-      if (cap.example !== undefined) entry.example = cap.example as Record<string, unknown>;
-      let pricing: V1InfoCapability["pricing"];
-      if (cap.onQuote?.schema) {
-        const qs = cap.onQuote.schema;
-        pricing = {
-          quote: {
-            schema: isZodSchema(qs) ? toJSONSchema(qs as z.ZodType, { io: "input" }) : qs,
-          },
-        };
-      } else {
-        const max = this.jobManager.currentPricingMax(name);
-        if (max) pricing = { max };
-      }
-      // Published verbatim: the construction-time check already holds every
-      // entry to the limits independent clients parse, so nothing is rewritten.
-      if (cap.rates) pricing = { ...pricing, rates: cap.rates };
-      if (pricing) entry.pricing = pricing;
-      out[name] = entry;
-    }
+    for (const [name, cap] of Object.entries(this.descriptor.capabilities)) out[name] = this.renderCapability(name, cap, "job");
     return out;
+  }
+
+  /**
+   * The x402 channel's capabilities, apart from {@link renderCapabilities}
+   * because a name may mean a different definition there. Each names its own
+   * route at this mount, the address its payments name.
+   */
+  private renderX402Capabilities(c: Context<AppEnv>): Record<string, V1InfoX402Capability> | undefined {
+    const caps = Object.entries(this.descriptor.x402Capabilities ?? {});
+    if (caps.length === 0) return undefined;
+    const origin = this.publicOrigin ?? new URL(c.req.url).origin;
+    const prefix = mountPrefix(c);
+    return Object.fromEntries(
+      caps.map(([name, cap]) => [name, { url: x402RouteUrl(origin, prefix, name), ...this.renderCapability(name, cap, "x402") }])
+    );
+  }
+
+  private renderCapability(
+    name: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cap: CapabilityDescriptor<any, any>,
+    channel: CapabilityChannel
+  ): V1InfoCapability {
+    const entry: V1InfoCapability = {};
+    if (cap.description) entry.description = cap.description;
+    if (channel === "x402") {
+      // The route's body: the input without the signed-request fields an
+      // unsigned x402 caller never sends.
+      if (cap.input && isZodSchema(cap.input)) entry.input_schema = x402BodySchema(cap.input);
+    } else if (cap.input && isZodSchema(cap.input)) {
+      // emit input-mode JSON Schema so `.default()` fields stay out
+      // of `required` and the advertised contract matches what the server's
+      // Zod safeParse/parse actually accepts. Output mode (the Zod 4 default)
+      // marks defaulted fields as required because they're guaranteed to be
+      // present *after* parsing — wrong story for an input-receiving surface.
+      entry.input_schema = toJSONSchema(cap.input as z.ZodType, { io: "input" });
+    }
+    // builder-supplied example payload. The CLI prefers this over
+    // schema-derived placeholders so cross-field refinements (e.g. narrate's
+    // text-XOR-dialogue) get a runnable `--data` value instead of `'{}'`.
+    if (cap.example !== undefined) entry.example = cap.example as Record<string, unknown>;
+    let pricing: V1InfoCapability["pricing"];
+    if (cap.onQuote?.schema) {
+      const qs = cap.onQuote.schema;
+      pricing = {
+        quote: {
+          schema: isZodSchema(qs) ? toJSONSchema(qs as z.ZodType, { io: "input" }) : qs,
+        },
+      };
+    } else {
+      const max = this.jobManager.currentPricingMax(name, channel);
+      if (max) pricing = { max };
+    }
+    // Published verbatim: the construction-time check already holds every
+    // entry to the limits independent clients parse, so nothing is rewritten.
+    if (cap.rates) pricing = { ...pricing, rates: cap.rates };
+    if (pricing) entry.pricing = pricing;
+    return entry;
   }
 
   private async handleQuote(c: Context<AppEnv>): Promise<Response> {
@@ -2942,15 +3045,20 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     c: Context<AppEnv>,
     capability: string | undefined
   ): { name: string } | { error: Response } {
-    const known = this.jobManager.capabilityNames();
+    // The dvmkit protocol's names only: an x402-only name is not one `/v1/job` serves.
+    const known = Object.keys(this.descriptor.capabilities);
     const infoUrl = infoSchemaUrl(c.req.url, this.publicOrigin);
+    const x402Only =
+      known.length === 0
+        ? `This DVM offers its capabilities to x402 clients only: send the request to POST ${mountPrefix(c)}${X402_CHANNEL_PATH_PREFIX}<capability>. See ${infoUrl}.`
+        : undefined;
     if (typeof capability !== "string" || capability.length === 0) {
       return {
         error: c.json(
           {
             error: "capability_required",
             message: 'Request body is missing the required "capability" field.',
-            hint: `Set body.capability to one of: ${known.join(", ")}. See ${infoUrl}.`,
+            hint: x402Only ?? `Set body.capability to one of: ${known.join(", ")}. See ${infoUrl}.`,
           },
           400
         ),
@@ -2962,7 +3070,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           {
             error: "unknown_capability",
             message: `"${capability}" is not a capability of "${this.descriptor.name}".`,
-            hint: `Known capabilities: ${known.join(", ")}. See ${infoUrl}.`,
+            hint: x402Only ?? `Known capabilities: ${known.join(", ")}. See ${infoUrl}.`,
           },
           400
         ),
@@ -3113,7 +3221,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!intentId || !this.x402ExactSettlement) return undefined;
     const intent = await this.x402ExactSettlement.get(this.opts.dvmId ?? "", intentId);
     return intent?.status === "complete" && intent.settleResponse
-      ? encodeSettleResponseHeader(intent.settleResponse as unknown as SettleResponse)
+      ? encodeSettleResponseHeader(intent.settleResponse)
       : undefined;
   }
 
@@ -3308,17 +3416,142 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return buildRequestResultResponse(c, requestId, snapshot, await this.contentFields(snapshot));
   }
 
-  private async handleCreateJob(c: Context<AppEnv>, resumeOnly = false): Promise<Response> {
+  /**
+   * `POST /v1/x402/<capability>`: a stock x402 client's single request. The
+   * body is the x402 definition's input, flat. Everything a caller could get
+   * wrong is refused here, before pricing or any facilitator call; the request
+   * then takes the unsigned deferred-x402 submit, and a paid one is answered
+   * with its outcome in the same response.
+   */
+  private async handleX402Route(c: Context<AppEnv>): Promise<Response> {
+    // The time budget runs from arrival, so verification counts against it.
+    const arrivalMs = Date.now();
+    const name = c.req.param("capability") ?? "";
+    const cap = capabilityForChannel(this.descriptor, name, "x402");
+    const prefix = mountPrefix(c);
+    // Pinned once the name resolves, so every answer the route gives a known
+    // capability, refusals included, is attributed to it and its channel.
+    if (cap) {
+      pinDimension("capability", name);
+      pinDimension("channel", "x402");
+    }
+    const schemaUrl = `${this.publicOrigin ?? new URL(c.req.url).origin}${prefix}/v1/info`;
+    if (!cap) {
+      return c.json(
+        {
+          error: "unknown_capability",
+          message: `No capability named ${JSON.stringify(name)} is offered on x402 here.`,
+          hint: `See ${schemaUrl} for the capabilities this DVM offers.`,
+        },
+        404
+      );
+    }
+    const authorization = c.req.header("Authorization");
+    const mppCredential = authorization
+      ? (await import("mppx")).Credential.extractPaymentScheme(authorization)
+      : undefined;
+    if (c.req.header("X-Cashu") || mppCredential) {
+      return c.json(
+        {
+          error: "payment_method_not_accepted",
+          message: "This route accepts only an unsigned x402 payment, in PAYMENT-SIGNATURE or X-PAYMENT.",
+          display: "This address takes x402 payment only. Nothing was charged.",
+          hint: `To pay another way, submit the input to POST ${prefix}/v1/job as {"capability": ${JSON.stringify(name)}, "data": <input>} where ${schemaUrl} lists it.`,
+        },
+        400
+      );
+    }
+    const text = await c.req.text();
+    const received = parseX402RouteBody(text);
+    const signed = received.kind === "json" ? signedFieldsIn(received.value) : [];
+    if (signed.length > 0) {
+      return c.json(
+        {
+          error: "signed_fields_not_accepted",
+          message: `x402 callers are unsigned, so the body may not carry ${signed.map((f) => JSON.stringify(f)).join(", ")}.`,
+          display: "This request carried signing fields, which this address does not accept. Nothing was charged.",
+          hint: `Send the input without signing fields, or sign the request and submit it to POST ${prefix}/v1/job.`,
+        },
+        400
+      );
+    }
+    const paid = Boolean(c.req.header("PAYMENT-SIGNATURE") ?? c.req.header("X-PAYMENT"));
+    const structured = isZodSchema(cap.input);
+    const read = (): { submitted: { data?: unknown; input?: string }; parsedInput: unknown } => {
+      if (!structured) return { submitted: { input: text }, parsedInput: text };
+      if (received.kind !== "json") throw new X402RouteBodyError(received.kind);
+      const submitted = { data: received.value };
+      return { submitted, parsedInput: this.jobManager.parseInput(submitted, name, true, "x402") };
+    };
+    let request: ReturnType<typeof read>;
+    try {
+      request = read();
+    } catch (err) {
+      const listing = cap.channels.x402?.listing;
+      // A paid request is never re-read from the example: it would run work the
+      // caller did not ask for. CDP's validator probes with no body or `{}`,
+      // and then with the listing's example, so an unpaid probe is quoted.
+      if (paid || !listing) {
+        if (!(err instanceof X402RouteBodyError)) return this.invalidInputResponse(c, err);
+        return c.json(
+          {
+            error: "invalid_input",
+            display: "The request body must be this capability's input as a JSON object.",
+            message: err.kind === "empty" ? "The request body is empty." : "The request body is not JSON.",
+            hint: `Send the input fields as the JSON body. Inspect ${schemaUrl} for the expected shape.`,
+          },
+          400
+        );
+      }
+      const submitted = { data: listing.example };
+      request = { submitted, parsedInput: this.jobManager.parseInput(submitted, name, true, "x402") };
+    }
+    const x402Deferred = this.unsignedX402(cap);
+    if (!x402Deferred) {
+      return c.json(
+        {
+          error: "x402_not_offered",
+          message: "This DVM cannot take x402 payment at the moment.",
+          display: "This service cannot take x402 payment at the moment. Nothing was charged.",
+          hint: `Check ${schemaUrl} for the payment methods this DVM offers.`,
+        },
+        503
+      );
+    }
+    const settleTimeoutMs = this.opts.x402?.facilitatorTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
+    const origin = this.publicOrigin ?? new URL(c.req.url).origin;
+    const listing = cap.channels.x402?.listing;
+    return this.handleCreateJob(c, false, {
+      name,
+      cap,
+      mountPrefix: prefix,
+      resource: x402RouteUrl(origin, prefix, name),
+      discovery: listing && buildX402Discovery({ name, listing, input: cap.input, publicOrigin: origin, mountPrefix: prefix }),
+      submitted: request.submitted,
+      parsedInput: request.parsedInput,
+      x402Deferred,
+      settleTimeoutMs,
+      ...x402RouteBudget(arrivalMs, x402Deferred.maxRuntimeSeconds, settleTimeoutMs),
+    });
+  }
+
+  /**
+   * `route` is set for the x402 route, whose preamble already resolved the
+   * capability and parsed the input. Its body carries no protocol fields, so
+   * every `/v1/job` envelope read below is skipped for it.
+   */
+  private async handleCreateJob(
+    c: Context<AppEnv>,
+    resumeOnly = false,
+    route?: X402RouteSubmit
+  ): Promise<Response> {
     if (!resumeOnly) this.maybeSweepTempoSessions();
-    const parsed = await this.requireJsonBody<{
-      capability?: string;
-      input?: string;
-      params?: Record<string, string>;
-      data?: unknown;
-    }>(c);
+    const parsed = route
+      ? { body: { capability: route.name, ...route.submitted } as SubmitBody }
+      : await this.requireJsonBody<SubmitBody>(c);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;
-    if (hasInvalidRequestId(body.data)) {
+    if (!route && hasInvalidRequestId(body.data)) {
       return c.json(
         {
           error: "invalid_request_id",
@@ -3330,7 +3563,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // The receive path refuses this id too; refusing it here as well tells a
     // caller before it pays, rather than answering 402 for a payment it could
     // not make under this id, and before the permanent public request-id binding.
-    if (c.req.header("X-Cashu-Request-Id")?.startsWith(DERIVED_REQUEST_ID_PREFIX)) {
+    if (!route && c.req.header("X-Cashu-Request-Id")?.startsWith(DERIVED_REQUEST_ID_PREFIX)) {
       return c.json(
         paymentErrorBody("reserved_request_id", {
           message: `X-Cashu-Request-Id may not start with "${DERIVED_REQUEST_ID_PREFIX}".`,
@@ -3338,7 +3571,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         400
       );
     }
-    const publicRequestId = requestIdFromEnvelope(body.data);
+    const publicRequestId = route ? undefined : requestIdFromEnvelope(body.data);
     const recoveryStore = requestRecoveryStore(this.jobManager.store);
     const resumedRequestId = resumeOnly ? c.req.param("requestId") : undefined;
     if (
@@ -3357,12 +3590,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
     }
 
-    const capabilityResult = this.requireCapabilityFromBody(c, body.capability);
+    const capabilityResult = route ? { name: route.name } : this.requireCapabilityFromBody(c, body.capability);
     if ("error" in capabilityResult) return capabilityResult.error;
     const capabilityName = capabilityResult.name;
     // No envelope field on a DVM that allows it: authenticate nothing, require
-    // a per-call payment below, and run as the anonymous requester.
-    const unsignedPaid = this.jobManager.unsignedPaidInput(body, capabilityName);
+    // a per-call payment below, and run as the anonymous requester. An x402
+    // route caller is always unsigned.
+    const unsignedPaid = route !== undefined || this.jobManager.unsignedPaidInput(body, capabilityName);
     if (unsignedPaid && publicRequestId) {
       return c.json(
         {
@@ -3378,24 +3612,28 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // and every downstream span carry the same capability. Missing/unknown
     // requests return above and remain honestly unattributed.
     pinDimension("capability", capabilityName);
-    const cap = this.descriptor.capabilities[capabilityName];
+    pinDimension("channel", route ? "x402" : "job");
+    const cap = route?.cap ?? this.descriptor.capabilities[capabilityName];
 
     // Input validation runs first so dynamic-priced capabilities (those that
     // declare `onQuote` instead of a static `price`) can recompute the
     // required price from the parsed input before the upfront-payment gate.
     // Accepts either body.data (structured, preferred) or body.input (legacy
     // JSON-encoded string). See JobManager.parseInput.
-    let parsedInput: unknown;
+    let parsedInput: unknown = route?.parsedInput;
     let deferredInputError: unknown;
     try {
-      parsedInput = await loggers.isolate.span(
-        "dvm.input.validate",
-        { capability: capabilityName, stage: "input" },
-        () => this.jobManager.parseInput(body, capabilityName, unsignedPaid),
-        { onError: () => ({ "error.code": "invalid_input" }) }
-      );
-      const schemaError = this.droppedSignedEnvelopeResponse(c, body, parsedInput, capabilityName);
-      if (schemaError) return schemaError;
+      // The route preamble already parsed its input on the x402 channel.
+      if (!route) {
+        parsedInput = await loggers.isolate.span(
+          "dvm.input.validate",
+          { capability: capabilityName, stage: "input" },
+          () => this.jobManager.parseInput(body, capabilityName, unsignedPaid),
+          { onError: () => ({ "error.code": "invalid_input" }) }
+        );
+        const schemaError = this.droppedSignedEnvelopeResponse(c, body, parsedInput, capabilityName);
+        if (schemaError) return schemaError;
+      }
     } catch (err) {
       if (unsignedPaid || !this.deferToAuthGate(err)) return this.invalidInputResponse(c, err);
       deferredInputError = err;
@@ -3408,7 +3646,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // envelope is stripped like a well-formed one, so it lands here as
     // `invalid_credit_fields` rather than as a schema error blaming the input.
     // Prepaid credit is owned by a verified pubkey; an unsigned body has none.
-    if (unsignedPaid && carriesCreditFields(signedRequestInput(body))) {
+    if (!route && unsignedPaid && carriesCreditFields(signedRequestInput(body))) {
       return c.json(
         {
           error: "invalid_credit_fields",
@@ -3420,7 +3658,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
     let creditEnvelope: CreditEnvelope | undefined;
     try {
-      creditEnvelope = extractCreditEnvelope(body.data);
+      creditEnvelope = route ? undefined : extractCreditEnvelope(body.data);
     } catch (err) {
       if (err instanceof CreditEnvelopeError) {
         return c.json(
@@ -3538,10 +3776,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // what this call asks the DVM to do, hashed. Persisted on the
     // job, and the thing a retried paid submit must reproduce to be handed
     // that job back instead of a bare 409.
+    // A route job's work is named by its route, so it can never match a
+    // `/v1/job` request for the same name and input.
     const fingerprint = requestFingerprint(
-      { capability: capabilityName, input: body.input, params: body.params, data: body.data },
+      {
+        capability: route ? x402ChannelPath(capabilityName) : capabilityName,
+        input: body.input,
+        params: body.params,
+        data: body.data,
+      },
       { stripAuthEnvelope: this.descriptor.auth !== undefined }
     );
+    const respond = (job: ServerJob | JobRecord, jobToken: string | undefined): Promise<Response> =>
+      route ? this.x402RouteResponse(c, job, jobToken, route) : this.submitResponse(c, job, jobToken);
     const authFingerprint = authEnvelope
       ? requestFingerprint(
           { capability: capabilityName, input: body.input, params: body.params, data: body.data },
@@ -3560,7 +3807,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // A previously accepted payment artifact may recover its original job
     // while hosting admission is closed. The durable reservation binds the
     // exact artifact to that job; no rail verifier or new settlement runs here.
-    if (!resumeOnly && this.opts.hostingControlInstance && hostingPaymentArtifactHash) {
+    // Recovering a route job from a presented payment is not offered.
+    if (!resumeOnly && !route && this.opts.hostingControlInstance && hostingPaymentArtifactHash) {
       const priorId = await this.opts.hostingControlInstance.acceptedJobByPaymentArtifactHash(
         hostingPaymentArtifactHash
       );
@@ -3670,7 +3918,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (!resumeOnly && !skipPayment) {
         try {
           if (cap.price !== undefined) pricedAt = await this.fxFetcher.fetch();
-          priceMsats = await this.jobManager.currentPriceMsats(capabilityName, pricedAt);
+          priceMsats = await this.jobManager.currentPriceMsats(capabilityName, pricedAt, route ? "x402" : "job");
         } catch (err) {
           const fxErr = pickFxRateUnavailable(err);
           if (fxErr) return c.json({ error: fxErr }, 503);
@@ -3708,6 +3956,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // Unsigned admission is for per-call payment only: a request that needs
       // no payment (free, or a development host that skips verification) gets
       // the refusal a signed-only DVM gives it, so free capabilities stay signed.
+      if (route && !priceMsats) {
+        return c.json(
+          {
+            error: "x402_not_offered",
+            message: "This request prices at zero, and an x402 payment cannot be for nothing.",
+            display: "This request is free here, so it cannot be paid with x402. Nothing was charged.",
+            hint: `Submit it to POST ${route.mountPrefix}/v1/job instead, where the capability is offered there.`,
+          },
+          400
+        );
+      }
       if (unsignedPaid && !priceMsats) {
         return buildAuthErrorResponse(
           c,
@@ -3744,12 +4003,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
       }
       if (!skipPayment && !resumedAcceptedPayment) {
-        const railOpts = unsignedPaid
-          ? unsignedRailOpts(await this.railVerifyOpts(c), this.unsignedX402(cap))
-          : await this.railVerifyOpts(c);
+        const railOpts = route
+          ? x402RouteRailOpts(
+              await this.railVerifyOpts(c),
+              { ...route.x402Deferred, settleByMs: route.settleByMs },
+              route.resource,
+              route.discovery
+            )
+          : unsignedPaid
+            ? unsignedRailOpts(await this.railVerifyOpts(c), this.unsignedX402(cap))
+            : await this.railVerifyOpts(c);
         // A NUT-24 wallet neither signs nor sends X-Cashu-Request-Id, so that
         // form is offered and accepted only where the request needs no signature.
-        if (!this.descriptor.auth || (unsignedPaid && this.unsignedCashuOffered())) {
+        if (!route && (!this.descriptor.auth || (unsignedPaid && this.unsignedCashuOffered()))) {
           railOpts.nut24 = {
             mints: this.advertisedMints(),
             previousRequiredMsats: this.previousPriceMsats(cap, dynamicUpfront, pricedAt),
@@ -3818,7 +4084,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             // was accepted under), never the incoming header alone. Explicit
             // draw keys remain a separate regime; try the draw key when the
             // payment reference cannot resolve an explicitly funded job.
-            if (err.detail.body.error === "replay_rejected") {
+            if (!route && err.detail.body.error === "replay_rejected") {
               const recovered = await this.recoverReplayedJob(c, {
                 requestId: err.detail.replayPaymentId,
                 fingerprint,
@@ -3863,6 +4129,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 err.detail.body.price_micro = priceFiat.amountMicro;
                 err.detail.body.price_currency = priceFiat.currency;
               }
+              // The wallet's running job ends within its own budget; a stock
+              // client reads when to retry from the header.
+              const retryAfterSeconds = route && err.detail.body.error === "x402_payer_busy"
+                ? route.x402Deferred.maxRuntimeSeconds + Math.ceil(route.settleTimeoutMs / 1000)
+                : undefined;
+              if (retryAfterSeconds !== undefined) {
+                err.detail.body.hint = `Wait ${retryAfterSeconds} seconds for this wallet's running job to finish, or pay from another wallet, then send the request again.`;
+              }
               const response = buildPaymentErrorResponse(
                 err.detail.body,
                 err.detail.mppChallenges,
@@ -3871,12 +4145,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 err.detail.x402V2Requirements,
                 undefined,
                 this.x402Support()?.exact,
-                err.detail.x402ErrorCode
+                err.detail.x402ErrorCode,
+                route?.discovery
               );
               if (err.detail.cashuPaymentRequest) {
                 response.headers.set("X-Cashu", err.detail.cashuPaymentRequest);
                 response.headers.set("Cache-Control", "no-store");
               }
+              if (retryAfterSeconds !== undefined) response.headers.set("Retry-After", String(retryAfterSeconds));
               return response;
             }
           }
@@ -3940,7 +4216,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             this.opts.dvmId ?? "",
             exactAdmission.intentId
           );
-          return await this.submitResponse(c, prior, prior.requesterToken);
+          return await respond(prior, prior.requesterToken);
         }
       }
 
@@ -4010,6 +4286,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           requestId: publicRequestId,
           authRequestPath: authEnvelope ? canonicalRequestPath(c.req.url) : undefined,
           jobId,
+          ...(route && { channel: "x402" as const }),
         }
       );
 
@@ -4027,7 +4304,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           await jm.finalizeStoredTerminal(jobId);
         }
         const terminal = await store.get(jobId);
-        if (terminal) return await this.submitResponse(c, terminal, jobToken);
+        if (terminal) return await respond(terminal, jobToken);
       }
       if (exactAdmission) {
         await this.x402ExactSettlement?.completeAdmission(
@@ -4038,12 +4315,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       const sdkCtx = jm.buildAndAttachContext(job, parsedInput);
 
+      if (route) job.handlerDeadlineMs = route.settleByMs;
       jm.runHandler(job, sdkCtx);
 
       await new Promise((resolve) => {
         setTimeout(resolve, 0);
       });
 
+      if (route) return await this.x402RouteResponse(c, job, jobToken, route);
       let response: Response = await this.submitResponse(c, job, jobToken);
       // Dual-serve window: v2 and v1 clients receive the same base64 settlement
       // artifact under their respective response header names.
@@ -4452,6 +4731,123 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const fields = await this.contentFields(snapshot);
     if (messages && fields.content_available !== false) fields.messages = messages;
     return buildSubmitResponse(c, snapshot, jobToken, fields);
+  }
+
+  /**
+   * Answer a paid x402 route request with its outcome. The job and its
+   * settlement are awaited until the request's deadline, then the answer is the
+   * row of the response table that the durable job and settlement records
+   * support, so a later read of the job can never contradict it.
+   */
+  private async x402RouteResponse(
+    c: Context<AppEnv>,
+    job: ServerJob | JobRecord,
+    jobToken: string | undefined,
+    route: X402RouteSubmit
+  ): Promise<Response> {
+    const store = this.jobManager.store;
+    const active = this.jobManager.activeJobs.get(job.id);
+    const remainingMs = (): number => Math.max(0, route.deadlineMs - Date.now());
+    await waitForInlineResult(store, job.id, active, remainingMs() / 1000, c.req.raw.signal);
+    // Settlement runs in the job's terminal work, which may chain a follow-up.
+    let terminalWorkFinished = false;
+    for (let work = active?.terminalWork; work; work = active?.terminalWork) {
+      terminalWorkFinished = await settlesWithin(work, remainingMs());
+      if (!terminalWorkFinished || active?.terminalWork === work) break;
+    }
+    const record = await store.get(job.id);
+    if (!record) throw new Error("Job snapshot unavailable");
+    const dvmId = this.opts.dvmId ?? "";
+    const intentId = deferredX402IntentId(record.creditId);
+    let intent = intentId ? await this.x402ExactSettlement?.get(dvmId, intentId) : undefined;
+    // Past `settleByMs`, an authorization still unsent can no longer settle in
+    // this request, so a job that may yet complete gives it up now. The
+    // release is a compare-and-set on `prepared`: if a settlement that started
+    // earlier claims the intent first, the release fails and the re-read
+    // shows how far that settlement got. A failed job's own terminal work
+    // releases it.
+    const mayComplete = record.status === "completed" || !isTerminal(record.status);
+    if (intentId && intent?.status === "prepared" && mayComplete && Date.now() > route.settleByMs) {
+      await this.deferredX402?.release(intentId, DEFERRED_X402_SETTLE_WINDOW_CLOSED);
+      intent = await this.x402ExactSettlement?.get(dvmId, intentId);
+    }
+    const row: X402RouteRow = classifyX402RouteOutcome({
+      status: record.status,
+      intent,
+      heldLocally: intentId !== undefined && this.deferredX402?.holds(intentId) === true,
+      runtimeLimitExceeded: active?.runtimeLimitExceeded === true,
+      terminalWorkFinished,
+    });
+    const identity = jobIdentityHeaders(record.id);
+
+    if (row === "charged" && intent) {
+      // The caller paid, so this answers 200 even with no result left to send.
+      const snapshot = await this.readJobSnapshot(job, !("listeners" in job));
+      const fields = await this.contentFields(snapshot);
+      const settlement = encodeSettleResponseHeader(chargedSettleResponse(intent));
+      const messages = fields.content_available === false ? undefined : await boundedResultMessages(store, snapshot);
+      const res: Record<string, unknown> = { job_id: snapshot.id };
+      if (jobToken) res.job_token = jobToken;
+      res.status = "completed";
+      Object.assign(res, terminalResponseFields(snapshot), fields);
+      if (messages) res.messages = messages;
+      res.charge_outcome = "charged";
+      removeUnavailableContent(res);
+      return c.json(res, 200, { ...identity, "PAYMENT-RESPONSE": settlement, "X-PAYMENT-RESPONSE": settlement });
+    }
+    if (row === "handler_failed" || row === "runtime_bound") {
+      // A completed job here finished too late to settle, not out of runtime.
+      const copy = record.status === "completed" ? X402_ROUTE_COPY.settle_window_closed : X402_ROUTE_COPY[row];
+      const reason =
+        record.status === "completed"
+          ? SETTLE_WINDOW_CLOSED_REASON
+          : (lastCancelReason(record.messages) ?? copy.display);
+      return c.json(
+        { job_id: record.id, status: "failed", reason, ...copy, charge_outcome: "not_charged" },
+        row === "handler_failed" ? 500 : 503,
+        identity
+      );
+    }
+    if (row === "settlement_refused" || row === "authorization_lost") {
+      if (row === "authorization_lost" && intentId) {
+        // Nothing holds the authorization any more, so later reads must say unpaid too.
+        await this.x402ExactSettlement?.release(dvmId, intentId, "authorization_unavailable");
+      }
+      const answer =
+        row === "settlement_refused" && intent?.settleResponse
+          ? intent.settleResponse
+          : row === "settlement_refused"
+            ? { success: false, errorReason: intent?.lastOutcome ?? "settle_failed", transaction: "", network: intent?.network }
+            : authorizationUnavailableSettleResponse(intent?.network);
+      const header = encodeSettleResponseHeader(answer);
+      return c.json(
+        {
+          job_id: record.id,
+          error: row === "settlement_refused" ? "x402_settlement_refused" : "authorization_unavailable",
+          ...X402_ROUTE_COPY[row],
+          charge_outcome: "not_charged",
+        },
+        402,
+        { ...identity, "PAYMENT-RESPONSE": header, "X-PAYMENT-RESPONSE": header }
+      );
+    }
+    // Unknown: the settlement may still land, so the caller keeps the job token
+    // to read the outcome and must not pay a second time.
+    const retryAfterSeconds = Math.ceil(route.settleTimeoutMs / 1000);
+    return c.json(
+      {
+        job_id: record.id,
+        ...(jobToken && { job_token: jobToken }),
+        status: "processing",
+        content_available: false,
+        content_withheld: "payment_pending",
+        charge_outcome: "unknown",
+        display: "The outcome of this request is not known yet. Do not pay again.",
+        hint: `Do not pay again. After ${retryAfterSeconds} seconds, read GET ${route.mountPrefix}/v1/job/${record.id} with the X-Job-Token header; the result is released once the payment settles, and the job reads failed if it does not.`,
+      },
+      202,
+      { ...identity, "Retry-After": String(retryAfterSeconds) }
+    );
   }
 
   /**
@@ -4932,7 +5328,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     // Legacy missing capabilities and capabilities removed during execution cannot
     // reactivate. Fail the job and return structured 410 before content validation.
-    if (!jm.hasCapability(record.capability)) {
+    if (!jm.hasCapability(record.capability, record.channel)) {
       const summary = record.capability
         ? `Capability "${record.capability}" is no longer registered on this DVM`
         : "Job predates capability dispatch and cannot be resumed";
@@ -5580,6 +5976,89 @@ function unsignedRailOpts(
     x402ExactVersions: opts.x402ExactVersions,
     x402Deferred,
   };
+}
+
+/**
+ * Rail options for the x402 route: deferred exact x402 alone, so its 402 offers
+ * no other rail and the body names no mints. `resource` is the capability's
+ * own address rather than the request URL, so a query string or another
+ * spelling of the path never reaches the challenge or the facilitator.
+ */
+function x402RouteRailOpts(
+  opts: UpfrontPaymentOpts,
+  x402Deferred: NonNullable<UpfrontPaymentOpts["x402Deferred"]>,
+  resource: string,
+  discovery: X402Discovery | undefined
+): UpfrontPaymentOpts {
+  return {
+    ...unsignedRailOpts(opts, x402Deferred),
+    cashuToken: undefined,
+    mints: undefined,
+    x402Resource: resource,
+    x402Discovery: discovery,
+  };
+}
+
+/** Whether `work` settles within `ms`, without waiting longer. */
+async function settlesWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function lastCancelReason(messages: Message[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.type === "cancel") return message.content.reason;
+  }
+  return undefined;
+}
+
+type SubmitBody = { capability?: string; input?: string; params?: Record<string, string>; data?: unknown };
+
+/** What the x402 route's preamble hands the shared submit path. */
+interface X402RouteSubmit {
+  name: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cap: CapabilityDescriptor<any, any>;
+  /** See {@link mountPrefix}. */
+  mountPrefix: string;
+  /** The capability's route address, which every payment names; see {@link x402RouteUrl}. */
+  resource: string;
+  /** The listing's resource and extension, when the capability is listed. */
+  discovery?: X402Discovery;
+  /** The route body, as `data` for a structured input or raw `input` text otherwise. */
+  submitted: { data?: unknown; input?: string };
+  parsedInput: unknown;
+  x402Deferred: NonNullable<UpfrontPaymentOpts["x402Deferred"]>;
+  settleTimeoutMs: number;
+  /** See {@link x402RouteBudget}. */
+  settleByMs: number;
+  deadlineMs: number;
+}
+
+/**
+ * The path a host mounted this server under, or "" at the root. It is read
+ * from the route as registered, so the caller's spelling of the path cannot
+ * change the addresses the server names.
+ */
+function mountPrefix(c: Context<AppEnv>): string {
+  return x402MountPrefix(baseRoutePath(c));
+}
+
+/** A route body that is no JSON value at all, so no schema can judge it. */
+class X402RouteBodyError extends Error {
+  constructor(readonly kind: "empty" | "malformed") {
+    super(kind === "empty" ? "empty body" : "body is not JSON");
+  }
 }
 
 function terminalResponseFields(job: TerminalFieldSource): Record<string, unknown> {

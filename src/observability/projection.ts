@@ -46,6 +46,8 @@ const TRANSACTION_HASH_FIELDS = new Set<string>(catalogue.transactionHashFields)
 const URL_FIELDS = new Set<string>(catalogue.urlFields);
 const IDENTITY_FIELDS = new Set<string>(catalogue.identityFields);
 const CAPABILITY_FIELDS = new Set<string>(catalogue.capabilityFields);
+// The channel a capability was reached on: `job` for /v1/job, `x402` for its route.
+const CAPABILITY_CHANNELS = new Set<string>(catalogue.capabilityChannels);
 const CLIENT_PROTOCOL_VERSIONS = new Set<number>(
   catalogue.clientProtocolVersions,
 );
@@ -75,6 +77,9 @@ const CARD_REFUND_EVENTS = new Set([
   "card_refund_sweep",
   "card_refund_sweep_step_failed",
 ]);
+// Facilitator diagnostics carry the facilitator's own words for the builder.
+const X402_FACILITATOR_EVENTS = new Set(["x402_facilitator_extension_response", "x402_facilitator_request_refused"]);
+const FACILITATOR_TEXT_MAX = 256;
 const CARD_REFUND_COUNTS = new Set(["frozen", "unfrozen", "expiry_refunds", "completed", "pending", "stranded_refunds"]);
 const CARD_REFUND_STAGES = new Set(["plan", "refund", "disputes", "expiry", "retry", "stranded"]);
 const CARD_REFUND_STATUSES = new Set(["planned", "pending", "requires_action", "succeeded", "failed", "canceled", "rejected"]);
@@ -380,6 +385,10 @@ function projectField(
     const projected = projectCardRefundField(key, value);
     if (projected !== undefined) return projected;
   }
+  if (eventName !== undefined && X402_FACILITATOR_EVENTS.has(eventName)) {
+    const projected = projectFacilitatorField(key, value);
+    if (projected !== undefined) return projected;
+  }
   if (dataset === "tempo") {
     if (key === "prior_status")
       return typeof value === "string" && TEMPO_CLOSE_REPORT_PRIOR_STATUSES.has(value) ? value : undefined;
@@ -445,6 +454,8 @@ function projectField(
   }
   if (key === "rail")
     return typeof value === "string" && RAILS.has(value) ? value : undefined;
+  if (key === "channel")
+    return typeof value === "string" && CAPABILITY_CHANNELS.has(value) ? value : undefined;
   if (key === "stage")
     return typeof value === "string" && STAGES.has(value) ? value : undefined;
   if (key === "handler")
@@ -492,6 +503,23 @@ function projectField(
     return typeof value === "string" && SANCTIONS_REGIONS.has(value)
       ? value
       : undefined;
+  return undefined;
+}
+
+/**
+ * An extension's name and status are short tokens; its rejection reason and a
+ * facilitator's error message are free text from the facilitator, kept to
+ * printable ASCII and {@link FACILITATOR_TEXT_MAX} characters.
+ */
+function projectFacilitatorField(key: string, value: unknown): unknown {
+  if (key === "extension" || key === "extension_status") {
+    return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value) ? value : undefined;
+  }
+  if (key === "extension_rejected_reason" || key === "facilitator_message") {
+    if (typeof value !== "string") return undefined;
+    const text = value.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, FACILITATOR_TEXT_MAX);
+    return text === "" ? undefined : text;
+  }
   return undefined;
 }
 

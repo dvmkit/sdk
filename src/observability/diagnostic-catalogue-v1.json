@@ -487,13 +487,21 @@
     "x402_claim_ceiling_unresolved",
     "x402_credential_rejected",
     "x402_facilitator_capability_degraded",
+    "x402_facilitator_extension_response",
+    "x402_facilitator_extension_responses_truncated",
     "x402_facilitator_fallback",
+    "x402_facilitator_request_refused",
     "x402_facilitator_staleness_ceiling",
     "x402_facilitator_unavailable",
     "x402_network_unsupported",
     "x402_refund_amount_unreported",
     "x402_repair_channel_state_stale",
     "x402_repair_write_off_restore_failed",
+    "x402_route_currency_unsupported",
+    "x402_route_dual_serve_off",
+    "x402_route_origin_from_request",
+    "x402_route_response_limit_exceeded",
+    "x402_route_settlement_store_missing",
     "x402_self_relay_gas_alert_failed",
     "x402_self_relay_gas_balance",
     "x402_self_relay_gas_balance_failed",
@@ -503,6 +511,7 @@
     "x402_self_relay_rpc_health_report_failed",
     "x402_self_relay_submission_lock_timeout",
     "x402_self_relay_unserialized",
+    "x402_settle_channel_state_dropped",
     "x402_settlement_reconciliation_chain_unreachable",
     "x402_settlement_reconciliation_facilitator_unavailable",
     "x402_settlement_submission_failed",
@@ -1083,6 +1092,10 @@
   ],
   "capabilityFields": [
     "capability"
+  ],
+  "capabilityChannels": [
+    "job",
+    "x402"
   ],
   "clientProtocolVersions": [
     1

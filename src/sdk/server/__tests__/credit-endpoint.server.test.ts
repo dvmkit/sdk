@@ -2512,6 +2512,19 @@ describe("POST /v1/credit", () => {
       expect(((await res.json()) as { error: string }).error).toBe("credit_id_unavailable");
     });
 
+    it("refuses a caller-named deferred-settlement credit id before funding", async () => {
+      const { url, ledger } = await startServer();
+      const creditId = "x402d:caller-chosen";
+      const res = await creditCall(url, {
+        op: "fund",
+        credit_id: creditId,
+        fund: { amount_micro: 300_000, fund_id: "squat", commitment: COMMITMENT },
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("credit_id_unavailable");
+      expect(await ledger.get(creditId)).toBeUndefined();
+    });
+
     it("still lets the OWNER name a derived id — that's how top-ups stack", async () => {
       const { url, ledger } = await startServer();
       const derived = derivedFundCreditId(CALLER, "f1");

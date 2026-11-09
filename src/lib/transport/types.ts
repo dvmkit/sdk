@@ -633,6 +633,17 @@ export interface V1InfoCapability {
 }
 
 /**
+ * A capability offered on the x402 channel, on `/v1/info.x402_capabilities`:
+ * the per-capability advertisement, with `input_schema` the route's flat body,
+ * plus `url`, the `POST` route a stock x402 client pays at (public origin,
+ * host mount prefix, `/v1/x402/<name>`). Kept apart from `capabilities`
+ * because the same name may be a different definition there.
+ */
+export interface V1InfoX402Capability extends V1InfoCapability {
+  url: string;
+}
+
+/**
  * Authoritative `/v1/info` response wire type — the single source of truth both
  * emit handlers construct against so a field add/rename is a compile error
  * across tiers. Snake_case matches the emitted JSON exactly; fields
@@ -686,8 +697,10 @@ export interface V1InfoResponse {
   credit?: CreditTerms;
   /** Accepted Cashu mints. */
   mints?: string[];
-  /** Per-capability advertisement. */
+  /** Per-capability advertisement for `/v1/job`. */
   capabilities?: Record<string, V1InfoCapability>;
+  /** Capabilities offered on the x402 channel, by name; omitted when there are none. Container tier only. */
+  x402_capabilities?: Record<string, V1InfoX402Capability>;
   /**
    * Accepted payment methods, nested envelope. Emitted unconditionally
    * by both handlers but typed optional so the imperative builders can assign it

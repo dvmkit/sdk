@@ -1132,6 +1132,72 @@ describe("x402 batch-settlement stateful round trip", () => {
   });
 });
 
+
+
+describe("x402 batch-settlement facilitator payload", () => {
+  it("sends the facilitator the server's resource and no extensions, never the caller's, on verify and settle", async () => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const facilitator = new StatefulFacilitator();
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK,
+      payTo: receiver.address,
+      earnedNative: earnedNothing,
+      config: {
+        storage: new InMemoryChannelStorage(),
+        facilitatorClient: facilitator,
+        receiverAuthorizerSigner: receiver,
+        autoSettlement: false,
+      },
+    });
+    const [built] = await server.buildRequirements("100");
+    const requirements = built as PaymentRequirements;
+    const channelConfig: Channel["channelConfig"] = {
+      payer: payer.address,
+      payerAuthorizer: payer.address,
+      receiver: receiver.address,
+      receiverAuthorizer: receiver.address,
+      token: TOKEN,
+      withdrawDelay: 86_400,
+      salt: generatePrivateKey(),
+    };
+    const channelId = computeChannelId(channelConfig, NETWORK);
+    const forged = (payload: Pick<PaymentPayload, "x402Version" | "payload">) =>
+      Buffer.from(
+        JSON.stringify({
+          ...payload,
+          accepted: requirements,
+          resource: { url: "https://attacker.example/listing", description: "Planted text." },
+          extensions: { bazaar: { info: { input: { type: "http", method: "GET" } }, schema: {} } },
+        })
+      ).toString("base64");
+    try {
+      const deposit = await createBatchSettlementEIP3009DepositPayload(payer, 2, requirements, channelConfig, "1000", "100");
+      await expect(
+        server.accept({ paymentHeader: forged(deposit), amount: "100", operation: "fund", effectId: "credit-forged:fund-1", commit: async () => "funded" })
+      ).resolves.toMatchObject({ ok: true });
+      const voucher = await signVoucher(payer, channelId, "200", NETWORK);
+      await expect(
+        server.accept({
+          paymentHeader: forged({ x402Version: 2, payload: { type: "voucher", channelConfig, voucher } } as never),
+          amount: "100",
+          operation: "fund",
+          effectId: "credit-forged:fund-2",
+          commit: async () => "funded",
+        })
+      ).resolves.toMatchObject({ ok: true });
+      const sent = [...facilitator.verify.mock.calls, ...facilitator.settle.mock.calls].map(([payload]) => payload);
+      expect(sent.length).toBeGreaterThanOrEqual(2);
+      for (const payload of sent) {
+        expect(payload.resource).toEqual({ url: "/v1/credit" });
+        expect(payload).not.toHaveProperty("extensions");
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
 /**
  * The claim ceiling. A fund charges the whole deposit to the
  * channel — that figure is the payer's cumulative authorization and has to

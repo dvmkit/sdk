@@ -1,6 +1,7 @@
 /** Wire compatibility requires independent v1 and v2 reference-client checks. */
 import { X402_DEFAULT_FACILITATOR } from "./constants";
 import { x402NetworkByCaip2, x402NetworkBySlug } from "./networks";
+import { callerSettleResponse } from "./settle-response";
 import type { X402Config } from "./types";
 
 /** Current x402 protocol version preferred by dvmkit clients and servers. */
@@ -38,6 +39,12 @@ export const X402_EXACT_SCHEME = "exact";
  * others no longer speak.
  */
 export const X402_BATCH_SETTLEMENT_SCHEME = "batch-settlement";
+
+/**
+ * The resource a reusable-channel (`batch-settlement`) `PAYMENT-REQUIRED`
+ * declares: such channels are opened and refunded only through `/v1/credit`.
+ */
+export const X402_BATCH_SETTLEMENT_RESOURCE = "/v1/credit";
 
 export { X402_DEFAULT_FACILITATOR };
 
@@ -138,7 +145,7 @@ export interface VerifyResponse {
   payer?: string;
 }
 
-/** Facilitator `/settle` response — what we base64 into `X-PAYMENT-RESPONSE`. */
+/** Facilitator `/settle` response; a caller sees only `callerSettleResponse`'s projection of it. */
 export interface SettleResponse {
   success: boolean;
   errorReason?: string;
@@ -147,6 +154,15 @@ export interface SettleResponse {
   network?: string;
   amount?: string;
   extensions?: Record<string, unknown>;
+  extra?: { channelState?: SettleResponseChannelState };
+}
+
+/** Batch-settlement channel state echoed to the payer; amounts are uint256 decimal strings. */
+export interface SettleResponseChannelState {
+  channelId: string;
+  balance?: string;
+  totalClaimed?: string;
+  chargedCumulativeAmount?: string;
 }
 
 /**
@@ -270,11 +286,7 @@ export function paymentRequiredV2FromV1(
   return {
     x402Version: X402_VERSION,
     ...(error ? { error } : {}),
-    resource: {
-      url: first.resource,
-      ...(first.description ? { description: first.description } : {}),
-      ...(first.mimeType ? { mimeType: first.mimeType } : {}),
-    },
+    resource: resourceInfoFromV1(first),
     accepts: requirements.map((requirement) => {
       const network = x402NetworkBySlug(requirement.network)?.caip2 ?? requirement.network;
       const usdcContract = usdcContractByCaip2(network);
@@ -297,6 +309,41 @@ export function paymentRequiredV2FromV1(
       };
     }),
     extensions: {},
+  };
+}
+
+/**
+ * The resource and extensions a server declares for one payment. A payment
+ * forwarded to a facilitator carries these, never the caller's: a catalog
+ * lists a resource from the payload the facilitator receives.
+ */
+export interface X402ServerDeclaration {
+  resource: ResourceInfo;
+  extensions?: Record<string, unknown>;
+}
+
+/** The declaration of a `PAYMENT-REQUIRED` built from `requirement` with no listing. */
+export function x402DeclarationFor(requirement: PaymentRequirementsV1): X402ServerDeclaration {
+  return { resource: resourceInfoFromV1(requirement) };
+}
+
+/**
+ * `payload` as it is forwarded to a facilitator: a v2 payload carries the
+ * server's resource and its extensions, when it declares any, in place of the
+ * caller's, and a v1 payload, whose schema has neither field, carries neither.
+ * Every other top-level key is forwarded as the caller sent it.
+ */
+export function withServerDeclaration(payload: PaymentPayload, declaration: X402ServerDeclaration): PaymentPayload {
+  const { resource: _resource, extensions: _extensions, ...rest } = payload as PaymentPayload & {
+    resource?: unknown;
+    extensions?: unknown;
+  };
+  if (payload.x402Version !== X402_VERSION) return rest as PaymentPayloadV1;
+  const extensions = declaration.extensions;
+  return {
+    ...(rest as Omit<PaymentPayloadV2, "resource" | "extensions">),
+    resource: declaration.resource,
+    ...(extensions && Object.keys(extensions).length > 0 ? { extensions } : {}),
   };
 }
 
@@ -391,12 +438,14 @@ export function exactEvmAuthorization(payload: PaymentPayload): ExactEvmPayloadA
 }
 
 /**
- * Encode a `SettleResponse` for the `X-PAYMENT-RESPONSE` header that the
- * server emits on a 2xx after a successful settlement (per the
- * x402 spec).
+ * Encode a facilitator's settle answer for the `PAYMENT-RESPONSE` and
+ * `X-PAYMENT-RESPONSE` headers. Only `callerSettleResponse`'s bounded
+ * allow-list is encoded, so no caller can send a raw facilitator body; a
+ * batch-settlement answer passes its voucher's `channelId` to keep the channel
+ * state its client reads back.
  */
-export function encodeSettleResponseHeader(response: SettleResponse): string {
-  return Buffer.from(JSON.stringify(response), "utf-8").toString("base64");
+export function encodeSettleResponseHeader(answer: unknown, options: { channelId?: string } = {}): string {
+  return Buffer.from(JSON.stringify(callerSettleResponse(answer, options)), "utf-8").toString("base64");
 }
 
 type PaymentSchemeDecoder = (parsed: Record<string, unknown>) => PaymentPayload;
@@ -464,6 +513,14 @@ function paymentRequirementExtra(
     ...(version === X402_VERSION ? { assetTransferMethod: "eip3009" } : {}),
     name: network.domainName,
     version: network.domainVersion,
+  };
+}
+
+function resourceInfoFromV1(requirement: PaymentRequirementsV1): ResourceInfo {
+  return {
+    url: requirement.resource,
+    ...(requirement.description ? { description: requirement.description } : {}),
+    ...(requirement.mimeType ? { mimeType: requirement.mimeType } : {}),
   };
 }
 

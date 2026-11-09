@@ -9,7 +9,7 @@ import type {
 } from "../../lib/messages/types";
 import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
 import { StepCache } from "../step-cache";
-import type { FundingMethod, SDKJobContext } from "../types";
+import type { CapabilityChannel, FundingMethod, SDKJobContext } from "../types";
 import { askExpiryAtMs } from "./ask-expiry";
 import type { CreditSnapshot } from "./credit-ledger";
 import type { AppendOutgoingOptions, JobRecord, TopUpCapUnenforcedReason } from "./job-store";
@@ -37,6 +37,20 @@ export interface ServerJob {
    * schema. Required — the wire layer rejects requests that omit it.
    */
   capability: string;
+  /** Mirror of `JobRecord.channel`; absent for the dvmkit protocol. */
+  channel?: CapabilityChannel;
+  /**
+   * Set in this process when the runtime bound stopped the handler, so a
+   * caller waiting in the same request can tell that failure from the
+   * handler's own. Never persisted.
+   */
+  runtimeLimitExceeded?: true;
+  /**
+   * When the runtime bound stops the handler, if earlier than its start plus
+   * the bound: an x402 route request's budget runs from its arrival, so the
+   * time verification took counts against it. Never persisted.
+   */
+  handlerDeadlineMs?: number;
   input: string;
   params: Record<string, string>;
   requesterId: string;
@@ -260,6 +274,7 @@ export function toJobRecord(job: ServerJob): JobRecord {
     id: job.id,
     tags: job.tags,
     capability: job.capability,
+    ...(job.channel !== undefined && { channel: job.channel }),
     input: job.input,
     params: job.params,
     requesterId: job.requesterId,
@@ -322,6 +337,7 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     id: record.id,
     tags: record.tags,
     capability: record.capability,
+    ...(record.channel !== undefined && { channel: record.channel }),
     input: record.input,
     params: record.params,
     requesterId: record.requesterId,

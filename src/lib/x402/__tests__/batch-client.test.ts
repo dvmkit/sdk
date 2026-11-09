@@ -422,6 +422,116 @@ describe("x402 batch client", () => {
     expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeGreaterThan(0);
   });
 
+  it("advances only the funded channel when a funding answer names another", async () => {
+    const key = `0x${"11".repeat(32)}` as `0x${string}`;
+    const account = privateKeyToAccount(key);
+    const network = "eip155:84532";
+    const receiver = `0x${"22".repeat(20)}` as `0x${string}`;
+    const receiverAuthorizer = `0x${"33".repeat(20)}` as `0x${string}`;
+    const token = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const;
+    const required: PaymentRequired = {
+      x402Version: 2,
+      resource: { url: "https://dvm.example/v1/credit" },
+      accepts: [
+        {
+          scheme: "batch-settlement",
+          network,
+          asset: token,
+          amount: "200000",
+          payTo: receiver,
+          maxTimeoutSeconds: 60,
+          extra: {
+            receiverAuthorizer,
+            withdrawDelay: 86_400,
+            name: "x402 Batch Settlement",
+            version: "1",
+            assetTransferMethod: "eip3009",
+          },
+        },
+      ],
+    };
+    const funded = computeChannelId(
+      {
+        payer: account.address,
+        payerAuthorizer: account.address,
+        receiver,
+        receiverAuthorizer,
+        token,
+        withdrawDelay: 86_400,
+        salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+      },
+      network
+    );
+    const other = `0x${"ee".repeat(32)}`;
+    const store = await import("../channel-store");
+    const storage = new store.DvmX402ChannelStorage();
+    // A known channel keeps upstream from reading the chain before it signs.
+    await storage.set(funded, { balance: "0", totalClaimed: "0", chargedCumulativeAmount: "0" });
+    await storage.set(other, { balance: "9000", chargedCumulativeAmount: "100" });
+    const batch = await import("../batch-client");
+    const wallet = { privateKey: key, address: account.address, network };
+    const payment = await batch.createX402BatchPayment({
+      wallet,
+      paymentRequired: required,
+      endpoint: "https://dvm.example",
+      callerPubkey: "aa".repeat(32),
+      creditId: "credit-1",
+      depositMicro: 200_000,
+    });
+    const response = encodePaymentResponseHeader({
+      success: true,
+      transaction: "0xsettled",
+      network,
+      payer: account.address,
+      extra: { channelState: { channelId: other, balance: "123", chargedCumulativeAmount: "123" } },
+    });
+
+    await batch.processX402BatchResponse(payment.scheme, response);
+    // A resumed acknowledgement builds a fresh scheme, so it names the pending channel.
+    await batch.processX402BatchResponseForWallet({
+      wallet,
+      depositMicro: 200_000,
+      paymentResponse: response,
+      channelId: payment.channelId,
+    });
+
+    await expect(storage.get(other)).resolves.toMatchObject({ balance: "9000", chargedCumulativeAmount: "100" });
+  });
+
+  // An older caller, or plain JavaScript, can still omit the now-required channel.
+  it.each([
+    ["names another channel", "other", "123"],
+    ["carries an amount past uint256", "own", (2n ** 256n).toString()],
+  ] as const)("stores nothing from an unbound acknowledgement that %s", async (_case, target, amount) => {
+    const key = `0x${"11".repeat(32)}` as `0x${string}`;
+    const account = privateKeyToAccount(key);
+    const network = "eip155:84532";
+    const own = `0x${"dd".repeat(32)}`;
+    const other = `0x${"ee".repeat(32)}`;
+    const store = await import("../channel-store");
+    const storage = new store.DvmX402ChannelStorage();
+    await storage.set(own, { balance: "0", chargedCumulativeAmount: "0" });
+    await storage.set(other, { balance: "9000", chargedCumulativeAmount: "100" });
+    const batch = await import("../batch-client");
+
+    await batch.processX402BatchResponseForWallet({
+      wallet: { privateKey: key, address: account.address, network },
+      depositMicro: 200_000,
+      paymentResponse: encodePaymentResponseHeader({
+        success: true,
+        transaction: "0xsettled",
+        network,
+        payer: account.address,
+        extra: {
+          channelState: { channelId: target === "own" ? own : other, balance: amount, chargedCumulativeAmount: amount },
+        },
+      }),
+    } as unknown as Parameters<typeof batch.processX402BatchResponseForWallet>[0]);
+
+    await expect(storage.get(own)).resolves.toMatchObject({ balance: "0", chargedCumulativeAmount: "0" });
+    await expect(storage.get(other)).resolves.toMatchObject({ balance: "9000", chargedCumulativeAmount: "100" });
+  });
+
   it("blocks even the credit that owns a refused voucher, until its deposit expires", async () => {
     const key = `0x${"11".repeat(32)}` as `0x${string}`;
     const account = privateKeyToAccount(key);
@@ -1206,6 +1316,43 @@ describe("x402 batch client", () => {
     expect(decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "").payload).toMatchObject({
       type: "refund",
       voucher: { channelId, maxClaimableAmount: "0" },
+    });
+  });
+
+  it("leaves another channel's record alone when a refund answer names that channel", async () => {
+    const { network, key, account, required } = await refundFixture();
+    viemClientMock.create.mockReturnValue({
+      readContract: vi.fn().mockResolvedValue([200_000n, 0n]),
+    });
+    const other = `0x${"ee".repeat(32)}` as const;
+    const store = await import("../channel-store");
+    await new store.DvmX402ChannelStorage().set(other, { balance: "9000", chargedCumulativeAmount: "100" });
+    const { DvmError } = await import("../../errors");
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: required,
+        })
+      )
+      .mockResolvedValueOnce(
+        refundResponse({ channelId: other, network, payer: account.address, amount: "200000" })
+      );
+    const batch = await import("../batch-client");
+
+    await batch.refundX402BatchChannel({
+      wallet: { privateKey: key, address: account.address, network },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+      post,
+    });
+
+    // A zero balance after refund deletes the named channel's record upstream.
+    await expect(new store.DvmX402ChannelStorage().get(other)).resolves.toMatchObject({
+      balance: "9000",
+      chargedCumulativeAmount: "100",
     });
   });
 

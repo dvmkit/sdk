@@ -1,11 +1,21 @@
 import { CAPABILITY_NAME_RE } from "../lib/wire-schema";
+import {
+  assertPaymentRequiredFits,
+  assertX402Listing,
+  X402_SIZE_CHECK_AMOUNT,
+  X402_SIZE_CHECK_ERROR,
+  X402_SIZE_CHECK_ORIGIN,
+  X402_SIZE_CHECK_TIMEOUT_SECONDS,
+  x402ChannelPaymentRequired,
+} from "../lib/x402/bazaar";
 import { resolveCashuConfig } from "./cashu-locktime";
-import { missingSignedSchemaFields } from "./signed-envelope-schema";
+import { CAPABILITY_SIGNED_FIELDS, missingSignedSchemaFields } from "./signed-envelope-schema";
 import { type Currency, InvalidCurrencyError, validateCurrency } from "./pricing/currency";
 import { parseUsdPrice } from "./pricing/usd";
 import {
   type CapabilityConfig,
   type CapabilityDescriptor,
+  type CapabilityChannels,
   type CapabilityRate,
   type CreditConfig,
   DEFAULT_CREDIT_MAX,
@@ -16,7 +26,9 @@ import {
   type DVMDescriptor,
   isZodSchema,
   type PriceValue,
+  type ResolvedCapabilityChannels,
   type ResolvedCreditConfig,
+  type X402ChannelConfig,
   type ZodLike,
 } from "./types";
 
@@ -36,20 +48,29 @@ export function configureDVM<
 >(config: DVMConfig<State, InputSchema>): DVMDescriptor<State, InputSchema> {
   const tags = collectTags(config);
   const currency = resolvePricingCurrency(config.currency);
-  const capabilities = buildCapabilityMap<State, InputSchema>(config, currency);
+  const definitions = buildCapabilityMap<State, InputSchema>(config, currency);
+  const partitioned = partitionByChannel(definitions);
+  for (const entry of Object.values(partitioned.x402Capabilities)) {
+    assertX402ChannelDefinition(entry, config);
+  }
+  // x402-channel callers are unsigned, so only dvmkit-protocol definitions
+  // must preserve the signed envelope.
   if (config.auth) {
-    for (const [name, cap] of Object.entries(capabilities)) {
+    for (const { label, def: cap } of Object.values(partitioned.capabilities)) {
       if (!isZodSchema(cap.input)) continue;
       const missing = missingSignedSchemaFields(cap.input);
       if (missing?.length) {
         throw new Error(
-          `configureDVM: capability "${name}" input schema must preserve signed envelope fields: ${missing.join(", ")}. ` +
+          `configureDVM: ${label} input schema must preserve signed envelope fields: ${missing.join(", ")}. ` +
           "Declare these fields or use .passthrough() / z.looseObject() to retain them."
         );
       }
     }
   }
   const jobRetentionDays = resolveJobRetentionDays(config.jobRetentionDays);
+  const capabilities = descriptorMap(partitioned.capabilities);
+  const x402Capabilities =
+    Object.keys(partitioned.x402Capabilities).length > 0 ? descriptorMap(partitioned.x402Capabilities) : undefined;
 
   // Single-capability mirror: copy the only entry's input/state/price onto the
   // top-level descriptor so code paths that read from the top level keep
@@ -74,6 +95,7 @@ export function configureDVM<
     jobRetentionDays,
     config,
     capabilities,
+    ...(x402Capabilities ? { x402Capabilities } : {}),
     paymentMethods: config.paymentMethods,
     x402: config.x402,
     mpp: config.mpp,
@@ -221,32 +243,243 @@ function validatePriceLiteral(value: unknown, field: string, key = field): numbe
  */
 function validateCapabilityPrice(
   price: PriceValue | undefined,
-  capabilityName: string,
+  label: string,
   currency: Currency
 ): void {
   if (price === undefined) return;
   if (currency !== "usd") {
     throw new Error(
-      `configureDVM: capability "${capabilityName}" declares a static price ` +
+      `configureDVM: ${label} declares a static price ` +
         `(${JSON.stringify(price)}) but this DVM prices in ${currency}. Static prices are USD ` +
         `literals, so they cannot express ${currency} — price this capability with \`onQuote\` ` +
         `returning { amount, currency: ${JSON.stringify(currency)} }, or drop the DVM-level ` +
         "`currency` to price in USD."
     );
   }
-  validatePriceLiteral(price, `configureDVM: capability "${capabilityName}" price`, "price");
+  validatePriceLiteral(price, `configureDVM: ${label} price`, "price");
 }
 
 /** Longest runtime bound a capability may declare, in seconds. */
 export const MAX_RUNTIME_SECONDS_LIMIT = 600;
 
-function validateMaxRuntimeSeconds(value: unknown, capabilityName: string): void {
+function validateMaxRuntimeSeconds(value: unknown, label: string): void {
   if (value === undefined) return;
   if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > MAX_RUNTIME_SECONDS_LIMIT) {
     throw new Error(
-      `configureDVM: capability "${capabilityName}" maxRuntimeSeconds must be a whole number ` +
+      `configureDVM: ${label} maxRuntimeSeconds must be a whole number ` +
         `of seconds from 1 to ${MAX_RUNTIME_SECONDS_LIMIT}, got ${JSON.stringify(value)}`
     );
+  }
+}
+
+/**
+ * One desugared definition with the `capabilities` entry it came from, so
+ * boot errors can name the entry when two share a published name.
+ */
+interface CapabilityDefinition {
+  key: string;
+  /** `capability "fetch"`, or `capability "fetch" (entry "fetch-x402")` when the key differs. */
+  label: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  def: CapabilityDescriptor<any, any>;
+}
+
+function descriptorMap(
+  entries: Record<string, CapabilityDefinition>
+): // eslint-disable-next-line @typescript-eslint/no-explicit-any
+Record<string, CapabilityDescriptor<any, any>> {
+  return Object.fromEntries(Object.entries(entries).map(([name, entry]) => [name, entry.def]));
+}
+
+function capabilityLabel(name: string, key: string): string {
+  return name === key ? `capability "${name}"` : `capability "${name}" (entry "${key}")`;
+}
+
+/**
+ * Resolve a definition's `channels` declaration. Unset means the dvmkit
+ * protocol only; a declaration offers exactly the channels it names, and one
+ * that names x402 must also say whether `/v1/job` keeps the definition.
+ */
+function resolveCapabilityChannels(raw: unknown, label: string): ResolvedCapabilityChannels {
+  if (raw === undefined) return Object.freeze({ job: true });
+  const at = `configureDVM: ${label} channels`;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${at} must be an object such as { job: true, x402: {} }`);
+  }
+  const declared = raw as CapabilityChannels & Record<string, unknown>;
+  for (const key of Object.keys(declared)) {
+    if (key === "listing") {
+      throw new Error(`${at}.listing is not a channel; a listing belongs under channels.x402.listing`);
+    }
+    if (key !== "job" && key !== "x402") {
+      throw new Error(`${at}.${key} is not a channel (job, x402)`);
+    }
+  }
+  if (declared.job !== undefined && typeof declared.job !== "boolean") {
+    throw new Error(`${at}.job must be true or false (got ${JSON.stringify(declared.job)})`);
+  }
+  let x402: X402ChannelConfig | undefined;
+  if (declared.x402 !== undefined) {
+    const channel: unknown = declared.x402;
+    if (typeof channel !== "object" || channel === null || Array.isArray(channel)) {
+      throw new Error(`${at}.x402 must be an object, such as {} or { listing: { ... } }`);
+    }
+    for (const key of Object.keys(channel)) {
+      if (key !== "listing") throw new Error(`${at}.x402.${key} is not an x402 channel field (listing)`);
+    }
+    if (declared.job === undefined) {
+      throw new Error(
+        `${at} declares x402 without job; set job: true to keep it on /v1/job, or job: false for x402 only`
+      );
+    }
+    x402 = deepFreeze(structuredClone(channel as X402ChannelConfig));
+  }
+  const job = declared.job === true;
+  if (!job && !x402) {
+    throw new Error(`${at} must offer at least one channel: set job: true, x402: {}, or both`);
+  }
+  return Object.freeze(x402 ? { job, x402 } : { job });
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * Split definitions into the dvmkit-protocol map, which `/v1/job` and
+ * `/v1/info` read unchanged, and the x402 map. Names are unique within each.
+ * Either map may be empty, since every definition offers at least one channel.
+ */
+function partitionByChannel(definitions: CapabilityDefinition[]): {
+  capabilities: Record<string, CapabilityDefinition>;
+  x402Capabilities: Record<string, CapabilityDefinition>;
+} {
+  const capabilities: Record<string, CapabilityDefinition> = {};
+  const x402: Record<string, CapabilityDefinition> = {};
+  const place = (map: Record<string, CapabilityDefinition>, entry: CapabilityDefinition, channel: string): void => {
+    const name = entry.def.name;
+    if (Object.hasOwn(map, name)) {
+      throw new Error(
+        `configureDVM: two capabilities are named "${name}" on ${channel} ` +
+          `(entries "${map[name].key}" and "${entry.key}"); names must be unique within a channel`
+      );
+    }
+    map[name] = entry;
+  };
+  for (const entry of definitions) {
+    if (entry.def.channels.job) place(capabilities, entry, "the dvmkit protocol");
+    if (entry.def.channels.x402) place(x402, entry, "the x402 channel");
+  }
+  return { capabilities, x402Capabilities: x402 };
+}
+
+/** Boot checks for one definition offered on the x402 channel. */
+function assertX402ChannelDefinition(
+  entry: CapabilityDefinition,
+  config: Pick<DVMConfig<unknown, ZodLike | undefined>, "x402" | "paymentMethods" | "auth">
+): void {
+  const { def, label } = entry;
+  const at = `configureDVM: ${label}`;
+  // validateCapabilityName already limited the name to [a-z0-9-], which is
+  // path-safe as the last segment of /v1/x402/<name>.
+  if (def.maxRuntimeSeconds === undefined) {
+    throw new Error(
+      `${at} is offered on x402 and must set maxRuntimeSeconds (1 to ${MAX_RUNTIME_SECONDS_LIMIT}); ` +
+        "an x402 caller waits for the result within one request"
+    );
+  }
+  const x402Config = config.x402;
+  if (!x402Config) {
+    throw new Error(`${at} is offered on x402 but the DVM has no x402 configuration; set DVMConfig.x402`);
+  }
+  if (config.paymentMethods !== undefined && !config.paymentMethods.includes("x402")) {
+    throw new Error(
+      `${at} is offered on x402 but paymentMethods (${JSON.stringify(config.paymentMethods)}) ` +
+        'leaves out "x402"; add "x402" to paymentMethods or stop offering the capability on x402'
+    );
+  }
+  // The one request carries the payment, so its amount must be known before
+  // the handler runs: from the fixed price, or from onQuote run on the body.
+  if (def.price === undefined && def.onQuote === undefined) {
+    throw new Error(
+      def.rates !== undefined
+        ? `${at} is offered on x402 and priced only by rates; an x402 caller pays before the ` +
+            "handler runs, so set a fixed price or an onQuote that prices the request body"
+        : `${at} is offered on x402 but is free; an x402 caller pays before the handler runs, ` +
+            "so set a fixed price or an onQuote that prices the request body"
+    );
+  }
+  assertX402InputUnsigned(def, at, config.auth !== undefined);
+
+  const listing = def.channels.x402?.listing;
+  if (listing === undefined) return;
+  assertX402Listing(label, listing, def.input);
+  if (isZodSchema(def.input)) {
+    const result = def.input.safeParse(listing.example);
+    if (!result.success) {
+      throw new Error(
+        `${at} channels.x402.listing.example does not satisfy its input schema. ` +
+          `Issues: ${formatZodIssues(result.error)}`
+      );
+    }
+  }
+  // The server reruns this at boot with its public origin, the route's own
+  // timeout and a fixed price; see `assertX402RoutesServable` in server/app.ts.
+  assertPaymentRequiredFits(
+    label,
+    x402ChannelPaymentRequired({
+      name: def.name,
+      listing,
+      input: def.input,
+      x402Config,
+      publicOrigin: X402_SIZE_CHECK_ORIGIN,
+      requiredUsdcMicro: X402_SIZE_CHECK_AMOUNT,
+      maxTimeoutSeconds: X402_SIZE_CHECK_TIMEOUT_SECONDS,
+      error: X402_SIZE_CHECK_ERROR,
+    })
+  );
+}
+
+/**
+ * An x402 caller never sends signed-request fields, so x402 reserves their
+ * names. A definition offered on x402 must not declare them, except that one
+ * also offered on `/v1/job` under `auth` declares them for that channel and
+ * must make them optional for an unsigned body to parse.
+ */
+function assertX402InputUnsigned(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  def: CapabilityDescriptor<any, any>,
+  at: string,
+  hasAuth: boolean
+): void {
+  if (!isZodSchema(def.input)) return;
+  const shape = (def.input._zod as { def?: { type?: unknown; shape?: Record<string, unknown> } } | undefined)?.def;
+  if (shape?.type !== "object" || !shape.shape) return;
+  for (const field of CAPABILITY_SIGNED_FIELDS) {
+    if (!Object.hasOwn(shape.shape, field)) continue;
+    if (!def.channels.job) {
+      throw new Error(
+        `${at} is offered on x402 only, whose callers are unsigned, but its input schema declares ` +
+          `the signed-request field "${field}"; remove it`
+      );
+    }
+    if (!hasAuth) {
+      throw new Error(
+        `${at} is offered on x402, whose callers are unsigned, and its input schema declares a field ` +
+          `named "${field}", which x402 reserves for the signed-request envelope; rename it`
+      );
+    }
+    const optin = (shape.shape[field] as { _zod?: { optin?: unknown } } | undefined)?._zod?.optin;
+    if (optin !== "optional") {
+      throw new Error(
+        `${at} is offered on both channels, and x402 callers are unsigned, so its input schema's ` +
+          `signed-request field "${field}" must be optional (for example z.string().optional())`
+      );
+    }
   }
 }
 
@@ -276,8 +509,7 @@ function collectTags(config: DVMConfig<any, any>): string[] {
 function buildCapabilityMap<State, InputSchema extends ZodLike | undefined>(
   config: DVMConfig<State, InputSchema>,
   currency: Currency
-): // eslint-disable-next-line @typescript-eslint/no-explicit-any
-Record<string, CapabilityDescriptor<any, any>> {
+): CapabilityDefinition[] {
   const hasExplicitBlock = config.capabilities !== undefined;
   const hasFlatCapabilityName = typeof config.capability === "string";
   const hasFlatHandler = typeof config.onJob === "function";
@@ -307,10 +539,18 @@ Record<string, CapabilityDescriptor<any, any>> {
   const name =
     typeof config.capability === "string" ? config.capability : slugifyCapabilityName(config.name);
   validateCapabilityName(name);
-  validateCapabilityPrice(config.price, name, currency);
-  validateMaxRuntimeSeconds(config.maxRuntimeSeconds, name);
+  const label = capabilityLabel(name, name);
+  validateCapabilityPrice(config.price, label, currency);
+  validateMaxRuntimeSeconds(config.maxRuntimeSeconds, label);
+  const channels = resolveCapabilityChannels(config.channels, label);
 
-  validateExampleAgainstInput(name, config.input, config.example);
+  validateExampleAgainstInput(label, config.input, config.example);
+  if (Object.hasOwn(config, "listing")) {
+    throw new Error(
+      `configureDVM: ${label} declares listing outside channels.x402; ` +
+        "a listing applies only to the x402 channel, as channels.x402.listing"
+    );
+  }
 
   // `config.onJob` and the optional message handlers are method-shorthand
   // declarations on `DVMConfig` (existing public surface). eslint flags raw
@@ -320,6 +560,7 @@ Record<string, CapabilityDescriptor<any, any>> {
   /* eslint-disable @typescript-eslint/unbound-method */
   const entry: CapabilityDescriptor<State, InputSchema> = {
     name,
+    channels,
     description: config.description ?? "",
     input: config.input,
     example: config.example,
@@ -336,38 +577,49 @@ Record<string, CapabilityDescriptor<any, any>> {
     onMessage: config.onMessage,
   };
   /* eslint-enable @typescript-eslint/unbound-method */
-  return { [name]: entry as unknown as CapabilityDescriptor };
+  return [{ key: name, label, def: entry as unknown as CapabilityDescriptor }];
 }
 
 /**
- * Build the desugared map from an explicit `capabilities` block. Each entry's
- * `state` is structuredCloned at construction so JobManager.createJob can
- * clone it again per-job without sharing references with the descriptor.
+ * Build the desugared definitions from an explicit `capabilities` block. Each
+ * entry's `state` is structuredCloned at construction so JobManager.createJob
+ * can clone it again per-job without sharing references with the descriptor.
  */
 function buildExplicitCapabilities(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   capabilities: Record<string, CapabilityConfig<any, any, any>>,
   currency: Currency
-): // eslint-disable-next-line @typescript-eslint/no-explicit-any
-Record<string, CapabilityDescriptor<any, any>> {
+): CapabilityDefinition[] {
   const keys = Object.keys(capabilities);
   if (keys.length === 0) {
     throw new Error("configureDVM: `capabilities` block must declare at least one capability");
   }
 
-  const out: // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  Record<string, CapabilityDescriptor<any, any>> = {};
-  for (const name of keys) {
-    validateCapabilityName(name);
-    const cap = capabilities[name];
-    if (typeof cap.onJob !== "function") {
-      throw new Error(`configureDVM: capability "${name}" is missing required onJob handler`);
+  const out: CapabilityDefinition[] = [];
+  for (const key of keys) {
+    validateCapabilityName(key);
+    const cap = capabilities[key];
+    const name: unknown = cap.name === undefined ? key : cap.name;
+    if (typeof name !== "string") {
+      throw new Error(`configureDVM: capability "${key}" name must be a string (got ${JSON.stringify(name)})`);
     }
-    validateCapabilityPrice(cap.price, name, currency);
-    validateMaxRuntimeSeconds(cap.maxRuntimeSeconds, name);
-    validateExampleAgainstInput(name, cap.input, cap.example);
+    if (name !== key) validateCapabilityName(name);
+    const label = capabilityLabel(name, key);
+    if (typeof cap.onJob !== "function") {
+      throw new Error(`configureDVM: ${label} is missing required onJob handler`);
+    }
+    validateCapabilityPrice(cap.price, label, currency);
+    validateMaxRuntimeSeconds(cap.maxRuntimeSeconds, label);
+    validateExampleAgainstInput(label, cap.input, cap.example);
+    if (Object.hasOwn(cap, "listing")) {
+      throw new Error(
+        `configureDVM: ${label} declares listing outside channels.x402; ` +
+          "a listing applies only to the x402 channel, as channels.x402.listing"
+      );
+    }
     const entry: CapabilityDescriptor = {
       name,
+      channels: resolveCapabilityChannels(cap.channels, label),
       description: cap.description ?? "",
       // Per-capability `input` is the builder's Zod schema; the `any` widening
       // through `Record<string, CapabilityConfig<any, any, any>>` is unavoidable
@@ -387,7 +639,7 @@ Record<string, CapabilityDescriptor<any, any>> {
       onCancel: cap.onCancel,
       onMessage: cap.onMessage,
     };
-    out[name] = entry;
+    out.push({ key, label, def: entry });
   }
   return out;
 }
@@ -403,6 +655,7 @@ function flatPerCapFieldsSet(config: DVMConfig<any, any>): boolean {
     config.onQuote !== undefined ||
     config.rates !== undefined ||
     config.maxRuntimeSeconds !== undefined ||
+    config.channels !== undefined ||
     typeof config.onResponse === "function" ||
     typeof config.onPayment === "function" ||
     typeof config.onApproval === "function" ||
@@ -418,13 +671,13 @@ function flatPerCapFieldsSet(config: DVMConfig<any, any>): boolean {
  * either `example` is absent or `input` isn't a Zod schema (plain JSON-Schema
  * objects can't validate).
  */
-function validateExampleAgainstInput(capName: string, input: unknown, example: unknown): void {
+function validateExampleAgainstInput(label: string, input: unknown, example: unknown): void {
   if (example === undefined) return;
   if (!isZodSchema(input)) return;
   const result = input.safeParse(example);
   if (result.success) return;
   throw new Error(
-    `configureDVM: capability "${capName}" example does not satisfy its input schema. ` +
+    `configureDVM: ${label} example does not satisfy its input schema. ` +
       `Update the example to match the schema (including any \`.refine()\` checks). ` +
       `Issues: ${formatZodIssues(result.error)}`
   );

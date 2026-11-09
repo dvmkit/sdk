@@ -331,6 +331,60 @@ describe("dvm.request span", () => {
     ]);
   });
 
+  it("pins each request's channel, and attributes a capability offered only on x402", async () => {
+    const x402 = {
+      payTo: "0x1111111111111111111111111111111111111111",
+      network: "eip155:8453",
+      facilitator: "https://facilitator.example.com"
+    };
+    const dvm = configureDVM({
+      name: "channel-span-test",
+      x402,
+      capabilities: {
+        fetch: { input: z.object({ url: z.string() }), onJob(ctx) { ctx.complete("job fetch"); } },
+        "fetch-x402": {
+          name: "fetch",
+          input: z.object({ url: z.string() }),
+          price: "$0.01",
+          maxRuntimeSeconds: 5,
+          channels: { job: false, x402: {} },
+          onJob(ctx) { ctx.complete("x402 fetch"); }
+        },
+        lookup: {
+          input: z.object({ q: z.string() }),
+          price: "$0.01",
+          maxRuntimeSeconds: 5,
+          channels: { job: false, x402: {} },
+          onJob(ctx) { ctx.complete("lookup"); }
+        }
+      }
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { app } = await createDVMServer(dvm, {
+      env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" },
+      store: new MemoryKVStore(),
+      x402,
+      fxFetcher: stubFx,
+      devMode: true
+    });
+    const post = (path: string, body: unknown) =>
+      app.request(`https://dvm.example.com${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+    await post("/v1/job", { capability: "fetch", data: { url: "https://example.com" } });
+    await post("/v1/x402/fetch", { url: "https://example.com" });
+    await post("/v1/x402/lookup", { q: "dvm" });
+
+    expect(spansByName("dvm.request").map((row) => row.dimensions)).toEqual([
+      expect.objectContaining({ capability: "fetch", channel: "job" }),
+      expect.objectContaining({ capability: "fetch", channel: "x402" }),
+      expect.objectContaining({ capability: "lookup", channel: "x402" })
+    ]);
+  });
+
   it("pins the synthesized capability of a flat single-capability descriptor", async () => {
     const dvm = configureDVM({
       name: "Synthesized Span Test",

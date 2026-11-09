@@ -35,6 +35,7 @@ import {
 } from "./channel-store";
 import { assertX402ChannelPayer } from "./lifecycle";
 import { x402NetworkByCaip2, x402NetworkLabel } from "./networks";
+import { settleChannelState } from "./settle-response";
 import { X402_BATCH_SETTLEMENT_SCHEME } from "./spec";
 import type { X402Wallet } from "./types";
 import { isX402SettlementReconciliationReason } from "./types";
@@ -96,6 +97,7 @@ export async function createX402BatchPayment(args: {
       "This is an upstream payload-shape change; do not retry until the CLI is updated."
     );
   }
+  schemeChannel.set(scheme, channelId);
   return {
     ...facts,
     paymentHeader: encodePaymentSignatureHeader(payload),
@@ -136,10 +138,16 @@ function formatX402VoucherPendingRefusal(
   );
 }
 
-/** Advance durable cumulative state from a successful PAYMENT-RESPONSE. */
+/**
+ * Advance durable cumulative state from a successful PAYMENT-RESPONSE. The
+ * answer's channel state is persisted only for the channel this payment was
+ * for: `channelId`, or the one `createX402BatchPayment` signed with `scheme`.
+ * With neither, the channel state is dropped rather than stored unchecked.
+ */
 export async function processX402BatchResponse(
   scheme: BatchSettlementEvmScheme,
-  paymentResponse: string | undefined
+  paymentResponse: string | undefined,
+  channelId: string | undefined = schemeChannel.get(scheme)
 ): Promise<void> {
   if (!paymentResponse) {
     throw new DvmError(
@@ -148,7 +156,7 @@ export async function processX402BatchResponse(
       "Retry the same funding. Its signed voucher remains journalled verbatim and will not advance locally until the DVM acknowledges it."
     );
   }
-  const response = decodePaymentResponseHeader(paymentResponse);
+  const response = boundToChannel(decodePaymentResponseHeader(paymentResponse), channelId);
   const clearProvenance = storageForScheme(scheme).stageNextUnobservedBalanceProvenance(
     dvmBalanceProvenance(response)
   );
@@ -164,9 +172,11 @@ export async function processX402BatchResponseForWallet(args: {
   wallet: X402Wallet;
   depositMicro: number;
   paymentResponse: string | undefined;
+  /** The pending funding's channel, the only one the answer may update. */
+  channelId: string;
 }): Promise<void> {
   const { scheme } = createScheme(args.wallet, args.depositMicro);
-  await processX402BatchResponse(scheme, args.paymentResponse);
+  await processX402BatchResponse(scheme, args.paymentResponse, args.channelId);
 }
 
 /**
@@ -551,7 +561,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       // superseded refusal as the reason would name a state the DVM has since
       // moved past.
       dvmRefusal = undefined;
-      responseHeader = result.x402PaymentResponse;
+      responseHeader = boundHeaderToChannel(result.x402PaymentResponse, channelId);
       clearResponseProvenance?.();
       clearResponseProvenance = responseHeader
         ? responseStorage.stageNextUnobservedBalanceProvenance("unreconciled")
@@ -659,6 +669,38 @@ export function assertX402RequirementDescribesChannel(args: {
 }
 
 const schemeStorage = new WeakMap<BatchSettlementEvmScheme, DvmX402ChannelStorage>();
+const schemeChannel = new WeakMap<BatchSettlementEvmScheme, string>();
+
+/**
+ * Keep an answer's channel state only when it is for `channelId` and within
+ * bounds. Upstream keys channel records by the answer's own `channelId`, so a
+ * DVM naming another channel, or sending an amount past uint256, would
+ * otherwise rewrite or delete that channel's record. With no expected channel
+ * the state is dropped.
+ */
+function boundToChannel<T extends { extra?: Record<string, unknown> }>(response: T, channelId: string | undefined): T {
+  const bound =
+    channelId === undefined
+      ? isRecord(response.extra) && response.extra.channelState !== undefined
+        ? ({ kind: "dropped" } as const)
+        : ({ kind: "absent" } as const)
+      : settleChannelState(response.extra, channelId);
+  if (bound.kind === "absent") return response;
+  const { extra: _dropped, ...rest } = response;
+  return (bound.kind === "kept" ? { ...rest, extra: { channelState: bound.state } } : rest) as T;
+}
+
+function boundHeaderToChannel(header: string | undefined, channelId: string): string | undefined {
+  if (header === undefined) return undefined;
+  let response: ReturnType<typeof decodePaymentResponseHeader>;
+  try {
+    response = decodePaymentResponseHeader(header);
+  } catch {
+    // Upstream refuses an undecodable header itself, with its own error.
+    return header;
+  }
+  return encodePaymentResponseHeader(boundToChannel(response, channelId));
+}
 
 function dvmBalanceProvenance(response: {
   extra?: Record<string, unknown>;
@@ -951,4 +993,8 @@ function normalizeEndpoint(endpoint: string): string {
   } catch {
     return endpoint.replace(/\/+$/, "");
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

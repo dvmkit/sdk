@@ -75,8 +75,13 @@ export function waitForInlineResult(
 const INLINE_RESULT_MESSAGES_MAX_BYTES = 1_048_576;
 
 export async function inlineResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {
-  if (job.status !== "completed" || job.redactedAt !== undefined ||
-    !job.messages.some((message) => message.type === "artifact")) return undefined;
+  if (!job.messages.some((message) => message.type === "artifact")) return undefined;
+  return boundedResultMessages(store, job);
+}
+
+/** A completed job's messages for a response body, or undefined when redacted or over the inline cap. */
+export async function boundedResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {
+  if (job.status !== "completed" || job.redactedAt !== undefined) return undefined;
   let messages = job.messages.filter((message) => message.seq > 0);
   if (isStreamableJobStore(store)) {
     const durable = await store.getMessages(job.id, 0, { includeHeld: true });

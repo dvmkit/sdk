@@ -284,6 +284,49 @@ describe("verifyX402Payment", () => {
     );
   });
 
+  // Covers the callers that verify an exact payment here rather than through
+  // the durable settlement server: the non-durable upfront path and the
+  // mid-job top-up.
+  it("sends the facilitator the server's resource and no extensions, never a forged payload's, on verify and settle", async () => {
+    const forged = { resource: { url: "https://attacker.example/listing", description: "Planted text." }, extensions: { bazaar: { info: {}, schema: {} } } };
+    const v2 = JSON.parse(Buffer.from(paymentHeaderV2("1000000"), "base64").toString("utf8")) as Record<string, unknown>;
+    const v1 = JSON.parse(Buffer.from(paymentHeader("1000000"), "base64").toString("utf8")) as Record<string, unknown>;
+    const encode = (value: Record<string, unknown>) => Buffer.from(JSON.stringify({ ...value, ...forged })).toString("base64");
+
+    expect((await verifyX402Payment(encode(v2), CONFIG, 1_000_000n, RESOURCE, RATE)).verified).toBe(true);
+    expect((await verifyX402Payment(encode(v1), CONFIG, 1_000_000n, RESOURCE, RATE)).verified).toBe(true);
+
+    const sent = [...vi.mocked(verifyWithFacilitator).mock.calls, ...vi.mocked(settleWithFacilitator).mock.calls]
+      .map(([payload]) => payload as unknown as Record<string, unknown>);
+    expect(sent).toHaveLength(4);
+    for (const payload of sent) {
+      expect(payload).not.toHaveProperty("extensions");
+      if (payload.x402Version === 2) expect(payload.resource).toEqual({ url: RESOURCE, mimeType: "application/json" });
+      else expect(payload).not.toHaveProperty("resource");
+    }
+  });
+
+  it("puts only the allowed, bounded settle fields into the caller's PAYMENT-RESPONSE", async () => {
+    vi.mocked(settleWithFacilitator).mockResolvedValue({
+      ...settled({ network: "eip155:84532", payer: "0xfrom" }),
+      errorMessage: "facilitator-internal diagnostic",
+      extensions: { trace: "x".repeat(9_000) },
+      padding: "y".repeat(4_000),
+    } as SettleResponse);
+
+    const result = await verifyX402Payment(paymentHeader("1000000"), CONFIG, 1_000_000n, RESOURCE, RATE);
+
+    expect(result.verified).toBe(true);
+    const header = result.settleResponseHeader ?? "";
+    expect(JSON.parse(Buffer.from(header, "base64").toString("utf8"))).toEqual({
+      success: true,
+      transaction: "0xtxhash123",
+      network: "eip155:84532",
+      payer: "0xfrom",
+    });
+    expect(header.length).toBeLessThan(512);
+  });
+
   it("converts a large micro-unit amount to finite proportional millisatoshis", async () => {
     // A large on-chain value must still produce a finite, proportional credit —
     // a silent NaN/truncation here would under- or over-credit real USDC.

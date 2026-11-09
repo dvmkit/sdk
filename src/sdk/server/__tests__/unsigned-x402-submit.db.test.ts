@@ -59,6 +59,16 @@ function authorization(
   });
 }
 
+/** A chain RPC that is at block 100 and answers nothing else. */
+function chainRpcAnswer(body: unknown): Response {
+  const parsed = JSON.parse(typeof body === "string" ? body : "{}") as { id?: number; method?: string } | { id?: number; method?: string }[];
+  const answer = (call: { id?: number; method?: string }) =>
+    call.method === "eth_blockNumber"
+      ? { jsonrpc: "2.0", id: call.id, result: "0x64" }
+      : { jsonrpc: "2.0", id: call.id, error: { code: -32601, message: `${call.method} is not answered in this test` } };
+  return Response.json(Array.isArray(parsed) ? parsed.map(answer) : answer(parsed));
+}
+
 function gate() {
   let resolve!: () => void;
   const promise = new Promise<void>((open) => { resolve = open; });
@@ -83,6 +93,7 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
   let finish: ReturnType<typeof gate>;
   let handled: number;
   let facilitatorCalls: string[];
+  let facilitatorPayloads: Record<string, unknown>[];
   let settleAnswer: () => Promise<Response>;
   let sawSettle: ReturnType<typeof gate>;
   let unholdSettle: (() => void) | undefined;
@@ -99,13 +110,20 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     finish = gate();
     handled = 0;
     facilitatorCalls = [];
+    facilitatorPayloads = [];
     settleAnswer = async () => Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
     sawSettle = gate();
     const fetch = globalThis.fetch;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = typeof request === "string" ? request : request instanceof URL ? request.href : request.url;
+      // The settlement server bookmarks a block before each submission; answer
+      // it here so no test waits on, or depends on, a public chain RPC.
+      if (!["localhost", "127.0.0.1"].includes(new URL(url).hostname) && !url.startsWith(`${X402.facilitator}/`)) {
+        return chainRpcAnswer(init?.body);
+      }
       if (!url.startsWith(`${X402.facilitator}/`)) return fetch(request, init);
       facilitatorCalls.push(new URL(url).pathname);
+      facilitatorPayloads.push((JSON.parse(String(init?.body)) as { paymentPayload: Record<string, unknown> }).paymentPayload);
       if (url === `${X402.facilitator}/verify`) return Response.json({ isValid: true });
       if (url === `${X402.facilitator}/settle`) {
         sawSettle.resolve();
@@ -419,5 +437,27 @@ describe.skipIf(!RUN)("unsigned x402 submit route (Postgres)", () => {
     expect(handled).toBe(0);
     expect((await poolA.query("SELECT id FROM jobs")).rowCount).toBe(0);
     expect((await poolA.query("SELECT intent_id FROM x402_exact_settlement_intents")).rowCount).toBe(0);
+  });
+
+  it("sends the facilitator the 402's own resource and no extensions, never the caller's, on verify and settle", async () => {
+    const url = await start();
+    const required = decodePaymentRequiredHeader((await submit(url)).headers.get("PAYMENT-REQUIRED")!);
+    const decoded = JSON.parse(Buffer.from(authorization(RUNTIME_SECONDS + 60), "base64").toString("utf8")) as Record<string, unknown>;
+    const forged = Buffer.from(JSON.stringify({
+      x402Version: 2,
+      resource: { url: "https://attacker.example/listing", description: "Planted text." },
+      accepted: required.accepts[0],
+      payload: decoded.payload,
+      extensions: { bazaar: { info: {}, schema: {} } },
+    }), "utf8").toString("base64");
+    const accepted = await submit(url, forged);
+    expect(accepted.status).toBe(202);
+    finish.resolve();
+    await sawSettle.promise;
+    await vi.waitFor(() => expect(facilitatorCalls).toEqual(["/verify", "/settle"]));
+    for (const payload of facilitatorPayloads) {
+      expect(payload.resource).toEqual(required.resource);
+      expect(payload).not.toHaveProperty("extensions");
+    }
   });
 });

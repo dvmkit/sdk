@@ -20,6 +20,17 @@ export const X402_SETTLEMENT_PENDING = "settlement_pending";
 export const FACILITATOR_TIMEOUT_REASON = "facilitator_timeout";
 /** Default bound on one facilitator call. */
 export const X402_DEFAULT_FACILITATOR_TIMEOUT_MS = 10_000;
+/**
+ * Header in which a facilitator reports, as base64 JSON keyed by extension
+ * name, what each extension made of a verify or settle request. It is logged
+ * and never passed on to the caller.
+ */
+export const X402_EXTENSION_RESPONSES_HEADER = "EXTENSION-RESPONSES";
+
+// One facilitator answer logs at most this many extension entries; the rest
+// are counted on a single truncation line, so a hostile header cannot flood
+// the log.
+const X402_EXTENSION_RESPONSES_LOGGED_MAX = 8;
 
 /** A facilitator call that did not complete within its bound; its effect, if any, is unknown. */
 export class X402FacilitatorTimeoutError extends Error {
@@ -83,6 +94,7 @@ export async function verifyWithFacilitator(
             }),
             signal,
           });
+          logExtensionResponses(res, "verifier");
           if (!res.ok) {
             const rejection = await readFacilitatorRejection(res, res.status === 400);
             if (
@@ -94,6 +106,7 @@ export async function verifyWithFacilitator(
               return rejection as unknown as VerifyResponse;
             }
             logRejected("verifier");
+            logRefusedRequest("verifier", res.status, rejection);
             return { isValid: false, invalidReason: `facilitator_status_${res.status}` };
           }
           const data = (await res.json()) as VerifyResponse;
@@ -138,6 +151,7 @@ export async function settleWithFacilitator(
           }),
           signal,
         });
+        logExtensionResponses(res, "broadcast");
         if (!res.ok) {
           // CDP answers a settlement that is still confirming with a 500, so the
           // pending marker is read on any status; other rejections only on 400.
@@ -152,6 +166,7 @@ export async function settleWithFacilitator(
             return rejection as unknown as SettleResponse;
           }
           logRejected("broadcast");
+          logRefusedRequest("broadcast", res.status, rejection);
           return { success: false, errorReason: `facilitator_status_${res.status}` };
         }
         const data = (await res.json()) as SettleResponse;
@@ -182,6 +197,63 @@ async function readFacilitatorRejection(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Log what each extension reported. Every status is logged, `processing`
+ * included: a facilitator may never report `success` for a listing that
+ * still completes. A header that is not base64 JSON is ignored.
+ */
+function logExtensionResponses(res: Response, stage: "verifier" | "broadcast"): void {
+  const header = res.headers.get(X402_EXTENSION_RESPONSES_HEADER);
+  if (!header) return;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+  } catch {
+    return;
+  }
+  if (!isRecord(decoded)) return;
+  const entries = Object.entries(decoded);
+  for (const [extension, value] of entries.slice(0, X402_EXTENSION_RESPONSES_LOGGED_MAX)) {
+    const entry = isRecord(value) ? value : {};
+    const rejectedReason = entry.rejectedReason ?? entry.reason;
+    diagnosticConsole[entry.status === "rejected" ? "warn" : "info"]({
+      event: "x402_facilitator_extension_response",
+      rail: "x402",
+      failure_stage: stage,
+      extension,
+      extension_status: entry.status,
+      ...(rejectedReason !== undefined && { extension_rejected_reason: rejectedReason }),
+    });
+  }
+  if (entries.length > X402_EXTENSION_RESPONSES_LOGGED_MAX) {
+    diagnosticConsole.warn({
+      event: "x402_facilitator_extension_responses_truncated",
+      rail: "x402",
+      failure_stage: stage,
+      count: entries.length - X402_EXTENSION_RESPONSES_LOGGED_MAX,
+    });
+  }
+}
+
+/**
+ * Log a refusal the caller sees only as `facilitator_status_<code>`, with the
+ * facilitator's own `errorMessage` (such as CDP's reason for an
+ * `invalid_request`) for the builder; the log projection bounds its length.
+ */
+function logRefusedRequest(
+  stage: "verifier" | "broadcast",
+  status: number,
+  body: Record<string, unknown> | null
+): void {
+  diagnosticConsole.warn({
+    event: "x402_facilitator_request_refused",
+    rail: "x402",
+    failure_stage: stage,
+    status_code: status,
+    ...(body?.errorMessage !== undefined && { facilitator_message: body.errorMessage }),
+  });
 }
 
 function logRejected(stage: "verifier" | "broadcast"): void {

@@ -202,3 +202,121 @@ describe("x402 facilitator call timeout", () => {
     }
   });
 });
+
+/** The diagnostic records the facilitator calls logged, as they reach the log after projection. */
+function loggedRecords(): Record<string, unknown>[] {
+  const lines = [console.log, console.info, console.warn, console.error].flatMap((sink) =>
+    vi.mocked(sink).mock.calls.map(([line]) => String(line))
+  );
+  return lines.flatMap((line) => {
+    try {
+      return [JSON.parse(line) as Record<string, unknown>];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function extensionResponses(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64");
+}
+
+describe("x402 facilitator diagnostics", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function silenceConsole() {
+    for (const level of ["log", "info", "warn", "error"] as const) {
+      vi.spyOn(console, level).mockImplementation(() => undefined);
+    }
+  }
+
+  it("logs each extension's status and rejection reason from EXTENSION-RESPONSES on verify and settle", async () => {
+    silenceConsole();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url.endsWith("/verify")
+          ? Response.json({ isValid: true }, {
+              headers: { "EXTENSION-RESPONSES": extensionResponses({ bazaar: { status: "processing" } }) },
+            })
+          : Response.json({ success: true, transaction: "0x1", network: REQUIREMENTS.network }, {
+              headers: {
+                "EXTENSION-RESPONSES": extensionResponses({
+                  bazaar: { status: "rejected", rejectedReason: "description too long" },
+                }),
+              },
+            })
+      )
+    );
+
+    await expect(verifyWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG)).resolves.toEqual({ isValid: true });
+    await expect(settleWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG)).resolves.toMatchObject({ success: true });
+
+    const logged = loggedRecords().filter((record) => record.event === "x402_facilitator_extension_response");
+    expect(logged).toEqual([
+      expect.objectContaining({ failure_stage: "verifier", extension: "bazaar", extension_status: "processing" }),
+      expect.objectContaining({
+        failure_stage: "broadcast",
+        extension: "bazaar",
+        extension_status: "rejected",
+        extension_rejected_reason: "description too long",
+      }),
+    ]);
+  });
+
+  it("logs at most eight EXTENSION-RESPONSES entries and counts the rest on one truncation line", async () => {
+    silenceConsole();
+    const many = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [`ext${index}`, { status: "processing" }]));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ isValid: true }, { headers: { "EXTENSION-RESPONSES": extensionResponses(many) } }))
+    );
+
+    await expect(verifyWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG)).resolves.toEqual({ isValid: true });
+    const records = loggedRecords();
+    expect(records.filter((record) => record.event === "x402_facilitator_extension_response")).toHaveLength(8);
+    expect(records.filter((record) => record.event === "x402_facilitator_extension_responses_truncated")).toEqual([
+      expect.objectContaining({ failure_stage: "verifier", count: 42 }),
+    ]);
+  });
+
+  it("ignores an EXTENSION-RESPONSES header that is not base64 JSON, without changing the answer", async () => {
+    silenceConsole();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ isValid: true }, { headers: { "EXTENSION-RESPONSES": "%%%not-base64" } }))
+    );
+
+    await expect(verifyWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG)).resolves.toEqual({ isValid: true });
+    expect(loggedRecords().filter((record) => record.event === "x402_facilitator_extension_response")).toEqual([]);
+  });
+
+  it.each(["verify", "settle"] as const)(
+    "logs the facilitator's errorMessage on an opaque %s refusal, bounded, while the answer stays the status code",
+    async (operation) => {
+      silenceConsole();
+      const errorMessage = `resource.description is too long ${"x".repeat(1000)}\u0007`;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => Response.json({ errorType: "invalid_request", errorMessage }, { status: 400 }))
+      );
+
+      const answer =
+        operation === "verify"
+          ? await verifyWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG)
+          : await settleWithFacilitator(PAYLOAD, REQUIREMENTS, CONFIG);
+      expect(answer).toEqual(
+        operation === "verify"
+          ? { isValid: false, invalidReason: "facilitator_status_400" }
+          : { success: false, errorReason: "facilitator_status_400" }
+      );
+      const refused = loggedRecords().filter((record) => record.event === "x402_facilitator_request_refused");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]).toMatchObject({ status_code: 400, failure_stage: operation === "verify" ? "verifier" : "broadcast" });
+      const message = refused[0]!.facilitator_message as string;
+      expect(message.startsWith("resource.description is too long xxx")).toBe(true);
+      expect(message.length).toBeLessThanOrEqual(256);
+      expect(message).not.toMatch(/[\x00-\x1f\x7f]/);
+    }
+  );
+});

@@ -155,6 +155,60 @@ describe("durable exact x402 settlement", () => {
     ).toMatchObject({ status: "complete", transaction: TRANSACTION });
   });
 
+  it("puts only the allowed, bounded settle fields into a fresh, recovered and replayed receipt", async () => {
+    const store = new MemoryX402ExactSettlementStore();
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(response({ isValid: true }))
+      .mockResolvedValueOnce(
+        response({
+          success: true,
+          transaction: TRANSACTION,
+          network: CONFIG.network,
+          errorMessage: "facilitator-internal diagnostic",
+          extensions: { trace: "x".repeat(9_000) },
+          padding: "y".repeat(4_000),
+        })
+      );
+    const server = new X402ExactSettlementServer({ store, evidence: evidence() });
+    const receipts: (string | undefined)[] = [];
+    const commit = vi
+      .fn<(txHash: string) => Promise<string>>()
+      .mockRejectedValueOnce(new Error("database unavailable"))
+      .mockResolvedValue("booked");
+    const capture = (paymentHeader = header()) =>
+      server.accept({
+        paymentHeader,
+        config: CONFIG,
+        requiredUsdcMicro: 1000n,
+        resource: "/v1/credit",
+        btcUsdRate: 100_000,
+        dvmId: "dvm-1",
+        commit: async (receipt) => {
+          receipts.push(receipt.settleResponseHeader);
+          return commit(receipt.txHash ?? "");
+        },
+      });
+
+    // The first commit fails after settlement, so the retry recovers the stored
+    // facilitator answer; the third presentation replays the completed intent.
+    await expect(capture()).rejects.toThrow("database unavailable");
+    await expect(capture()).resolves.toMatchObject({ outcome: "accepted", replayed: false });
+    const replay = await capture();
+    expect(replay).toMatchObject({ outcome: "accepted", replayed: true });
+    if (replay.outcome !== "accepted") throw new Error("expected the replay to be accepted");
+
+    const headers = [...receipts, replay.receipt.settleResponseHeader];
+    expect(headers).toHaveLength(3);
+    for (const encoded of headers) {
+      expect(JSON.parse(Buffer.from(encoded ?? "", "base64").toString("utf8"))).toEqual({
+        success: true,
+        transaction: TRANSACTION,
+        network: CONFIG.network,
+      });
+      expect((encoded ?? "").length).toBeLessThan(512);
+    }
+  });
+
   it("rejects a same-nonce retry whose durable authorization binding changed", async () => {
     const store = new MemoryX402ExactSettlementStore();
     const fetch = vi

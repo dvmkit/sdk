@@ -16,7 +16,7 @@ import {
   repairX402ExactSettlementEffect,
   verifyUpfrontPayment,
 } from "../payment";
-import { deferredX402IntentId } from "../funding";
+import { deferredX402IntentId, implicitCreditId } from "../funding";
 import {
   InProcessDeferredX402Settler,
   X402ExactSettlementServer,
@@ -145,12 +145,12 @@ function answerSettle(r: Rig, body: Record<string, unknown>): void {
   Object.assign(r.settleBody, { network: X402.network }, body);
 }
 
-function admit(r: Rig, header: string | undefined, jobId: string): Promise<PaymentInfo & { error?: { status: number; body: Record<string, unknown>; x402Requirements?: { maxTimeoutSeconds: number }[] } }> {
+function admit(r: Rig, header: string | undefined, jobId: string, settleByMs?: number): Promise<PaymentInfo & { error?: { status: number; body: Record<string, unknown>; x402Requirements?: { maxTimeoutSeconds: number }[] } }> {
   return verifyUpfrontPayment({
     x402Payment: header,
     x402Config: X402,
     x402ExactSettlement: r.settlement,
-    x402Deferred: { maxRuntimeSeconds: RUNTIME_SECONDS, settler: r.settler },
+    x402Deferred: { maxRuntimeSeconds: RUNTIME_SECONDS, settler: r.settler, ...(settleByMs !== undefined && { settleByMs }) },
     requiredMsats: PRICE_MSATS,
     priceFiat: { currency: "usd", amountMicro: PRICE_MICRO },
     creditLedger: r.ledger,
@@ -268,6 +268,91 @@ describe("unsigned x402 settled after the job", () => {
     const intent = await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!);
     expect(intent?.status).toBe("released");
     jobs.shutdown();
+  });
+
+  it.each(["prompt", "send-prompt", "payment-request"] as const)("fails and releases the authorization when the handler asks for %s", async (ask) => {
+    const r = rig();
+    const { jobs, completed } = manager(r, async (ctx) => {
+      if (ask === "prompt") await ctx.prompt("confirm", "Continue?");
+      else if (ask === "send-prompt") ctx.sendMessage("prompt", { id: "confirm", text: "Continue?" });
+      else ctx.sendMessage("payment-request", { amount_msats: 1000 });
+      ctx.complete("must not complete");
+    });
+    try {
+      const payment = await admit(r, authorization(60), "job-ask");
+      const job = await run(jobs, payment, "job-ask");
+
+      expect(job.status).toBe("failed");
+      expect(job.messages.find((message) => message.type === "cancel")?.content.reason).toBe(
+        `ctx.${ask === "prompt" ? "prompt" : `sendMessage("${ask === "send-prompt" ? "prompt" : "payment-request"}")`} is unavailable: this job was paid by an x402 authorization that settles only when it succeeds`
+      );
+      expect(job.messages.some((message) => message.type === (ask === "send-prompt" ? "prompt" : ask))).toBe(false);
+      expect(job.pendingPrompts.size).toBe(0);
+      expect(job.pendingPaymentMsats).toBeUndefined();
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+      expect(completed).not.toHaveBeenCalled();
+      expect((await r.store.get(DVM_ID, deferredX402IntentId(payment.creditId)!))?.status).toBe("released");
+    } finally {
+      jobs.shutdown();
+    }
+  });
+
+  it("returns a rejected prompt promise that a handler can catch", async () => {
+    const r = rig();
+    const { jobs } = manager(r, async (ctx) => {
+      const fallback = await ctx.prompt("confirm", "Continue?").catch(() => "fallback");
+      ctx.complete(typeof fallback === "string" ? fallback : "unexpected response");
+    });
+    try {
+      const payment = await admit(r, authorization(60), "job-prompt-fallback");
+      const job = await run(jobs, payment, "job-prompt-fallback");
+      expect(job.status).toBe("completed");
+      expect(job.messages.some((message) => message.type === "prompt")).toBe(false);
+      expect(r.facilitatorCalls("/settle")).toBe(1);
+    } finally {
+      jobs.shutdown();
+    }
+  });
+
+  it.each([
+    ["signed", "x402"],
+    ["signed", "cashu"],
+    ["unsigned", "cashu"],
+  ] as const)("keeps prompts and payment-request messages available on %s %s jobs", async (caller, rail) => {
+    const r = rig();
+    const { jobs } = manager(r, async (ctx) => {
+      const response = await ctx.prompt("confirm", "Continue?");
+      ctx.sendMessage("prompt", { id: "follow-up", text: "Anything else?" });
+      ctx.sendMessage("payment-request", { amount_msats: 1000, reason: response.text });
+      ctx.complete("done");
+    });
+    try {
+      const payment: PaymentInfo = {
+        paidMsats: PRICE_MSATS, receivedProofs: [], paymentRail: rail,
+        ...(rail === "x402" && { creditId: implicitCreditId("x402", TX) }),
+      };
+      const job = jobs.createJob(
+        { input: "https://example.com" },
+        caller === "signed" ? "ab".repeat(32) : "anonymous",
+        payment, PRICE_MSATS, "scrape", undefined, { jobId: "job-interactive" }
+      );
+      await jobs.persistJob(job);
+      jobs.runHandler(job, jobs.buildAndAttachContext(job, undefined));
+      await vi.waitFor(() => expect(job.pendingPrompts.has("confirm")).toBe(true));
+      expect(job.status).toBe("awaiting-input");
+      expect(job.messages.find((message) => message.type === "prompt")?.content).toMatchObject({ id: "confirm", text: "Continue?" });
+      await jobs.dispatchMessage(job, "response", { prompt_id: "confirm", text: "yes" });
+      await vi.waitFor(() => expect(job.terminalWork).toBeDefined());
+      await job.terminalWork;
+
+      expect(job.status).toBe("completed");
+      expect(job.messages.find((message) => message.type === "prompt" && message.content.id === "follow-up")?.content)
+        .toMatchObject({ id: "follow-up", text: "Anything else?" });
+      expect(job.messages.find((message) => message.type === "payment-request")?.content).toMatchObject({ amount_msats: 1000, reason: "yes" });
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+    } finally {
+      jobs.shutdown();
+    }
   });
 
   it("never settles when the caller cancels: a cancel charges an unsigned x402 job nothing", async () => {
@@ -599,6 +684,62 @@ describe("unsigned x402 whose settlement outcome is not known", () => {
       expect(terminal).not.toHaveBeenCalled();
       jobs.shutdown();
     });
+  });
+
+  describe("a settle window that has closed", () => {
+    it("releases an authorization never sent, without calling the facilitator", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-unsent", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+
+      expect(await r.settler.settle(intentId)).toBe("unpaid");
+
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+      expect(await r.store.get(DVM_ID, intentId)).toMatchObject({ status: "released", lastOutcome: "settle_window_closed" });
+    });
+
+    it("settles, not reports unpaid, when a concurrent attempt claimed the intent before the release", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-raced", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      const release = r.store.release.bind(r.store);
+      vi.spyOn(r.store, "release").mockImplementation(async (args) => {
+        // Another attempt, past its own window check, marks the intent submitting first.
+        await r.store.markSubmitting({ dvmId: DVM_ID, intentId, submissionBlock: "100" });
+        return release(args);
+      });
+
+      expect(await r.settler.settle(intentId)).toBe("settled");
+
+      expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+    });
+
+    it("keeps the authorization when the release is not recorded, so a retry can release it", async () => {
+      const r = rig();
+      const payment = await admit(r, authorization(60), "job-window-unrecorded", Date.now() - 1);
+      const intentId = deferredX402IntentId(payment.creditId)!;
+      vi.spyOn(r.store, "release").mockRejectedValueOnce(new Error("database unavailable"));
+
+      await expect(r.settler.settle(intentId)).rejects.toThrow("database unavailable");
+      expect(r.settler.holds(intentId)).toBe(true);
+
+      expect(await r.settler.settle(intentId)).toBe("unpaid");
+      expect(r.settler.holds(intentId)).toBe(false);
+      expect(r.facilitatorCalls("/settle")).toBe(0);
+    });
+
+    it.each(["ambiguous", "settled"] as const)(
+      "still settles an authorization already submitted (%s), since money may have moved",
+      async (status) => {
+        const r = rig();
+        const payment = await admit(r, authorization(60), `job-window-${status}`, Date.now() - 1);
+        const intentId = await strand(r, payment, status);
+
+        expect(await r.settler.settle(intentId)).toBe("settled");
+
+        expect((await r.store.get(DVM_ID, intentId))?.status).toBe("complete");
+      }
+    );
   });
 
   describe("a settlement the facilitator reports as pending", () => {
