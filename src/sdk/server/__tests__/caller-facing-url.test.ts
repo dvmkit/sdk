@@ -36,9 +36,9 @@ describe("caller-facing URLs", () => {
 
   it("uses the same origin selection for schema URLs", () => {
     const requestUrl = "http://request.example/v1/job";
-    expect(infoSchemaUrl(requestUrl, "https://dvmkit--scrape.example.com")).toBe(
+    expect(infoSchemaUrl(requestUrl, "", "https://dvmkit--scrape.example.com")).toBe(
       "https://dvmkit--scrape.example.com/v1/info"
     );
-    expect(infoSchemaUrl(requestUrl)).toBe("http://request.example/v1/info");
+    expect(infoSchemaUrl(requestUrl, "")).toBe("http://request.example/v1/info");
   });
 });
