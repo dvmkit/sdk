@@ -234,11 +234,12 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
    * `{ callerFault: true }` says the caller's own request caused the failure, such as a URL
    * the service refuses or a target that does not exist. It is recorded on the job's final
    * `cancel` message as `caller_fault: true`, and the x402 route answers such a failure 422
-   * instead of 500, so a stock x402 client sees a request it should correct rather than a
-   * broken service. It moves no money: charging is unchanged on every channel.
+   * instead of 500, so the caller sees a 4xx rather than a 5xx. It moves no money: charging
+   * is unchanged on every channel.
    *
-   * `{ refund: true }` has no effect. It moves no money on any rail, never has, and is not
-   * recorded; use `callerFault` to mark a failure as the caller's.
+   * `{ refund: true }` has no effect on the job and is not recorded on it; it moves no money
+   * on any rail and never has. The test context from `@dvmkit/sdk/testing` still exposes it
+   * as `refundRequested`. Use `callerFault` to mark a failure as the caller's.
    */
   fail(error: string, opts?: { refund?: boolean; callerFault?: boolean }): void;
 

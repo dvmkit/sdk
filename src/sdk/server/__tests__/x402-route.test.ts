@@ -8,7 +8,8 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { chargedSettleResponse, classifyX402RouteOutcome } from "../x402-route";
+import type { Message } from "../../../lib/messages/types";
+import { chargedSettleResponse, classifyX402RouteOutcome, x402FailedJobAnswer } from "../x402-route";
 
 const completed = { status: "completed" as const, runtimeLimitExceeded: false };
 
@@ -62,5 +63,25 @@ describe("chargedSettleResponse", () => {
   it("passes the facilitator's own answer through unchanged", () => {
     const answer = { success: true, transaction: "0xabc", network: "base", payer: "0x22" };
     expect(chargedSettleResponse({ ...settled, settleResponse: answer })).toEqual(answer);
+  });
+});
+
+describe("x402FailedJobAnswer", () => {
+  const cancel = (from: Message["from"], content: Record<string, unknown>, seq = 1) =>
+    ({ seq, from, timestamp: 0, type: "cancel", content }) as Message;
+
+  it("answers 422 only when the service's own cancel marks the failure as the caller's", () => {
+    expect(x402FailedJobAnswer([cancel("provider", { reason: "page not found", caller_fault: true })])).toEqual({
+      reason: "page not found",
+      status: 422,
+    });
+  });
+
+  it("ignores a caller-fault mark on a requester's cancel, which the caller writes itself", () => {
+    const messages = [
+      cancel("provider", { reason: "service error" }, 1),
+      cancel("requester", { reason: "not my fault", caller_fault: true }, 2),
+    ];
+    expect(x402FailedJobAnswer(messages)).toEqual({ reason: "not my fault", status: 500 });
   });
 });
