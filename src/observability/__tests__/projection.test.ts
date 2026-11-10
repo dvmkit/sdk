@@ -212,6 +212,7 @@ describe("projectSpanRow", () => {
   it.each([
     ["route", "GET /dvms/private/jobs/job-private/status", "GET /dvms/:dvmId/jobs/:jobId/status"],
     ["http.route", "/orgs/acme/members/history", "/orgs/:handle/members/history"],
+    ["http.route", "/v1/x402/search", "/v1/x402/:capability"],
     ["resource_path", "/dvms/:uuid/jobs/:b58/status", "/dvms/:dvmId/jobs/:jobId/status"],
   ])("normalizes approved %s values to the most specific template", (key, value, expected) => {
     expect(projectDiagnosticFields({ [key]: value })).toEqual({

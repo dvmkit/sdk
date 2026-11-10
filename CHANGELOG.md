@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A `dvm.request` span for the x402 route, `POST /v1/x402/<capability>`, now keeps its `http.route` as the template `/v1/x402/:capability` when the span is stored. Before, the diagnostic catalogue had no template for the route, so the projection dropped the attribute and stored x402 requests could not be counted by route.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

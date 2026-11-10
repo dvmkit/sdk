@@ -797,7 +797,8 @@
     "/v1/job/:id/messages",
     "/v1/quote",
     "/v1/request-result/:requestId",
-    "/v1/request-resume/:requestId"
+    "/v1/request-resume/:requestId",
+    "/v1/x402/:capability"
   ],
   "postgresErrorCodes": [
     "08000",
