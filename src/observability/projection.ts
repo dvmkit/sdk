@@ -3,19 +3,53 @@ import { isIP } from "node:net";
 import catalogueJson from "./diagnostic-catalogue-v1.json";
 import type { SpanRow } from "./types";
 
-type DeepReadonly<T> = T extends readonly (infer U)[]
-  ? readonly DeepReadonly<U>[]
-  : T extends object
-    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
-    : T;
-
-export type DiagnosticCatalogue = DeepReadonly<typeof catalogueJson>;
+// Declared by hand: a type derived from the JSON module makes the declaration
+// bundler emit the catalogue as invalid `var` statements in the published types.
+export interface DiagnosticCatalogue {
+  readonly version: number;
+  readonly events: readonly string[];
+  readonly routeTemplates: readonly string[];
+  readonly postgresErrorCodes: readonly string[];
+  readonly errorCodes: readonly string[];
+  readonly datasets: readonly string[];
+  readonly levels: readonly string[];
+  readonly statuses: readonly string[];
+  readonly methods: readonly string[];
+  readonly nwcExcessMethods: readonly string[];
+  readonly rails: readonly string[];
+  readonly stages: readonly string[];
+  readonly handlers: readonly string[];
+  readonly currencyTokens: readonly string[];
+  readonly booleanFields: readonly string[];
+  readonly integerFields: readonly string[];
+  readonly tokenFields: readonly string[];
+  readonly hashFields: readonly string[];
+  readonly transactionHashFields: readonly string[];
+  readonly urlFields: readonly string[];
+  readonly identityFields: readonly string[];
+  readonly capabilityFields: readonly string[];
+  readonly capabilityChannels: readonly string[];
+  readonly clientProtocolVersions: readonly number[];
+  readonly clientVersionFields: readonly string[];
+  readonly paymentSkipReasons: readonly string[];
+  readonly denominationCauses: readonly string[];
+  readonly fxSourceFailures: readonly string[];
+  readonly paymentFailureCategories: readonly string[];
+  readonly paymentFailureStages: readonly string[];
+  readonly paymentPhases: readonly string[];
+  readonly sanctionsRegions: readonly string[];
+  readonly submitIdentitySources: readonly string[];
+  readonly fundedRuntimeReclaims: readonly string[];
+  readonly suspensionReasons: readonly string[];
+  readonly tempoCloseReportPriorStatuses: readonly string[];
+}
 
 /**
- * The catalogue this projection admits values from. It is the same frozen
- * object the projection reads, so a consumer sees exactly what is stored and
- * cannot widen it. `version` changes only with the catalogue's format, not
- * when a list gains a value.
+ * The list-valued part of what this projection admits: the same frozen object
+ * the projection reads, so a consumer cannot widen it. Code-defined rules (such
+ * as service names, event-scoped fields, and pattern-checked fields) are not
+ * included. `version` changes only with the catalogue's format, not when a list
+ * gains a value.
  */
 export const DIAGNOSTIC_CATALOGUE: DiagnosticCatalogue = deepFreeze(catalogueJson);
 const catalogue = DIAGNOSTIC_CATALOGUE;
@@ -747,10 +781,10 @@ function ownDataEntries(
   return entries;
 }
 
-function deepFreeze<T>(value: T): DeepReadonly<T> {
+function deepFreeze<T>(value: T): T {
   if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
     for (const child of Object.values(value)) deepFreeze(child);
     Object.freeze(value);
   }
-  return value as DeepReadonly<T>;
+  return value;
 }

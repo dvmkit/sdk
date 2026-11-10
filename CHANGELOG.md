@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `@dvmkit/sdk/internal` now exports `DIAGNOSTIC_CATALOGUE`, the deep-frozen diagnostic catalogue span projection reads, with its type `DiagnosticCatalogue`, so a platform can read the route templates, events, error codes and other lists the projection admits instead of keeping its own copy. `DIAGNOSTIC_CATALOGUE_VERSION` still changes only with the catalogue's format; compare the lists to detect an addition.
+- `@dvmkit/sdk/internal` now exports `DIAGNOSTIC_CATALOGUE`, the deep-frozen diagnostic catalogue span projection reads, with its type `DiagnosticCatalogue`. It is the list-valued part of what projection admits (route templates, events, error codes and the other lists), so a platform can read those lists instead of keeping its own copy; code-defined rules, such as service names, event-scoped fields and pattern-checked fields, are not included. `DIAGNOSTIC_CATALOGUE_VERSION` still changes only with the catalogue's format; compare the lists to detect an addition.
 
 - The diagnostic catalogue now admits the audit event `admin.withdrawal_finalize` and the error code `screenshot_unavailable`. Before, span projection stored the event under `diagnostic.unknown` and the error code as `unknown_error`.
 

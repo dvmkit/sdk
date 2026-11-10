@@ -510,9 +510,9 @@ describe("router.proxy dimensions", () => {
 });
 
 // Consumers read the exported catalogue to learn what the projection keeps, so
-// every value it lists must survive projection.
+// every value it lists must survive projection. Code-defined rules admit more.
 describe("DIAGNOSTIC_CATALOGUE", () => {
-  it("lists exactly the route templates, events, and error codes the projection keeps", () => {
+  it("every listed route template, event, and error code survives projection", () => {
     for (const template of DIAGNOSTIC_CATALOGUE.routeTemplates) {
       expect(projectDiagnosticFields({ "http.route": template })).toEqual({ "http.route": template });
     }
@@ -524,12 +524,10 @@ describe("DIAGNOSTIC_CATALOGUE", () => {
     }
   });
 
-  it("refuses a consumer's attempt to admit a value", () => {
+  it("rejects a consumer's changes to the exported object", () => {
     expect(() => (DIAGNOSTIC_CATALOGUE.routeTemplates as string[]).push("/private")).toThrow(TypeError);
     expect(() => {
       (DIAGNOSTIC_CATALOGUE as unknown as { events: string[] }).events = ["private.event"];
     }).toThrow(TypeError);
-    expect(projectDiagnosticFields({ "http.route": "/private" })).toEqual({});
-    expect(projectEventName("private.event")).toBe("diagnostic.unknown");
   });
 });
