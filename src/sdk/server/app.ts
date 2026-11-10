@@ -1488,8 +1488,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // full request lifecycle so even pre-handler failures (auth, validation,
     // payment) appear in the trace. Skips /health and internal /_* routes.
     this.app.use("*", async (c, next) => {
-      if (c.req.path === "/health" || c.req.path === "/healthz" || c.req.path.startsWith("/_"))
-        return next();
+      // Relative to this server's mount, so a mounted DVM skips and names its
+      // routes exactly as one served at the root.
+      const route = c.req.path.slice(mountPrefix(c).length) || "/";
+      if (route === "/health" || route === "/healthz" || route.startsWith("/_")) return next();
 
       let statusCode = 200;
       let errorCode: string | undefined;
@@ -1505,7 +1507,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           name: "dvm.request",
           attrs: {
             "http.method": c.req.method,
-            "http.route": c.req.path,
+            "http.route": route,
             ...clientCompatibilityAttributes(
               c.get("clientCompatibility") ?? {
                 capabilities: [],

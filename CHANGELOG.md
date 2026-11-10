@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `@dvmkit/sdk/internal` now exports `DIAGNOSTIC_CATALOGUE`, the deep-frozen diagnostic catalogue span projection reads, with its type `DiagnosticCatalogue`. It is the list-valued part of what projection admits (route templates, events, error codes and the other lists), so a platform can read those lists instead of keeping its own copy; code-defined rules, such as service names, event-scoped fields and pattern-checked fields, are not included. `DIAGNOSTIC_CATALOGUE_VERSION` still changes only with the catalogue's format; compare the lists to detect an addition.
+
+- The diagnostic catalogue now admits the audit event `admin.withdrawal_finalize` and the error code `screenshot_unavailable`. Before, span projection stored the event under `diagnostic.unknown` and the error code as `unknown_error`.
+
+- A `dvm.request` span from a DVM served under a host mount prefix now records `http.route` relative to the mount, so `/feed/v1/job/<id>` is stored as `/v1/job/:id` and a request for the mount itself as `/`. Before, the span carried the full path, which matched no route template, so every route of a mounted DVM was stored without one. A mounted DVM also now skips the span for `/health`, `/healthz` and internal `/_` paths under its mount, as a DVM served at the root does; before, those requests each produced a `dvm.request` span. A DVM served at the root records the same spans as before.
+
+- A `dvm.request` span for the x402 route, `POST /v1/x402/<capability>`, now keeps its `http.route` as the template `/v1/x402/:capability` when the span is stored. Before, the diagnostic catalogue had no template for the route, so the projection dropped the attribute and stored x402 requests could not be counted by route.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

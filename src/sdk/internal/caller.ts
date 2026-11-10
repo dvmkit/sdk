@@ -865,6 +865,7 @@ export {
 } from "../../observability/loggers";
 
 export {
+  DIAGNOSTIC_CATALOGUE,
   DIAGNOSTIC_CATALOGUE_VERSION,
   bindDiagnosticCapabilityAuthority,
   bindDiagnosticIdentityAuthority,
@@ -874,6 +875,7 @@ export {
   projectEventName,
   projectSpanRow,
   type DiagnosticCapabilityAuthority,
+  type DiagnosticCatalogue,
   type DiagnosticIdentityAuthority,
   type SpanProjectionResult
 } from "../../observability/projection";

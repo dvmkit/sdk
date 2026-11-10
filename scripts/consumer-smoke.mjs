@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import ts from "typescript";
@@ -69,6 +69,7 @@ try {
   const declarations = countInstalledDeclarations(installedRoot, installedManifest);
   typecheckConsumer(consumer, "bundler");
   typecheckConsumer(consumer, "node16");
+  libCheckInstalledDeclarations(consumer, installedRoot, installedManifest);
   runSignedRequestCopies(consumer, archive);
   runExamples(consumer);
   runDrainRecovery(consumer);
@@ -451,6 +452,57 @@ function typecheckConsumer(consumer, resolution) {
   }
   rmSync(entry, { force: true });
   rmSync(capabilityTypes, { force: true });
+}
+
+/**
+ * The other compiles skip library checks, which hides an invalid emitted declaration
+ * (for example a bundled JSON module's `var` statements). Check the package's own
+ * declaration files as a consumer with `skipLibCheck: false` would; diagnostics from
+ * third-party dependencies are not this package's to fix.
+ * @param {string} consumer @param {string} installedRoot @param {any} installedManifest
+ */
+function libCheckInstalledDeclarations(consumer, installedRoot, installedManifest) {
+  const entry = join(consumer, "consumer-lib-check.ts");
+  writeFileSync(
+    entry,
+    Object.keys(installedManifest.exports)
+      .map((name, index) => `export * as entry${index} from "${join(manifest.name, name)}";`)
+      .join("\n") + "\n"
+  );
+  const program = ts.createProgram({
+    rootNames: [entry],
+    options: {
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+      noEmit: true,
+      skipLibCheck: false,
+      strict: true,
+      target: ts.ScriptTarget.ES2024,
+      lib: ["lib.esnext.d.ts", "lib.dom.d.ts"],
+      // A consumer brings Node's types. Installing the optional pg dependency brings no types,
+      // so the mapping stands in for @types/pg, which a consumer currently adds itself.
+      typeRoots: [join(root, "node_modules", "@types")],
+      types: ["node"],
+      paths: { pg: [join(root, "node_modules", "@types", "pg")] },
+    },
+  });
+  const diagnostics = [...program.getSyntacticDiagnostics(), ...program.getSemanticDiagnostics()];
+  // The compiler reports resolved paths, which differ from a symlinked temporary directory.
+  const packageRoot = realpathSync(installedRoot);
+  const sdkFile = (/** @type {ts.Diagnostic} */ item) =>
+    item.file === undefined || realpathSync(item.file.fileName) === realpathSync(entry) || item.file.fileName.startsWith(`${packageRoot}/`);
+  const own = diagnostics.filter(sdkFile);
+  const declarationFiles = program.getSourceFiles().filter((file) => file.fileName.startsWith(`${packageRoot}/`));
+  if (declarationFiles.length === 0) fail("the library check loaded none of the installed declarations");
+  if (own.length > 0) {
+    const formatted = ts.formatDiagnostics(own, {
+      getCanonicalFileName: (name) => name,
+      getCurrentDirectory: () => consumer,
+      getNewLine: () => "\n",
+    });
+    fail(`the installed declarations do not compile with skipLibCheck: false:\n${formatted}`);
+  }
+  rmSync(entry, { force: true });
 }
 
 /** @param {string[]} args @param {string} cwd */

@@ -4,9 +4,11 @@ import {
   bindDiagnosticCapabilityAuthority,
   bindDiagnosticIdentityAuthority,
   createDiagnosticCapabilityAuthority,
+  DIAGNOSTIC_CATALOGUE,
   DIAGNOSTIC_CATALOGUE_VERSION,
   extendDiagnosticIdentityAuthority,
   projectDiagnosticFields,
+  projectEventName,
   projectSpanRow,
 } from "../projection";
 import type { SpanRow } from "../types";
@@ -212,6 +214,7 @@ describe("projectSpanRow", () => {
   it.each([
     ["route", "GET /dvms/private/jobs/job-private/status", "GET /dvms/:dvmId/jobs/:jobId/status"],
     ["http.route", "/orgs/acme/members/history", "/orgs/:handle/members/history"],
+    ["http.route", "/v1/x402/search", "/v1/x402/:capability"],
     ["resource_path", "/dvms/:uuid/jobs/:b58/status", "/dvms/:dvmId/jobs/:jobId/status"],
   ])("normalizes approved %s values to the most specific template", (key, value, expected) => {
     expect(projectDiagnosticFields({ [key]: value })).toEqual({
@@ -338,6 +341,15 @@ describe("projectSpanRow", () => {
     expect(projectSpanRow(makeSpan({ service }))).toEqual({
       ok: true,
       row: expect.objectContaining({ service: expected }),
+    });
+  });
+
+  it("keeps the admin.withdrawal_finalize audit event name", () => {
+    expect(
+      projectSpanRow(makeSpan({ dataset: "audit", name: "admin.withdrawal_finalize" })),
+    ).toEqual({
+      ok: true,
+      row: expect.objectContaining({ name: "admin.withdrawal_finalize" }),
     });
   });
 
@@ -481,7 +493,7 @@ describe("router.proxy dimensions", () => {
     ).toEqual({});
   });
 
-  it.each(["no_open_ask", "ask_already_open", "decline_unavailable", "ask_expired"])(
+  it.each(["no_open_ask", "ask_already_open", "decline_unavailable", "ask_expired", "screenshot_unavailable"])(
     "keeps the %s refusal as an error code rather than unknown_error",
     (code) => {
       expect(projectDiagnosticFields({ "error.code": code })).toEqual({ "error.code": code });
@@ -494,5 +506,28 @@ describe("router.proxy dimensions", () => {
         error_code: "hosting_identity_revoke_failed",
       }),
     ).toEqual({ error_code: "hosting_identity_revoke_failed" });
+  });
+});
+
+// Consumers read the exported catalogue to learn what the projection keeps, so
+// every value it lists must survive projection. Code-defined rules admit more.
+describe("DIAGNOSTIC_CATALOGUE", () => {
+  it("every listed route template, event, and error code survives projection", () => {
+    for (const template of DIAGNOSTIC_CATALOGUE.routeTemplates) {
+      expect(projectDiagnosticFields({ "http.route": template })).toEqual({ "http.route": template });
+    }
+    for (const event of DIAGNOSTIC_CATALOGUE.events) {
+      expect(projectEventName(event)).toBe(event);
+    }
+    for (const code of DIAGNOSTIC_CATALOGUE.errorCodes) {
+      expect(projectDiagnosticFields({ "error.code": code })).toEqual({ "error.code": code });
+    }
+  });
+
+  it("rejects a consumer's changes to the exported object", () => {
+    expect(() => (DIAGNOSTIC_CATALOGUE.routeTemplates as string[]).push("/private")).toThrow(TypeError);
+    expect(() => {
+      (DIAGNOSTIC_CATALOGUE as unknown as { events: string[] }).events = ["private.event"];
+    }).toThrow(TypeError);
   });
 });

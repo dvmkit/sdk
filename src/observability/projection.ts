@@ -1,7 +1,65 @@
 import { isIP } from "node:net";
 
-import catalogue from "./diagnostic-catalogue-v1.json";
+import catalogueJson from "./diagnostic-catalogue-v1.json";
 import type { SpanRow } from "./types";
+
+// Declared by hand: a type derived from the JSON module makes the declaration
+// bundler emit the catalogue as invalid `var` statements in the published types.
+export interface DiagnosticCatalogue {
+  readonly version: number;
+  readonly events: readonly string[];
+  readonly routeTemplates: readonly string[];
+  readonly postgresErrorCodes: readonly string[];
+  readonly errorCodes: readonly string[];
+  readonly datasets: readonly string[];
+  readonly levels: readonly string[];
+  readonly statuses: readonly string[];
+  readonly methods: readonly string[];
+  readonly nwcExcessMethods: readonly string[];
+  readonly rails: readonly string[];
+  readonly stages: readonly string[];
+  readonly handlers: readonly string[];
+  readonly currencyTokens: readonly string[];
+  readonly booleanFields: readonly string[];
+  readonly integerFields: readonly string[];
+  readonly tokenFields: readonly string[];
+  readonly hashFields: readonly string[];
+  readonly transactionHashFields: readonly string[];
+  readonly urlFields: readonly string[];
+  readonly identityFields: readonly string[];
+  readonly capabilityFields: readonly string[];
+  readonly capabilityChannels: readonly string[];
+  readonly clientProtocolVersions: readonly number[];
+  readonly clientVersionFields: readonly string[];
+  readonly paymentSkipReasons: readonly string[];
+  readonly denominationCauses: readonly string[];
+  readonly fxSourceFailures: readonly string[];
+  readonly paymentFailureCategories: readonly string[];
+  readonly paymentFailureStages: readonly string[];
+  readonly paymentPhases: readonly string[];
+  readonly sanctionsRegions: readonly string[];
+  readonly submitIdentitySources: readonly string[];
+  readonly fundedRuntimeReclaims: readonly string[];
+  readonly suspensionReasons: readonly string[];
+  readonly tempoCloseReportPriorStatuses: readonly string[];
+}
+
+/**
+ * The list-valued part of what this projection admits: the same frozen object
+ * the projection reads, so a consumer cannot widen it. Code-defined rules (such
+ * as service names, event-scoped fields, and pattern-checked fields) are not
+ * included. `version` changes only with the catalogue's format, not when a list
+ * gains a value.
+ */
+export const DIAGNOSTIC_CATALOGUE: DiagnosticCatalogue = deepFreeze(catalogueJson);
+
+// Fails typecheck when the JSON gains a list the hand-written type lacks. Not
+// exported, so it never reaches the published declarations.
+type AssertNever<T extends never> = T;
+type _CatalogueTypeIsExact = AssertNever<
+  Exclude<keyof typeof catalogueJson, keyof DiagnosticCatalogue>
+>;
+const catalogue = DIAGNOSTIC_CATALOGUE;
 
 export const DIAGNOSTIC_CATALOGUE_VERSION = catalogue.version;
 
@@ -728,4 +786,12 @@ function ownDataEntries(
     if (entries.length >= limit) break;
   }
   return entries;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
 }
