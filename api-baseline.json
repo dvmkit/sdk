@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "storeContracts": {
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean }",
@@ -267,7 +267,7 @@
         },
         "CashuConfig": {
           "stability": "stable",
-          "signature": "9866d837c7dc689896dfa1f6ffc98f10fda2d69d96257b1ba90b455bc6ab1354"
+          "signature": "23a99a46cbc621d46b28dc76310ff5d5d51ffea7faed74ad2d2e5f69d2db6aba"
         },
         "CompleteOpts": {
           "stability": "stable",
@@ -275,7 +275,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "8f5912634723a2f7d40fba40388b31ae1bcb4d06efe2936cb9da00ee74da7dea"
+          "signature": "1fa0440c0e393e480005806748933e9966587f12559a899994f8715e8c577e90"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -343,11 +343,11 @@
         },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "dab505abc615fcb8f09491c581fda6f4e891f4939a14809fc8955a559eb5b025"
+          "signature": "d67b96abad13ccfcc1838c7cf2500ad9b5cb2902b5fa5f1ee9136e218bdb0a32"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "7f8032286ec5fa4a81497a21359b1c0183eeea0056352fec32c6ac75e87fbbea"
+          "signature": "0c1fbda43937df7dd9f21bbea93dddcb6da7619b446b8819021461e9539aebdd"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -411,7 +411,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "f1b6163b55f3b48423f31d3dad5c563a929fb7d2c3011391caa1f34c5e008c06"
+          "signature": "352036cf105b2c4cebe6ed4df5c1a80b3ce5c9561b0dbbbdda117b9a930c4f69"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -487,7 +487,7 @@
         },
         "ResolvedCashuConfig": {
           "stability": "stable",
-          "signature": "18597a1c21c0e85ec6413dbf8148965ba1358187334cbda04c9363f9f7257c0a"
+          "signature": "f9c963bc6a99a666f082cadcb1d0236e3762efb05cf8c9e59445bb6fb5b049ce"
         },
         "ResolvedCreditConfig": {
           "stability": "stable",
@@ -1034,7 +1034,7 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "75f1a58b10fc1af96c158ba0db3dc9a557d784ad5e106a56d013cac23f1e2a56"
+          "signature": "8a76b6d73344347ec0a9864471cd20bac7ed726d8d5975730b14bd6ef051b0d8"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1150,7 +1150,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "1a9fe2dee9f44b58afb585b60c93095d3ba3828a48a91f853ff247656fa9d229"
+          "signature": "b6f1faeea3fad1606024ada4671ec3eeb033e420689bc7ec2d4e1de98aabc6c5"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1214,7 +1214,7 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "9ab0107e16e902a55dd8ef49b705185bb1d941da13296d50e5c7ee234ee9f072"
+          "signature": "1a1aea86eb0dab33ed84ebe3f905d23d6947bfbcedb400357d781e514b92e21d"
         },
         "DVMHostOpts": {
           "stability": "experimental",
@@ -1242,7 +1242,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "faa318f4a6372aa46125393915aead09f189dde8db0737f0719fd3ddf2ca9a57"
+          "signature": "29e7ebc00a0bbbe481a54d82a6b8d9306e0e93c4cc5087f546833486b88f43b6"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1322,7 +1322,7 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "720a5b8d9afa4e0c8a4c29672bb056b10ba38b11eb538b19f92128fc2dd5fa5c"
+          "signature": "55de395e39a79c26ab013bd427763f6964813a4ef5ebecafaf4427cd2bdc830d"
         },
         "JobManagerOpts": {
           "stability": "experimental",
@@ -1562,7 +1562,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "7eef6de1b74c6622fb99397e80e250de5d808fb790c129ac94a6fd8a9b40bfea"
+          "signature": "60f1fe1d05c4935195f7a0b92d82d3ca564090195fed1ae829b5ab0fd46009df"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
@@ -2638,6 +2638,12 @@
       "maximum": 20,
       "resolved": "ResolvedCashuConfig.unsignedResultWaitSeconds: number",
       "behavior": "0 disables the bounded inline result wait for unsigned NUT-24 submits and replays"
+    },
+    "CashuConfig.advertiseRefundDelay": {
+      "type": "optional boolean",
+      "default": false,
+      "resolved": "ResolvedCashuConfig.advertiseRefundDelay?: boolean (configureDVM always sets it)",
+      "behavior": "true adds refund_delay (the enforced lock window plus 600 seconds) to the NUT-24 X-Cashu payment request; false leaves the request unchanged"
     }
   }
 }

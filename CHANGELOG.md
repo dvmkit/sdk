@@ -2,14 +2,6 @@
 
 ## Unreleased
 
-- A NUT-24 payment request can now invite the wallet to add a refund path. With `cashu.advertiseRefundDelay: true`, the `X-Cashu` request on an unpaid 402 carries `["refund_delay", "<seconds>"]` in `nut10.t`, where `<seconds>` is the lock floor the DVM enforces on the paid retry plus 600 seconds for the round trip. A wallet that honours the tag can lock with a `locktime` that far ahead and a `refund` key of its own, so a payment the DVM never redeems returns to the payer. The option is off by default, and with it off the request is byte-for-byte unchanged. Independently of the option, a proof whose secret carries a copied `refund_delay` tag is now accepted and judged as if the tag were absent; any other tag outside NUT-11's list is still refused, as is a repeated tag. A proof secret longer than 1024 characters, the default limit a Nutshell mint redeems, is now refused as `lock_not_exclusive` with a message naming its length; before, the cashu-ts parser refused it as `not_p2pk_locked`. The `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. See `docs/PROTOCOL-NOTES.md#nut-24-payment-requests`.
-
-### Breaking changes
-
-- `CashuConfig` and `ResolvedCashuConfig` gain one optional field, `advertiseRefundDelay`, off by default. The type changes are additive; no migration is needed.
-
-- For every DVM, with or without the option: a Cashu proof secret longer than 1024 characters is now refused as `lock_not_exclusive`, where it was `not_p2pk_locked`, and the `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. A client that matches on either should expect the new values.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -39,6 +31,16 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Miscellaneous Chores
 
 * **api:** advance the comparison baseline to v0.32.0 ([#141](https://github.com/dvmkit/sdk/issues/141)) ([32ce136](https://github.com/dvmkit/sdk/commit/32ce136a1b5097e5449c92b0b901b35a475fa9f9))
+
+### Breaking change details
+
+- `CashuConfig` and `ResolvedCashuConfig` gain one optional field, `advertiseRefundDelay`, off by default. The type changes are additive; no migration is needed.
+
+- For every DVM, with or without the option: a Cashu proof secret longer than 1024 characters is now refused as `lock_not_exclusive`, where it was `not_p2pk_locked`, and the `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. A client that matches on either should expect the new values.
+
+### Release notes
+
+- A NUT-24 payment request can now invite the wallet to add a refund path. With `cashu.advertiseRefundDelay: true`, the `X-Cashu` request on an unpaid 402 carries `["refund_delay", "<seconds>"]` in `nut10.t`, where `<seconds>` is the lock floor the DVM enforces on the paid retry plus 600 seconds for the round trip. A wallet that honours the tag can lock with a `locktime` that far ahead and a `refund` key of its own, so a payment the DVM never redeems returns to the payer. The option is off by default, and with it off the request is byte-for-byte unchanged. Independently of the option, a proof whose secret carries a copied `refund_delay` tag is now accepted and judged as if the tag were absent; any other tag outside NUT-11's list is still refused, as is a repeated tag. A proof secret longer than 1024 characters, the default limit a Nutshell mint redeems, is now refused as `lock_not_exclusive` with a message naming its length; before, the cashu-ts parser refused it as `not_p2pk_locked`. The `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. See `docs/PROTOCOL-NOTES.md#nut-24-payment-requests`.
 
 ## [0.32.0](https://github.com/dvmkit/sdk/compare/v0.31.1...v0.32.0) (2026-11-10)
 
