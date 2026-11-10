@@ -24,6 +24,22 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.33.0](https://github.com/dvmkit/sdk/compare/v0.32.0...v0.33.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** offer a refund_delay on the NUT-24 payment request ([#140](https://github.com/dvmkit/sdk/issues/140))
+
+### Features
+
+* **server:** offer a refund_delay on the NUT-24 payment request ([#140](https://github.com/dvmkit/sdk/issues/140)) ([cd9abe2](https://github.com/dvmkit/sdk/commit/cd9abe20869a8b7827eb4ce6c7b424cc900db9d7))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.32.0 ([#141](https://github.com/dvmkit/sdk/issues/141)) ([32ce136](https://github.com/dvmkit/sdk/commit/32ce136a1b5097e5449c92b0b901b35a475fa9f9))
+
 ## [0.32.0](https://github.com/dvmkit/sdk/compare/v0.31.1...v0.32.0) (2026-11-10)
 
 
