@@ -342,6 +342,15 @@ describe("projectSpanRow", () => {
     });
   });
 
+  it("keeps the admin.withdrawal_finalize audit event name", () => {
+    expect(
+      projectSpanRow(makeSpan({ dataset: "audit", name: "admin.withdrawal_finalize" })),
+    ).toEqual({
+      ok: true,
+      row: expect.objectContaining({ name: "admin.withdrawal_finalize" }),
+    });
+  });
+
   it("uses fixed fallbacks for unknown event, service, version, host, and sample rate", () => {
     const result = projectSpanRow(
       makeSpan({
@@ -482,7 +491,7 @@ describe("router.proxy dimensions", () => {
     ).toEqual({});
   });
 
-  it.each(["no_open_ask", "ask_already_open", "decline_unavailable", "ask_expired"])(
+  it.each(["no_open_ask", "ask_already_open", "decline_unavailable", "ask_expired", "screenshot_unavailable"])(
     "keeps the %s refusal as an error code rather than unknown_error",
     (code) => {
       expect(projectDiagnosticFields({ "error.code": code })).toEqual({ "error.code": code });
