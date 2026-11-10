@@ -374,8 +374,11 @@ export interface UpfrontPaymentOpts {
    * proofs. Such a payment's payer-fixable refusals answer 400, and it may
    * cover `previousRequiredMsats`, the same price at the rate snapshot before
    * the current one, so a 402 priced just before a rate refresh stays payable.
+   * With `refundDelay`, the payment request also carries a `refund_delay`
+   * derived from {@link cashuLockWindowSeconds}, the window a retry carrying
+   * the same headers is held to.
    */
-  nut24?: { mints: string[]; previousRequiredMsats?: number };
+  nut24?: { mints: string[]; previousRequiredMsats?: number; refundDelay?: boolean };
   /**
    * Runtime mint-health tracker. Receive path short-circuits with
    * `cashu_mint_sick` when the token's mint is currently flagged sick, so
@@ -2066,7 +2069,12 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     const lockPubkey = opts.lockPubkeys?.[0];
     const cashuRequest =
       opts.nut24 && opts.nut24.mints.length > 0 && !opts.fundOnly && cashuAccumulatorReady(opts) && lockPubkey
-        ? cashuPaymentRequest({ requiredMsats, mints: opts.nut24.mints, lockPubkey })
+        ? cashuPaymentRequest({
+            requiredMsats,
+            mints: opts.nut24.mints,
+            lockPubkey,
+            ...(opts.nut24.refundDelay && { lockWindowSeconds: lockWindowOrDefault(opts.cashuLockWindowSeconds) }),
+          })
         : undefined;
     return {
       paidMsats: 0,
@@ -2379,7 +2387,7 @@ export type PaymentErrorCode =
   | AccumulatorRejectionCode;
 
 const LOCK_SHAPE_HINT =
-  "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key. Use only the locktime, refund, pubkeys, n_sigs, sigflag and n_sigs_refund tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys";
+  "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key, in a secret of at most 1024 characters. Use only the locktime, refund, pubkeys, n_sigs, sigflag, n_sigs_refund and refund_delay tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys";
 
 /** `lock_not_exclusive` hint for an unsigned payment judged against `cashu.unsigned_min_locktime`. */
 export const UNSIGNED_LOCK_REFUSAL_HINT = `${LOCK_SHAPE_HINT}, and any locktime at least cashu.unsigned_min_locktime seconds in the future.`;

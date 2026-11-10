@@ -87,7 +87,13 @@ export function resolveCashuConfig(cashu: CashuConfig | undefined): ResolvedCash
     unsignedResultWaitSeconds < 0 || unsignedResultWaitSeconds > 20) {
     throw new Error("configureDVM: cashu.unsignedResultWaitSeconds must be an integer from 0 to 20");
   }
-  return { minLocktimeSeconds, unsignedMinLocktimeSeconds, unsignedResultWaitSeconds };
+  const advertiseRefundDelay = cashu.advertiseRefundDelay === undefined ? false : cashu.advertiseRefundDelay;
+  if (typeof advertiseRefundDelay !== "boolean") {
+    throw new Error(
+      `configureDVM: cashu.advertiseRefundDelay must be true or false; received ${JSON.stringify(advertiseRefundDelay)}`
+    );
+  }
+  return { minLocktimeSeconds, unsignedMinLocktimeSeconds, unsignedResultWaitSeconds, advertiseRefundDelay };
 }
 
 function validFloor(value: unknown, field: string, minimum: number): number | undefined {

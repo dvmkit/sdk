@@ -31,5 +31,8 @@ export function acceptedLockShapes(keys: {
     { label: "an explicit n_sigs of 1", data: current, tags: [["n_sigs", "1"]], matches: "current" },
     { label: "a 1-of-2 main path over two DVM keys", data: current, tags: [["pubkeys", retired.toUpperCase()]], matches: "current" },
     { label: "an n_sigs_refund within the refund keys", data: current, tags: [["locktime", weekOut], ["refund", payer], ["n_sigs_refund", "1"]], matches: "current" },
+    // A payer answering a request that carries refund_delay may copy the tag into the secret; mints ignore it.
+    { label: "a copied refund_delay without a locktime", data: current, tags: [["refund_delay", "519000"]], matches: "current" },
+    { label: "a copied refund_delay beside a locktime and payer refund", data: current, tags: [["locktime", weekOut], ["refund", payer], ["refund_delay", "519000"]], matches: "current" },
   ];
 }

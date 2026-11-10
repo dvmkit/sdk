@@ -1,7 +1,48 @@
+import { OutputData, PaymentRequest } from "@cashu/cashu-ts";
 import { describe, expect, it } from "vitest";
 
+import { toLockPubkey } from "../../../lib/cashu/lock-pubkey";
 import type { FxFetcher, FxRateSnapshot } from "../../pricing/index";
-import { proofSetRequestId, withFxHistory } from "../cashu-payment-request";
+import { cashuPaymentRequest, proofSetRequestId, withFxHistory } from "../cashu-payment-request";
+import { assessCashuLock } from "../wallet-accumulator-receive";
+
+describe("cashuPaymentRequest", () => {
+  const DVM_KEY = toLockPubkey("02" + "ab".repeat(32));
+  const PAYER_KEY = "02" + "ef".repeat(32);
+  const base = { requiredMsats: 21_500, mints: ["https://mint.example.com"], lockPubkey: DVM_KEY };
+  const WINDOW = 518_400;
+
+  it("encodes the same request as before when refund_delay is off", () => {
+    // Captured from the encoder before refund_delay existed; any byte change breaks wallets' caches and fixtures.
+    expect(cashuPaymentRequest(base)).toBe(
+      "creqApGFhFmF1Y3NhdGFtgXgYaHR0cHM6Ly9taW50LmV4YW1wbGUuY29tZW51dDEwo2FrZFAyUEthZHhCMDJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYXSA"
+    );
+  });
+
+  it("advertises the enforced window plus a ten-minute round trip as refund_delay", () => {
+    const request = PaymentRequest.fromEncodedRequest(cashuPaymentRequest({ ...base, lockWindowSeconds: WINDOW }));
+    expect(request.nut10).toEqual({ kind: "P2PK", data: DVM_KEY, tags: [["refund_delay", "519000"]] });
+  });
+
+  it("is banked when a wallet builds its lock from the request, and floors that lock where the receive path does", () => {
+    const request = PaymentRequest.fromEncodedRequest(cashuPaymentRequest({ ...base, lockWindowSeconds: WINDOW }));
+    const delay = Number(request.nut10!.tags![0]![1]);
+    const receivedAt = 1_790_000_000;
+    // A payer following the proposal locks to its clock plus the delay; the payee's floor is that less the tolerance.
+    const payerSecret = (locktime: number) => {
+      const lock = { ...request.toP2PKOptions()!, locktime, refundKeys: [PAYER_KEY] };
+      return new TextDecoder().decode(OutputData.createSingleP2PKData(lock, 1, "00" + "11".repeat(7)).secret);
+    };
+    const honest = payerSecret(receivedAt + delay - 600);
+    expect(JSON.parse(honest)[1].tags).toContainEqual(["refund_delay", "519000"]);
+    const floorSec = receivedAt + WINDOW;
+    expect(assessCashuLock(honest, [DVM_KEY], receivedAt, floorSec)).toEqual({ kind: "exclusive", lockPubkey: DVM_KEY });
+    expect(assessCashuLock(payerSecret(receivedAt + delay - 601), [DVM_KEY], receivedAt, floorSec)).toMatchObject({
+      code: "lock_not_exclusive",
+      locktimeBelowFloor: true,
+    });
+  });
+});
 
 describe("proofSetRequestId", () => {
   it("names a proof set the same however a wallet orders its proofs", () => {

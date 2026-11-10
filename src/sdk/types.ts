@@ -650,13 +650,24 @@ export interface CashuConfig {
    * 30-second request deadline commonly enforced by an HTTP proxy.
    */
   unsignedResultWaitSeconds?: number;
+  /**
+   * Add a `refund_delay` tag to the NUT-18 request a 402 carries in `X-Cashu`,
+   * telling a wallet that it may lock its proofs with a `locktime` and a
+   * `refund` key it holds, so a payment the DVM never redeems returns to the
+   * payer. The value is the lock window the DVM enforces on that payment plus
+   * 600 seconds for the 402 round trip. Default false. Leave it off until the
+   * mints and wallets your callers use support the tag.
+   */
+  advertiseRefundDelay?: boolean;
 }
 
-/** A {@link CashuConfig} with refund floors and the result wait filled from their defaults. */
+/** A {@link CashuConfig} with refund floors, the result wait and the `refund_delay` switch filled from their defaults. */
 export interface ResolvedCashuConfig {
   minLocktimeSeconds: number;
   unsignedMinLocktimeSeconds: number;
   unsignedResultWaitSeconds: number;
+  /** Absent reads as false, so a config built before the option existed keeps the request unchanged. */
+  advertiseRefundDelay?: boolean;
 }
 
 /** Platform default for {@link CreditConfig.min} — a dust floor below which rail fees dominate. */
