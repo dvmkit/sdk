@@ -111,4 +111,19 @@ describe("Postgres streaming recovery", () => {
       await store.shutdownStreaming();
     }
   });
+
+  it("keeps the job-message LISTEN session active with SELECT 1 on its own client", async () => {
+    const client = new ListenClient();
+    const poolQuery = vi.fn(() => Promise.resolve({ rows: [] }));
+    const connect = vi.fn().mockResolvedValue(client);
+    const store = new PostgresJobStore({ query: poolQuery, connect } as unknown as Pool);
+    await store.initStreaming();
+    try {
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(client.query.mock.calls).toEqual([["LISTEN job_messages"], ["SELECT 1"]]);
+      expect(poolQuery).not.toHaveBeenCalled();
+    } finally {
+      await store.shutdownStreaming();
+    }
+  });
 });

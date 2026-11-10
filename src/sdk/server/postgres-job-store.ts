@@ -1716,6 +1716,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   async initStreaming(): Promise<void> {
     this.listenChannel = new ListenChannel(this.pool, {
       channel: JOB_MESSAGES_CHANNEL,
+      heartbeat: true,
       onNotification: (payload) => {
         this.dispatch(payload);
       },
