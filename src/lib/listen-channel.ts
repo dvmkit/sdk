@@ -3,6 +3,9 @@ import type { Pool, PoolClient } from "pg";
 /** Default exponential backoff schedule (ms) between reconnect attempts. */
 const DEFAULT_BACKOFF_MS = [1000, 4000, 15_000, 30_000] as const;
 
+/** Default interval (ms) between heartbeat queries when `heartbeat` is enabled. */
+const DEFAULT_HEARTBEAT_MS = 5 * 60_000;
+
 export interface ListenChannelOpts {
   channel: string;
   /** Called for every notification on `channel`. Payload may be empty. */
@@ -21,6 +24,15 @@ export interface ListenChannelOpts {
   onRestored?: (downtimeMs: number) => void;
   /** Override the default `[1s, 4s, 15s, 30s]` backoff schedule. Min length 1. */
   backoffMs?: readonly number[];
+  /**
+   * Opt in to a periodic `SELECT 1` on the LISTEN connection itself, so
+   * proxies that close connections after a stretch without queries do not
+   * recycle an idle listener. `true` uses five minutes; `{ intervalMs }`
+   * overrides it. Omitted or `false` sends nothing. A failed heartbeat takes
+   * the same loss/reconnect path as a dropped socket; it does not replace
+   * catching up after a reconnect.
+   */
+  heartbeat?: boolean | { intervalMs?: number };
 }
 
 /**
@@ -41,13 +53,25 @@ export class ListenChannel {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private disconnectedAt: number | null = null;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly backoffMs: readonly number[];
+  private readonly heartbeatMs: number | null;
 
   constructor(
     private pool: Pool,
     private opts: ListenChannelOpts
   ) {
     this.backoffMs = opts.backoffMs ?? DEFAULT_BACKOFF_MS;
+    const heartbeat = opts.heartbeat;
+    if (!heartbeat) {
+      this.heartbeatMs = null;
+    } else {
+      const intervalMs = heartbeat === true ? undefined : heartbeat.intervalMs;
+      this.heartbeatMs = intervalMs ?? DEFAULT_HEARTBEAT_MS;
+      if (!Number.isFinite(this.heartbeatMs) || this.heartbeatMs <= 0) {
+        throw new RangeError("ListenChannel heartbeat intervalMs must be a positive number");
+      }
+    }
   }
 
   /**
@@ -69,6 +93,7 @@ export class ListenChannel {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearHeartbeat();
     const client = this.client;
     this.client = null;
     if (client) {
@@ -113,7 +138,10 @@ export class ListenChannel {
     const onLost = (err?: Error) => {
       if (lost || this.stopped) return;
       lost = true;
-      if (this.client === client) this.client = null;
+      if (this.client === client) {
+        this.clearHeartbeat();
+        this.client = null;
+      }
       this.opts.onLost?.(err);
       try {
         client.release(err ?? new Error("listen connection lost"));
@@ -177,11 +205,44 @@ export class ListenChannel {
       this.opts.onNotification(notification.payload);
     });
 
+    this.scheduleHeartbeat(client, onLost);
+
     if (this.disconnectedAt !== null) {
       const downtimeMs = Math.max(0, Date.now() - this.disconnectedAt);
       this.disconnectedAt = null;
       this.opts.onRestored?.(downtimeMs);
     }
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Queue the next heartbeat for `client`. The following beat is scheduled
+   * only after this one's query settles, so beats never overlap. Each step
+   * re-checks that `client` is still the live connection: a result arriving
+   * late from a replaced or stopped client must not tear down its successor
+   * or revive a stopped listener.
+   */
+  private scheduleHeartbeat(client: PoolClient, onLost: (err?: Error) => void): void {
+    if (this.heartbeatMs === null) return;
+    const live = () => !this.stopped && this.client === client;
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      if (!live()) return;
+      client.query("SELECT 1").then(
+        () => {
+          if (live()) this.scheduleHeartbeat(client, onLost);
+        },
+        (err: unknown) => {
+          if (live()) onLost(err instanceof Error ? err : new Error(String(err)));
+        }
+      );
+    }, this.heartbeatMs);
   }
 
   private scheduleReconnect(): void {

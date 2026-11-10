@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The Postgres job-message LISTEN connection now sends `SELECT 1` on itself every five minutes while idle, so a database proxy that closes connections after 30 minutes without queries no longer recycles it on a routine schedule. A failed heartbeat reconnects and catches up like any other lost connection; the heartbeat does not replace that catch-up, which still covers failovers, deploys and network interruptions. `ListenChannel` gains an opt-in `heartbeat` option (`true` for five minutes, or `{ intervalMs }`); callers that do not set it behave as before.
+
 - Postgres job-message subscribers catch up after the LISTEN connection reconnects, and notification subscribers wake to recheck payments and cancellation. Reconnects log their downtime; connection-loss, failed-connect and pool-error diagnostics retain approved Postgres and socket error codes without logging error text or credentials.
 
 - Builders can offer capabilities on the x402 channel without setting `DVMConfig.x402` when the host supplies the rail through its `x402` option or `DVMKIT_X402_PAY_TO` and related environment variables. The server still refuses to start without an x402 rail and checks the challenge size with its resolved configuration at boot.
