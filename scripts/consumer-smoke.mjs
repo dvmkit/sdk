@@ -479,7 +479,8 @@ function libCheckInstalledDeclarations(consumer, installedRoot, installedManifes
       strict: true,
       target: ts.ScriptTarget.ES2024,
       lib: ["lib.esnext.d.ts", "lib.dom.d.ts"],
-      // A consumer brings Node's types, and pg's when it installs that optional dependency.
+      // A consumer brings Node's types. Installing the optional pg dependency brings no types,
+      // so the mapping stands in for @types/pg, which a consumer currently adds itself.
       typeRoots: [join(root, "node_modules", "@types")],
       types: ["node"],
       paths: { pg: [join(root, "node_modules", "@types", "pg")] },

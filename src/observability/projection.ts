@@ -52,6 +52,13 @@ export interface DiagnosticCatalogue {
  * gains a value.
  */
 export const DIAGNOSTIC_CATALOGUE: DiagnosticCatalogue = deepFreeze(catalogueJson);
+
+// Fails typecheck when the JSON gains a list the hand-written type lacks. Not
+// exported, so it never reaches the published declarations.
+type AssertNever<T extends never> = T;
+type _CatalogueTypeIsExact = AssertNever<
+  Exclude<keyof typeof catalogueJson, keyof DiagnosticCatalogue>
+>;
 const catalogue = DIAGNOSTIC_CATALOGUE;
 
 export const DIAGNOSTIC_CATALOGUE_VERSION = catalogue.version;
