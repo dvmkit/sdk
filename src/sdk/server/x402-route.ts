@@ -6,6 +6,7 @@ import {
   X402_SIZE_CHECK_TIMEOUT_SECONDS,
   x402ChannelPaymentRequired,
 } from "../../lib/x402/bazaar";
+import type { Message } from "../../lib/messages/types";
 import { X402_DEFAULT_FACILITATOR_TIMEOUT_MS } from "../../lib/x402/facilitator-request";
 import { callerSettleResponse } from "../../lib/x402/settle-response";
 import type { SettleResponse } from "../../lib/x402/spec";
@@ -272,6 +273,26 @@ export function classifyX402RouteOutcome(args: {
       // Submitted, or settled on chain but not yet recorded: money may have moved.
       return "unknown";
   }
+}
+
+/**
+ * The reason and status of a failed job's row, from its last `cancel` message.
+ * A failure the handler marked as the caller's (`ctx.fail(..., { callerFault:
+ * true })`) answers 422: the request was well formed and paid, passed the input
+ * schema and ran, but what it asked for could not be done, such as a URL the
+ * fetcher refuses or a page that does not exist. Not 400, because the x402 v2
+ * HTTP transport reserves 400 for an invalid or malformed payment payload, and
+ * this route already answers 400 to a body refused before anything ran; 500
+ * says the service itself failed. Only a provider's cancel counts: a requester
+ * can put any content on its own cancel message. The stock x402 server
+ * middleware skips settlement at a status of 400 or above; this route never
+ * settles a failed job, whatever the status.
+ */
+export function x402FailedJobAnswer(messages: readonly Message[]): { reason?: string; status: 422 | 500 } {
+  const cancel = messages.findLast((message) => message.type === "cancel");
+  if (cancel?.type !== "cancel") return { status: 500 };
+  const callerFault = cancel.from === "provider" && cancel.content.caller_fault === true;
+  return { reason: cancel.content.reason, status: callerFault ? 422 : 500 };
 }
 
 /**

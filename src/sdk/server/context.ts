@@ -1021,18 +1021,15 @@ export function buildContext(
       providerMessage(job, "complete", { summary });
       runTerminal();
     },
-    // `failOpts.refund` is a caller-fault annotation and nothing more
-    // No rail hands value backwards: a failed job's debit is the
-    // credit draw the terminal funnel releases, and the caller reclaims that
-    // balance through the `drain` op. The Cashu branch that used to
-    // send proofs back here was dead — `job.receivedProofs` has been empty on
-    // every path since the accumulator became the commit boundary for inbound
-    // proofs — and the accumulator-debit rewrite that would
-    // have revived it, was cancelled as superseded by the ledger.
-    fail: (error) => {
+    // Neither option moves money. No rail hands value backwards: a failed job's
+    // debit is the credit draw the terminal funnel releases, and the caller
+    // reclaims that balance through the `drain` op. `caller_fault` rides the
+    // durable cancel message so a route answering from the stored record, on
+    // any machine, can read it.
+    fail: (error, failOpts) => {
       if (terminated("fail")) return;
       job.status = "failed";
-      providerMessage(job, "cancel", { reason: error });
+      providerMessage(job, "cancel", { reason: error, ...(failOpts?.callerFault === true && { caller_fault: true }) });
       runTerminal();
     },
 

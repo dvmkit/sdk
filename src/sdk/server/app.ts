@@ -261,6 +261,7 @@ import {
   SETTLE_WINDOW_CLOSED_REASON,
   signedFieldsIn,
   X402_ROUTE_COPY,
+  x402FailedJobAnswer,
   x402RouteBudget,
   x402RouteUnpayableReasons,
   type X402RouteRow,
@@ -4806,13 +4807,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (row === "handler_failed" || row === "runtime_bound") {
       // A completed job here finished too late to settle, not out of runtime.
       const copy = record.status === "completed" ? X402_ROUTE_COPY.settle_window_closed : X402_ROUTE_COPY[row];
-      const reason =
-        record.status === "completed"
-          ? SETTLE_WINDOW_CLOSED_REASON
-          : (lastCancelReason(record.messages) ?? copy.display);
+      const failure = record.status === "completed" ? undefined : x402FailedJobAnswer(record.messages);
+      const reason = record.status === "completed" ? SETTLE_WINDOW_CLOSED_REASON : (failure?.reason ?? copy.display);
       return c.json(
         { job_id: record.id, status: "failed", reason, ...copy, charge_outcome: "not_charged" },
-        row === "handler_failed" ? 500 : 503,
+        row === "runtime_bound" ? 503 : (failure?.status ?? 500),
         identity
       );
     }
@@ -6020,14 +6019,6 @@ async function settlesWithin(work: Promise<unknown>, ms: number): Promise<boolea
   } finally {
     clearTimeout(timer);
   }
-}
-
-function lastCancelReason(messages: Message[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]!;
-    if (message.type === "cancel") return message.content.reason;
-  }
-  return undefined;
 }
 
 type SubmitBody = { capability?: string; input?: string; params?: Record<string, string>; data?: unknown };

@@ -61,6 +61,15 @@ describe("createTestContext", () => {
     });
   });
 
+  it("records a caller-fault mark on the cancel message, as the runtime stores it", () => {
+    const ctx = createTestContext();
+    ctx.fail("page not found", { callerFault: true });
+    expect(ctx.messages).toContainEqual({
+      type: "cancel",
+      content: { reason: "page not found", caller_fault: true },
+    });
+  });
+
   it("fail sets failed and failError", () => {
     const ctx = createTestContext();
     ctx.fail("bad input");

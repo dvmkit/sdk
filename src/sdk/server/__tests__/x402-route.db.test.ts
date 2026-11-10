@@ -393,6 +393,27 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     expect(await intentStatus(body.job_id)).toMatchObject({ status: "released" });
   });
 
+  it("answers 422 to a failure the handler marks as the caller's, never settles, and keeps the mark on the stored job", async () => {
+    const url = await start({ behaviour: async (ctx) => { ctx.fail("the page answered 404", { callerFault: true }); } });
+    const response = await call(url, { payment: authorization(60) });
+    expect(response.status).toBe(fixture.callerFault.status);
+    const body = await response.json() as { job_id: string };
+    expect(body).toMatchObject({ ...fixture.callerFault.body, reason: "the page answered 404" });
+    for (const field of fixture.callerFault.requiredFields) expect(body).toHaveProperty(field);
+    for (const field of fixture.callerFault.omittedFields) expect(body).not.toHaveProperty(field);
+    expect(response.headers.get(fixture.identityHeader)).toBe(body.job_id);
+    expect(response.headers.get("PAYMENT-RESPONSE")).toBeNull();
+    expect(response.headers.get("X-PAYMENT-RESPONSE")).toBeNull();
+    expect(facilitatorCalls).toEqual(["/verify"]);
+    expect(await intentStatus(body.job_id)).toMatchObject({ status: "released" });
+    // Another machine, or a later /v1/job read, sees the mark only through the stored record.
+    const stored = await new PostgresJobStore(pool).get(body.job_id);
+    expect(stored?.messages.findLast((message) => message.type === "cancel")).toMatchObject({
+      from: "provider",
+      content: { reason: "the page answered 404", caller_fault: true },
+    });
+  });
+
   it("aborts a handler still running at its runtime bound and answers 503 without settling", async () => {
     let signal: AbortSignal | undefined;
     const url = await start({
