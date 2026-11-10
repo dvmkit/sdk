@@ -4,9 +4,11 @@ import {
   bindDiagnosticCapabilityAuthority,
   bindDiagnosticIdentityAuthority,
   createDiagnosticCapabilityAuthority,
+  DIAGNOSTIC_CATALOGUE,
   DIAGNOSTIC_CATALOGUE_VERSION,
   extendDiagnosticIdentityAuthority,
   projectDiagnosticFields,
+  projectEventName,
   projectSpanRow,
 } from "../projection";
 import type { SpanRow } from "../types";
@@ -504,5 +506,30 @@ describe("router.proxy dimensions", () => {
         error_code: "hosting_identity_revoke_failed",
       }),
     ).toEqual({ error_code: "hosting_identity_revoke_failed" });
+  });
+});
+
+// Consumers read the exported catalogue to learn what the projection keeps, so
+// every value it lists must survive projection.
+describe("DIAGNOSTIC_CATALOGUE", () => {
+  it("lists exactly the route templates, events, and error codes the projection keeps", () => {
+    for (const template of DIAGNOSTIC_CATALOGUE.routeTemplates) {
+      expect(projectDiagnosticFields({ "http.route": template })).toEqual({ "http.route": template });
+    }
+    for (const event of DIAGNOSTIC_CATALOGUE.events) {
+      expect(projectEventName(event)).toBe(event);
+    }
+    for (const code of DIAGNOSTIC_CATALOGUE.errorCodes) {
+      expect(projectDiagnosticFields({ "error.code": code })).toEqual({ "error.code": code });
+    }
+  });
+
+  it("refuses a consumer's attempt to admit a value", () => {
+    expect(() => (DIAGNOSTIC_CATALOGUE.routeTemplates as string[]).push("/private")).toThrow(TypeError);
+    expect(() => {
+      (DIAGNOSTIC_CATALOGUE as unknown as { events: string[] }).events = ["private.event"];
+    }).toThrow(TypeError);
+    expect(projectDiagnosticFields({ "http.route": "/private" })).toEqual({});
+    expect(projectEventName("private.event")).toBe("diagnostic.unknown");
   });
 });

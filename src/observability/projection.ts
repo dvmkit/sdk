@@ -1,7 +1,24 @@
 import { isIP } from "node:net";
 
-import catalogue from "./diagnostic-catalogue-v1.json";
+import catalogueJson from "./diagnostic-catalogue-v1.json";
 import type { SpanRow } from "./types";
+
+type DeepReadonly<T> = T extends readonly (infer U)[]
+  ? readonly DeepReadonly<U>[]
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+    : T;
+
+export type DiagnosticCatalogue = DeepReadonly<typeof catalogueJson>;
+
+/**
+ * The catalogue this projection admits values from. It is the same frozen
+ * object the projection reads, so a consumer sees exactly what is stored and
+ * cannot widen it. `version` changes only with the catalogue's format, not
+ * when a list gains a value.
+ */
+export const DIAGNOSTIC_CATALOGUE: DiagnosticCatalogue = deepFreeze(catalogueJson);
+const catalogue = DIAGNOSTIC_CATALOGUE;
 
 export const DIAGNOSTIC_CATALOGUE_VERSION = catalogue.version;
 
@@ -728,4 +745,12 @@ function ownDataEntries(
     if (entries.length >= limit) break;
   }
   return entries;
+}
+
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
 }
