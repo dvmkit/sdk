@@ -10,6 +10,12 @@
 
 - A `dvm.request` span for the x402 route, `POST /v1/x402/<capability>`, now keeps its `http.route` as the template `/v1/x402/:capability` when the span is stored. Before, the diagnostic catalogue had no template for the route, so the projection dropped the attribute and stored x402 requests could not be counted by route.
 
+- A handler can now mark a failure as the caller's with `ctx.fail(reason, { callerFault: true })`, for a request the service could not serve because of what it asked for, such as a URL the fetcher refuses or a page that does not exist. On the x402 route, `POST /v1/x402/<capability>`, such a failure answers 422 instead of 500, with the same body (`status: "failed"`, `reason`, `display`, `hint`, `charge_outcome: "not_charged"`) and no `PAYMENT-RESPONSE`, so a stock x402 client sees a request to correct rather than a failing service. The mark is stored on the job's final `cancel` message as `caller_fault: true`, so the route reads it from the job record on any machine and a `/v1/job` reader sees it in the messages. Without the mark nothing changes: a failed handler still answers 500, a runtime-bound failure 503, and `/v1/job` responses keep their status. The option moves no money on any rail. `{ refund: true }` was documented as a caller-fault annotation, but nothing ever read it; the documentation now says it has no effect. See `docs/PROTOCOL-NOTES.md#the-x402-channel-route` and the `callerFault` row of `protocol-fixtures/x402-route-v1.json`.
+
+### Breaking changes
+
+- `SDKJobContext.fail`'s options gain one optional field, `callerFault`, and `CancelContent` gains the optional `caller_fault: true`. Both are additive; no migration is needed, and a handler that does not pass `callerFault` behaves as before.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

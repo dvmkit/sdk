@@ -275,6 +275,19 @@ export function classifyX402RouteOutcome(args: {
 }
 
 /**
+ * The status of the handler-failed row. A failure the handler marked as the
+ * caller's (`ctx.fail(..., { callerFault: true })`) answers 422: the request
+ * was well formed and paid, passed the input schema and ran, but what it asked
+ * for could not be done, such as a URL the fetcher refuses or a page that does
+ * not exist. 400 stays the answer to a body refused before anything ran, so a
+ * client can tell the two apart; 500 says the service itself failed. Any status
+ * of 400 or above leaves the authorization unsettled for a stock x402 client.
+ */
+export function x402HandlerFailedStatus(cancel: { callerFault: boolean } | undefined): 422 | 500 {
+  return cancel?.callerFault ? 422 : 500;
+}
+
+/**
  * The PAYMENT-RESPONSE of a charged request: the facilitator's stored answer,
  * with the intent's transaction and network filling what it lacks. A
  * settlement recovered from chain evidence stores an answer with no network.

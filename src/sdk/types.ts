@@ -230,10 +230,17 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
   /**
    * Fail the job with an error message. The caller is charged for the pieces of work already
    * finished; the piece in progress is released back to their credit.
-   * `{ refund: true }` annotates the failure as caller-fault; it
-   * moves no money on any rail and never has.
+   *
+   * `{ callerFault: true }` says the caller's own request caused the failure, such as a URL
+   * the service refuses or a target that does not exist. It is recorded on the job's final
+   * `cancel` message as `caller_fault: true`, and the x402 route answers such a failure 422
+   * instead of 500, so a stock x402 client sees a request it should correct rather than a
+   * broken service. It moves no money: charging is unchanged on every channel.
+   *
+   * `{ refund: true }` has no effect. It moves no money on any rail, never has, and is not
+   * recorded; use `callerFault` to mark a failure as the caller's.
    */
-  fail(error: string, opts?: { refund?: boolean }): void;
+  fail(error: string, opts?: { refund?: boolean; callerFault?: boolean }): void;
 
   /**
    * Declare what this job cost **you**, the builder, to serve.
@@ -530,8 +537,8 @@ export type FundingMethod = PaymentMethod | "lightning" | "stripe";
  *
  * Failed credit jobs release their draw hold back to the caller's balance.
  * Reclaiming that balance uses `drain`; this flag describes rail reversal,
- * independently of the credit ledger. `{ refund: true }` records caller fault
- * and does not move funds.
+ * independently of the credit ledger. `ctx.fail`'s `refund` and `callerFault`
+ * options move no funds.
  */
 export const RAIL_REFUNDABLE: Record<PaymentMethod, boolean> = {
   cashu: false,

@@ -189,6 +189,8 @@ export interface ApprovalContent {
 /** Requester or provider cancels the job. */
 export interface CancelContent {
   reason?: string;
+  /** Set by a provider's `ctx.fail(..., { callerFault: true })`: the caller's request caused the failure. */
+  caller_fault?: true;
 }
 
 /**

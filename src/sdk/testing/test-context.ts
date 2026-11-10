@@ -227,12 +227,15 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       summary = s;
       messages.push({ type: "complete", content: { summary: s } });
     },
-    fail(error: string, failOpts?: { refund?: boolean }): void {
+    fail(error: string, failOpts?: { refund?: boolean; callerFault?: boolean }): void {
       if (cancelled) return;
       failed = true;
       failError = error;
       if (failOpts?.refund) refundRequested = true;
-      messages.push({ type: "cancel", content: { reason: error } });
+      messages.push({
+        type: "cancel",
+        content: { reason: error, ...(failOpts?.callerFault === true && { caller_fault: true }) },
+      });
     },
     cancel(reason = "Job cancelled"): void {
       if (cancelled) return;

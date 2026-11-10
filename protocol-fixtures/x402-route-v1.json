@@ -24,6 +24,15 @@
     "headers": ["DVM-Job-Identity-V1"],
     "absentHeaders": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
   },
+  "callerFault": {
+    "description": "The handler failed with ctx.fail(..., { callerFault: true }): the request was paid and ran, but what it asked for could not be done.",
+    "status": 422,
+    "body": { "status": "failed", "charge_outcome": "not_charged" },
+    "requiredFields": ["job_id", "reason", "display", "hint"],
+    "omittedFields": ["job_token", "messages"],
+    "headers": ["DVM-Job-Identity-V1"],
+    "absentHeaders": ["PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"]
+  },
   "runtimeBound": {
     "status": 503,
     "body": { "status": "failed", "charge_outcome": "not_charged" },
