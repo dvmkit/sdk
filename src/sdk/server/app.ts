@@ -1505,7 +1505,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           name: "dvm.request",
           attrs: {
             "http.method": c.req.method,
-            "http.route": c.req.path,
+            // Relative to this server's mount, so a mounted DVM's routes match
+            // the same diagnostic templates as one served at the root.
+            "http.route": c.req.path.slice(mountPrefix(c).length) || "/",
             ...clientCompatibilityAttributes(
               c.get("clientCompatibility") ?? {
                 capabilities: [],
