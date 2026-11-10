@@ -699,8 +699,11 @@ export interface StreamableJobStore extends JobStore {
    * Read verified history without advancing past a pending payment. Terminal
    * output releases the cutoff. Snapshot reconstruction uses includeHeld to
    * retain every verified message, independently of incremental delivery.
+   * limit, when supplied, must be a positive safe integer. Return the next limit
+   * messages (or all remaining if fewer), after deduplication in ascending seq
+   * order. Continue after the page's last seq; omit limit for the full history.
    */
-  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]>;
+  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean; limit?: number }): Promise<Message[]>;
 
   /**
    * Find stale non-terminal jobs. Two status-aware

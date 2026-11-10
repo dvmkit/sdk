@@ -159,6 +159,26 @@ describe("toJobRecord / fromJobRecord", () => {
 });
 
 describe("MemoryJobStore", () => {
+  it("pages terminal history in sequence order after deduplication", async () => {
+    const store = new MemoryJobStore();
+    const messages: Message[] = [5, 1, 3].map(seq => ({
+      seq, from: "provider", timestamp: 1, type: "artifact", content: { data: `snapshot-${seq}` },
+    }));
+    await store.save(makeRecord({ status: "completed", messages, seq: 2 }));
+    await store.appendOutgoing("job-abc-1", {
+      from: "provider", timestamp: 1, type: "artifact", content: { data: "durable-3" },
+    });
+    expect(await store.getMessages("job-abc-1", 0, { includeHeld: true, limit: 2 })).toEqual([
+      messages[1], { ...messages[2], content: { data: "durable-3" } },
+    ]);
+    expect(await store.getMessages("job-abc-1", 3, { includeHeld: true, limit: 2 })).toEqual([messages[0]]);
+    expect(await store.getMessages("job-abc-1", 5, { limit: 2 })).toEqual([]);
+  });
+
+  it.each([0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid message page limit %s", async (limit) => {
+    await expect(new MemoryJobStore().getMessages("missing", 0, { limit })).rejects.toThrow(RangeError);
+  });
+
   it.each([undefined, { amount_msats: 0 }, {
     amount_msats: 321, amount_micro: 123, currency: "eur", credit_id: "c", draw_id: "d",
   }])("keeps the original upfront fact through later snapshots (%j)", async (upfrontPayment) => {
