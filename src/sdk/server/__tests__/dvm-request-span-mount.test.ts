@@ -53,4 +53,13 @@ describe.each(["/feed", "/feed/"])("dvm.request route under mount '%s'", (prefix
     expect(spans).toHaveLength(1);
     expect(spans[0].attributes["http.route"]).toBe(template);
   });
+
+  it.each(["/feed/health", "/feed/healthz", "/feed/_internal/tempo-close-event"])(
+    "records no request span for %s, as at the root",
+    async (path) => {
+      await app.request(`${origin}${path}`);
+
+      expect(emitted.filter((row) => row.name === "dvm.request")).toEqual([]);
+    },
+  );
 });
