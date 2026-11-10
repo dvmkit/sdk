@@ -100,6 +100,15 @@ describe("configureDVM", () => {
     expect(configureDVM({ name: "X", capability: "test", cashu: { unsignedResultWaitSeconds: value }, onJob: noop }).cashu?.unsignedResultWaitSeconds).toBe(value);
   });
 
+  it.each(["true", 1, null])("rejects a refund_delay switch that is not a boolean: %s", (value) => {
+    expect(() => configureDVM({ name: "X", capability: "test", cashu: { advertiseRefundDelay: value as unknown as boolean }, onJob: noop }))
+      .toThrow(/cashu\.advertiseRefundDelay must be true or false/);
+  });
+
+  it("leaves refund_delay off unless the builder turns it on", () => {
+    expect(configureDVM({ name: "X", capability: "test", cashu: {}, onJob: noop }).cashu?.advertiseRefundDelay).toBe(false);
+  });
+
   describe("cashu refund-locktime floors", () => {
     it("leaves the descriptor without floors when the builder sets none", () => {
       expect(configureDVM({ name: "X", capability: "test", onJob: noop }).cashu).toBeUndefined();

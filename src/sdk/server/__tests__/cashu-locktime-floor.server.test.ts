@@ -19,9 +19,9 @@ const live = await localMintAvailable();
 const HOUR = 3_600;
 const DAY = 86_400;
 
-// The 0.17.1 hint, which a DVM on the default floors must keep serving verbatim.
+// The hint a DVM on the default floors serves; pinned so a change is deliberate and disclosed.
 const DEFAULT_LOCK_HINT =
-  "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key. Use only the locktime, refund, pubkeys, n_sigs, sigflag and n_sigs_refund tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys, and any locktime at least cashu.min_locktime minus 24 hours in the future.";
+  "Lock a fresh token with data set to cashu.lock_pubkeys[0] from /v1/info as a 33-byte compressed hex key, in a secret of at most 1024 characters. Use only the locktime, refund, pubkeys, n_sigs, sigflag, n_sigs_refund and refund_delay tags, each once and with a value: pubkeys may list only other cashu.lock_pubkeys entries, n_sigs must be 1, sigflag SIG_INPUTS, refund keys compressed and distinct, n_sigs_refund at most the number of refund keys, and any locktime at least cashu.min_locktime minus 24 hours in the future.";
 
 const fx: FxFetcher = {
   fetch: () => Promise.resolve({ rates: { usd: 100_000 }, as_of: new Date().toISOString() }),

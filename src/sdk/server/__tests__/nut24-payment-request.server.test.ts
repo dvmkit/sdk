@@ -16,6 +16,7 @@ import type { ArtifactContent } from "../../../lib/messages/types";
 import { LOCAL_MINT_URL, localMintAvailable } from "../../../lib/cashu/__tests__/__helpers__/local-mint";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
+import type { CashuConfig } from "../../types";
 import { proofSetRequestId } from "../cashu-payment-request";
 import { MemoryJobStore } from "../memory-job-store";
 import { secp256k1Auth } from "../secp256k1-auth";
@@ -66,7 +67,7 @@ function handlerGate() {
   return { release, enter: () => held };
 }
 
-async function startHost(signed: boolean, options: { wait?: number; prompt?: boolean; fail?: boolean; artifact?: ArtifactContent; redactOnMessageRead?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
+async function startHost(signed: boolean, options: { wait?: number; cashu?: CashuConfig; prompt?: boolean; fail?: boolean; artifact?: ArtifactContent; redactOnMessageRead?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
   let handlerStarted = false;
   const processingReaders = new Set<() => void>();
   class ObservedStore extends MemoryJobStore {
@@ -104,7 +105,9 @@ async function startHost(signed: boolean, options: { wait?: number; prompt?: boo
   };
   const descriptor = configureDVM({
     name: "nut24-payment-request",
-    ...(options.wait === undefined ? {} : { cashu: { unsignedResultWaitSeconds: options.wait } }),
+    ...((options.wait !== undefined || options.cashu) && {
+      cashu: { ...options.cashu, ...(options.wait !== undefined && { unsignedResultWaitSeconds: options.wait }) },
+    }),
     capabilities: {
       paid: {
         input: signed ? signedSchema : z.object({ text: z.string().min(1) }),
@@ -396,6 +399,26 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
       }, 60_000);
     });
   }
+
+  it("advertises refund_delay from the floor a retry with the same headers is held to, and banks a lock built from it", async () => {
+    const host = await startHost(false, { cashu: { unsignedMinLocktimeSeconds: 3_600, advertiseRefundDelay: true } });
+    const unsigned = await paymentRequest(host, "refundable");
+    expect(unsigned.nut10?.tags).toEqual([["refund_delay", "4200"]]);
+    // A payer that sends X-Cashu-Request-Id takes the signed floor: 7 days less the 24-hour resume margin.
+    const withId = await submit(host, "refundable", undefined, randomUUID());
+    expect(withId.status).toBe(402);
+    expect(decodePaymentRequest(withId.headers.get("X-Cashu")!).nut10?.tags).toEqual([["refund_delay", "519000"]]);
+
+    const payer = "02" + "ef".repeat(32);
+    const locktime = Math.floor(Date.now() / 1000) + 4_200;
+    const paid = await submit(host, "refundable", await payRequest(unsigned, undefined, {
+      ...unsigned.toP2PKOptions()!,
+      locktime,
+      refundKeys: [payer],
+    }));
+    expect(paid.status).toBe(inlineContract.completed.status);
+    expect(((await paid.json()) as Job).summary).toBe("result:refundable");
+  }, 30_000);
 
   it("returns the unchanged accepted response at expiry and leaves the result available to polling", async () => {
     const gate = handlerGate();

@@ -4,7 +4,15 @@
 
 - The Postgres job-message LISTEN connection now sends `SELECT 1` on itself every five minutes while idle, so a database proxy that closes connections after 30 minutes without queries no longer recycles it on a routine schedule. A failed heartbeat reconnects and catches up like any other lost connection; the heartbeat does not replace that catch-up, which still covers failovers, deploys and network interruptions. `ListenChannel` gains an opt-in `heartbeat` option (`true` for five minutes, or `{ intervalMs }`); callers that do not set it behave as before.
 
+- A NUT-24 payment request can now invite the wallet to add a refund path. With `cashu.advertiseRefundDelay: true`, the `X-Cashu` request on an unpaid 402 carries `["refund_delay", "<seconds>"]` in `nut10.t`, where `<seconds>` is the lock floor the DVM enforces on the paid retry plus 600 seconds for the round trip. A wallet that honours the tag can lock with a `locktime` that far ahead and a `refund` key of its own, so a payment the DVM never redeems returns to the payer. The option is off by default, and with it off the request is byte-for-byte unchanged. Independently of the option, a proof whose secret carries a copied `refund_delay` tag is now accepted and judged as if the tag were absent; any other tag outside NUT-11's list is still refused, as is a repeated tag. A proof secret longer than 1024 characters, the default limit a Nutshell mint redeems, is now refused as `lock_not_exclusive` with a message naming its length; before, the cashu-ts parser refused it as `not_p2pk_locked`. The `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. See `docs/PROTOCOL-NOTES.md#nut-24-payment-requests`.
+
 - Postgres job-message subscribers catch up after the LISTEN connection reconnects, and notification subscribers wake to recheck payments and cancellation. Reconnects log their downtime; connection-loss, failed-connect and pool-error diagnostics retain approved Postgres and socket error codes without logging error text or credentials.
+
+### Breaking changes
+
+- `CashuConfig` and `ResolvedCashuConfig` gain one optional field, `advertiseRefundDelay`, off by default. The type changes are additive; no migration is needed.
+
+- For every DVM, with or without the option: a Cashu proof secret longer than 1024 characters is now refused as `lock_not_exclusive`, where it was `not_p2pk_locked`, and the `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. A client that matches on either should expect the new values.
 
 ## Upgrade details
 

@@ -175,9 +175,23 @@ export function valueCashuFunding(
   };
 }
 
-/** The NUT-11 tags a banked proof may carry; any other tag is refused. */
-const P2PK_TAG_KEYS = new Set(["locktime", "refund", "pubkeys", "n_sigs", "sigflag", "n_sigs_refund"]);
-const SINGLE_VALUE_TAG_KEYS = new Set(["locktime", "n_sigs", "sigflag", "n_sigs_refund"]);
+/**
+ * Longest proof secret banked, in characters. Nutshell's default
+ * `mint_max_secret_length` is 1024 and it refuses a longer secret at swap or
+ * melt. JavaScript counts UTF-16 code units where Nutshell counts code points,
+ * so this is never looser than the mint.
+ */
+const MAX_CASHU_SECRET_LENGTH = 1_024;
+
+/**
+ * The tags a banked proof may carry; any other tag is refused. All but
+ * `refund_delay` are NUT-11's. A payment request may carry `refund_delay`, and
+ * a payer building its lock from that request can copy the tag into the
+ * secret. It states no spending condition and mints ignore it, so it is read
+ * as absent.
+ */
+const P2PK_TAG_KEYS = new Set(["locktime", "refund", "pubkeys", "n_sigs", "sigflag", "n_sigs_refund", "refund_delay"]);
+const SINGLE_VALUE_TAG_KEYS = new Set(["locktime", "n_sigs", "sigflag", "n_sigs_refund", "refund_delay"]);
 
 /** Outcome of judging one proof secret's NUT-11 spending conditions. */
 export type CashuLockAssessment =
@@ -215,6 +229,16 @@ export function assessCashuLock(
   nowSec: number,
   floorSec: number = nowSec + DEFAULT_CASHU_LOCK_WINDOW_SECONDS
 ): CashuLockAssessment {
+  // Checked here rather than left to cashu-ts's parser, whose own limit is an
+  // implementation detail: an oversized proof would bank, serve the job, and
+  // then fail at the melt.
+  if (secret.length > MAX_CASHU_SECRET_LENGTH) {
+    return {
+      kind: "rejected",
+      code: "lock_not_exclusive",
+      message: `Proof secret is ${secret.length} characters; the mint redeems at most ${MAX_CASHU_SECRET_LENGTH}.`,
+    };
+  }
   try {
     parseP2PKSecret(secret);
     if (getSecretKind(secret) !== "P2PK") throw new Error("not P2PK");

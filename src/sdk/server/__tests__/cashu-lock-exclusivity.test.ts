@@ -91,6 +91,8 @@ describe("assessCashuLock", () => {
     ["an unknown tag", [["memo", "hello"]]],
     ["an unknown valueless tag", [["memo"]]],
     ["a duplicated unknown-to-cashu-ts tag", [["memo", "a"], ["memo", "b"]]],
+    ["a repeated refund_delay", [["refund_delay", "519000"], ["refund_delay", "519000"]]],
+    ["a refund_delay with two values", [["refund_delay", "519000", "1"]]],
     ["n_sigs with two values", [["n_sigs", "1", "1"]]],
     ["a non-canonical n_sigs", [["n_sigs", "01"]]],
     ["n_sigs_refund of 0", [["locktime", `${NOW + 7 * DAY}`], ["refund", PAYER_KEY], ["n_sigs_refund", "0"]]],
@@ -113,6 +115,21 @@ describe("assessCashuLock", () => {
     expect(assessCashuLock(secret(DVM_KEY, tags as string[][]), ACTIVE, NOW)).toMatchObject({
       kind: "rejected",
       code: "not_p2pk_locked",
+    });
+  });
+
+  it("refuses a secret longer than the mint redeems, whatever tag makes it long", () => {
+    // A payer-chosen refund_delay value is never read, so it can pad a secret to any length.
+    const padded = (length: number) => {
+      const bare = secret(DVM_KEY, [["refund_delay", ""]]);
+      return secret(DVM_KEY, [["refund_delay", "9".repeat(length - bare.length)]]);
+    };
+    expect(padded(1_024)).toHaveLength(1_024);
+    expect(assessCashuLock(padded(1_024), ACTIVE, NOW)).toEqual({ kind: "exclusive", lockPubkey: DVM_KEY });
+    expect(assessCashuLock(padded(1_025), ACTIVE, NOW)).toMatchObject({
+      kind: "rejected",
+      code: "lock_not_exclusive",
+      message: expect.stringMatching(/1025 characters.*at most 1024/),
     });
   });
 

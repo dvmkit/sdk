@@ -4024,6 +4024,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           railOpts.nut24 = {
             mints: this.advertisedMints(),
             previousRequiredMsats: this.previousPriceMsats(cap, dynamicUpfront, pricedAt),
+            refundDelay: this.descriptor.cashu?.advertiseRefundDelay ?? false,
           };
           // Only a NUT-24 wallet's payment, which carries no request id, takes
           // the unsigned floor. A payer sending `X-Cashu-Request-Id` reads

@@ -10,12 +10,24 @@ import type { FxFetcher, FxRateSnapshot } from "../pricing/fx";
  * wallet that honours `nut10` produces proofs the DVM banks without a swap.
  * Never adds a `locktime` tag: with no refund key the DVM could name, a lock
  * that expires becomes spendable by anyone. No transport, so payment is in-band.
+ *
+ * Given `lockWindowSeconds`, the request also carries `refund_delay`, inviting
+ * the payer to add a `locktime` and a refund key of its own. The tag's value is
+ * that window plus {@link REFUND_DELAY_TOLERANCE_SECONDS}, so the floor the
+ * payee applies to such a lock (receipt plus the value, less the tolerance)
+ * is the one the receive path enforces for this payment.
  */
 export function cashuPaymentRequest(args: {
   requiredMsats: number;
   mints: string[];
   lockPubkey: string;
+  /** The lock window the receive path will enforce on this payment; omit to send no `refund_delay`. */
+  lockWindowSeconds?: number;
 }): string {
+  const tags =
+    args.lockWindowSeconds === undefined
+      ? []
+      : [["refund_delay", String(args.lockWindowSeconds + REFUND_DELAY_TOLERANCE_SECONDS)]];
   return new PaymentRequest(
     undefined,
     undefined,
@@ -24,7 +36,7 @@ export function cashuPaymentRequest(args: {
     args.mints,
     undefined,
     false,
-    { kind: "P2PK", data: args.lockPubkey, tags: [] }
+    { kind: "P2PK", data: args.lockPubkey, tags }
   ).toEncodedCreqA();
 }
 
@@ -111,3 +123,12 @@ function sameRates(a: FxRateSnapshot, b: FxRateSnapshot): boolean {
  * while keeping a stale quote from being redeemable for the life of the next one.
  */
 const FX_HOLD_WINDOW_MS = 10 * 60_000;
+
+/**
+ * The time a `refund_delay` allows between the payer reading the 402 and the
+ * DVM receiving its payment: the payer locks to its own clock plus the
+ * advertised delay, and the DVM floors the lock at receipt. Taken from
+ * {@link FX_HOLD_WINDOW_MS}, the bound this SDK already sets on an honest 402
+ * round trip.
+ */
+const REFUND_DELAY_TOLERANCE_SECONDS = FX_HOLD_WINDOW_MS / 1000;
