@@ -2,11 +2,7 @@
 
 ## Unreleased
 
-- The Postgres job-message LISTEN connection now sends `SELECT 1` on itself every five minutes while idle, so a database proxy that closes connections after 30 minutes without queries no longer recycles it on a routine schedule. A failed heartbeat reconnects and catches up like any other lost connection; the heartbeat does not replace that catch-up, which still covers failovers, deploys and network interruptions. `ListenChannel` gains an opt-in `heartbeat` option (`true` for five minutes, or `{ intervalMs }`); callers that do not set it behave as before.
-
 - A NUT-24 payment request can now invite the wallet to add a refund path. With `cashu.advertiseRefundDelay: true`, the `X-Cashu` request on an unpaid 402 carries `["refund_delay", "<seconds>"]` in `nut10.t`, where `<seconds>` is the lock floor the DVM enforces on the paid retry plus 600 seconds for the round trip. A wallet that honours the tag can lock with a `locktime` that far ahead and a `refund` key of its own, so a payment the DVM never redeems returns to the payer. The option is off by default, and with it off the request is byte-for-byte unchanged. Independently of the option, a proof whose secret carries a copied `refund_delay` tag is now accepted and judged as if the tag were absent; any other tag outside NUT-11's list is still refused, as is a repeated tag. A proof secret longer than 1024 characters, the default limit a Nutshell mint redeems, is now refused as `lock_not_exclusive` with a message naming its length; before, the cashu-ts parser refused it as `not_p2pk_locked`. The `lock_not_exclusive` hint now names `refund_delay` among the allowed tags and the 1024-character limit. See `docs/PROTOCOL-NOTES.md#nut-24-payment-requests`.
-
-- Postgres job-message subscribers catch up after the LISTEN connection reconnects, and notification subscribers wake to recheck payments and cancellation. Reconnects log their downtime; connection-loss, failed-connect and pool-error diagnostics retain approved Postgres and socket error codes without logging error text or credentials.
 
 ### Breaking changes
 
@@ -45,6 +41,12 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Miscellaneous Chores
 
 * **api:** advance the comparison baseline to v0.31.1 ([#138](https://github.com/dvmkit/sdk/issues/138)) ([5e8d11a](https://github.com/dvmkit/sdk/commit/5e8d11a992d3bfe890a42657dc54fa9937656935))
+
+### Release notes
+
+- The Postgres job-message LISTEN connection now sends `SELECT 1` on itself every five minutes while idle, so a database proxy that closes connections after 30 minutes without queries no longer recycles it on a routine schedule. A failed heartbeat reconnects and catches up like any other lost connection; the heartbeat does not replace that catch-up, which still covers failovers, deploys and network interruptions. `ListenChannel` gains an opt-in `heartbeat` option (`true` for five minutes, or `{ intervalMs }`); callers that do not set it behave as before.
+
+- Postgres job-message subscribers catch up after the LISTEN connection reconnects, and notification subscribers wake to recheck payments and cancellation. Reconnects log their downtime; connection-loss, failed-connect and pool-error diagnostics retain approved Postgres and socket error codes without logging error text or credentials.
 
 ## [0.31.1](https://github.com/dvmkit/sdk/compare/v0.31.0...v0.31.1) (2026-11-09)
 
