@@ -73,6 +73,7 @@ export function waitForInlineResult(
 // A held paid retry and its generic client both buffer the body. Keep large
 // results on the messages endpoint to limit server memory and client/context load.
 const INLINE_RESULT_MESSAGES_MAX_BYTES = 1_048_576;
+const INLINE_RESULT_MESSAGES_PAGE_SIZE = 16;
 
 export async function inlineResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {
   if (!job.messages.some((message) => message.type === "artifact")) return undefined;
@@ -82,10 +83,28 @@ export async function inlineResultMessages(store: JobStore, job: JobRecord): Pro
 /** A completed job's messages for a response body, or undefined when redacted or over the inline cap. */
 export async function boundedResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {
   if (job.status !== "completed" || job.redactedAt !== undefined) return undefined;
-  let messages = job.messages.filter((message) => message.seq > 0);
+  const messages: Message[] = [];
+  let bytes = 2; // JSON array brackets.
+  const append = (message: Message): boolean => {
+    bytes += (messages.length > 0 ? 1 : 0) + Buffer.byteLength(JSON.stringify(message), "utf8");
+    if (bytes > INLINE_RESULT_MESSAGES_MAX_BYTES) return false;
+    messages.push(message);
+    return true;
+  };
   if (isStreamableJobStore(store)) {
-    const durable = await store.getMessages(job.id, 0, { includeHeld: true });
-    if (durable.length > 0) messages = durable;
+    let afterSeq = 0;
+    for (;;) {
+      const page = await store.getMessages(job.id, afterSeq, {
+        includeHeld: true, limit: INLINE_RESULT_MESSAGES_PAGE_SIZE,
+      });
+      for (const message of page) if (!append(message)) return undefined;
+      if (page.length < INLINE_RESULT_MESSAGES_PAGE_SIZE) break;
+      afterSeq = page[page.length - 1].seq;
+    }
+    if (messages.length > 0) return messages;
   }
-  return Buffer.byteLength(JSON.stringify(messages), "utf8") <= INLINE_RESULT_MESSAGES_MAX_BYTES ? messages : undefined;
+  for (const message of job.messages) {
+    if (message.seq > 0 && !append(message)) return undefined;
+  }
+  return messages;
 }

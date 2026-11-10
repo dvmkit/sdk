@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking API changes
+
+- `StreamableJobStore.getMessages` accepts an optional `limit` for pages in ascending sequence order after deduplication. This is additive: callers that omit it retain full-history reads, and existing custom stores remain compatible. Custom stores can honor the limit to stop durable reads early when an inline result exceeds the message byte cap.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

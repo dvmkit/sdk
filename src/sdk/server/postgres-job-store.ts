@@ -1691,7 +1691,10 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     });
   }
 
-  async getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]> {
+  async getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean; limit?: number }): Promise<Message[]> {
+    if (options?.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1)) {
+      throw new RangeError("Message limit must be a positive safe integer");
+    }
     const { rows } = await this.pool.query<{ data: Message | string }>(
       `WITH terminal AS (
          SELECT messages FROM jobs WHERE id = $1 AND status IN ('completed', 'failed', 'cancelled')
@@ -1707,8 +1710,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
          SELECT (message->>'seq')::bigint, message, 1 AS origin
          FROM terminal CROSS JOIN LATERAL jsonb_array_elements(terminal.messages) AS snapshot(message)
          WHERE (message->>'seq')::bigint > $2
-       ) SELECT DISTINCT ON (seq) data FROM history ORDER BY seq, origin`,
-      [jobId, afterSeq, options?.includeHeld ?? false]
+       ) SELECT DISTINCT ON (seq) data FROM history ORDER BY seq, origin LIMIT $4`,
+      [jobId, afterSeq, options?.includeHeld ?? false, options?.limit ?? null]
     );
     return rows.map((r) => (typeof r.data === "string" ? JSON.parse(r.data) : r.data) as Message);
   }

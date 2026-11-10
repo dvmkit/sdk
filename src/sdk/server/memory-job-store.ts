@@ -625,8 +625,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     });
   }
 
-  getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean }): Promise<Message[]> {
-    return Promise.resolve(this.visibleMessages(jobId, afterSeq, options?.includeHeld));
+  async getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean; limit?: number }): Promise<Message[]> {
+    if (options?.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1)) {
+      throw new RangeError("Message limit must be a positive safe integer");
+    }
+    return this.visibleMessages(jobId, afterSeq, options?.includeHeld, options?.limit);
   }
 
   initStreaming(): Promise<void> {
@@ -738,7 +741,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return list;
   }
 
-  private visibleMessages(jobId: string, afterSeq: number, includeHeld = false): Message[] {
+  private visibleMessages(jobId: string, afterSeq: number, includeHeld = false, limit?: number): Message[] {
     const stored = this.messagesFor(jobId);
     const record = this.data.get(jobId);
     const terminal = record && isTerminal(record.status);
@@ -753,12 +756,20 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
       }
     }
     const messages = new Map<number, Message>();
+    const retain = (message: Message) => {
+      messages.set(message.seq, message);
+      if (limit !== undefined && messages.size > limit) {
+        let lastSeq = -Infinity;
+        for (const seq of messages.keys()) lastSeq = Math.max(lastSeq, seq);
+        messages.delete(lastSeq);
+      }
+    };
     if (terminal) {
-      for (const message of record.messages) if (message.seq > afterSeq) messages.set(message.seq, message);
+      for (const message of record.messages) if (message.seq > afterSeq) retain(message);
     }
     for (const entry of stored) {
       if (entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary) {
-        messages.set(entry.message.seq, entry.message);
+        retain(entry.message);
       }
     }
     return [...messages.values()].sort((a, b) => a.seq - b.seq);

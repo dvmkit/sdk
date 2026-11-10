@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { fromJobRecord } from "../job";
 import { inlineResultMessages, waitForInlineResult } from "../inline-result-wait";
 import { MemoryJobStore } from "../memory-job-store";
-import type { JobRecord } from "../job-store";
+import type { JobRecord, JobStore } from "../job-store";
 
 class ObservedStore extends MemoryJobStore {
   watchers = 0;
@@ -115,6 +115,94 @@ it("reads terminal artifact history durably instead of using a stale snapshot", 
   const store = new MemoryJobStore();
   await store.save({ ...job, messages: artifact("durable result") });
   expect(await inlineResultMessages(store, job)).toEqual(artifact("durable result"));
+});
+
+it("stops durable reads before loading the rest of an oversized transcript", async () => {
+  const messages: JobRecord["messages"] = Array.from({ length: 100 }, (_, index) => ({
+    seq: index + 1, from: "provider", timestamp: 1, type: "artifact", content: { data: "x".repeat(40_000) },
+  }));
+  const job: JobRecord = { ...record, status: "completed", messages };
+  const store = new MemoryJobStore();
+  await store.save(job);
+  const read = vi.spyOn(store, "getMessages");
+  expect(await inlineResultMessages(store, job)).toBeUndefined();
+  expect(read.mock.calls.length).toBeGreaterThan(1);
+  const pages = await Promise.all(read.mock.results.map(result => result.value));
+  const loaded = pages.flat();
+  expect(loaded.length).toBeGreaterThan(0);
+  expect(loaded.length).toBeLessThan(messages.length);
+  expect(loaded.at(-1)!.seq).toBeLessThan(messages.at(-1)!.seq);
+});
+
+it("keeps every under-cap message across durable pages, including escaped and UTF-8 content", async () => {
+  const messages: JobRecord["messages"] = Array.from({ length: 100 }, (_, index) => ({
+    seq: index * 2 + 1, from: "provider", timestamp: 1, type: "artifact", content: { data: `é\n\"\\ ${index}` },
+  }));
+  const job: JobRecord = { ...record, status: "completed", messages };
+  const store = new MemoryJobStore();
+  await store.save(job);
+  const read = vi.spyOn(store, "getMessages");
+  expect(await inlineResultMessages(store, job)).toEqual(messages);
+  expect(read.mock.calls.length).toBeGreaterThan(1);
+});
+
+it.each([-1, 0, 1])("counts commas and escaped UTF-8 in multi-message arrays (offset %s)", async (offset) => {
+  // Two empty artifact envelopes occupy 265 bytes, including brackets and comma.
+  // The first data string adds eight JSON bytes: é, newline, quote, backslash.
+  const messages: JobRecord["messages"] = ["é\n\"\\", "a".repeat(1_048_576 + offset - 265 - 8)]
+    .map((data, index) => ({
+      seq: index + 1, from: "provider", timestamp: 1, type: "artifact",
+      content: { mime_type: "application/json", encoding: "utf-8", data },
+    }));
+  const job: JobRecord = { ...record, status: "completed", messages };
+  const store = new MemoryJobStore();
+  await store.save(job);
+  const result = await inlineResultMessages(store, job);
+  if (offset <= 0) expect(result).toEqual(messages);
+  else expect(result).toBeUndefined();
+});
+
+it("keeps compatibility with custom streamable stores that ignore the page limit", async () => {
+  const messages: JobRecord["messages"] = Array.from({ length: 40 }, (_, index) => ({
+    seq: index + 1, from: "provider", timestamp: 1, type: "artifact", content: { data: `${index}` },
+  }));
+  const job: JobRecord = { ...record, status: "completed", messages };
+  class LegacyStore extends MemoryJobStore {
+    override getMessages(id: string, afterSeq: number, options?: { includeHeld?: boolean }) {
+      return super.getMessages(id, afterSeq, { includeHeld: options?.includeHeld });
+    }
+  }
+  const store = new LegacyStore();
+  await store.save(job);
+  expect(await inlineResultMessages(store, job)).toEqual(messages);
+});
+
+it.each(["snapshot", "empty-durable"])("stops serializing an oversized %s fallback before later messages", async (kind) => {
+  const tailContent = vi.fn(() => ({ data: "unread tail" }));
+  const messages: JobRecord["messages"] = [{
+    seq: 1, from: "provider", timestamp: 1, type: "artifact", content: { data: "x".repeat(1_048_576) },
+  }, {
+    seq: 2, from: "provider", timestamp: 1, type: "artifact", get content() { return tailContent(); },
+  }];
+  const job: JobRecord = { ...record, status: "completed", messages };
+  const store: JobStore = kind === "empty-durable" ? new MemoryJobStore() : {
+    get: async () => job, findJobByPaymentTxHash: async () => undefined,
+    save: async () => undefined, delete: async () => undefined,
+  };
+  expect(await inlineResultMessages(store, job)).toBeUndefined();
+  expect(tailContent).not.toHaveBeenCalled();
+});
+
+it.each(["snapshot", "empty-durable"])("preserves positive-sequence messages in an under-cap %s fallback", async (kind) => {
+  const messages: JobRecord["messages"] = [0, 1, 3].map(seq => ({
+    seq, from: "provider", timestamp: 1, type: "artifact", content: { data: `${seq}` },
+  }));
+  const job: JobRecord = { ...record, status: "completed", messages };
+  const store: JobStore = kind === "empty-durable" ? new MemoryJobStore() : {
+    get: async () => job, findJobByPaymentTxHash: async () => undefined,
+    save: async () => undefined, delete: async () => undefined,
+  };
+  expect(await inlineResultMessages(store, job)).toEqual(messages.slice(1));
 });
 
 it.each(["processing", "awaiting-input", "failed", "cancelled"] as const)("does not inline messages for %s jobs", async (status) => {

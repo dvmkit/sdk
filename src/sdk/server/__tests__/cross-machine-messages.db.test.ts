@@ -88,6 +88,28 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     expect((msgs[0].content as { text: string }).text).toBe("hello");
   });
 
+  it("pages terminal history in sequence order after deduplication", async () => {
+    const jobId = "paged-terminal";
+    await ensureJob(jobId);
+    const messages: Message[] = [5, 1, 3].map(seq => ({
+      seq, from: "provider", timestamp: 1, type: "artifact", content: { data: `snapshot-${seq}` },
+    }));
+    await store.save({ ...(await store.get(jobId))!, status: "completed", messages, seq: 2 });
+    // A surviving incremental row wins over the snapshot at the same sequence.
+    const duplicate = { ...messages[2], content: { data: "durable-3" } };
+    await pool.query("INSERT INTO job_messages (job_id, seq, data, status) VALUES ($1, $2, $3, 'verified')", [
+      jobId, duplicate.seq, JSON.stringify(duplicate),
+    ]);
+    expect(await store.getMessages(jobId, 0, { includeHeld: true, limit: 2 })).toEqual([messages[1], duplicate]);
+    expect(await store.getMessages(jobId, 3, { includeHeld: true, limit: 2 })).toEqual([messages[0]]);
+    expect(await store.getMessages(jobId, 5, { limit: 2 })).toEqual([]);
+    expect(await store.getMessages(jobId, 0)).toEqual([messages[1], duplicate, messages[0]]);
+  });
+
+  it.each([0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid message page limit %s", async (limit) => {
+    await expect(store.getMessages("missing", 0, { limit })).rejects.toThrow(RangeError);
+  });
+
   it("persists the exact x402 amount atomically with its payment request", async () => {
     await ensureJob("job-x402-binding");
     const nonce = `0x${"a".repeat(64)}`;
@@ -188,6 +210,11 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
       expect((await store.getMessages(job.id, 0)).map(message => message.type)).toEqual(["text"]);
       expect((await store.getMessages(job.id, 0, { includeHeld: true })).map(message => message.type))
         .toEqual(["text", "payment", "text"]);
+      expect((await store.getMessages(job.id, 0, { limit: 2 })).map(message => message.type)).toEqual(["text"]);
+      expect((await store.getMessages(job.id, 1, { includeHeld: true, limit: 1 })).map(message => message.type))
+        .toEqual(["payment"]);
+      expect((await store.getMessages(job.id, acceptedSeq, { includeHeld: true, limit: 1 })).map(message => message.type))
+        .toEqual(["text"]);
       job.status = "completed";
       providerMessage(job, "complete", { summary: "done" });
       await jm.persistJob(job);
