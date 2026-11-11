@@ -39,8 +39,8 @@ export const X402_ROUTE_SIGNED_FIELDS: readonly string[] = [...CAPABILITY_SIGNED
  * A server with no x402 rail is not refused for that alone, since the rail
  * can come from an account setting (`DVMKIT_X402_PAY_TO`) the builder does not
  * control here; it starts without serving the routes. The checks that do not
- * depend on the rail still run then, so a rail arriving later cannot turn a
- * starting DVM into one that refuses to boot.
+ * depend on the rail still run then, so a rail arriving later can only add the
+ * challenge-size refusal, which needs the rail's configuration.
  */
 export function assertX402RoutesServable(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
