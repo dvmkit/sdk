@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Pool, PoolClient } from "pg";
 
+import { withPostgresCheckoutCancellation } from "../../lib/pg-retry";
+
 // Resolve host-provided environment without adding an option to the public factory.
 export const x402ShutdownClaimEnvironment = new AsyncLocalStorage<Record<string, string | undefined>>();
 
@@ -34,11 +36,11 @@ export function withX402ShutdownClaimBudget<T extends object>(target: T): T {
 }
 
 /** A timed-out session must be destroyed: returning a held advisory lock would block the fleet. */
-export async function connectForX402ShutdownClaim(pool: Pool): Promise<PoolClient> {
+export async function connectForX402ShutdownClaim(pool: Pick<Pool, "connect">): Promise<PoolClient> {
   const signal = x402ShutdownClaimSignal.getStore();
   if (!signal) return pool.connect();
   signal.throwIfAborted();
-  const pending = pool.connect();
+  const pending = withPostgresCheckoutCancellation(signal, () => pool.connect());
   let client: PoolClient;
   try {
     client = await waitForX402ShutdownClaim(() => pending);
@@ -68,8 +70,8 @@ export async function connectForX402ShutdownClaim(pool: Pool): Promise<PoolClien
   });
 }
 
-/** Use a cancellable checkout for the final claim's pool queries, including channel reads and its marker. */
-export function poolForX402ShutdownClaim(pool: Pool): Pool {
+/** Cancellable checkouts let pool shutdown finish when a claim abandons a database read or write. */
+export function poolForX402ShutdownClaim<T extends Pick<Pool, "query" | "connect">>(pool: T): T {
   if (!x402ShutdownClaimSignal.getStore()) return pool;
   return new Proxy(pool, {
     get(object, property) {

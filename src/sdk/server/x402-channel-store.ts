@@ -1010,10 +1010,10 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
 
   /** Durable effect bookkeeping reached while a caller already holds a host-pool client. */
   async withSettlementTransaction<T>(operation: (tx: PoolClient) => Promise<T>): Promise<T> {
-    const client = await (await this.settlementPoolRef()).connect();
+    const client = await connectForX402ShutdownClaim(await this.settlementPoolRef());
     try {
       await client.query("BEGIN");
-      const result = await operation(client);
+      const result = await waitForX402ShutdownClaim(() => operation(client));
       await client.query("COMMIT");
       return result;
     } catch (error) {

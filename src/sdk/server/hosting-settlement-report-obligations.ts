@@ -11,6 +11,7 @@ import { loggers } from "../../observability/loggers";
 import { resolveRpcOverride } from "../../lib/payment-rails/rpc";
 import { X402_BATCH_CHANNEL_ABI } from "../../lib/x402/batch-abi";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
+import { poolForX402ShutdownClaim } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
 import { parseStoreValue } from "./store-json";
 import type { PostgresX402ChannelStorage } from "./x402-channel-store";
@@ -726,7 +727,7 @@ export class HostedSettlementReportObligations {
   async submittedIds(rail: Rail, operation: Operation, txHash: string,
     batchId?: string): Promise<string[]> {
     if (!hex(txHash, 32)) throw new Error("Hosted effect has no exact transaction hash");
-    const result = await this.pool.query<{ id: string; original: Record<string, unknown> }>(
+    const result = await poolForX402ShutdownClaim(this.pool).query<{ id: string; original: Record<string, unknown> }>(
       `SELECT id,original FROM sdk_hosted_settlement_report_obligations
        WHERE dvm_id=$1 AND scope=$2 AND rail=$3 AND operation=$4 AND tx_hash=$5
        ORDER BY source_key`,

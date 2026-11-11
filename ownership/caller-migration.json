@@ -8431,6 +8431,7 @@
             "formatPostgresApplicationName",
             "isTransportError",
             "withInitRetry",
+            "withPostgresCheckoutCancellation",
             "withPostgresRecoveryContext",
             "withPostgresTransactionRecovery"
           ],
@@ -25637,6 +25638,9 @@
         },
         {
           "module": "src/sdk/server/credit-draw-resolution.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -27375,6 +27379,9 @@
         },
         {
           "module": "src/sdk/server/x402-channel-store.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -30347,6 +30354,9 @@
         },
         {
           "module": "src/sdk/server/revenue-reporter.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -35091,7 +35101,11 @@
           ]
         }
       ],
-      "dependencies": []
+      "dependencies": [
+        {
+          "module": "src/lib/pg-retry.ts"
+        }
+      ]
     },
     {
       "module": "src/sdk/server/zod-error.ts",

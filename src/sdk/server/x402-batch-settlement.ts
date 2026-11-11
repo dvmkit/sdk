@@ -425,6 +425,7 @@ function hostedSettlementFacilitator(
             throw new Error("Hosted x402 claim has no selected vouchers");
           }
           for (const raw of payload.claims) {
+            x402ShutdownClaimSignal.getStore()?.throwIfAborted();
             const claim = raw as { voucher?: { channel?: Parameters<typeof computeChannelId>[0] };
               signature?: string; totalClaimed?: string };
             if (!claim.voucher?.channel || !claim.signature || !claim.totalClaimed) {
@@ -471,7 +472,7 @@ function hostedSettlementFacilitator(
           if (reservation.replayed) throw new Error("Hosted x402 settle already has an original effect attempt");
           reservations.push(reservation);
         }
-        const response = await target.settle(payment, requirements);
+        const response = await waitForX402ShutdownClaim(() => target.settle(payment, requirements));
         if (response.success && reservations.length) {
           for (const reservation of reservations) {
             await obligations.recordSubmitted(reservation.id, response.transaction);
@@ -1853,6 +1854,7 @@ function claimCeilingSelector(earnedNative: X402EarnedNative): ClaimChannelSelec
   return async (channels: Channel[]): Promise<Channel[]> => {
     const selected: Channel[] = [];
     for (const channel of channels) {
+      x402ShutdownClaimSignal.getStore()?.throwIfAborted();
       const charged = BigInt(channel.chargedCumulativeAmount);
       const claimed = BigInt(channel.totalClaimed);
       // Nothing under the authorization is left to present, so upstream would

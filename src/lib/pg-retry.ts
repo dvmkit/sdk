@@ -22,6 +22,28 @@ export function withPostgresRecoveryContext<value>(
   return postgresRecovery.run(context, operation);
 }
 
+const checkoutCancellation = new AsyncLocalStorage<AbortSignal>();
+
+/** Include the checkout health probe in a caller's cancellation scope. */
+export function withPostgresCheckoutCancellation<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  return checkoutCancellation.run(signal, operation);
+}
+
+async function probeCheckedOutClient(client: PoolClient, probe: { text: string; query_timeout: number }): Promise<void> {
+  const signal = checkoutCancellation.getStore();
+  if (!signal) {
+    await client.query(probe);
+    return;
+  }
+  signal.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    client.query(probe).then(() => resolve(), reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 /** Returns true for TCP/network transport errors that warrant transport recovery.
  * Excludes Postgres-level error codes (5-char alphanumeric, e.g. '23505') — those must never be retried. */
 export function isTransportError(err: unknown): boolean {
@@ -115,6 +137,7 @@ export function applyRetryToPool(pool: Pool, label = "pg-pool"): void {
       return queryingPool.exit(() => callback ? origConnect(callback) : origConnect());
     }
     const pending = withTransportRecovery(pool, label, "pool.connect", async () => {
+      checkoutCancellation.getStore()?.throwIfAborted();
       const client = await origConnect();
       guardCheckedOutClient(client, label);
       const remainingMs = (postgresRecovery.getStore()?.deadlineMs ?? Infinity) - Date.now();
@@ -123,7 +146,7 @@ export function applyRetryToPool(pool: Pool, label = "pg-pool"): void {
         query_timeout: Math.max(1, Math.min(connectionTimeoutMs(pool), remainingMs)),
       };
       try {
-        await client.query(probe);
+        await probeCheckedOutClient(client, probe);
         return client;
       } catch (error) {
         client.release(asError(error));
