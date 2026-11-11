@@ -13,6 +13,7 @@ import type { Pool, PoolClient, PoolConfig } from "pg";
 import { applyRetryToPool } from "../../lib/pg-retry";
 import { x402NetworkByCaip2 } from "../../lib/x402/networks";
 import { X402_BATCH_SETTLEMENT_RESOURCE } from "../../lib/x402/spec";
+import { connectForX402ShutdownClaim, poolForX402ShutdownClaim, waitForX402ShutdownClaim } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
 import { HostingCleanupFence, type HostedFundingReservation } from "./hosting-cleanup-fence";
 
@@ -921,7 +922,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
   }
 
   async get(channelId: string): Promise<Channel | undefined> {
-    const q = this.transaction.getStore() ?? this.pool;
+    const q = this.transaction.getStore() ?? poolForX402ShutdownClaim(this.pool);
     const { rows } = await q.query<X402ChannelRow>(
       `SELECT * FROM x402_batch_channels WHERE channel_id = $1`,
       [normalizeChannelId(channelId)]
@@ -931,7 +932,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
 
   /** List all channel snapshots in stable channel-id order. */
   async list(): Promise<Channel[]> {
-    const q = this.transaction.getStore() ?? this.pool;
+    const q = this.transaction.getStore() ?? poolForX402ShutdownClaim(this.pool);
     const { rows } = await q.query<X402ChannelRow>(
       `SELECT * FROM x402_batch_channels ORDER BY channel_id`
     );
@@ -946,7 +947,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
     const active = this.transaction.getStore();
     if (active) return this.updateInTransaction(active, channelId, update, true);
 
-    const client = await this.pool.connect();
+    const client = await connectForX402ShutdownClaim(this.pool);
     try {
       await client.query("BEGIN");
       const result = await this.updateInTransaction(client, channelId, update, false);
@@ -1009,10 +1010,10 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
 
   /** Durable effect bookkeeping reached while a caller already holds a host-pool client. */
   async withSettlementTransaction<T>(operation: (tx: PoolClient) => Promise<T>): Promise<T> {
-    const client = await (await this.settlementPoolRef()).connect();
+    const client = await connectForX402ShutdownClaim(await this.settlementPoolRef());
     try {
       await client.query("BEGIN");
-      const result = await operation(client);
+      const result = await waitForX402ShutdownClaim(() => operation(client));
       await client.query("COMMIT");
       return result;
     } catch (error) {
@@ -1079,7 +1080,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
    */
   async withRelaySubmissionLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const pool = await this.settlementPoolRef();
-    const client = await pool.connect();
+    const client = await connectForX402ShutdownClaim(pool);
     let locked = false;
     let destroyClient = false;
     try {
@@ -1095,7 +1096,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
           await relayLockHolder(client, key)
         );
       }
-      return await operation();
+      return await waitForX402ShutdownClaim(operation);
     } finally {
       if (locked) {
         await client.query(RELAY_UNLOCK_SQL, [key]).catch(() => {
@@ -1120,7 +1121,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
   }
 
   private async settlementWriter(): Promise<X402ChannelQuerier> {
-    return this.settlementPoolRef();
+    return poolForX402ShutdownClaim(await this.settlementPoolRef());
   }
 
   private async settlementPoolRef(): Promise<Pool> {
@@ -1132,7 +1133,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
     operation: () => Promise<unknown>,
     wait: boolean
   ): Promise<boolean> {
-    const client = await this.pool.connect();
+    const client = await connectForX402ShutdownClaim(this.pool);
     let locked = false;
     let timeoutSet = false;
     try {
@@ -1154,7 +1155,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
         locked = rows[0]?.locked ?? false;
       }
       if (!locked) return false;
-      await operation();
+      await waitForX402ShutdownClaim(operation);
       return true;
     } finally {
       // A failed unlock or RESET means this session still carries state the next

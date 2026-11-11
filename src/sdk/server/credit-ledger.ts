@@ -27,6 +27,7 @@ import {
   type CreditDrawRefundResult,
 } from "./credit-draw-refund";
 import { assertSettleMicro, type DrawSettleRequest, planDrawResolution, settledShare } from "./credit-draw-resolution";
+import { poolForX402ShutdownClaim } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
 import { parseStoreValue } from "./store-json";
 import { HostingCleanupFence } from "./hosting-cleanup-fence";
@@ -2432,7 +2433,7 @@ export class CreditLedger {
    * distinct from earned zero, so settlement cannot guess a claim limit.
    */
   async earnedNativeForX402Channel(channelId: string): Promise<number | undefined> {
-    const { rows } = await this.pool.query<{ earned: string }>(
+    const { rows } = await poolForX402ShutdownClaim(this.pool).query<{ earned: string }>(
       `SELECT COALESCE(
                 (SELECT SUM(d.draw_native)
                    FROM credit_draws d

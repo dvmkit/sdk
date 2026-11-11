@@ -10,6 +10,7 @@ import type { Pool } from "pg";
 
 import type { ChannelDrainCursor, CreditDrainRecord } from "./credit-ledger";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
+import { poolForX402ShutdownClaim, x402ShutdownClaimSignal } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
 import type { RevenueReporterQuerier } from "./revenue-reporter";
 
@@ -355,7 +356,7 @@ export class PostgresX402BatchStore implements X402BatchStore {
   }
 
   async get(scope: string): Promise<X402OpenBatch | undefined> {
-    const { rows } = await this.db.query<{
+    const { rows } = await poolForX402ShutdownClaim(this.db).query<{
       scope: string;
       batch_id: string;
       claimed_native: string;
@@ -386,7 +387,7 @@ export class PostgresX402BatchStore implements X402BatchStore {
   }
 
   async put(batch: X402OpenBatch): Promise<void> {
-    await this.db.query(
+    await poolForX402ShutdownClaim(this.db).query(
       `INSERT INTO payout_x402_batches (
          scope, batch_id, claimed_native, voucher_count, claims, opened_at,
          attempts, first_failed_at, last_error, next_retry_at, obligation_ids, updated_at
@@ -838,7 +839,8 @@ export class PayoutReporter implements PayoutTransport {
           vouchers: results.reduce((sum, r) => sum + r.vouchers, 0),
           transactions: results.map((result) => result.transaction),
         });
-        void this.snapshotX402();
+        // Skip the background snapshot during shutdown so it cannot outlive the claim budget.
+        if (!x402ShutdownClaimSignal.getStore()) void this.snapshotX402();
       }
       return results;
     };

@@ -3,6 +3,7 @@ import { InMemoryChannelStorage } from "@x402/evm/batch-settlement/server";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 
+import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 
 const PAY_TO = "0x1111111111111111111111111111111111111111";
@@ -117,6 +118,18 @@ describe("x402 batch-settlement boot policy", () => {
       config: { storage: new InMemoryChannelStorage(), withdrawDelay: 900 },
     })).rejects.toThrow("requires selfRelay");
   });
+
+  it.each(["", "0", "-1", "1.5", "NaN", "2147483648"])(
+    "rejects an invalid shutdown claim budget before allocating resources: %s",
+    async (value) => {
+      const facilitator = facilitatorWithoutAuthorizer();
+      await expect(x402ShutdownClaimEnvironment.run({ DVMKIT_X402_SHUTDOWN_CLAIM_MS: value }, () => createX402BatchSettlementServer({
+        network: "eip155:84532", payTo: PAY_TO, earnedNative: earnedNothing,
+        config: { storage: new InMemoryChannelStorage(), facilitatorClient: facilitator, autoSettlement: false },
+      }))).rejects.toThrow("DVMKIT_X402_SHUTDOWN_CLAIM_MS");
+      expect(facilitator.getSupported).not.toHaveBeenCalled();
+    },
+  );
 
   it("refuses boot when neither the facilitator nor the DVM can authorize claims", async () => {
     await expect(

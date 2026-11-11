@@ -14,6 +14,7 @@ import { type Channel, InMemoryChannelStorage } from "@x402/evm/batch-settlement
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 
+import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 import type { HostedSettlementReportObligations } from "../hosting-settlement-report-obligations";
 import type { X402PayoutObserver } from "../payout-reporter";
@@ -1205,11 +1206,14 @@ describe("x402 batch-settlement facilitator payload", () => {
  * earnings.
  */
 describe("x402 batch-settlement claim ceiling", () => {
-  async function fundedChannel(earnedNative: () => Promise<number | undefined>) {
+  async function fundedChannel(
+    earnedNative: () => Promise<number | undefined>,
+    env: Record<string, string | undefined> = {},
+  ) {
     const payer = privateKeyToAccount(generatePrivateKey());
     const receiver = privateKeyToAccount(generatePrivateKey());
     const facilitator = new StatefulFacilitator();
-    const server = await createX402BatchSettlementServer({
+    const server = await x402ShutdownClaimEnvironment.run(env, () => createX402BatchSettlementServer({
       network: NETWORK,
       payTo: receiver.address,
       earnedNative,
@@ -1219,7 +1223,7 @@ describe("x402 batch-settlement claim ceiling", () => {
         receiverAuthorizerSigner: receiver,
         autoSettlement: false,
       },
-    });
+    }));
     const [built] = await server.buildRequirements("100");
     const requirements = built as PaymentRequirements;
     const channelConfig: Channel["channelConfig"] = {
@@ -1264,6 +1268,83 @@ describe("x402 batch-settlement claim ceiling", () => {
         (raw.claims ?? []).map((c) => (c as { totalClaimed: string }).totalClaimed)
       );
   }
+
+  it("claims only earned draws once on shutdown, without settling, including concurrent stops", async () => {
+    let earned = 40;
+    const { server, facilitator, channelId } = await fundedChannel(() => Promise.resolve(earned));
+    await Promise.all([server.stop(), server.stop()]);
+    expect(claimedAmounts(facilitator)).toEqual(["40"]);
+    expect(await server.getChannel(channelId)).toMatchObject({
+      chargedCumulativeAmount: "100", totalClaimed: "40",
+    });
+    expect(facilitator.settle.mock.calls.some(([payload]) => payload.payload.type === "settle")).toBe(false);
+    earned = 80;
+    await server.stop();
+    expect(claimedAmounts(facilitator)).toEqual(["40"]);
+  });
+
+  it("reports a failed shutdown claim without throwing or retrying on a second stop", async () => {
+    const { server, facilitator } = await fundedChannel(() => Promise.resolve(40));
+    facilitator.claimFails = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(server.stop()).resolves.toBeUndefined();
+    await server.stop();
+    expect(claimedAmounts(facilitator)).toEqual(["40"]);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({
+      event: "x402_shutdown_claim_incomplete", level: "warn", reason: "failed", timeout_ms: 3000,
+      unclaimed_channels: 1, unclaimed_amount_native: "40",
+    }));
+  });
+
+  it("cuts off a slow shutdown claim and does not apply a late success", async () => {
+    const { server, facilitator, channelId } = await fundedChannel(() => Promise.resolve(40), {
+      DVMKIT_X402_SHUTDOWN_CLAIM_MS: "25",
+    });
+    let finish!: (response: SettleResponse) => void;
+    facilitator.settle.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    try {
+      const stopped = server.stop();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopped).resolves.toBeUndefined();
+      expect(claimedAmounts(facilitator)).toEqual(["40"]);
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({
+        event: "x402_shutdown_claim_incomplete", level: "warn", reason: "timeout", timeout_ms: 25,
+        unclaimed_channels: 1, unclaimed_amount_native: "40",
+      }));
+      finish({ success: true, transaction: "0xlate", network: NETWORK });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await server.getChannel(channelId)).toMatchObject({ totalClaimed: "0" });
+      await server.stop();
+      expect(claimedAmounts(facilitator)).toEqual(["40"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds ledger selection too and never submits when a late read finishes", async () => {
+    let finish!: (earned: number) => void;
+    const { server, facilitator } = await fundedChannel(() => new Promise((resolve) => { finish = resolve; }), {
+      DVMKIT_X402_SHUTDOWN_CLAIM_MS: "25",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    try {
+      const stopped = server.stop();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopped).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({
+        event: "x402_shutdown_claim_incomplete", level: "warn", reason: "timeout", timeout_ms: 25,
+        unclaimed_channels: null, unclaimed_amount_native: null,
+      }));
+      finish(40);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(claimedAmounts(facilitator)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("claims cumulative draws, advances with them, and never claws a claim back", async () => {
     let earned = 40;

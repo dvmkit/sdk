@@ -4,6 +4,10 @@
 
 When mints are configured but Cashu is absent from the resolved payment methods, the server emits one `cashu_not_advertised` warning at boot. Boolean fields identify the cause: `cashu_explicitly_excluded` means the override omits Cashu; `cashu_mode_missing` means `p2pk-accumulator` mode is absent; `cashu_lock_pubkey_missing` means no lock public key is wired; `cashu_store_missing` means neither Postgres nor the explicit development Cashu store is wired. Multiple prerequisites can be missing together. The diagnostic contains no key values, mint addresses, or connection strings, and info requests do not repeat it.
 
+## x402 shutdown claims
+
+`x402_shutdown_claim_incomplete` warns that the final reusable-channel claim did not finish. `reason` is `timeout`, `failed` or `lock_unavailable` (another local operation or fleet machine owns the settlement lock); `timeout_ms` is the configured budget. `unclaimed_channels` and `unclaimed_amount_native` report the last known remaining earned vouchers, with the amount as an exact decimal string in token atomic units (USDC micro-units). Both are `null` if the inventory could not be read within the budget. Confirmed batches are excluded; an in-flight transaction may still land, so a timeout is not proof that its funds remain unclaimed. The diagnostic retains no keys, signatures, channel identifiers or provider error text. Shutdown continues and repeated stops do not retry the claim.
+
 ## Payment failures
 
 Payment diagnostics retain fixed SDK categories so operators can distinguish a skipped credit leg from a credential, persistence, or accounting failure. Categories identify what the SDK observed; they do not establish that a service is down or that money moved.

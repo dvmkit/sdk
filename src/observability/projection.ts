@@ -427,6 +427,11 @@ function projectField(
   identityAuthority?: DiagnosticIdentityAuthority,
   eventName?: string,
 ): unknown {
+  if (eventName === "x402_shutdown_claim_incomplete") {
+    if (key === "unclaimed_channels") return value === null || isNonnegativeSafeInteger(value) ? value : undefined;
+    if (key === "unclaimed_amount_native") return value === null || typeof value === "string" && DECIMAL_RE.test(value) ? value : undefined;
+    if (key === "reason") return value === "timeout" || value === "failed" || value === "lock_unavailable" ? value : undefined;
+  }
   const closedEnum = Object.hasOwn(PAYMENT_ENUMS, key)
     ? PAYMENT_ENUMS[key]
     : Object.hasOwn(ROUTER_ENUMS, key)

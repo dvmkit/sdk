@@ -51,6 +51,26 @@ describe("diagnosticConsole", () => {
     });
   });
 
+  it("preserves exact shutdown claim amounts and rejects credential-shaped diagnostic fields", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    diagnosticConsole.warn({
+      event: "x402_shutdown_claim_incomplete", reason: "timeout", timeout_ms: 3000,
+      unclaimed_channels: 2, unclaimed_amount_native: "9007199254740993",
+      signature: "SENTINEL_SIGNATURE", error: new Error("SENTINEL_KEY"),
+    });
+    expect(JSON.parse(String(warn.mock.calls[0]?.[0]))).toEqual({
+      event: "x402_shutdown_claim_incomplete", level: "warn", reason: "timeout", timeout_ms: 3000,
+      unclaimed_channels: 2, unclaimed_amount_native: "9007199254740993",
+    });
+    diagnosticConsole.warn({
+      event: "x402_shutdown_claim_incomplete", reason: "SENTINEL_KEY",
+      unclaimed_channels: -1, unclaimed_amount_native: "SENTINEL_SIGNATURE",
+    });
+    expect(JSON.parse(String(warn.mock.calls[1]?.[0]))).toEqual({
+      event: "x402_shutdown_claim_incomplete", level: "warn",
+    });
+  });
+
   it("does not treat caller text as an event name", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 

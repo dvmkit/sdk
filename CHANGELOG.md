@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug fixes
+
+- Reusable x402 channels make one final earned-draw-capped claim during shutdown, without transferring the claimed funds. `DVMKIT_X402_SHUTDOWN_CLAIM_MS` bounds the attempt (default 3000 ms); an incomplete claim emits `x402_shutdown_claim_incomplete` and shutdown continues. A timeout does not establish whether an already submitted transaction landed.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

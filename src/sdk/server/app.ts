@@ -246,6 +246,7 @@ import {
   type X402BatchSettlementServer,
 } from "./x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "./x402-channel-store";
+import { x402ShutdownClaimEnvironment } from "./x402-shutdown-claim";
 import {
   DEFERRED_X402_SETTLE_WINDOW_CLOSED,
   InProcessDeferredX402Settler,
@@ -891,7 +892,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   const x402BatchSettlementFactory =
     x402Config && effectiveX402BatchConfig
       ? () =>
-          createX402BatchSettlementServer({
+          x402ShutdownClaimEnvironment.run(opts.env, () => createX402BatchSettlementServer({
             channelStorage: x402ChannelStorage,
             network: x402Config.network,
             payTo: x402Config.payTo,
@@ -906,7 +907,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
               : opts.x402FacilitatorHealth?.supportedResponse?.(),
             payout: payoutReporter?.x402Observer(),
             hostedObligations: hostedSettlementReports,
-          })
+          }))
       : undefined;
   x402BatchSettlement =
     x402BatchSettlementFactory && (bootX402Support?.batchSettlement || selfRelayEnabled)

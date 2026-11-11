@@ -241,6 +241,7 @@
       "src/sdk/server/x402-self-relay.ts",
       "src/sdk/server/x402-settlement-evidence.ts",
       "src/sdk/server/x402-settlement-scheduler.ts",
+      "src/sdk/server/x402-shutdown-claim.ts",
       "src/sdk/server/zod-error.ts",
       "src/sdk/signed-envelope-schema.ts",
       "src/sdk/step-cache.ts",
@@ -8430,6 +8431,7 @@
             "formatPostgresApplicationName",
             "isTransportError",
             "withInitRetry",
+            "withPostgresCheckoutCancellation",
             "withPostgresRecoveryContext",
             "withPostgresTransactionRecovery"
           ],
@@ -23809,6 +23811,9 @@
         },
         {
           "module": "src/sdk/server/x402-route.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -25633,6 +25638,9 @@
         },
         {
           "module": "src/sdk/server/credit-draw-resolution.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -27371,6 +27379,9 @@
         },
         {
           "module": "src/sdk/server/x402-channel-store.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -30343,6 +30354,9 @@
         },
         {
           "module": "src/sdk/server/revenue-reporter.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -34185,6 +34199,9 @@
         },
         {
           "module": "src/sdk/server/x402-settlement-scheduler.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -34509,6 +34526,9 @@
         },
         {
           "module": "src/sdk/server/hosting-cleanup-fence.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -34901,6 +34921,9 @@
         },
         {
           "module": "src/sdk/server/x402-channel-store.ts"
+        },
+        {
+          "module": "src/sdk/server/x402-shutdown-claim.ts"
         }
       ]
     },
@@ -35053,6 +35076,34 @@
       "dependencies": [
         {
           "module": "src/observability/diagnostic-console.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/sdk/server/x402-shutdown-claim.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Bounds final x402 claims and releases their database sessions during server shutdown.",
+          "symbols": [
+            "connectForX402ShutdownClaim",
+            "poolForX402ShutdownClaim",
+            "waitForX402ShutdownClaim",
+            "withX402ShutdownClaimBudget",
+            "x402ShutdownClaimEnvironment",
+            "x402ShutdownClaimSignal"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./server#createX402BatchSettlementServer",
+            "supported:./server#serve"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/pg-retry.ts"
         }
       ]
     },

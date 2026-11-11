@@ -95,7 +95,10 @@ function claimedAmounts(facilitator: FacilitatorClient): string[] {
 }
 
 /** A DVM whose claim job runs every 20 ms against `ledger` and `storage`. */
-async function claimingDvm(ledger: MemoryCreditLedger, storage: InMemoryChannelStorage, facilitator: FacilitatorClient) {
+async function claimingDvm(
+  ledger: MemoryCreditLedger, storage: InMemoryChannelStorage, facilitator: FacilitatorClient,
+  env: Record<string, string> = {},
+) {
   const dvm = configureDVM({
     name: "x402-claim-wiring",
     capability: "do",
@@ -107,7 +110,7 @@ async function claimingDvm(ledger: MemoryCreditLedger, storage: InMemoryChannelS
     auth: secp256k1Auth(),
   });
   return createDVMServer(dvm, {
-    env: {},
+    env,
     store: new MemoryKVStore(),
     jobStore: new MemoryJobStore(),
     fxFetcher: stubFx,
@@ -146,6 +149,31 @@ async function channelCredit(): Promise<MemoryCreditLedger> {
 }
 
 describe("the DVM's claim job reads the DVM's own credit ledger", () => {
+  it("uses the DVM's supplied environment to bound its final claim before the first scheduled tick", async () => {
+    const ledger = await channelCredit();
+    await ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: 400 });
+    await ledger.settle({ creditId: "c1", drawId: "d1" });
+    const storage = new InMemoryChannelStorage();
+    await storage.updateChannel(CHANNEL_ID, () => fundedChannel());
+    const facilitator = claimingFacilitator();
+    vi.mocked(facilitator.settle).mockImplementation(() => new Promise(() => undefined));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    try {
+      const { shutdown } = await claimingDvm(ledger, storage, facilitator, { DVMKIT_X402_SHUTDOWN_CLAIM_MS: "25" });
+      const stopped = shutdown();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopped).resolves.toBeUndefined();
+      expect(claimedAmounts(facilitator)).toEqual(["400"]);
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({
+        event: "x402_shutdown_claim_incomplete", level: "warn", reason: "timeout", timeout_ms: 25,
+        unclaimed_channels: 1, unclaimed_amount_native: "400",
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("claims only the settled part of a partly settled draw", async () => {
     const ledger = await channelCredit();
     await ledger.draw({ creditId: "c1", drawId: "d1", amountMicro: 1_000 });
