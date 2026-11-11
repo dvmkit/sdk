@@ -2,14 +2,6 @@
 
 ## Unreleased
 
-### Breaking API changes
-
-- `StreamableJobStore.getMessages` accepts an optional `limit` for pages in ascending sequence order after deduplication. This is additive: callers that omit it retain full-history reads, and existing custom stores remain compatible. Custom stores can honor the limit to stop durable reads early when an inline result exceeds the message byte cap.
-
-### Behavior changes
-
-- A server whose capabilities are offered on the x402 channel but which has no x402 rail (no `x402` option, and none from `createDVMHost`'s options, `DVMKIT_X402_PAY_TO` or the mounted DVM's `DVMConfig.x402`) now starts instead of refusing to. It logs one `x402_rail_missing` warning naming the affected capabilities, answers each `POST /v1/x402/<name>` with 503 `x402_not_offered` (`retryable: false`) and a hint that x402 is not configured for this DVM, never a 402, leaves those capabilities out of `/v1/info`'s `x402_capabilities`, and drops `x402` from the payment methods `/v1/info` and `/v1/quote` advertise even when `paymentMethods` lists it. Its `/v1/job` capabilities and other payment rails serve as usual, in production and `devMode` alike. The other x402 boot refusals still stop the server with or without a rail: a `paymentMethods` list that leaves out `"x402"`, a missing or invalid `DVMKIT_PUBLIC_URL` outside `devMode`, a pricing currency other than USD, and a deadline over `DVMKIT_X402_RESPONSE_LIMIT_MS` (counted with the default facilitator timeout when there is no rail). A descriptor's `DVMConfig.x402` that a direct `createDVMServer` call was not given still refuses to start, and the challenge-size check still runs once a rail is configured.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -25,6 +17,14 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
 ## [0.35.0](https://github.com/dvmkit/sdk/compare/v0.34.0...v0.35.0) (2026-11-11)
+
+### Breaking API changes
+
+- `StreamableJobStore.getMessages` accepts an optional `limit` for pages in ascending sequence order after deduplication. This is additive: callers that omit it retain full-history reads, and existing custom stores remain compatible. Custom stores can honor the limit to stop durable reads early when an inline result exceeds the message byte cap.
+
+### Behavior changes
+
+- A server whose capabilities are offered on the x402 channel but which has no x402 rail (no `x402` option, and none from `createDVMHost`'s options, `DVMKIT_X402_PAY_TO` or the mounted DVM's `DVMConfig.x402`) now starts instead of refusing to. It logs one `x402_rail_missing` warning naming the affected capabilities, answers each `POST /v1/x402/<name>` with 503 `x402_not_offered` (`retryable: false`) and a hint that x402 is not configured for this DVM, never a 402, leaves those capabilities out of `/v1/info`'s `x402_capabilities`, and drops `x402` from the payment methods `/v1/info` and `/v1/quote` advertise even when `paymentMethods` lists it. Its `/v1/job` capabilities and other payment rails serve as usual, in production and `devMode` alike. The other x402 boot refusals still stop the server with or without a rail: a `paymentMethods` list that leaves out `"x402"`, a missing or invalid `DVMKIT_PUBLIC_URL` outside `devMode`, a pricing currency other than USD, and a deadline over `DVMKIT_X402_RESPONSE_LIMIT_MS` (counted with the default facilitator timeout when there is no rail). A descriptor's `DVMConfig.x402` that a direct `createDVMServer` call was not given still refuses to start, and the challenge-size check still runs once a rail is configured.
 
 
 ### Features
