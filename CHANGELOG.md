@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Bug fixes
-
-- Reusable x402 channels make one final earned-draw-capped claim during shutdown, without transferring the claimed funds. `DVMKIT_X402_SHUTDOWN_CLAIM_MS` bounds the attempt (default 3000 ms); an incomplete claim emits `x402_shutdown_claim_incomplete` and shutdown continues. A timeout does not establish whether an already submitted transaction landed.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -26,6 +22,8 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Bug Fixes
 
 * **server:** claim earned x402 vouchers during shutdown ([9b58776](https://github.com/dvmkit/sdk/commit/9b5877624ac787d99110de02bb48ef3f90c90275))
+
+* Reusable x402 channels make one final earned-draw-capped claim during shutdown, without transferring the claimed funds. `DVMKIT_X402_SHUTDOWN_CLAIM_MS` bounds the attempt (default 3000 ms); an incomplete claim emits `x402_shutdown_claim_incomplete` and shutdown continues. A timeout does not establish whether an already submitted transaction landed.
 
 ## [0.35.1](https://github.com/dvmkit/sdk/compare/v0.35.0...v0.35.1) (2026-11-11)
 
