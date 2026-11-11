@@ -758,16 +758,17 @@ export interface X402Listing {
  * is the capability input itself.
  *
  * The capability must set `maxRuntimeSeconds`: the payment is verified before
- * the handler runs and settled after it finishes, inside the one request. A
- * host typically fits machine wake-up, the runtime bound and the settlement
- * timeout (10 seconds by default) within a roughly 28-second request deadline,
- * so keep the bound short.
+ * the handler runs and settled after it finishes, inside the one request. The
+ * runtime bound plus the settlement timeout (10 seconds by default) must fit
+ * within `DVMKIT_X402_RESPONSE_LIMIT_MS` when the host sets it, or the server
+ * refuses to start; a host sets it to what its gateway allows after waking the
+ * machine, so keep the bound short.
  *
  * The 402 must name an amount before the handler runs, so the capability must
  * set a fixed `price` or an `onQuote`, which prices an unpaid request from its
  * body; a free capability, or one priced only by `rates`, cannot be offered on
- * x402. The DVM must configure `x402`, and an explicit `paymentMethods` list
- * must include `"x402"`.
+ * x402. The DVM needs an x402 rail, from `x402` or `DVMKIT_X402_PAY_TO`, and an
+ * explicit `paymentMethods` list must include `"x402"`.
  */
 export interface X402ChannelConfig {
   /** Optional catalog listing. See {@link X402Listing}. */
