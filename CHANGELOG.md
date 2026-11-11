@@ -24,6 +24,29 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.35.0](https://github.com/dvmkit/sdk/compare/v0.34.0...v0.35.0) (2026-11-11)
+
+
+### Features
+
+* **server:** start without x402 routes when no x402 rail is configured ([#151](https://github.com/dvmkit/sdk/issues/151)) ([f253be4](https://github.com/dvmkit/sdk/commit/f253be47f9e0da2dd3cf694832e587b40032f836))
+
+
+### Bug Fixes
+
+* **server:** bound inline result message reads ([2cc9acb](https://github.com/dvmkit/sdk/commit/2cc9acb43eb4d8eedfbf779689de4cb92684d4b8))
+
+
+### Documentation
+
+* **sdk:** describe the x402 deadline and env-configured rail accurately ([#150](https://github.com/dvmkit/sdk/issues/150)) ([ea97096](https://github.com/dvmkit/sdk/commit/ea9709683b0601b80e3c8edbf866138c8f443f4f))
+* **server:** narrow the claim about a rail configured later ([#152](https://github.com/dvmkit/sdk/issues/152)) ([21bed78](https://github.com/dvmkit/sdk/commit/21bed7880f4e6f53911308f8435492b0c8f1223a))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.34.0 ([#147](https://github.com/dvmkit/sdk/issues/147)) ([58fe913](https://github.com/dvmkit/sdk/commit/58fe91365c127f74c2720063cd570e43b1da628c))
+
 ## [0.34.0](https://github.com/dvmkit/sdk/compare/v0.33.0...v0.34.0) (2026-11-10)
 
 
