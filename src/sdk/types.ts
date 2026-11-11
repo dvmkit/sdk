@@ -767,8 +767,10 @@ export interface X402Listing {
  * The 402 must name an amount before the handler runs, so the capability must
  * set a fixed `price` or an `onQuote`, which prices an unpaid request from its
  * body; a free capability, or one priced only by `rates`, cannot be offered on
- * x402. The DVM needs an x402 rail, from `x402` or `DVMKIT_X402_PAY_TO`, and an
- * explicit `paymentMethods` list must include `"x402"`.
+ * x402. The DVM needs an x402 rail, from `x402` or `DVMKIT_X402_PAY_TO`;
+ * without one the server still starts, but without these routes: each answers
+ * 503 `x402_not_offered` and `/v1/info` leaves it out. An explicit
+ * `paymentMethods` list must include `"x402"`.
  */
 export interface X402ChannelConfig {
   /** Optional catalog listing. See {@link X402Listing}. */
