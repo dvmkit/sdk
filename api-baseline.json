@@ -1,10 +1,11 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.34.0",
+  "version": "0.35.0",
   "storeContracts": {
     "StreamableJobStore.getMessages": {
-      "options": "optional { includeHeld?: boolean }",
-      "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff"
+      "options": "optional { includeHeld?: boolean, limit?: number }",
+      "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff",
+      "limit": "positive safe integer; returns the next page after deduplication in ascending seq order, or all remaining messages if fewer; omitted means unlimited"
     },
     "StreamableJobStore.appendOutgoing": {
       "options": "optional { appendId?: string, ... }",
@@ -634,7 +635,7 @@
         },
         "MemoryJobStore": {
           "stability": "stable",
-          "signature": "e79936bacbf7e27feb60a7116df84a71d38da3f55849be6d09dc6f684f1c6291"
+          "signature": "321534e88386ec7fd44c606616db59ea64f101cb981bf8b7ab2b0dc0f34d3b94"
         },
         "RecordedMessage": {
           "stability": "stable",
@@ -1306,7 +1307,7 @@
         },
         "isStreamableJobStore": {
           "stability": "experimental",
-          "signature": "d3943f90a94ce2c4059b478fb2ca1815c97157993f1a0736cfbf8405a8fd2ac5"
+          "signature": "b309b03e7863d567bd1f3c78b8a965e6883cfc9f8b2826902c66563adef4ebb9"
         },
         "JobContentMetadata": {
           "stability": "experimental",
@@ -1442,7 +1443,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "dcdf48b6b90674b1426e78d8aa0a6e5142760629808f880ad4d0c4053f8ec947"
+          "signature": "35db1b0d1757f87c553ca67773ef588a3e18f9fb5797fd9283641d5cdc2b9c4a"
         },
         "PostgresKVStore": {
           "stability": "experimental",
@@ -1642,7 +1643,7 @@
         },
         "StreamableJobStore": {
           "stability": "experimental",
-          "signature": "d0b17f85848488f436dc72c4cd23cc55a3d8d73b9c1cada145e3858158ef2025"
+          "signature": "e8861377d52e5e92f077e414d0d0a9f89b70a5917d783b87819438f56c9b8c85"
         },
         "stripCreditEnvelope": {
           "stability": "experimental",
