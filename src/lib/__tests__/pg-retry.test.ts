@@ -138,6 +138,8 @@ describe("applyRetryToPool", () => {
     ["claim", 3],
     ["claim", 10],
     ["callback", 3],
+    ["wrapped-query", 10],
+    ["rejected-checkout", 3],
   ] as const)("recovers the first %s through %i stale idle clients", async (boundary, size) => {
     const clients: TransportClient[] = [];
     const statements: string[] = [];
@@ -193,6 +195,18 @@ describe("applyRetryToPool", () => {
       idleTimeoutMillis: 0,
       Client: TransportClient as unknown as typeof pg.Client,
     });
+    if (boundary === "wrapped-query" || boundary === "rejected-checkout") {
+      const nativeConnect = pool.connect.bind(pool);
+      let rejectCheckout = boundary === "rejected-checkout";
+      // Host instrumentation can expose only the promise form of connect().
+      pool.connect = (async () => {
+        if (rejectCheckout) {
+          rejectCheckout = false;
+          throw new Error("Connection terminated unexpectedly");
+        }
+        return nativeConnect();
+      }) as Pool["connect"];
+    }
     applyRetryToPool(pool, "test");
     try {
       const checkedOut = await Promise.all(Array.from({ length: size }, () => pool.connect()));

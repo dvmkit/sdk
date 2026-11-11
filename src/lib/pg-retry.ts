@@ -167,7 +167,17 @@ function installCheckoutCancellation(candidate: Pick<Pool, "connect">): void {
       const previous = entering;
       const before = new Set(pool._pendingQueue);
       entering = ticket;
-      try { connect(complete); } catch (error) { complete(asError(error)); }
+      try {
+        const returned: unknown = connect(complete);
+        // Host wrappers may expose only the promise overload. complete() also
+        // prevents an adapter supporting both forms from completing twice.
+        if (returned && typeof (returned as PromiseLike<PoolClient>).then === "function") {
+          void Promise.resolve(returned as PromiseLike<PoolClient>).then(
+            (client) => complete(undefined, client),
+            (error: unknown) => complete(asError(error))
+          );
+        }
+      } catch (error) { complete(asError(error)); }
       finally { entering = previous; }
       for (const item of pool._pendingQueue) {
         if (!before.has(item) && !queued.has(item)) {
