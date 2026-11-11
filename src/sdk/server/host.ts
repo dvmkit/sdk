@@ -1473,13 +1473,34 @@ function normalizeX402Config(config: X402Config): X402Config {
   return { ...config, network };
 }
 
+/** Settings that build the environment's x402 rail around `DVMKIT_X402_PAY_TO`. */
+const X402_RAIL_SETTINGS = [
+  "DVMKIT_X402_NETWORK",
+  "DVMKIT_X402_ASSET",
+  "DVMKIT_X402_FACILITATOR",
+  "DVMKIT_X402_FACILITATOR_KEY_ID",
+  "DVMKIT_X402_FACILITATOR_KEY_SECRET",
+  "DVMKIT_X402_DESCRIPTION",
+  "DVMKIT_X402_BATCH_SETTLEMENT",
+  "DVMKIT_X402_RPC_URL",
+  "DVMKIT_X402_SELF_RELAY_KEY",
+  "DVMKIT_X402_SELF_RELAY_MIN_BALANCE_WEI",
+  "DVMKIT_X402_RECEIVER_AUTHORIZER_KEY",
+  "DVMKIT_X402_WITHDRAW_DELAY_SECONDS",
+] as const;
+
 function buildX402FromEnv(env: Record<string, string | undefined>): X402Config | undefined {
   validateX402Env(env);
   const payTo = env.DVMKIT_X402_PAY_TO;
   const batchEnabled = env.DVMKIT_X402_BATCH_SETTLEMENT === "true";
+  // The payout address alone decides whether the environment has a rail. A
+  // hosted platform turns x402 off by removing only the address, and keeps the
+  // rest of the stored settings, private keys included, for when it returns.
   if (!payTo) {
-    if (batchEnabled) {
-      throw new Error("DVMKIT_X402_BATCH_SETTLEMENT requires DVMKIT_X402_PAY_TO.");
+    const ignored = X402_RAIL_SETTINGS.filter((name) => env[name] !== undefined);
+    if (ignored.length > 0) {
+      // Names only: several of these values are private keys.
+      diagnosticConsole.warn({ level: "warn", event: "x402_env_ignored", variables: ignored });
     }
     return undefined;
   }
