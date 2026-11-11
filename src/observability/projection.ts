@@ -451,6 +451,11 @@ function projectField(
       .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
       .flatMap(([, name]) => projectCapability(name, authority) ?? []);
   }
+  if (eventName === "x402_env_ignored" && key === "variables" && Array.isArray(value)) {
+    return ownDataEntries(value, 64)
+      .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
+      .flatMap(([, name]) => typeof name === "string" && /^DVMKIT_X402_[A-Z0-9_]{1,64}$/.test(name) ? [name] : []);
+  }
   if (eventName !== undefined && CARD_REFUND_EVENTS.has(eventName)) {
     const projected = projectCardRefundField(key, value);
     if (projected !== undefined) return projected;

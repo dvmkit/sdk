@@ -491,6 +491,7 @@
     "x402_claim_ceiling_unbound",
     "x402_claim_ceiling_unresolved",
     "x402_credential_rejected",
+    "x402_env_ignored",
     "x402_facilitator_capability_degraded",
     "x402_facilitator_extension_response",
     "x402_facilitator_extension_responses_truncated",
