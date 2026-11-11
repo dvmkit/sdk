@@ -1143,6 +1143,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   private undeclareSessionCapability?: () => void;
   private hostingSweepTimer?: ReturnType<typeof setInterval>;
   private readonly diagnosticCapabilityAuthority: DiagnosticCapabilityAuthority;
+  /**
+   * Capabilities are offered on x402 but no rail reached this server, as when
+   * the account routes no payouts to the x402 network. The server still
+   * starts: an optional payment channel must not take the DVM's other
+   * capabilities and rails down with it, so the x402 routes refuse and
+   * `/v1/info` leaves them out.
+   */
+  private readonly x402RailMissing: boolean;
 
   constructor(descriptor: DVMDescriptor<State, InputSchema>, opts: InternalSDKServerOpts) {
     this.descriptor = descriptor;
@@ -1182,6 +1190,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
     }
     assertCapabilityRates(descriptor.capabilities);
+    const x402Names = Object.keys(descriptor.x402Capabilities ?? {});
+    this.x402RailMissing = x402Names.length > 0 && !opts.x402;
     assertX402RoutesServable(descriptor, {
       x402Config: opts.x402,
       paymentMethods: opts.paymentMethods,
@@ -1190,7 +1200,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       devMode: opts.devMode,
       responseLimitMs: parseX402ResponseLimitMs(opts.env.DVMKIT_X402_RESPONSE_LIMIT_MS),
     });
-    if (!this.publicOrigin && Object.keys(descriptor.x402Capabilities ?? {}).length > 0) {
+    if (!this.publicOrigin && x402Names.length > 0 && !this.x402RailMissing) {
       // Only devMode boots so: each x402 route payment then names the
       // request's own origin as its resource.
       diagnosticConsole.warn({ level: "warn", event: "x402_route_origin_from_request" });
@@ -1266,8 +1276,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       pricingCurrency: this.pricingCurrency,
       dualServe: opts.x402?.dualServe ?? true,
     })) {
+      // Without a rail only the pricing currency is the builder's to fix now;
+      // the settlement store and dual-serve follow the rail when it arrives.
+      if (this.x402RailMissing && reason.event !== "x402_route_currency_unsupported") continue;
       if (!opts.devMode) throw new Error(reason.message);
       diagnosticConsole.warn({ level: "warn", event: reason.event });
+    }
+    if (this.x402RailMissing) {
+      diagnosticConsole.warn(bindDiagnosticCapabilityAuthority({
+        level: "warn",
+        event: "x402_rail_missing",
+        capabilities: x402Names,
+      }, this.diagnosticCapabilityAuthority));
     }
     this.jobManager = new JobManager(descriptor, {
       deferredX402: this.deferredX402,
@@ -1529,7 +1549,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 status: "error",
                 errorMessage: errorMsg ?? `HTTP ${statusCode}`,
                 attrs,
-                ...(probe ? { level: "warn" as const } : {}),
+                // A DVM with no x402 rail refusing its x402 route is expected
+                // configuration, not a fault.
+                ...(probe || (this.x402RailMissing && errorCode === "x402_not_offered") ? { level: "warn" as const } : {}),
               };
             }
             return { attrs };
@@ -2088,7 +2110,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const currencyFiltered = configured.filter(
       (method) => method !== "x402" || this.x402CurrencySupported()
     );
-    if (!this.opts.x402) return currencyFiltered;
+    if (!this.opts.x402) {
+      // An explicit list must name x402 to offer the channel at all; with no
+      // rail behind it, advertising x402 would invite a payment nothing takes.
+      return this.x402RailMissing ? currencyFiltered.filter((method) => method !== "x402") : currencyFiltered;
+    }
     const x402Available = this.x402CurrencySupported() && (this.x402Support()?.available ?? false);
     return currencyFiltered.filter((method) => method !== "x402" || x402Available);
   }
@@ -2726,7 +2752,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private renderX402Capabilities(c: Context<AppEnv>): Record<string, V1InfoX402Capability> | undefined {
     const caps = Object.entries(this.descriptor.x402Capabilities ?? {});
-    if (caps.length === 0) return undefined;
+    if (caps.length === 0 || this.x402RailMissing) return undefined;
     const origin = this.publicOrigin ?? new URL(c.req.url).origin;
     const prefix = mountPrefix(c);
     return Object.fromEntries(
@@ -3452,6 +3478,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           hint: `See ${schemaUrl} for the capabilities this DVM offers.`,
         },
         404
+      );
+    }
+    // Never a 402 here: a stock client pays whatever 402 it is shown.
+    if (this.x402RailMissing) {
+      return c.json(
+        {
+          error: "x402_not_offered",
+          retryable: false,
+          message: "x402 payment is not configured for this DVM.",
+          display: "This service does not take x402 payment. Nothing was charged.",
+          hint: `x402 is not configured for this DVM. See ${schemaUrl} for the capabilities and payment methods it offers.`,
+        },
+        503
       );
     }
     const authorization = c.req.header("Authorization");

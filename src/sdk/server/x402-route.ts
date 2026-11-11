@@ -35,10 +35,16 @@ export const X402_ROUTE_SIGNED_FIELDS: readonly string[] = [...CAPABILITY_SIGNED
  * without a public origin, answering on each request's own, so the
  * configure-time stand-in stays there; an `onQuote` amount is unknown until
  * the body arrives.
+ *
+ * A server with no x402 rail is not refused for that alone, since the rail
+ * can come from an account setting (`DVMKIT_X402_PAY_TO`) the builder does not
+ * control here; it starts without serving the routes. The checks that do not
+ * depend on the rail still run then, so a rail arriving later cannot turn a
+ * starting DVM into one that refuses to boot.
  */
 export function assertX402RoutesServable(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  descriptor: Pick<DVMDescriptor<any, any>, "x402Capabilities">,
+  descriptor: Pick<DVMDescriptor<any, any>, "x402Capabilities" | "x402">,
   server: {
     x402Config: X402Config | undefined;
     paymentMethods: readonly PaymentMethod[] | undefined;
@@ -55,10 +61,12 @@ export function assertX402RoutesServable(
   if (!first) return;
   const at = `createDVMServer: capability "${first.name}" is offered on x402`;
   const { x402Config, paymentMethods } = server;
-  if (!x402Config) {
+  // A host passes the descriptor's own rail through, so only a direct
+  // createDVMServer call can drop it: a wiring mistake, not an account setting.
+  if (!x402Config && descriptor.x402) {
     throw new Error(
-      `${at} but the server has no x402 configuration; pass the x402 option to createDVMServer, ` +
-        "or supply an x402 rail through createDVMHost's options, environment, or mounted DVM"
+      `${at} and DVMConfig.x402 is set, but the server was given no x402 configuration; pass the x402 option ` +
+        "to createDVMServer, or mount the DVM on createDVMHost, which passes it through"
     );
   }
   if (paymentMethods !== undefined && !paymentMethods.includes("x402")) {
@@ -76,9 +84,13 @@ export function assertX402RoutesServable(
         "this DVM at, such as https://dvm.example.com, since each x402 payment names that address as its resource"
     );
   }
+  // Without a rail the deadline uses the default facilitator timeout, which an
+  // environment-configured rail (`DVMKIT_X402_PAY_TO`) keeps.
   if (server.responseLimitMs !== undefined) {
-    assertX402DeadlinesFit(definitions, x402Config, server.responseLimitMs, server.devMode);
+    assertX402DeadlinesFit(definitions, x402Config?.facilitatorTimeoutMs, server.responseLimitMs, server.devMode);
   }
+  // The challenge size depends on the rail's network and payee.
+  if (!x402Config) return;
   for (const def of definitions) {
     const price = typeof def.price === "string" ? priceFiatMicro({ price: def.price }) : undefined;
     const required = x402ChannelPaymentRequired({
@@ -130,11 +142,11 @@ export function parseX402ResponseLimitMs(value: string | undefined): number | un
 function assertX402DeadlinesFit(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   definitions: CapabilityDescriptor<any, any>[],
-  x402Config: X402Config,
+  configuredTimeoutMs: number | undefined,
   limitMs: number,
   devMode: boolean | undefined
 ): void {
-  const facilitatorTimeoutMs = x402Config.facilitatorTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
+  const facilitatorTimeoutMs = configuredTimeoutMs ?? X402_DEFAULT_FACILITATOR_TIMEOUT_MS;
   for (const def of definitions) {
     if (def.maxRuntimeSeconds === undefined) continue;
     const deadlineMs = def.maxRuntimeSeconds * 1000 + facilitatorTimeoutMs;

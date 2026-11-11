@@ -71,6 +71,23 @@ function boot(
   });
 }
 
+function noRailDvm(extra: { currency?: "eur" } = {}) {
+  return configureDVM({
+    name: "missing-rail",
+    ...(extra.currency && { currency: extra.currency }),
+    capabilities: {
+      fetch: {
+        channels: { job: false, x402: {} },
+        ...(extra.currency
+          ? { onQuote: { schema: z.object({}), handler: async () => ({ upfront: { amount: 0.01, currency: extra.currency! }, description: "One cent." }) } }
+          : { price: "$0.01" }),
+        maxRuntimeSeconds: 5,
+        onJob(ctx) { ctx.complete("done"); },
+      },
+    },
+  });
+}
+
 /** The largest `outputExample` a listing configures with at its 100-character stand-in host. */
 function largestConfigurable(): number {
   let lo = 0;
@@ -106,11 +123,21 @@ afterEach(() => {
 });
 
 describe("x402 route boot checks", () => {
-  it("refuses a descriptor whose x402 rail was never wired", async () => {
+  it("starts without a rail, serving /v1/job while the x402 route refuses without a 402 and /v1/info omits it", async () => {
     const descriptor = configureDVM({
       name: "missing-rail",
       capabilities: {
+        echo: {
+          input: z.object({ text: z.string() }),
+          onJob(ctx) { ctx.complete(`echo ${(ctx.input as { text: string }).text}`); },
+        },
+        paid: {
+          input: z.object({ text: z.string() }),
+          price: "$0.01",
+          onJob(ctx) { ctx.complete("paid"); },
+        },
         fetch: {
+          input: z.object({ url: z.string() }),
           channels: { job: false, x402: {} },
           price: "$0.01",
           maxRuntimeSeconds: 5,
@@ -118,14 +145,80 @@ describe("x402 route boot checks", () => {
         },
       },
     });
-    const options = {
-      env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" },
+    const origin = "https://dvm.example.com";
+    const server = await createDVMServer(descriptor, {
+      env: { DVMKIT_PUBLIC_URL: origin },
       store: new MemoryKVStore(),
-      devMode: true,
-    };
-    const guidance = "server has no x402 configuration; pass the x402 option to createDVMServer";
-    await expect(createDVMServer(descriptor, options)).rejects.toThrow(guidance);
-    await expect(createDVMServer(dvm(0), options)).rejects.toThrow(guidance);
+      fxFetcher: createFxFetcher(),
+      // An explicit list must name x402 to offer the channel at all.
+      paymentMethods: ["cashu", "x402"],
+    });
+    try {
+      const job = await server.app.request(`${origin}/v1/job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capability: "echo", data: { text: "hi" } }),
+      });
+      expect(job.status).toBeLessThan(300);
+      expect(await job.json()).toMatchObject({ status: "completed", summary: "echo hi" });
+
+      // A paid attempt is refused the same way: no route here can take it.
+      for (const headers of [{}, { "PAYMENT-SIGNATURE": "e30=" }] as Record<string, string>[]) {
+        const route = await server.app.request(`${origin}/v1/x402/fetch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify({ url: "https://example.com" }),
+        });
+        expect(route.status).toBe(503);
+        expect(route.headers.get("PAYMENT-REQUIRED")).toBeNull();
+        const body = (await route.json()) as { error: string; retryable: boolean; hint: string };
+        expect(body.error).toBe("x402_not_offered");
+        expect(body.retryable).toBe(false);
+        expect(body.hint).toContain("x402 is not configured for this DVM");
+      }
+
+      const info = (await (await server.app.request(`${origin}/v1/info`)).json()) as Record<string, unknown>;
+      expect(info).not.toHaveProperty("x402_capabilities");
+      expect(Object.keys(info.capabilities as object)).toEqual(["echo", "paid"]);
+      expect((info.payment as { methods: string[] }).methods).toEqual(["cashu"]);
+
+      const quote = await server.app.request(`${origin}/v1/quote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capability: "paid", data: { text: "hi" } }),
+      });
+      const quoted = (await quote.json()) as { payment: { methods: string[]; refundable?: Record<string, boolean> } };
+      expect(quoted.payment.methods).toEqual(["cashu"]);
+      expect(quoted.payment.refundable ?? {}).not.toHaveProperty("x402");
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("refuses a descriptor whose own x402 rail was not passed to createDVMServer", async () => {
+    await expect(
+      createDVMServer(dvm(0), { env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" }, store: new MemoryKVStore(), devMode: true })
+    ).rejects.toThrow("DVMConfig.x402 is set, but the server was given no x402 configuration; pass the x402 option to createDVMServer");
+  });
+
+  it("logs one x402_rail_missing warning naming every affected capability, in devMode too", async () => {
+    const descriptor = configureDVM({
+      name: "missing-rail",
+      capabilities: Object.fromEntries(["fetch", "summarize"].map((name) => [name, {
+        channels: { job: false, x402: {} },
+        price: "$0.01",
+        maxRuntimeSeconds: 5,
+        onJob(ctx: { complete(result: string): void }) { ctx.complete("done"); },
+      }])),
+    });
+    await expect(createDVMServer(descriptor, { env: {}, store: new MemoryKVStore(), devMode: true })).resolves.toBeDefined();
+    const lines = vi.mocked(console.warn).mock.calls
+      .map(([line]) => JSON.parse(String(line)) as { event: string; capabilities?: string[] })
+      .filter((line) => line.event === "x402_rail_missing");
+    expect(lines).toEqual([{ event: "x402_rail_missing", level: "warn", capabilities: ["fetch", "summarize"] }]);
+    // The route checks that need a rail stay quiet when there is none.
+    expect(warnedEvents()).not.toContain("x402_route_origin_from_request");
+    expect(warnedEvents()).not.toContain("x402_route_settlement_store_missing");
   });
 
   it("refuses to start when the public origin pushes a listing's challenge past the size limit", async () => {
@@ -187,6 +280,32 @@ describe("x402 route boot checks", () => {
     await expect(host.serve()).rejects.toThrow(
       'capability "fetch" is offered on x402 but paymentMethods (["cashu"]) leaves out "x402"'
     );
+  });
+
+  it("keeps refusing a payment-methods or public-origin contradiction when there is no rail", async () => {
+    const host = createDVMHost({ devMode: true, port: 0, env: {}, paymentMethods: ["cashu"], fx: createFxFetcher() });
+    host.mount(noRailDvm());
+    await expect(host.serve()).rejects.toThrow('paymentMethods (["cashu"]) leaves out "x402"');
+    await expect(createDVMServer(noRailDvm(), { env: {}, store: new MemoryKVStore(), fxFetcher: createFxFetcher() })).rejects.toThrow(
+      /capability "fetch" is offered on x402 but DVMKIT_PUBLIC_URL is unset/
+    );
+    // A server that refuses to start does not also report itself as starting without x402.
+    expect(warnedEvents()).not.toContain("x402_rail_missing");
+  });
+
+  // Turning a rail on later must not make a starting DVM refuse to boot.
+  it("refuses, without a rail, the contradictions a rail would later expose", async () => {
+    const options = { env: { DVMKIT_PUBLIC_URL: "https://dvm.example.com" }, store: new MemoryKVStore(), fxFetcher: createFxFetcher({ currencies: ["usd", "eur"] }) };
+    await expect(createDVMServer(noRailDvm({ currency: "eur" }), options)).rejects.toThrow(
+      /capability "fetch" is offered on x402 but this DVM prices in "eur"/
+    );
+    // 5 s runtime plus the default 10 s facilitator timeout.
+    await expect(
+      createDVMServer(noRailDvm(), { ...options, env: { ...options.env, DVMKIT_X402_RESPONSE_LIMIT_MS: "14999" } })
+    ).rejects.toThrow(/over DVMKIT_X402_RESPONSE_LIMIT_MS \(14999 ms\)/);
+    await expect(
+      createDVMServer(noRailDvm(), { ...options, env: { ...options.env, DVMKIT_X402_RESPONSE_LIMIT_MS: "15000" } })
+    ).resolves.toBeDefined();
   });
 
   it("refuses to start without a valid DVMKIT_PUBLIC_URL, since every payment names it as the resource", async () => {

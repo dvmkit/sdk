@@ -446,6 +446,11 @@ function projectField(
         ))];
     }
   }
+  if (eventName === "x402_rail_missing" && key === "capabilities" && Array.isArray(value)) {
+    return ownDataEntries(value, 64)
+      .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
+      .flatMap(([, name]) => projectCapability(name, authority) ?? []);
+  }
   if (eventName !== undefined && CARD_REFUND_EVENTS.has(eventName)) {
     const projected = projectCardRefundField(key, value);
     if (projected !== undefined) return projected;

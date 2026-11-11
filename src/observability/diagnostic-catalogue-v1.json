@@ -499,6 +499,7 @@
     "x402_facilitator_staleness_ceiling",
     "x402_facilitator_unavailable",
     "x402_network_unsupported",
+    "x402_rail_missing",
     "x402_refund_amount_unreported",
     "x402_repair_channel_state_stale",
     "x402_repair_write_off_restore_failed",
@@ -983,7 +984,8 @@
     "use_alternative_source",
     "wait_for_selector",
     "wait_too_long",
-    "wrong_content_type"
+    "wrong_content_type",
+    "x402_not_offered"
   ],
   "datasets": [
     "platform",
