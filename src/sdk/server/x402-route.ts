@@ -61,18 +61,18 @@ export function assertX402RoutesServable(
   if (!first) return;
   const at = `createDVMServer: capability "${first.name}" is offered on x402`;
   const { x402Config, paymentMethods } = server;
+  if (paymentMethods !== undefined && !paymentMethods.includes("x402")) {
+    throw new Error(
+      `${at} but paymentMethods (${JSON.stringify(paymentMethods)}) leaves out "x402"; ` +
+        'add "x402" to paymentMethods or stop offering the capability on x402'
+    );
+  }
   // A host passes the descriptor's own rail through, so only a direct
   // createDVMServer call can drop it: a wiring mistake, not an account setting.
   if (!x402Config && descriptor.x402) {
     throw new Error(
       `${at} and DVMConfig.x402 is set, but the server was given no x402 configuration; pass the x402 option ` +
         "to createDVMServer, or mount the DVM on createDVMHost, which passes it through"
-    );
-  }
-  if (paymentMethods !== undefined && !paymentMethods.includes("x402")) {
-    throw new Error(
-      `${at} but paymentMethods (${JSON.stringify(paymentMethods)}) leaves out "x402"; ` +
-        'add "x402" to paymentMethods or stop offering the capability on x402'
     );
   }
   // Every payment, and the facilitator's settlement of it, names the route's

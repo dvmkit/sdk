@@ -2,11 +2,12 @@ import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isTestMintUrl } from "../../../lib/mints";
 import { configureDVM } from "../../configure";
-import { isConfiguredX402Settleable } from "../host";
+import { createDVMHost, isConfiguredX402Settleable } from "../host";
 import { MemoryJobStore } from "../memory-job-store";
 import type { MppxServer } from "../mpp-setup";
 import { devModeSkipsPaymentVerification } from "../payment";
 import { resolvePaymentMode } from "../payment-mode";
+import { secp256k1Auth } from "../secp256k1-auth";
 import { serve } from "../serve";
 import { X402FacilitatorHealth, type X402FacilitatorSupport } from "../x402-facilitator-support";
 
@@ -15,6 +16,122 @@ const mpp = { methods: [{ name: "tempo" }], tempoConfiguration: { chainId: 42431
 const dvm = configureDVM({ name: "mode", capability: "test", tag: "test", price: "$0.01", onJob(ctx) { ctx.complete("ok"); } });
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0)) await close(); });
+
+function railRequests() {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (!url.endsWith("/supported") && !url.endsWith("/tempo-observer-health")) {
+      return originalFetch(input, init);
+    }
+    requests.push(url);
+    return Promise.resolve(Response.json({ kinds: [], extensions: [], signers: {} }));
+  });
+  return requests;
+}
+
+describe("excluded host rails", () => {
+  it.each<{ rail: string; env: Record<string, string> }>([
+    { rail: "x402", env: { DVMKIT_X402_PAY_TO: x402.payTo, DVMKIT_X402_NETWORK: "eip155:8453" } },
+    { rail: "Tempo", env: { DVMKIT_TEMPO_RECIPIENT: x402.payTo } },
+    { rail: "malformed x402 and Tempo", env: { DVMKIT_X402_PAY_TO: "invalid", DVMKIT_TEMPO_RECIPIENT: "invalid" } },
+  ])("boots a Cashu-only descriptor without initializing inherited $rail", async ({ env }) => {
+    const requests = railRequests();
+    const descriptor = configureDVM({
+      name: "cashu-only", capability: "test", price: "$0.01", paymentMethods: ["cashu"],
+      auth: secp256k1Auth(), credit: { min: "$0.10", max: "$5.00", allowOneShotStablecoin: true },
+      onJob(ctx) { ctx.complete("ok"); },
+    });
+    const running = await serve(descriptor, {
+      devMode: true, port: 0,
+      env: { ...env, DVMKIT_FAIL_FAST: "true", DVMKIT_PLATFORM_URL: "https://platform.example.com" },
+    });
+    cleanup.unshift(running.close);
+    expect(running.paymentModes[0]?.rails).toMatchObject({
+      x402: { status: "absent" }, tempo: { status: "absent" },
+    });
+    const info = await (await fetch(`${running.url}/v1/info`)).json();
+    expect(info.payment.methods).toEqual(["cashu"]);
+    expect(info).not.toHaveProperty("x402");
+    expect(info).not.toHaveProperty("tempo");
+    expect(info.credit).toMatchObject({ funding: [] });
+    expect(info.credit).not.toHaveProperty("x402");
+    expect(info.credit).not.toHaveProperty("tempo");
+    expect(requests).toEqual([]);
+  });
+
+  it.each([{ paymentMethods: undefined }, { paymentMethods: ["cashu", "x402"] as const }])(
+    "still probes and refuses unusable x402 with paymentMethods $paymentMethods", async ({ paymentMethods }) => {
+      const requests = railRequests();
+      const descriptor = configureDVM({ ...dvm.config, paymentMethods: paymentMethods ? [...paymentMethods] : undefined });
+      await expect(serve(descriptor, {
+        devMode: true, port: 0,
+        env: { DVMKIT_FAIL_FAST: "true", DVMKIT_X402_PAY_TO: x402.payTo, DVMKIT_X402_NETWORK: "eip155:8453" },
+      })).rejects.toThrow(/eip155:8453.*has no settleable kind/);
+      expect(requests).toEqual(["https://x402.org/facilitator/supported"]);
+    }
+  );
+
+  it.each([{ paymentMethods: undefined }, { paymentMethods: ["cashu", "tempo"] as const }])(
+    "still validates inherited Tempo with paymentMethods $paymentMethods", async ({ paymentMethods }) => {
+      const descriptor = configureDVM({ ...dvm.config, paymentMethods: paymentMethods ? [...paymentMethods] : undefined });
+      await expect(serve(descriptor, {
+        devMode: true, port: 0,
+        env: { DVMKIT_FAIL_FAST: "true", DVMKIT_TEMPO_RECIPIENT: x402.payTo },
+      })).rejects.toThrow("Tempo requires DVMKIT_TEMPO_SECRET_KEY");
+    }
+  );
+
+  it("keeps shared rails available to an eligible mount without wiring them into an excluded mount", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "https://x402.org/facilitator/supported") {
+        requests.push(url);
+        return Promise.resolve(Response.json({ kinds: [{ x402Version: 2, scheme: "exact", network: "eip155:84532" }], extensions: [], signers: {} }));
+      }
+      return originalFetch(input, init);
+    });
+    const host = createDVMHost({
+      devMode: true, port: 0,
+      env: { DVMKIT_FAIL_FAST: "true", DVMKIT_X402_PAY_TO: x402.payTo,
+        DVMKIT_X402_NETWORK: "eip155:84532", DVMKIT_TEMPO_RECIPIENT: x402.payTo,
+        DVMKIT_TEMPO_SECRET_KEY: "11".repeat(32) },
+    });
+    host.mount(configureDVM({ ...dvm.config, name: "excluded", paymentMethods: ["cashu"], x402: { ...x402, facilitator: "https://excluded.example.com" } }), { prefix: "/excluded" });
+    host.mount(configureDVM({ ...dvm.config, name: "included", paymentMethods: ["x402", "tempo"] }), { prefix: "/included" });
+    const running = await host.serve();
+    cleanup.unshift(running.close);
+    expect(running.paymentModes.map((mode) => [mode.rails.x402.status, mode.rails.tempo.status])).toEqual([
+      ["absent", "absent"], ["verifying", "verifying"],
+    ]);
+    const excluded = await (await fetch(`${running.url}/excluded/v1/info`)).json();
+    const included = await (await fetch(`${running.url}/included/v1/info`)).json();
+    expect(excluded.payment.methods).toEqual(["cashu"]);
+    expect(included.payment.methods).toEqual(["x402", "tempo"]);
+    expect(included).toHaveProperty("x402.pay_to", x402.payTo);
+    expect(included).toHaveProperty("tempo.recipient", x402.payTo);
+    expect(requests).toEqual(["https://x402.org/facilitator/supported"]);
+  });
+
+  it("uses the host payment-method override when deciding whether to initialize a rail", async () => {
+    const requests = railRequests();
+    const running = await serve(configureDVM({ ...dvm.config, paymentMethods: ["x402", "tempo"] }), {
+      devMode: true, port: 0, paymentMethods: ["cashu"],
+      env: { DVMKIT_FAIL_FAST: "true", DVMKIT_X402_PAY_TO: "invalid", DVMKIT_TEMPO_RECIPIENT: "invalid" },
+    });
+    cleanup.unshift(running.close);
+    expect(running.paymentModes[0]?.rails).toMatchObject({ x402: { status: "absent" }, tempo: { status: "absent" } });
+    expect(requests).toEqual([]);
+    await expect(serve(configureDVM({ ...dvm.config, paymentMethods: ["cashu"] }), {
+      devMode: true, port: 0, paymentMethods: ["x402"],
+      env: { DVMKIT_FAIL_FAST: "true", DVMKIT_X402_PAY_TO: x402.payTo, DVMKIT_X402_NETWORK: "eip155:8453" },
+    })).rejects.toThrow(/has no settleable kind/);
+    expect(requests).toEqual(["https://x402.org/facilitator/supported"]);
+  });
+});
 
 describe("effective payment mode", () => {
   it("skips only absent rails, preserving empty-mints semantics in both call paths", () => {
