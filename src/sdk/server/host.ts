@@ -491,9 +491,18 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     // paid calls at `mint_health_pending` until its first probe lands. Nothing
     // to await here; the port binds without waiting on the mint probe.
 
+    const mountAllowsRail = (entry: MountEntry, rail: PaymentMethod): boolean => {
+      const methods = opts.paymentMethods ?? entry.descriptor.paymentMethods;
+      return methods === undefined || methods.includes(rail);
+    };
+    const needsHostX402 = mounts.some((entry) => mountAllowsRail(entry, "x402") && !entry.descriptor.x402);
+    const needsHostMpp = mounts.some((entry) => mountAllowsRail(entry, "tempo") && !entry.descriptor.mpp);
+    const tempoEnabled = mounts.some((entry) => mountAllowsRail(entry, "tempo"));
+
     // Host options take precedence over environment defaults. Each mount
     // prefers its descriptor's x402 configuration over this host fallback.
-    const rawX402Base = opts.x402 ?? buildX402FromEnv(envMaybe);
+    // Inherited settings are irrelevant when no mount can use the fallback.
+    const rawX402Base = needsHostX402 ? opts.x402 ?? buildX402FromEnv(envMaybe) : undefined;
     const x402Base = rawX402Base ? normalizeX402Config(rawX402Base) : undefined;
     // Dual-serve is a default-true opt-out: unset (or anything but "false")
     // ⇒ enabled. `envFlag` only matches "1"/"true", so it can't express a
@@ -506,7 +515,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         }
       : undefined;
     const x402HealthCache = new Map<string, X402FacilitatorHealth>();
-    let bootX402 = x402WithDualServe;
+    let bootX402: X402Config | undefined;
     let bootX402Support: X402FacilitatorSupport | undefined;
 
     const x402Health = (config: X402Config): X402FacilitatorHealth => {
@@ -538,7 +547,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     // observer is watching. Undefined when self-hosted — a self-hosted builder
     // runs their own observer and wake path, so nothing here withholds their
     // session offers.
-    const tempoObserverHealth = createPlatformTempoObserverHealth(envMaybe);
+    const tempoObserverHealth = tempoEnabled ? createPlatformTempoObserverHealth(envMaybe) : undefined;
     // Prime it off the request path. Every surface that reads it also awaits
     // `ensureFresh()`, so this is an optimization rather than the guarantee —
     // it keeps the probe out of the first request when boot has any slack, and
@@ -557,11 +566,11 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     let stripeCredit = opts.stripeCredit;
     const stripeCreditConfig = stripeCredit ? undefined : stripeCreditConfigFromEnv(envMaybe);
 
-    let mpp = opts.mpp;
+    let mpp = needsHostMpp ? opts.mpp : undefined;
     let mppSecretState: MppSecretState | null = null;
     // An injected handle owns whatever stores its own methods were built with.
     let tempoChargeBackend: StoreBackend = "user-supplied";
-    const mppTempoRecipient = envMaybe.DVMKIT_TEMPO_RECIPIENT;
+    const mppTempoRecipient = needsHostMpp ? envMaybe.DVMKIT_TEMPO_RECIPIENT : undefined;
     if (!mpp && mppTempoRecipient) {
       const { createMppFromOpts, createDualKeyMppxFromOpts, parseMppMethodsAllowlist } =
         await import("./mpp-setup");
@@ -588,7 +597,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         pgPool &&
         receiptKey &&
         tempoOperatorKey &&
-        mounts.some((entry) => !!entry.descriptor.credit && !!entry.descriptor.auth)
+        mounts.some((entry) => mountAllowsRail(entry, "tempo") && !entry.descriptor.mpp &&
+          !!entry.descriptor.credit && !!entry.descriptor.auth)
       ) {
         const [
           { PostgresTempoSessionStore },
@@ -942,7 +952,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       }
     };
 
-    const mppActive = mounts.some((e) => (e.descriptor.mpp ?? mpp) !== undefined);
+    const mppActive = mounts.some((entry) => mountAllowsRail(entry, "tempo") &&
+      (entry.descriptor.mpp ?? mpp) !== undefined);
     const adminActive = !!cashuOpts.db && !!cashuOpts.dvmId && !!cashuOpts.lockPubkey;
     const consumedBackend: StoreBackend = opts.consumedCredentialStore
       ? "user-supplied"
@@ -996,20 +1007,24 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
 
     for (const entry of mounts) {
       const descriptor = entry.descriptor;
-      // Resolve per-descriptor x402 (descriptor.x402 if set, else host-level)
-      const descX402 = descriptor.x402 ? normalizeX402Config(descriptor.x402) : x402WithDualServe;
+      const paymentMethods = opts.paymentMethods ?? descriptor.paymentMethods;
+      const descX402 = mountAllowsRail(entry, "x402")
+        ? descriptor.x402 ? normalizeX402Config(descriptor.x402) : x402WithDualServe
+        : undefined;
       const descX402WithDualServe = descX402
         ? {
             ...descX402,
             dualServe: dualServeEnabled ? (descX402.dualServe ?? true) : false,
           }
         : undefined;
-      if (!bootX402 && descX402WithDualServe) bootX402 = descX402WithDualServe;
       const descX402Health = descX402WithDualServe ? x402Health(descX402WithDualServe) : undefined;
       await descX402Health?.refresh();
       const descX402Support = descX402Health?.support();
-      if (!bootX402Support && descX402Support) bootX402Support = descX402Support;
-      const descMpp = descriptor.mpp ?? mpp;
+      if (!bootX402 && descX402WithDualServe) {
+        bootX402 = descX402WithDualServe;
+        bootX402Support = descX402Support;
+      }
+      const descMpp = mountAllowsRail(entry, "tempo") ? descriptor.mpp ?? mpp : undefined;
       const x402Settleable = isConfiguredX402Settleable(
         descX402Support,
         descX402WithDualServe
@@ -1022,7 +1037,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       const paymentMode = resolvePaymentMode({
         mount: descriptor.name, devMode: opts.devMode, mints: effectiveMints,
         x402: descX402WithDualServe, mpp: descMpp,
-        paymentMethods: opts.paymentMethods ?? descriptor.paymentMethods,
+        paymentMethods,
         cashuReady: !!cashuOpts.lockPubkey && !!(cashuOpts.db || disposableCashu) && !!effectiveMints?.length,
         x402Available: x402Settleable,
         durable: !!pgPool,
@@ -1046,7 +1061,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         devMode: opts.devMode,
         onPaidJobCompleted: opts.onPaidJobCompleted,
         paymentMode,
-        paymentMethods: opts.paymentMethods ?? descriptor.paymentMethods,
+        paymentMethods,
         x402: descX402WithDualServe,
         x402FacilitatorHealth: descX402Health,
         mpp: descMpp,
@@ -1062,8 +1077,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         hostingControl,
         hostingCleanupSingleMount: mounts.length === 1,
         hostingCleanupKnownRailStores: !mpp || tempoChargeBackend === "postgres",
-        hostingTempoSessionStore: tempoSessionStore,
-        hostingTempoChargeStore: tempoChargeStore,
+        hostingTempoSessionStore: descMpp ? tempoSessionStore : undefined,
+        hostingTempoChargeStore: descMpp ? tempoChargeStore : undefined,
         dvmId: cashuOpts.dvmId,
         failFast,
         mintHealthTracker: opts.mintHealthTracker,
@@ -1077,17 +1092,17 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         creditLedger,
         processedPayments,
         lightningReceive,
-        tempoObserverHealth,
-        tempoSettlementReadiness,
+        tempoObserverHealth: descMpp ? tempoObserverHealth : undefined,
+        tempoSettlementReadiness: descMpp ? tempoSettlementReadiness : undefined,
         onJobRetentionSweepFailed: opts.onJobRetentionSweepFailed,
         onJobRetentionSweepRecovered: opts.onJobRetentionSweepRecovered,
       });
       entry.shutdown = shutdown;
       // Tempo state is host-level — one session store, one recipient — so its
       // payouts and its pending pool are attributed to the first mounted DVM
-      // and reported once: a second mount's reporter would book the same
+      // accepting Tempo and reported once: a second mount's reporter would book the same
       // settlement again under its own id and count the same pool twice.
-      if (payoutReporter && !tempoPayoutOwner) {
+      if (payoutReporter && !tempoPayoutOwner && descMpp) {
         tempoPayoutOwner = payoutReporter;
         const ledger = creditLedger;
         payoutReporter.attachTempo({
