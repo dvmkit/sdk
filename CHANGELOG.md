@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Behavior changes
-
-- A server whose environment has no `DVMKIT_X402_PAY_TO` now starts without an x402 rail even when `DVMKIT_X402_BATCH_SETTLEMENT=true` and the rest of the batch-settlement settings are present; it used to refuse to start with `DVMKIT_X402_BATCH_SETTLEMENT requires DVMKIT_X402_PAY_TO.` A hosted platform turns x402 off by removing only the payout address, so the stored settings, private keys included, no longer stop the DVM. The server logs one `x402_env_ignored` warning naming the x402 variables it ignored, never their values, and behaves as any server without a rail: x402 capabilities answer 503 `x402_not_offered` after the `x402_rail_missing` warning, and `/v1/job` serves as usual. A present but malformed `DVMKIT_X402_PAY_TO` still refuses to start, as does a contradictory bundle such as `DVMKIT_X402_SELF_RELAY_KEY` without `DVMKIT_X402_BATCH_SETTLEMENT=true`.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -19,6 +15,22 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Breaking changes
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
+
+## [0.35.1](https://github.com/dvmkit/sdk/compare/v0.35.0...v0.35.1) (2026-11-11)
+
+
+### Behavior changes
+
+- A server whose environment has no `DVMKIT_X402_PAY_TO` now starts without an x402 rail even when `DVMKIT_X402_BATCH_SETTLEMENT=true` and the rest of the batch-settlement settings are present; it used to refuse to start with `DVMKIT_X402_BATCH_SETTLEMENT requires DVMKIT_X402_PAY_TO.` A hosted platform turns x402 off by removing only the payout address, so the stored settings, private keys included, no longer stop the DVM. The server logs one `x402_env_ignored` warning naming the x402 variables it ignored, never their values, and behaves as any server without a rail: x402 capabilities answer 503 `x402_not_offered` after the `x402_rail_missing` warning, and `/v1/job` serves as usual. A present but malformed `DVMKIT_X402_PAY_TO` still refuses to start, as does a contradictory bundle such as `DVMKIT_X402_SELF_RELAY_KEY` without `DVMKIT_X402_BATCH_SETTLEMENT=true`.
+
+### Bug Fixes
+
+* **server:** start without x402 when the payout address is missing ([#153](https://github.com/dvmkit/sdk/issues/153)) ([b81d46d](https://github.com/dvmkit/sdk/commit/b81d46dbd426fb0d2a49f76c0e45f1066f2be364))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.35.0 ([#155](https://github.com/dvmkit/sdk/issues/155)) ([5d043ed](https://github.com/dvmkit/sdk/commit/5d043edeaf7b83523f411abbe54161c1e41be4e5))
 
 ## [0.35.0](https://github.com/dvmkit/sdk/compare/v0.34.0...v0.35.0) (2026-11-11)
 
