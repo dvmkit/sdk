@@ -26,6 +26,7 @@ import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
 import { CreditLedger } from "../credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
+import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "../x402-channel-store";
 import type { X402FacilitatorHealthLike } from "../x402-facilitator-support";
@@ -225,8 +226,125 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     expect(await storage.isSettlePending(scope)).toBe(false);
   });
 
+  async function shutdownFixture(
+    saltByte: string, timeoutMs = "3000", owner = storage, maxClaimsPerBatch?: number,
+  ) {
+    const row = channel();
+    row.channelConfig.salt = `0x${saltByte.repeat(32)}`;
+    row.channelId = computeChannelId(row.channelConfig, NETWORK).toLowerCase();
+    row.chargedCumulativeAmount = "100";
+    row.signedMaxClaimable = "100";
+    await owner.updateChannel(row.channelId, () => row);
+    const facilitator: FacilitatorClient = {
+      verify: vi.fn(),
+      getSupported: vi.fn(async () => ({
+        kinds: [{ x402Version: 2, scheme: "batch-settlement", network: NETWORK,
+          extra: { receiverAuthorizer: row.channelConfig.receiverAuthorizer } }],
+        extensions: [], signers: {},
+      })),
+      settle: vi.fn(async () => ({ success: true, transaction: "0xclaim", network: NETWORK })),
+    };
+    const earnedChannelIds = new Set([row.channelId]);
+    const server = await x402ShutdownClaimEnvironment.run({ DVMKIT_X402_SHUTDOWN_CLAIM_MS: timeoutMs }, () => createX402BatchSettlementServer({
+      network: NETWORK, payTo: row.channelConfig.receiver, channelStorage: owner,
+      earnedNative: (id) => Promise.resolve(earnedChannelIds.has(id.toLowerCase()) ? 40 : 0),
+      config: {
+        facilitatorClient: facilitator,
+        autoSettlement: maxClaimsPerBatch === undefined ? false : {
+          maxClaimsPerBatch, claimIntervalSecs: 3600, settleIntervalSecs: 3600,
+        },
+      },
+    }));
+    const scope = `${NETWORK}|${row.channelConfig.receiver.toLowerCase()}|${row.channelConfig.token.toLowerCase()}`;
+    await owner.setSettlePending(scope, false);
+    return { server, facilitator, scope, channelId: row.channelId, row, earnedChannelIds };
+  }
+
+  it("persists a shutdown claim's earned cap and settle marker for the next process", async () => {
+    const { server, facilitator, scope, channelId } = await shutdownFixture("61");
+    const observer = new PostgresX402ChannelStorage(pool);
+    try {
+      await server.stop();
+      expect(await observer.get(channelId)).toMatchObject({ chargedCumulativeAmount: "100", totalClaimed: "40" });
+      expect(await observer.isSettlePending(scope)).toBe(true);
+      expect(facilitator.settle).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(facilitator.settle).mock.calls[0][0].payload.type).toBe("claim");
+      await server.stop();
+      expect(facilitator.settle).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+      await observer.close();
+    }
+  });
+
+  it("skips shutdown claiming while another fleet machine owns the lock and reports the earnings", async () => {
+    const { server, facilitator } = await shutdownFixture("62");
+    const sibling = new PostgresX402ChannelStorage(pool);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let release!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const held = sibling.withFleetSettlementLock(async () => {
+      started();
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    try {
+      await entered;
+      await server.stop();
+      expect(facilitator.settle).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({
+        event: "x402_shutdown_claim_incomplete", level: "warn", reason: "lock_unavailable", timeout_ms: 3000,
+        unclaimed_channels: 1, unclaimed_amount_native: "40",
+      }));
+    } finally {
+      release();
+      await held;
+      await server.stop();
+      await sibling.close();
+    }
+  });
+
+  it("releases the fleet session after a slow shutdown claim so the shared pool can close", async () => {
+    const ownedPool = new pg.Pool({ connectionString: DATABASE_URL, options: `-c search_path=${SCHEMA}`, max: 2 });
+    const ownedStorage = new PostgresX402ChannelStorage(ownedPool);
+    const { server, facilitator, scope } = await shutdownFixture("63", "500", ownedStorage);
+    vi.mocked(facilitator.settle).mockImplementation(() => new Promise(() => undefined));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await server.stop();
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({
+        event: "x402_shutdown_claim_incomplete", level: "warn", reason: "timeout", timeout_ms: 500,
+        unclaimed_channels: 1, unclaimed_amount_native: "40",
+      }));
+      await expect(storage.withFleetSettlementLock(async () => undefined)).resolves.toBe(true);
+      expect(await storage.isSettlePending(scope)).toBe(false);
+    } finally {
+      await server.stop();
+      await ownedStorage.close();
+      await ownedPool.end();
+    }
+  });
+
+  it("keeps the marker and excludes landed earnings when a later shutdown batch fails", async () => {
+    const { server, facilitator, scope, row, earnedChannelIds } = await shutdownFixture("64", "3000", storage, 1);
+    const next = { ...row, channelConfig: { ...row.channelConfig, salt: `0x${"65".repeat(32)}` as const } };
+    next.channelId = computeChannelId(next.channelConfig, NETWORK).toLowerCase();
+    earnedChannelIds.add(next.channelId);
+    await storage.updateChannel(next.channelId, () => next);
+    vi.mocked(facilitator.settle).mockResolvedValueOnce({ success: true, transaction: "0xclaim", network: NETWORK })
+      .mockResolvedValueOnce({ success: false, errorReason: "rejected", transaction: "", network: NETWORK });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await server.stop();
+    expect(await storage.isSettlePending(scope)).toBe(true);
+    expect(facilitator.settle).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({
+      event: "x402_shutdown_claim_incomplete", level: "warn", reason: "failed", timeout_ms: 3000,
+      unclaimed_channels: 1, unclaimed_amount_native: "40",
+    }));
+  });
+
   /**
-   * The withdraw race claims outside the scheduler, so it is the one claim on a
+   * The withdraw race claims outside the scheduler, so it is a claim on a
    * Postgres fleet that no later job knows about. Without the marker its funds
    * sit in the contract until an unrelated channel happens to claim.
    */

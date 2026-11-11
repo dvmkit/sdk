@@ -523,6 +523,7 @@
     "x402_settlement_reconciliation_facilitator_unavailable",
     "x402_settlement_submission_failed",
     "x402_settlement_written_off",
+    "x402_shutdown_claim_incomplete",
     "card_charge_journal_failed",
     "card_charge_stranded_refunded",
     "card_charge_unsettled",

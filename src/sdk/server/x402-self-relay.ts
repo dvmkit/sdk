@@ -15,6 +15,7 @@ import type {
   X402SelfRelayRpcHealthObservation,
 } from "../../lib/x402/types";
 import { type X402RelaySubmissionLock, X402RelaySubmissionLockError } from "./x402-channel-store";
+import { waitForX402ShutdownClaim, x402ShutdownClaimSignal } from "./x402-shutdown-claim";
 
 /** Default reserve floor: 0.001 ETH, ample runway at Base's normal fees. */
 export const X402_SELF_RELAY_DEFAULT_LOW_BALANCE_WEI = 1_000_000_000_000_000n;
@@ -69,7 +70,15 @@ export function createX402SelfRelay(opts: CreateX402SelfRelayOpts): X402SelfRela
   }
   const chain = relayChain(opts.network);
   const account = privateKeyToAccount(opts.config.privateKey);
-  const transport = http(opts.config.rpcUrl);
+  const transport = http(opts.config.rpcUrl, {
+    fetchFn: (input, init) => {
+      const signal = x402ShutdownClaimSignal.getStore();
+      return fetch(input, signal ? {
+        ...init,
+        signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal,
+      } : init);
+    },
+  });
   const publicClient = createPublicClient({ chain, transport });
   const walletClient = createWalletClient({ account, chain, transport });
   const observeRpcFailure = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -229,11 +238,12 @@ function createSubmissionLock(
     tail = new Promise<void>((resolve) => {
       releaseLocal = resolve;
     });
-    await prior;
     try {
-      if (!lock) return await operation();
+      await waitForX402ShutdownClaim(() => prior);
+      const submit = () => waitForX402ShutdownClaim(operation);
+      if (!lock) return await submit();
       if (lastRefusal && lastRefusal !== refusalAtEntry) throw lastRefusal;
-      return await lock.withRelaySubmissionLock(key, operation);
+      return await lock.withRelaySubmissionLock(key, submit);
     } catch (error) {
       // Identity, not `instanceof`: an inherited refusal is the same object, and
       // one wedge must produce one log line rather than one per queued caller.

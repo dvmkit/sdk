@@ -62,6 +62,12 @@ import {
   type X402SettlementWriteOff,
   withBatchSettlementResource,
 } from "./x402-channel-store";
+import {
+  waitForX402ShutdownClaim,
+  withX402ShutdownClaimBudget,
+  x402ShutdownClaimEnvironment,
+  x402ShutdownClaimSignal,
+} from "./x402-shutdown-claim";
 import { createX402SelfRelay } from "./x402-self-relay";
 import {
   createX402SettlementEvidenceReader,
@@ -486,6 +492,12 @@ function hostedSettlementFacilitator(
 export async function createX402BatchSettlementServer(
   opts: CreateX402BatchSettlementServerOpts
 ): Promise<X402BatchSettlementServer> {
+  const rawShutdownClaimMs = (x402ShutdownClaimEnvironment.getStore() ?? process.env).DVMKIT_X402_SHUTDOWN_CLAIM_MS;
+  const shutdownClaimMs = rawShutdownClaimMs === undefined ? 3_000 : Number(rawShutdownClaimMs);
+  if (!/^[1-9]\d*$/.test(rawShutdownClaimMs ?? "3000") ||
+      !Number.isSafeInteger(shutdownClaimMs) || shutdownClaimMs > 2_147_483_647) {
+    throw new Error("DVMKIT_X402_SHUTDOWN_CLAIM_MS must be a positive integer number of milliseconds, at most 2147483647");
+  }
   const selfRelayEnabled = !!opts.config.selfRelay;
   if (selfRelayEnabled && opts.network !== X402_BATCH_SETTLEMENT_MAINNET_NETWORK) {
     throw new Error(`x402 selfRelay is Base mainnet-only; got ${opts.network}`);
@@ -551,6 +563,7 @@ export async function createX402BatchSettlementServer(
     }
     storage = new InMemoryChannelStorage();
   }
+  storage = withX402ShutdownClaimBudget(storage);
   if (postgres && opts.hostedObligations) {
     opts.hostedObligations.attachX402SettlementStore(postgres);
   }
@@ -602,9 +615,26 @@ export async function createX402BatchSettlementServer(
     opts.supportedResponse && !selfRelayEnabled
       ? withCachedSupportedResponse(rawFacilitator, opts.supportedResponse)
       : rawFacilitator;
-  const settlementFacilitator = opts.hostedObligations
+  const accountingFacilitator = opts.hostedObligations
     ? hostedSettlementFacilitator(facilitator, opts.hostedObligations, opts.network)
     : facilitator;
+  let remaining: Map<string, bigint> | undefined;
+  // Mark each landed batch, even if a later batch fails or misses shutdown's deadline.
+  const settlementFacilitator = withX402ShutdownClaimBudget({
+    verify: accountingFacilitator.verify.bind(accountingFacilitator),
+    getSupported: accountingFacilitator.getSupported.bind(accountingFacilitator),
+    async settle(payload: PaymentPayload, requirements: PaymentRequirements) {
+      const response = await waitForX402ShutdownClaim(() => accountingFacilitator.settle(payload, requirements));
+      if (x402ShutdownClaimSignal.getStore() && response.success && payload.payload.type === "claim") {
+        const claims = payload.payload.claims as { voucher: { channel: Channel["channelConfig"] } }[];
+        for (const claim of claims) {
+          remaining?.delete(computeChannelId(claim.voucher.channel, opts.network as `${string}:${string}`).toLowerCase());
+        }
+        await marker?.write(true);
+      }
+      return response;
+    },
+  });
   const rpcUrl = opts.rpcUrl ?? opts.config.rpcUrl;
   const settlementEvidence =
     opts.settlementEvidenceReader ??
@@ -651,7 +681,7 @@ export async function createX402BatchSettlementServer(
     ...X402_BATCH_AUTO_SETTLEMENT,
     ...(opts.config.autoSettlement === false ? {} : opts.config.autoSettlement),
     // Every claim this fleet builds is capped at earned draws — the claim
-    // timer, `claimAndSettle()`, and the withdraw-race rush claim all route
+    // timer, `claimAndSettle()`, withdraw-race rush and shutdown claim all route
     // through this selector. A builder-supplied
     // `autoSettlement.selectClaimChannels` cannot override it: the ceiling is
     // a money invariant, not a policy knob. Upstream's refund job builds its
@@ -671,7 +701,7 @@ export async function createX402BatchSettlementServer(
     : undefined;
   // the payout tracker sees every claim and settle whichever path
   // runs them — the scheduler, `claimAndSettle()`, the withdraw-race rush
-  // claim — because all three go through `tracked`. It answers the pending
+  // claim, and shutdown — because every path goes through `tracked`. It answers the pending
   // snapshot from this scope, so it is attached before any of them can run.
   opts.payout?.attach({
     scope: settleScope,
@@ -725,6 +755,7 @@ export async function createX402BatchSettlementServer(
     return requirements as PaymentRequirementsV2[];
   };
 
+  let stopPromise: Promise<void> | undefined;
   selfRelay?.start();
   return {
     buildRequirements,
@@ -1253,18 +1284,68 @@ export async function createX402BatchSettlementServer(
       if (postgres) await postgres.withFleetSettlementLock(operation, true);
       else await operation();
     },
-    async stop(): Promise<void> {
-      selfRelay?.stop();
-      scheduler?.stop();
-      await manager.stop();
-      // Idempotent, and deliberately unconditional: an adopted store
-      // is torn down by the same `createDVMServer` shutdown that
-      // stops this server, so closing it from either side is correct and
-      // closing it from both is a no-op the second time.
-      await postgres?.close();
-      // Only when it is a store of our own: `postgres` is closed above, and a
-      // builder-supplied storage was never ours to close.
-      if (relayLockOwner !== postgres) await relayLockOwner?.close();
+    stop(): Promise<void> {
+      return (stopPromise ??= (async () => {
+        selfRelay?.stop();
+        scheduler?.stop();
+        // In-memory development uses upstream's timers rather than the fleet scheduler.
+        if (!scheduler) await manager.stop();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(new Error("x402 shutdown claim deadline")), shutdownClaimMs);
+        let reason: "timeout" | "failed" | "lock_unavailable" | undefined;
+        try {
+          await x402ShutdownClaimSignal.run(controller.signal, () => waitForX402ShutdownClaim(async () => {
+            const selectRemaining: ClaimChannelSelector = async (channels, context) => {
+              const selected = await claimCeiling(channels, context);
+              remaining = new Map(selected.map((channel) => [
+                channel.channelId.toLowerCase(),
+                BigInt(channel.chargedCumulativeAmount) - BigInt(channel.totalClaimed),
+              ]));
+              return selected;
+            };
+            const claim = async () => {
+              const claims = await tracked.claim({
+                maxClaimsPerBatch: settlementConfig.maxClaimsPerBatch ?? 100,
+                selectClaimChannels: selectRemaining,
+              });
+              if (claims.length > 0) await marker?.write(true);
+            };
+            if (postgres) {
+              // A sibling already claiming wins; do not queue shutdown behind it.
+              if (!(await postgres.withFleetSettlementLock(claim))) {
+                reason = "lock_unavailable";
+                await selectRemaining(await storage.list(), {
+                  now: Date.now(), lastClaimTime: 0, lastSettleTime: 0, pendingSettle: false,
+                });
+              }
+            } else await claim();
+          }));
+        } catch {
+          reason = controller.signal.aborted ? "timeout" : "failed";
+        } finally {
+          clearTimeout(timer);
+        }
+        if (reason) {
+          diagnosticConsole.warn({
+            event: "x402_shutdown_claim_incomplete",
+            reason,
+            timeout_ms: shutdownClaimMs,
+            unclaimed_channels: remaining?.size ?? null,
+            unclaimed_amount_native: remaining
+              ? [...remaining.values()].reduce((total, amount) => total + amount, 0n).toString()
+              : null,
+          });
+        }
+        if (scheduler) await manager.stop();
+        // Idempotent, and deliberately unconditional: an adopted store
+        // is torn down by the same `createDVMServer` shutdown that
+        // stops this server, so closing it from either side is correct and
+        // closing it from both is a no-op the second time.
+        await postgres?.close();
+        // Only when it is a store of our own: `postgres` is closed above, and a
+        // builder-supplied storage was never ours to close.
+        if (relayLockOwner !== postgres) await relayLockOwner?.close();
+      })());
     },
   };
 }
