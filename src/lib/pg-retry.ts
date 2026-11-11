@@ -24,9 +24,165 @@ export function withPostgresRecoveryContext<value>(
 
 const checkoutCancellation = new AsyncLocalStorage<AbortSignal>();
 
-/** Include the checkout health probe in a caller's cancellation scope. */
-export function withPostgresCheckoutCancellation<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+/** Include connection establishment and the health probe in a caller's cancellation scope. */
+export function withPostgresCheckoutCancellation<T>(
+  signal: AbortSignal,
+  operation: () => Promise<T>,
+  pool?: Pick<Pool, "connect">
+): Promise<T> {
+  if (pool) installCheckoutCancellation(pool);
   return checkoutCancellation.run(signal, operation);
+}
+
+type CheckoutCallback = (error: Error | undefined, client?: PoolClient, release?: PoolClient["release"]) => void;
+type PendingCheckout = { callback: CheckoutCallback; timedOut?: boolean };
+type ConnectingClient = Omit<PoolClient, "connect"> & {
+  connect(callback: (error?: Error) => void): void;
+  end(callback?: () => void): void;
+  connection?: { stream: { destroy(): void } };
+};
+type CancellablePool = Pool & {
+  Client: new (...args: unknown[]) => ConnectingClient;
+  newClient(pending: PendingCheckout): void;
+  _pendingQueue: PendingCheckout[];
+  _remove(client: ConnectingClient, callback: () => void): void;
+  _pulseQueue(): void;
+};
+type CheckoutTicket = {
+  signal: AbortSignal | undefined;
+  settled: boolean;
+  pending?: PendingCheckout;
+  cancel?: (error: Error) => void;
+};
+const cancellablePools = new WeakSet<object>();
+
+/**
+ * pg retains connecting clients in its pool before a lease exists. Its native
+ * queue/newClient boundary identifies which checkout owns a handshake; ambient
+ * async context alone can accidentally adopt an unrelated queued checkout when
+ * a failed connection pulses the queue. Keep that ownership until checkout,
+ * including pg's optional asynchronous onConnect hook.
+ */
+function installCheckoutCancellation(candidate: Pick<Pool, "connect">): void {
+  if (cancellablePools.has(candidate)) return;
+  const pool = candidate as CancellablePool;
+  if (typeof pool.Client !== "function" || typeof pool.newClient !== "function" ||
+      !Array.isArray(pool._pendingQueue) || typeof pool._remove !== "function" || typeof pool._pulseQueue !== "function") return;
+  cancellablePools.add(pool);
+  const queued = new WeakMap<PendingCheckout, CheckoutTicket>();
+  let entering: CheckoutTicket | undefined;
+  let constructing: ((client: ConnectingClient) => void) | undefined;
+  pool.Client = new Proxy(pool.Client, {
+    construct(target, args, newTarget) {
+      const client = Reflect.construct(target, args, newTarget) as ConnectingClient;
+      constructing?.(client);
+      return client;
+    },
+  });
+  const newClient = pool.newClient.bind(pool);
+  pool.newClient = (pending) => {
+    const ticket = queued.get(pending) ?? entering;
+    if (!ticket?.signal) {
+      const previous = constructing;
+      constructing = undefined;
+      try { newClient(pending); } finally { constructing = previous; }
+      return;
+    }
+    const signal = ticket.signal;
+    if (ticket.settled || signal.aborted) {
+      pending.callback(asError(signal.reason));
+      queueMicrotask(() => pool._pulseQueue());
+      return;
+    }
+    let client: ConnectingClient | undefined;
+    let rejectHandshake: ((error: Error) => boolean) | undefined;
+    let cancelled = false;
+    ticket.cancel = (error) => {
+      if (cancelled) return;
+      cancelled = true;
+      pending.timedOut = true;
+      // Run pg's handshake callback once to clear its native connection timer
+      // and registry entry, then destroy TCP/TLS rather than graceful end().
+      const connecting = rejectHandshake?.(error);
+      if (client) {
+        if (client.connection) client.connection.stream.destroy();
+        else client.end();
+        if (!connecting) pool._remove(client, () => pool._pulseQueue());
+      }
+      pending.callback(error);
+    };
+    const previous = constructing;
+    constructing = (created) => {
+      client = created;
+      const connect = client.connect.bind(client);
+      client.connect = (callback) => {
+        let called = false;
+        const complete = (error?: Error): boolean => {
+          if (called) return false;
+          called = true;
+          callback(error);
+          return true;
+        };
+        rejectHandshake = complete;
+        if (signal.aborted) ticket.cancel?.(asError(signal.reason));
+        else connect(complete);
+      };
+    };
+    try { newClient(pending); } finally { constructing = previous; }
+  };
+  const connect = pool.connect.bind(pool);
+  pool.connect = ((callback?: CheckoutCallback) => {
+    const signal = checkoutCancellation.getStore();
+    const ticket: CheckoutTicket = { signal, settled: false };
+    const pending = new Promise<PoolClient>((resolve, reject) => {
+      const complete: CheckoutCallback = (error, client) => {
+        if (ticket.settled) return;
+        ticket.settled = true;
+        signal?.removeEventListener("abort", abort);
+        if (error) {
+          ticket.cancel?.(error);
+          reject(error);
+        } else {
+          ticket.cancel = undefined;
+          resolve(client!);
+        }
+      };
+      const abort = () => {
+        if (ticket.settled) return;
+        const error = asError(signal?.reason);
+        if (ticket.cancel) ticket.cancel(error);
+        else {
+          const item = ticket.pending;
+          if (item) {
+            const index = pool._pendingQueue.indexOf(item);
+            if (index !== -1) pool._pendingQueue.splice(index, 1);
+            item.timedOut = true;
+            item.callback(error);
+            pool._pulseQueue();
+          } else complete(error);
+        }
+      };
+      if (signal?.aborted) { complete(asError(signal.reason)); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      const previous = entering;
+      const before = new Set(pool._pendingQueue);
+      entering = ticket;
+      try { connect(complete); } catch (error) { complete(asError(error)); }
+      finally { entering = previous; }
+      for (const item of pool._pendingQueue) {
+        if (!before.has(item) && !queued.has(item)) {
+          queued.set(item, ticket);
+          ticket.pending = item;
+        }
+      }
+      if (signal?.aborted) abort();
+    });
+    if (!callback) return pending;
+    void pending.then(
+      (client) => callback(undefined, client, client.release),
+      (error: unknown) => callback(asError(error), undefined, () => undefined)
+    );
+  }) as Pool["connect"];
 }
 
 async function probeCheckedOutClient(client: PoolClient, probe: { text: string; query_timeout: number }): Promise<void> {
@@ -109,6 +265,7 @@ const guardedClients = new WeakSet<object>();
 export function applyRetryToPool(pool: Pool, label = "pg-pool"): void {
   if (patchedPools.has(pool)) return;
   patchedPools.add(pool);
+  installCheckoutCancellation(pool);
 
   // pg-pool passes `options` to every new Client, so this startup parameter
   // labels ordinary and dedicated LISTEN connections without a per-checkout

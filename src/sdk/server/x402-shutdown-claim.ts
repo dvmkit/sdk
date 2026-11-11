@@ -40,7 +40,7 @@ export async function connectForX402ShutdownClaim(pool: Pick<Pool, "connect">): 
   const signal = x402ShutdownClaimSignal.getStore();
   if (!signal) return pool.connect();
   signal.throwIfAborted();
-  const pending = withPostgresCheckoutCancellation(signal, () => pool.connect());
+  const pending = withPostgresCheckoutCancellation(signal, () => pool.connect(), pool);
   let client: PoolClient;
   try {
     client = await waitForX402ShutdownClaim(() => pending);

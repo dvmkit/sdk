@@ -1325,6 +1325,8 @@ export async function createX402BatchSettlementServer(
           reason = controller.signal.aborted ? "timeout" : "failed";
         } finally {
           clearTimeout(timer);
+          // Parallel work may still be pending after another branch fails.
+          controller.abort(new Error("x402 shutdown claim finished"));
         }
         if (reason) {
           diagnosticConsole.warn({
