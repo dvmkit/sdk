@@ -198,6 +198,15 @@ function nativeAmount(value: unknown): string {
   return value.toString();
 }
 
+/** Scope given to a database whose reporting ownership no earlier configuration named. */
+const DEFAULT_REPORTING_SCOPE = "default";
+
+/**
+ * Reporting instances this process has already booted, per database. Mounts
+ * sharing a pool join that boot instead of advancing its epoch again.
+ */
+const bootedIdentities = new WeakMap<Pool, Map<string, string>>();
+
 async function transaction<T>(pool: Pool, operation: (tx: PoolClient) => Promise<T>): Promise<T> {
   const tx = await pool.connect();
   try {
@@ -219,11 +228,30 @@ export class HostedSettlementReportObligations {
   private tempo?: TempoConfig;
   private x402SettlementStore?: PostgresX402ChannelStorage;
 
+  private boundScope: string | undefined;
+
+  /**
+   * `scope` names the deployment whose obligations this instance owns. Omitted,
+   * `init()` or `bindPersistedScope()` resolves the scope this database records.
+   */
   constructor(
     private readonly pool: Pool,
     private readonly dvmId: string,
-    private readonly scope: string
-  ) {}
+    scope?: string
+  ) {
+    this.boundScope = scope;
+  }
+
+  private get scope(): string {
+    if (!this.boundScope) throw new Error("Hosted settlement identity is unavailable");
+    return this.boundScope;
+  }
+
+  /** Adopt the persisted reporting scope without running boot DDL or advancing the boot epoch. */
+  async bindPersistedScope(): Promise<void> {
+    this.boundScope ??= await this.persistedScope(this.pool);
+    if (!this.boundScope) throw new Error("Hosted settlement identity is unavailable");
+  }
 
   configureX402(config: X402Config): void {
     if (!x402NetworkByCaip2(config.network) || !hex(config.receiver, 20) || !hex(config.token, 20)) {
@@ -286,6 +314,12 @@ export class HostedSettlementReportObligations {
           created_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint,
           updated_at_ms BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
         );
+        CREATE TABLE IF NOT EXISTS sdk_hosted_settlement_report_identity (
+          dvm_id TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope <> ''),
+          instance_id TEXT NOT NULL CHECK (instance_id <> ''),
+          boot_epoch BIGINT NOT NULL CHECK (boot_epoch > 0),
+          PRIMARY KEY (dvm_id, scope)
+        );
         CREATE INDEX IF NOT EXISTS sdk_hosted_settlement_report_pending
           ON sdk_hosted_settlement_report_obligations (dvm_id,scope,state)
           WHERE state NOT IN ('delivered','no_report');
@@ -321,6 +355,93 @@ export class HostedSettlementReportObligations {
          VALUES (TRUE,$1) ON CONFLICT (singleton) DO NOTHING`,
         [Object.values(earlier.rows[0]).every((exists) => !exists)]
       );
+      this.boundScope = await this.bootIdentity();
+    });
+  }
+
+  /**
+   * The scope a boot with no configured one reports under. A database that
+   * already holds this DVM's obligations under a single scope keeps it, so an
+   * upgrade neither strands those reservations nor splits ownership; obligations
+   * under several scopes are never assigned by guesswork.
+   */
+  private async persistedScope(query: Query): Promise<string | undefined> {
+    const own = await query.query(
+      "SELECT 1 FROM sdk_hosted_settlement_report_identity WHERE dvm_id=$1 AND scope=$2",
+      [this.dvmId, DEFAULT_REPORTING_SCOPE]
+    );
+    if (own.rowCount) return DEFAULT_REPORTING_SCOPE;
+    const owners = await query.query<{ scope: string }>(
+      "SELECT DISTINCT scope FROM sdk_hosted_settlement_report_obligations WHERE dvm_id=$1",
+      [this.dvmId]
+    );
+    if (owners.rows.length > 1) {
+      throw new Error("Hosted settlement reporting has ambiguous earlier ownership");
+    }
+    return owners.rows[0]?.scope;
+  }
+
+  /**
+   * Establish this scope's reporting identity and count this process's boot
+   * once. A scope that predates the identity table inherits the instance its
+   * obligations and hosting-control row already name, so earlier reservations
+   * stay owned and replayable.
+   */
+  private async bootIdentity(): Promise<string> {
+    return transaction(this.pool, async (tx) => {
+      const scope = this.boundScope ?? await this.persistedScope(tx) ?? DEFAULT_REPORTING_SCOPE;
+      const key = JSON.stringify([this.dvmId, scope]);
+      let booted = bootedIdentities.get(this.pool);
+      if (!booted) bootedIdentities.set(this.pool, booted = new Map());
+      const existing = await tx.query<{ instance_id: string }>(
+        `SELECT instance_id FROM sdk_hosted_settlement_report_identity
+         WHERE dvm_id=$1 AND scope=$2 FOR UPDATE`, [this.dvmId, scope]
+      );
+      const current = existing.rows[0];
+      if (current) {
+        if (booted.get(key) !== current.instance_id) {
+          await tx.query(
+            `UPDATE sdk_hosted_settlement_report_identity SET boot_epoch=boot_epoch+1
+             WHERE dvm_id=$1 AND scope=$2`, [this.dvmId, scope]
+          );
+          booted.set(key, current.instance_id);
+        }
+        return scope;
+      }
+      const earlier = await tx.query<{ instance_id: string | null; boot_epoch: string }>(
+        `SELECT instance_id,MAX(boot_epoch)::text AS boot_epoch
+         FROM sdk_hosted_settlement_report_obligations WHERE dvm_id=$1 AND scope=$2
+         GROUP BY instance_id`, [this.dvmId, scope]
+      );
+      const control = await tx.query<{ present: boolean }>(
+        "SELECT to_regclass('sdk_hosting_control') IS NOT NULL AS present"
+      );
+      if (control.rows[0]?.present) {
+        // to_jsonb tolerates a control table created before it carried a boot identity.
+        const rows = await tx.query<{ instance_id: string | null; boot_epoch: string }>(
+          `SELECT to_jsonb(hosting)->>'instance_id' AS instance_id,
+                  COALESCE(to_jsonb(hosting)->>'boot_epoch','0') AS boot_epoch
+           FROM sdk_hosting_control hosting WHERE dvm_id=$1 AND scope=$2`, [this.dvmId, scope]
+        );
+        earlier.rows.push(...rows.rows);
+      }
+      const instances = new Set<string>();
+      let epoch = 0n;
+      for (const row of earlier.rows) {
+        if (!row.instance_id) continue;
+        instances.add(row.instance_id);
+        if (BigInt(row.boot_epoch) > epoch) epoch = BigInt(row.boot_epoch);
+      }
+      if (instances.size > 1) {
+        throw new Error("Hosted settlement reporting has ambiguous earlier ownership");
+      }
+      const instanceId = [...instances][0] ?? randomUUID();
+      await tx.query(
+        `INSERT INTO sdk_hosted_settlement_report_identity (dvm_id,scope,instance_id,boot_epoch)
+         VALUES ($1,$2,$3,$4)`, [this.dvmId, scope, instanceId, (epoch + 1n).toString()]
+      );
+      booted.set(key, instanceId);
+      return scope;
     });
   }
 
@@ -402,7 +523,13 @@ export class HostedSettlementReportObligations {
         computeChannelId(row.channel_config as Parameters<typeof computeChannelId>[0], config.network).toLowerCase() !== channelId.toLowerCase()) {
         throw new Error("Hosted x402 channel has another recipient or token");
       }
-      if (operation === "claim" && (expected.charged !== row.charged_cumulative_amount ||
+      // A claim presents what the credit has earned, which trails the stored
+      // charge until the deposit is spent, so the reservation records the
+      // presented figure: it is what the transaction carries on chain.
+      const presented = operation === "claim" && /^\d+$/.test(expected.charged ?? "")
+        ? BigInt(expected.charged!) : undefined;
+      if (operation === "claim" && (presented === undefined ||
+        presented > BigInt(row.charged_cumulative_amount) || presented <= BigInt(row.total_claimed) ||
         expected.signature?.toLowerCase() !== row.signature.toLowerCase() ||
         expected.signedMax !== row.signed_max_claimable)) {
         throw new Error("Hosted x402 claim changed after selection");
@@ -415,7 +542,7 @@ export class HostedSettlementReportObligations {
         BigInt(row.charged_cumulative_amount) > BigInt(row.total_claimed)
         ? await this.ensureOpenX402Batch(tx, config) : undefined;
       const original = operation === "claim" ? {
-        charged: row.charged_cumulative_amount, claimedBefore: row.total_claimed,
+        charged: presented!.toString(), claimedBefore: row.total_claimed,
         signed: row.signed_max_claimable, signature: row.signature, batchId,
         authorizationRequirements: requirements,
         authorizationCallData: originalCallData,
@@ -431,7 +558,7 @@ export class HostedSettlementReportObligations {
       };
       return this.insert(tx, identity, "x402", operation, config.network,
         BATCH_SETTLEMENT_ADDRESS, channelId.toLowerCase(), original,
-        operation === "claim" ? [row.charged_cumulative_amount, row.signature.toLowerCase()] :
+        operation === "claim" ? [presented!.toString(), row.signature.toLowerCase()] :
           [refundSettlementId, row.refund_nonce]);
     });
   }
@@ -698,6 +825,17 @@ export class HostedSettlementReportObligations {
       searchBefore: searchCursor(row.close_search_before) };
   }
 
+  /** Whether this drain's close was ever reserved, whatever became of its report. */
+  async hasTempoClose(channelId: string, drainId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM sdk_hosted_settlement_report_obligations
+       WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
+         AND original->>'drainId'=$4 LIMIT 1`,
+      [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
+    );
+    return result.rows.length > 0;
+  }
+
   /** A recorded close transaction remains refund evidence after its report is delivered. */
   async tempoCloseTransaction(channelId: string, drainId: string): Promise<string | undefined> {
     const result = await this.pool.query<{ tx_hash: string }>(
@@ -912,13 +1050,33 @@ export class HostedSettlementReportObligations {
          AND (block_hash IS NULL OR report_id IS NULL)
        ORDER BY created_at_ms,id`, [this.dvmId, this.scope]
     );
-    return result.rows.map((row) => ({
+    return result.rows.filter((row) => this.ownsRail(row)).map((row) => ({
       id: row.id, rail: row.rail, operation: row.operation,
       channelId: row.channel_id, txHash: row.tx_hash!,
       ...(typeof row.original.batchId === "string" ? { batchId: row.original.batchId } : {}),
       reportId: row.report_id, blockHash: row.block_hash,
       deltaNative: row.delta_native,
     }));
+  }
+
+  /**
+   * Mounts share one DVM's obligations but each recovers only effects of a rail
+   * it is configured for: another mount's recipient cannot prove them on chain.
+   */
+  private ownsRail(row: ObligationRow): boolean {
+    if (row.rail === "tempo") {
+      return !!this.tempo && row.network === this.tempo.network &&
+        row.contract === this.tempo.escrow.toLowerCase();
+    }
+    const config = this.x402;
+    if (!config || row.network !== config.network) return false;
+    if (row.operation === "settle") {
+      return row.channel_id ===
+        `${config.network}|${config.receiver.toLowerCase()}|${config.token.toLowerCase()}`;
+    }
+    const requirements = row.original.authorizationRequirements as { payTo?: unknown } | undefined;
+    return typeof requirements?.payTo !== "string" ||
+      requirements.payTo.toLowerCase() === config.receiver.toLowerCase();
   }
 
   async recoverOriginalX402Refunds(): Promise<Array<{ id: string; error: unknown }>> {
@@ -1335,15 +1493,27 @@ export class HostedSettlementReportObligations {
     return result.rows[0]?.complete === true;
   }
 
-  private async lockIdentity(tx: PoolClient): Promise<{ instanceId: string; bootEpoch: string }> {
-    const result = await tx.query<{ instance_id: string | null; boot_epoch: string }>(
-      "SELECT instance_id,boot_epoch FROM sdk_hosting_control WHERE dvm_id=$1 AND scope=$2 FOR UPDATE",
-      [this.dvmId, this.scope]
+  /**
+   * Record that an effect can occur without an original reservation. One-way:
+   * nothing promotes the marker back to complete.
+   */
+  async markHistoryIncomplete(): Promise<void> {
+    const result = await this.pool.query(
+      "UPDATE sdk_hosted_settlement_report_history SET complete=FALSE WHERE singleton=TRUE AND complete"
     );
-    if (!result.rows[0]?.instance_id || !BigInt(result.rows[0].boot_epoch)) {
-      throw new Error("Hosted settlement identity is unavailable");
+    if (result.rowCount) {
+      loggers.tempo.warn("settlement_report_history_incomplete", { dvm_id: this.dvmId });
     }
-    return { instanceId: result.rows[0].instance_id, bootEpoch: result.rows[0].boot_epoch };
+  }
+
+  private async lockIdentity(tx: PoolClient): Promise<{ instanceId: string; bootEpoch: string }> {
+    const result = await tx.query<{ instance_id: string; boot_epoch: string }>(
+      `SELECT instance_id,boot_epoch FROM sdk_hosted_settlement_report_identity
+       WHERE dvm_id=$1 AND scope=$2 FOR UPDATE`, [this.dvmId, this.scope]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Hosted settlement identity is unavailable");
+    return { instanceId: row.instance_id, bootEpoch: row.boot_epoch };
   }
 
   private async insert(
@@ -1394,10 +1564,12 @@ export class HostedSettlementReportObligations {
 export async function retryHostedTempoCloseReport(args: {
   db: Pool;
   dvmId: string;
-  scope: string;
+  /** Defaults to the scope a boot without hosting control reports under. */
+  scope?: string;
   obligationId: string;
 }): Promise<boolean> {
   const obligations = new HostedSettlementReportObligations(args.db, args.dvmId, args.scope);
+  await obligations.bindPersistedScope();
   return obligations.reopenTempoClose(args.obligationId);
 }
 
@@ -1408,7 +1580,10 @@ export interface HostedTempoCloseReportWriteOff {
 }
 
 interface WriteOffHostedTempoCloseReportArgs {
-  db: Pool; dvmId: string; scope: string; obligationId: string; note: string;
+  db: Pool; dvmId: string;
+  /** Defaults to the scope a boot without hosting control reports under. */
+  scope?: string;
+  obligationId: string; note: string;
 }
 
 /** Forgo an unmatched builder payout report; includeDetails returns the amount without another read. */
@@ -1423,8 +1598,9 @@ export async function writeOffHostedTempoCloseReport(
 ): Promise<boolean | HostedTempoCloseReportWriteOff> {
   const note = args.note.trim();
   if (!note || note.length > 2_000) throw new Error("A write-off requires a note of 1 to 2000 characters");
-  const row = await new HostedSettlementReportObligations(args.db, args.dvmId, args.scope)
-    .writeOffTempoClose(args.obligationId, note);
+  const obligations = new HostedSettlementReportObligations(args.db, args.dvmId, args.scope);
+  await obligations.bindPersistedScope();
+  const row = await obligations.writeOffTempoClose(args.obligationId, note);
   if (!row) return false;
   return args.includeDetails ? { channelId: row.channelId, amountForgoneNative: row.amount } : true;
 }

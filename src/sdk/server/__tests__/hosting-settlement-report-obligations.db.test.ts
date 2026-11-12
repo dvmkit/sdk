@@ -95,6 +95,8 @@ interface Fixture {
   control: HostingControl;
   obligations: HostedSettlementReportObligations;
   channelStore: PostgresX402ChannelStorage;
+  /** Another pool on the same schema, standing in for a later process. */
+  restartPool(): pg.Pool;
   initializeState(): Promise<void>;
   cleanup(): Promise<void>;
 }
@@ -127,10 +129,11 @@ async function prepareFixture(preexistingChannelTable = false, certificateReady 
   const channelStore = new PostgresX402ChannelStorage(pool,
     certificateReady ? { hostedNetwork: NETWORK } : undefined);
   let schemaCreated = false;
+  const restarts: pg.Pool[] = [];
   const cleanup = async () => {
     try { await channelStore.close(); }
     finally {
-      try { await pool.end(); }
+      try { await Promise.all([pool, ...restarts].map((open) => open.end())); }
       finally {
         try { if (schemaCreated) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
         finally { await admin.end(); }
@@ -164,6 +167,11 @@ async function prepareFixture(preexistingChannelTable = false, certificateReady 
     obligations.attachX402SettlementStore(channelStore);
     await new PostgresX402BatchStore(pool).init();
     return { pool, dvmId, scope, control, obligations, channelStore, cleanup,
+      restartPool: () => {
+        const restart = new pg.Pool({ connectionString: DATABASE_URL, options: `-c search_path=${schema}` });
+        restarts.push(restart);
+        return restart;
+      },
       initializeState: async () => {
         expect(await control.transition({ action: "resume", version: 2, dvmId, scope,
           generation: 1, leaseExpiresAtMs: Date.now() + 60_000,
@@ -465,6 +473,96 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("delivers an obligation reserved before the upgrade once hosting control is no longer configured", async () => {
+    const current = await fixture(); fixtures.push(current);
+    const claimSource = { authorizationPayload: claimAuthorization(),
+      authorizationRequirements: AUTH_REQUIREMENTS, charged: "100", signature: SIGNATURE, signedMax: "100" };
+    const claim = await current.obligations.reserveX402(CHANNEL, "claim", claimSource);
+    await current.obligations.recordSubmitted(claim!.id, TX);
+    const batchId = (await current.pool.query<{ original: { batchId: string } }>(
+      "SELECT original FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
+    )).rows[0].original.batchId;
+    await new PostgresX402BatchStore(current.pool).put({
+      scope: `${NETWORK}|${RECEIVER}|${TOKEN.toLowerCase()}`, batchId,
+      claimedNative: 100n, voucherCount: 1, claims: 1, openedAt: Date.now(),
+      attempts: 0, firstFailedAt: null, lastError: null, nextRetryAt: null,
+      obligationIds: [claim!.id],
+    });
+    const settle = await current.obligations.reserveOpenX402Settlement();
+    await current.obligations.recordSubmitted(settle.id, `0x${"cd".repeat(32)}`);
+    const owner = (await current.pool.query<{ instance_id: string }>(
+      "SELECT instance_id FROM sdk_hosting_control WHERE dvm_id=$1", [current.dvmId]
+    )).rows[0].instance_id;
+    const reservedEpoch = (await current.pool.query<{ boot_epoch: string }>(
+      "SELECT boot_epoch FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
+    )).rows[0].boot_epoch;
+    // Before the upgrade, ownership lived only on the control row and the obligations themselves.
+    await current.pool.query("DROP TABLE sdk_hosted_settlement_report_identity");
+
+    const restart = current.restartPool();
+    const upgraded = new HostedSettlementReportObligations(restart, current.dvmId);
+    upgraded.configureX402({ network: NETWORK, receiver: RECEIVER, token: TOKEN });
+    await upgraded.init();
+    upgraded.attachX402SettlementStore(current.channelStore);
+    const identity = (await restart.query<{ scope: string; instance_id: string; boot_epoch: string }>(
+      "SELECT scope,instance_id,boot_epoch FROM sdk_hosted_settlement_report_identity WHERE dvm_id=$1",
+      [current.dvmId]
+    )).rows;
+    expect(identity).toMatchObject([{ scope: current.scope, instance_id: owner }]);
+    expect(BigInt(identity[0].boot_epoch)).toBeGreaterThan(BigInt(reservedEpoch));
+    expect(await upgraded.reserveX402(CHANNEL, "claim", claimSource))
+      .toEqual({ id: claim!.id, replayed: true });
+
+    const reporter = new RevenueReporter(restart, "https://platform.invalid", "local-token", upgraded);
+    await reporter.init();
+    await reporter.enqueueHostedPayout({ dvmId: current.dvmId, payoutId: `x402:batch:${batchId}`,
+      rail: "x402", kind: "batch", nativeAmount: 100, nativeAsset: "usdc",
+      recipient: RECEIVER, refs: { batchId }, landedAt: 1_000 }, [claim!.id, settle.id]);
+    await restart.query(
+      `UPDATE sdk_hosted_settlement_report_obligations
+       SET block_hash=$1,block_number=10,delta_native=100,state='observed'
+       WHERE id=ANY($2::text[])`, [BLOCK, [claim!.id, settle.id]]
+    );
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 200 })));
+    try {
+      await reporter.drainPending();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect((await restart.query<{ id: string; state: string }>(
+      "SELECT id,state FROM sdk_hosted_settlement_report_obligations ORDER BY created_at_ms,id"
+    )).rows.map((row) => row.state)).toEqual(["delivered", "delivered"]);
+    expect(await upgraded.unresolvedCount()).toBe(0);
+  });
+
+  it("refuses to pick an owner when earlier obligations sit under more than one scope", async () => {
+    const current = await fixture(); fixtures.push(current);
+    const claim = await current.obligations.reserveX402(CHANNEL, "claim", {
+      authorizationPayload: claimAuthorization(),
+      authorizationRequirements: AUTH_REQUIREMENTS, charged: "100", signature: SIGNATURE, signedMax: "100" });
+    const before = (await current.pool.query(
+      "SELECT * FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
+    )).rows;
+    await current.pool.query("DROP TABLE sdk_hosted_settlement_report_identity");
+    await current.pool.query(
+      `INSERT INTO sdk_hosted_settlement_report_obligations
+         (id,source_key,dvm_id,scope,instance_id,boot_epoch,rail,operation,network,contract,
+          channel_id,original,state)
+       SELECT $2,source_key || ':another',dvm_id,'another-deployment','another-instance',boot_epoch,
+         rail,operation,network,contract,channel_id,original,state
+       FROM sdk_hosted_settlement_report_obligations WHERE id=$1`, [claim!.id, randomUUID()]
+    );
+    const restart = current.restartPool();
+    await expect(new HostedSettlementReportObligations(restart, current.dvmId).init())
+      .rejects.toThrow("ambiguous earlier ownership");
+    expect((await restart.query(
+      "SELECT * FROM sdk_hosted_settlement_report_identity WHERE dvm_id=$1", [current.dvmId]
+    )).rows).toEqual([]);
+    expect((await restart.query(
+      "SELECT * FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
+    )).rows).toEqual(before);
   });
 
   it("keeps pre-instrumentation channel history unknown even when the table has no rows", async () => {

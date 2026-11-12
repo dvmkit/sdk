@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Settlement-report history no longer requires hosting control. Any host or server boot with a PostgreSQL pool and a DVM ID now creates the history, obligation and reporting-identity tables before its financial stores. A server that delivers platform reports now reserves x402 batch and Tempo session reports before each effect without control, accepts a Tempo close only from the authenticated credit drain, and requires the original reservation for payout reports while history is complete. A session or batch rail that cannot reserve reports keeps its earlier reporting and marks history incomplete; without control, so does an x402 batch rail on a database whose history is already incomplete.
+- Report ownership moves from the hosting-control row to the additive `sdk_hosted_settlement_report_identity` table, keyed by DVM and scope. An upgraded scope inherits its existing instance, and a boot without hosting control keeps the single scope that already owns the DVM's obligations; boot fails rather than guess when those obligations sit under several scopes or one scope names several instances. Existing databases keep an incomplete or missing history marker.
+- `scope` is now optional in `retryHostedTempoCloseReport` and `writeOffHostedTempoCloseReport`, and the experimental server signatures that carry the report-obligation recorder change with it. See `docs/HOSTING.md`.
+- A Tempo session close broadcast before the upgrade has no reservation, so recovery reports its payout once through the close intent, as a self-hosted close does. An x402 claim reservation now records the amount the claim presents, which trails the channel's stored charge until the deposit is spent, so a partly spent credit can be claimed under reservation.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

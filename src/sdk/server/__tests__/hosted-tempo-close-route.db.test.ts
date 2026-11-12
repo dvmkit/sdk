@@ -56,6 +56,7 @@ import { PostgresJobStore } from "../postgres-job-store";
 import { RevenueReporter } from "../revenue-reporter";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
+import { completeTempoChannelDrain } from "../tempo-drain-leg";
 import { PostgresTempoSessionStore } from "../tempo-session-store";
 
 /** The `onSessionSettlement` the SDK last handed mppx's `tempo.session`. */
@@ -215,6 +216,8 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     /** Whether a landing close leaves a `ChannelClosed` log for recovery to find. */
     closeLogged?: boolean;
     hosted?: boolean;
+    /** Whether the hosted server also runs the opt-in hosting control. Defaults to `hosted`. */
+    control?: boolean;
     reporting?: boolean;
     withoutExitCapability?: boolean;
     head?: bigint;
@@ -228,6 +231,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
   } = {}) {
     const modes = [...(options.modes ?? ["lands"])];
     const hosted = options.hosted ?? true;
+    const control = options.control ?? hosted;
     const dvmId = `dvm-${randomUUID()}`;
     const scope = `deployment-${randomUUID()}`;
     const operator = privateKeyToAccount(generatePrivateKey());
@@ -255,10 +259,10 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
         tempoSession: { channelId, cumulativeAmount: (options.highestVoucherAmount ?? SPENT).toString() } },
     });
 
-    if (hosted) {
-      const control = new HostingControl(pool, dvmId, { secret: SECRET, scope });
-      await control.init();
-      expect(await control.transition({ action: "resume", version: 2, dvmId, scope,
+    if (control) {
+      const hostingControl = new HostingControl(pool, dvmId, { secret: SECRET, scope });
+      await hostingControl.init();
+      expect(await hostingControl.transition({ action: "resume", version: 2, dvmId, scope,
         generation: 1, leaseExpiresAtMs: Date.now() + 60_000, deadlineMs: Date.now() + 90_000,
         timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` })).toBe("ok");
     }
@@ -292,7 +296,8 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       }
     };
     // The obligations the host hands its Tempo session runtime, as `host.ts` does.
-    const hostedObligations = new HostedSettlementReportObligations(pool, dvmId, scope);
+    const hostedObligations = new HostedSettlementReportObligations(pool, dvmId, control ? scope : undefined);
+    if (hosted && !control) await hostedObligations.init();
     const readChannelClose = vi.fn((_client: Client, _channelId: Hex, _txHash: Hex) => Promise.resolve({ settledToPayee: SPENT,
       refundedToPayer: DEPOSIT - SPENT }));
     const runtimeConfig = { ...tempoSession, ...(hosted && { hostedObligations }) };
@@ -376,7 +381,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       env: {}, store: new MemoryKVStore(), jobStore: jobs, db: pool, dvmId, fxFetcher: stubFx,
       creditLedger: routeLedger, mpp, hostingTempoSessionStore: sessions,
       ...(options.reporting && { platformUrl: "https://platform.example.com", platformToken: "local-token" }),
-      ...(hosted && { hostingControl: { secret: SECRET, scope } }),
+      ...(control && { hostingControl: { secret: SECRET, scope } }),
     });
 
     /** `payloadDescriptor: null` sends a close credential without a descriptor. */
@@ -414,7 +419,8 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     );
     /** Close searches started: each one first asks for the chain head. */
     const searches = () => rpc.requests.filter(({ method }) => method === "eth_blockNumber").length;
-    return { server, mpp: { ...mpp, sweepTempoSessions: manualSweep }, creditId, channelId, dvmId, scope, drain, broadcasts, obligations,
+    return { server, mpp: { ...mpp, sweepTempoSessions: manualSweep }, creditId, channelId, dvmId,
+      scope, reportingScope: control ? scope : undefined, drain, broadcasts, obligations,
       ageObligations, searches, settlements, logs, chain, operator, rpc, descriptor, readChannelClose, runtimeConfig, chainOps };
   }
 
@@ -455,7 +461,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
   }
 
   /** The real payout and revenue reporters over this pool, posting to a stubbed platform. */
-  function payoutReporting(dvmId: string, scope: string) {
+  function payoutReporting(dvmId: string, scope?: string) {
     const sentPayouts: Record<string, unknown>[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -473,6 +479,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       sentPayouts,
       payoutIds: () => [...new Set(sentPayouts.map((payout) => String(payout.payoutId)))].sort(),
       start: async () => {
+        await reporterObligations.bindPersistedScope();
         await transport.init();
         await reporter.init();
         reporter.start();
@@ -572,11 +579,15 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       }
     });
 
-  it("reports the payout of a close that landed after its receipt wait timed out, once", async () => {
+  it.each([
+    ["with hosting control", true], ["without hosting control", false],
+  ])("reports the payout of a close that landed after its receipt wait timed out, once, %s", async (_name, control) => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, creditId, channelId, dvmId, scope, drain, obligations, searches } =
-      await hostedCredit(payer, { modes: ["lands-then-receipt-times-out"] });
-    const reporting = payoutReporting(dvmId, scope);
+    const { server, creditId, channelId, dvmId, reportingScope, drain, obligations, searches } =
+      await hostedCredit(payer, { modes: ["lands-then-receipt-times-out"], control,
+        // Without control, reports are reserved only for a server that delivers them.
+        ...(!control && { reporting: true }) });
+    const reporting = payoutReporting(dvmId, reportingScope);
     try {
       // The drain completes from the landed chain state; its refund is owed
       // whether or not the receipt arrived.
@@ -930,6 +941,52 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       expect(await drain(payer)).toMatchObject({ status: 200 });
       expect(settlements).toEqual([{ txHash: TX_HASH, channelId, trigger: "close",
         amount: SPENT, delta: SPENT }]);
+      expect(await obligations()).toEqual([]);
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it.each(["drain sweep", "close poll"] as const)(
+    "reports a close begun before reports were reserved once after the upgrade: %s", async (path) => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, creditId, channelId, dvmId, drain, chain, logs, operator, runtimeConfig, chainOps, obligations } =
+      await hostedCredit(payer, { hosted: false, modes: ["submits-then-times-out"] });
+    try {
+      expect((await drain(payer)).status).toBe(402);
+      // The close lands unseen, then the DVM restarts reserving its reports.
+      chain.deposit = 0n;
+      chain.settled = SPENT;
+      logs.push({ event: "ChannelClosed", block: HEAD - 3n, txHash: TX_HASH, from: operator.address });
+      const upgraded = new HostedSettlementReportObligations(pool, dvmId);
+      await upgraded.init();
+      upgraded.configureTempo({ network: `eip155:${CHAIN_ID}`, escrow: ESCROW, payee: PAYEE, token: TOKEN });
+      const reported: unknown[] = [];
+      const restarted = _testing.attachTempoSessionRuntime({} as MppxServer, { ...runtimeConfig,
+        hostedObligations: upgraded, onSessionSettlement: (settlement: unknown) => { reported.push(settlement); } },
+      chainOps);
+      // The ledger wiring the server gives its runtime, so a sweep can complete the drain.
+      restarted.useTempoCreditLedger!(ledger, async (drain, evidence) => !(await completeTempoChannelDrain({
+        deps: { ledger, drainReport: { db: pool, dvmId } },
+        creditId: drain.creditId, drainId: drain.drainId, channelId: drain.channelId!,
+        refundedNative: evidence.refundedNative, debitedNative: drain.drainedNative,
+        reference: evidence.reference,
+        finalization: { outcome: evidence.outcome, creditUnbacked: evidence.creditUnbacked },
+      })).replayed);
+      if (path === "drain sweep") await ledger.requireTempoDrainExit({ creditId, drainId: "d1" });
+      const recover = async () => {
+        if (path === "drain sweep") await restarted.sweepTempoSessions!();
+        else expect(await restarted.recoverTempoSessionClose!(channelId, "d1")).toBe(TX_HASH);
+      };
+      await recover();
+      expect(reported).toEqual([expect.objectContaining({ txHash: TX_HASH, trigger: "close",
+        amount: SPENT, delta: SPENT })]);
+      if (path === "drain sweep") {
+        expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "sent" });
+      }
+      await recover();
+      expect(reported).toHaveLength(1);
+      // The close was never reserved, so its report did not go through an obligation.
       expect(await obligations()).toEqual([]);
     } finally {
       await server.shutdown();

@@ -566,6 +566,7 @@ export interface SDKServerOpts {
 interface InternalSDKServerOpts extends SDKServerOpts {
   hostingControlInstance?: HostingControl;
   hostedSettlementReports?: HostedSettlementReportObligations;
+  hostedTempoReports?: HostedSettlementReportObligations;
   hostingClosureSupport?: HostingClosureSupport;
   enqueueCreditDeposit?: CreditDepositEnqueue;
   enqueueCreditDrain?: CreditDrainEnqueue;
@@ -600,6 +601,10 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   let server: DVMServer<State, InputSchema> | undefined;
   let hostingControl: HostingControl | undefined;
   let hostedSettlementReports: HostedSettlementReportObligations | undefined;
+  /** Set only when this server's Tempo session runtime reserves reports before each effect. */
+  let hostedTempoReports: HostedSettlementReportObligations | undefined;
+  /** Set only when this server's x402 batch rail reserves reports before each effect. */
+  let hostedX402Reports: HostedSettlementReportObligations | undefined;
   let shutdownPromise: Promise<void> | undefined;
 
   const shutdown = (): Promise<void> =>
@@ -664,22 +669,22 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   const platformUrl = opts.platformUrl ?? envMaybe.DVMKIT_PLATFORM_URL;
   const dvmId = opts.dvmId;
 
-  if (opts.hostingControl && opts.db && dvmId && typeof opts.db.connect === "function") {
+  // Settlement history is decided by the first initializer to run: it must
+  // precede every store below that creates a financial or report table.
+  if (opts.db && dvmId && typeof opts.db.connect === "function") {
     hostedSettlementReports = new HostedSettlementReportObligations(
-      opts.db, dvmId, opts.hostingControl.scope
+      opts.db, dvmId, opts.hostingControl?.scope
     );
     await hostedSettlementReports.init();
-    if (opts.x402?.batchSettlement) {
-      const network = x402NetworkByCaip2(opts.x402.network);
-      if (!network) throw new Error("Hosted x402 batch network is unsupported");
-      hostedSettlementReports.configureX402({
-        network: opts.x402.network,
-        receiver: opts.x402.payTo,
-        token: network.usdc,
-        ...(opts.x402.batchSettlement.rpcUrl ? { rpcUrl: opts.x402.batchSettlement.rpcUrl } : {}),
-      });
-    }
-    if (opts.hostingTempoSessionStore && opts.mpp?.tempoConfiguration) {
+    // Reservations are discharged by the platform reporter or examined by
+    // hosting control. With neither, they would only accumulate and block the
+    // next effect on the same channel.
+    const discharged = !!opts.hostingControl ||
+      (!opts.onJobCompleted && !!platformToken && !!platformUrl);
+    // `reconcileTempoSessionCloses` exists only on a session runtime built to
+    // reserve each settlement before its effect.
+    if (discharged && opts.hostingTempoSessionStore && opts.mpp?.tempoConfiguration &&
+      opts.mpp.reconcileTempoSessionCloses) {
       const { Session: TempoSession } = await import("mppx/tempo");
       const tempo = opts.mpp.tempoConfiguration;
       hostedSettlementReports.configureTempo({
@@ -689,6 +694,31 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
         token: tempo.paymentToken,
         ...(envMaybe.DVMKIT_TEMPO_RPC_URL ? { rpcUrl: envMaybe.DVMKIT_TEMPO_RPC_URL } : {}),
       });
+      hostedTempoReports = hostedSettlementReports;
+    } else if (opts.mpp && (opts.hostingTempoSessionStore || opts.mpp.sweepTempoSessions ||
+      (opts.mpp.methods as { intent?: string }[] | undefined)?.some((method) => method.intent === "session"))) {
+      // This rail handle settles sessions without reserving their reports, so
+      // the database can no longer claim every effect has an original record.
+      await hostedSettlementReports.markHistoryIncomplete();
+    }
+    if (opts.x402?.batchSettlement) {
+      // An open batch from before reservations existed cannot be bound to
+      // them, so a database with incomplete history keeps its earlier x402
+      // reporting. Only the SDK's own channel storage can reserve atomically.
+      if (discharged && !opts.x402.batchSettlement.storage &&
+        (opts.hostingControl || await hostedSettlementReports.hasCompleteHistory())) {
+        const network = x402NetworkByCaip2(opts.x402.network);
+        if (!network) throw new Error("Hosted x402 batch network is unsupported");
+        hostedSettlementReports.configureX402({
+          network: opts.x402.network,
+          receiver: opts.x402.payTo,
+          token: network.usdc,
+          ...(opts.x402.batchSettlement.rpcUrl ? { rpcUrl: opts.x402.batchSettlement.rpcUrl } : {}),
+        });
+        hostedX402Reports = hostedSettlementReports;
+      } else {
+        await hostedSettlementReports.markHistoryIncomplete();
+      }
     }
   }
 
@@ -709,6 +739,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
       db: opts.db,
       transport: reporter,
       ...(hostedSettlementReports ? { hostedObligations: hostedSettlementReports } : {}),
+      hostedX402: !!hostedX402Reports,
       // The same condition the admin routes and the accumulator monitor mount on.
       cashu: opts.cashuMode === "p2pk-accumulator" && !!opts.lockPubkey,
       ...(typeof opts.db.connect === "function" ? {} : { batchStore: new MemoryX402BatchStore() }),
@@ -879,7 +910,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   x402ChannelStorage =
     opts.db && x402Config && effectiveX402BatchConfig && !effectiveX402BatchConfig.storage
       ? new PostgresX402ChannelStorage(opts.db, {
-          ...(opts.hostingControl ? { hostedNetwork: x402Config.network } : {}),
+          ...(hostedX402Reports ? { hostedNetwork: x402Config.network } : {}),
           terminalizeUnbackedCredit: (evidence, tx) =>
             creditLedger.terminalizeX402Credit(evidence, tx),
         })
@@ -906,7 +937,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
               ? undefined
               : opts.x402FacilitatorHealth?.supportedResponse?.(),
             payout: payoutReporter?.x402Observer(),
-            hostedObligations: hostedSettlementReports,
+            hostedObligations: hostedX402Reports,
           }))
       : undefined;
   x402BatchSettlement =
@@ -977,11 +1008,11 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
       if (opts.mpp && opts.hostingTempoChargeStore) {
         installHostedTempoChargeGuard(opts.mpp, opts.hostingTempoChargeStore);
       }
-      if (opts.mpp && opts.hostingTempoSessionStore && hostedSettlementReports) {
-        installHostedTempoCloseGuard(opts.mpp, hostedSettlementReports);
-      }
     }
   }
+  // The credit drain refuses a hosted close without this guard, and reports
+  // are reserved with or without hosting control.
+  if (opts.mpp && hostedTempoReports) installHostedTempoCloseGuard(opts.mpp, hostedTempoReports);
   const hostingClosureSupport: HostingClosureSupport | undefined = hostingControl ? {
     singleMount: opts.hostingCleanupSingleMount ?? true,
     durableLedger: opts.creditLedger instanceof CreditLedger,
@@ -996,6 +1027,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
     platformUrl,
     hostingControlInstance: hostingControl,
     hostedSettlementReports,
+    hostedTempoReports,
     hostingClosureSupport,
     creditLedger,
     processedPayments,
@@ -2476,7 +2508,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     this.maybeSweepTempoSessions();
     return handleCreditRequest(c, {
       checkoutProductName: `${this.descriptor.name} prepaid credit`,
-      hostedSettlementReports: this.opts.hostedSettlementReports,
+      hostedSettlementReports: this.opts.hostedTempoReports,
       menu: () => this.creditMenu(this.creditCurrency()),
       creditConfig: this.descriptor.credit,
       auth: this.descriptor.auth,

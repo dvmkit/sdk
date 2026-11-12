@@ -469,6 +469,8 @@ export interface PayoutReporterOpts {
   /** Override the batch store (tests); defaults to Postgres on `db`, memory without. */
   batchStore?: X402BatchStore;
   hostedObligations?: HostedSettlementReportObligations;
+  /** False when the x402 batch rail settles without reserving its reports; it then reports as before. */
+  hostedX402?: boolean;
   /** Snapshot cadence, ms. Default 5 minutes. */
   snapshotIntervalMs?: number;
   now?: () => number;
@@ -491,9 +493,11 @@ export class PayoutReporter implements PayoutTransport {
   private readonly intervalMs: number;
   private readonly now: () => number;
   private readonly hostedObligations?: HostedSettlementReportObligations;
+  private readonly x402Obligations?: HostedSettlementReportObligations;
   private lastX402SnapshotAt = 0;
   private x402?: X402PayoutContext;
   private tempo?: TempoPayoutReader;
+  private reportsTempo = true;
   private timer: ReturnType<typeof setInterval> | null = null;
   private warmup: ReturnType<typeof setTimeout> | null = null;
 
@@ -509,6 +513,7 @@ export class PayoutReporter implements PayoutTransport {
     this.intervalMs = opts.snapshotIntervalMs ?? PAYOUT_SNAPSHOT_INTERVAL_MS;
     this.now = opts.now ?? Date.now;
     this.hostedObligations = opts.hostedObligations;
+    this.x402Obligations = opts.hostedX402 === false ? undefined : opts.hostedObligations;
   }
 
   async init(): Promise<void> {
@@ -563,7 +568,7 @@ export class PayoutReporter implements PayoutTransport {
       for (const candidate of await this.hostedObligations.recoveryCandidates()) {
         if (!candidate.blockHash || candidate.reportId) continue;
         try {
-          if (candidate.rail === "tempo" &&
+          if (candidate.rail === "tempo" && this.reportsTempo &&
             (candidate.operation === "settle" || candidate.operation === "close") &&
             candidate.deltaNative !== null && BigInt(candidate.deltaNative) > 0n) {
             await this.tempoSettled({ txHash: candidate.txHash, channelId: candidate.channelId,
@@ -661,6 +666,14 @@ export class PayoutReporter implements PayoutTransport {
 
   attachTempo(reader: TempoPayoutReader): void {
     this.tempo = reader;
+  }
+
+  /**
+   * Leave recovered Tempo reports to the mount that owns the host's Tempo
+   * state: this reporter has no recipient to attribute them to.
+   */
+  withholdTempo(): void {
+    this.reportsTempo = false;
   }
 
   /**
@@ -861,7 +874,7 @@ export class PayoutReporter implements PayoutTransport {
       const ctx = this.x402;
       const before = ctx ? await claimedByChannel(ctx.storage) : new Map<string, ClaimedView>();
       const results = await manager.refund!(channelIds);
-      if (ctx && this.hostedObligations) {
+      if (ctx && this.x402Obligations) {
         for (const result of results) {
           const original = before.get(result.channel.toLowerCase());
           if (!original) throw new Error("Hosted x402 refund lost its original channel snapshot");
@@ -895,7 +908,7 @@ export class PayoutReporter implements PayoutTransport {
     try {
       const now = this.now();
       const existing = await this.batches.get(ctx.scope);
-      if (this.hostedObligations && !existing) {
+      if (this.x402Obligations && !existing) {
         throw new Error("Hosted x402 claim lost its pre-effect payout batch");
       }
       const open = existing ?? {
@@ -913,9 +926,9 @@ export class PayoutReporter implements PayoutTransport {
       open.claimedNative += claim.delta;
       open.voucherCount += claim.vouchers;
       open.claims += 1;
-      if (this.hostedObligations) {
+      if (this.x402Obligations) {
         const ids = (await Promise.all(claim.transactions.map((txHash) =>
-          this.hostedObligations!.submittedIds("x402", claim.operation ?? "claim",
+          this.x402Obligations!.submittedIds("x402", claim.operation ?? "claim",
             txHash, open.batchId)))).flat();
         if (!ids.length || ids.length < claim.vouchers || new Set(ids).size !== ids.length) {
           throw new Error("Hosted x402 claim has no exact reserved voucher set");
@@ -925,7 +938,7 @@ export class PayoutReporter implements PayoutTransport {
       await this.batches.put(open);
     } catch (err) {
       warn("payout_batch_track_failed", { scope: ctx.scope, error: message(err) });
-      if (this.hostedObligations) throw err;
+      if (this.x402Obligations) throw err;
     }
   }
 
@@ -941,18 +954,18 @@ export class PayoutReporter implements PayoutTransport {
         warn("payout_batch_empty", { scope: ctx.scope, transaction, batchId: open.batchId });
         return;
       }
-      if (this.hostedObligations) {
+      if (this.x402Obligations) {
         if (!open.obligationIds?.length) {
           throw new Error("Hosted x402 payout has no original claim identities");
         }
-        const settleId = await this.hostedObligations.settlementId(open.batchId, transaction);
-        const settled = await this.hostedObligations.observeCanonical(settleId);
+        const settleId = await this.x402Obligations.settlementId(open.batchId, transaction);
+        const settled = await this.x402Obligations.observeCanonical(settleId);
         if (BigInt(settled.deltaNative) !== open.claimedNative) {
           throw new Error("Hosted x402 settled amount differs from its original batch");
         }
         let claimed = 0n;
         for (const id of open.obligationIds) {
-          claimed += BigInt((await this.hostedObligations.observeCanonical(id)).deltaNative);
+          claimed += BigInt((await this.x402Obligations.observeCanonical(id)).deltaNative);
         }
         if (claimed !== open.claimedNative) {
           throw new Error("Hosted x402 batch amount differs from finalized original claims");
@@ -976,11 +989,11 @@ export class PayoutReporter implements PayoutTransport {
         landedAt: this.now(),
       };
       const closed = await this.batches.settle(ctx.scope, open.batchId, async (tx) => {
-        if (!this.hostedObligations) return this.enqueuePayout(payload, tx);
+        if (!this.x402Obligations) return this.enqueuePayout(payload, tx);
         if (!this.transport.enqueueHostedPayout || !open.obligationIds?.length) {
           throw new Error("Hosted x402 payout lacks its original claims or durable queue");
         }
-        const settleId = await this.hostedObligations.settlementId(open.batchId, transaction);
+        const settleId = await this.x402Obligations.settlementId(open.batchId, transaction);
         await this.transport.enqueueHostedPayout(payload,
           [...open.obligationIds, settleId], tx);
       });
@@ -990,7 +1003,7 @@ export class PayoutReporter implements PayoutTransport {
       }
     } catch (err) {
       warn("payout_report_failed", { rail: "x402", kind: "batch", error: message(err) });
-      if (this.hostedObligations) throw err;
+      if (this.x402Obligations) throw err;
       return;
     }
     void this.flush();
