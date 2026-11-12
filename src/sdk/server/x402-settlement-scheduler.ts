@@ -53,11 +53,9 @@ export interface X402FleetSettlementScheduler {
  * {@link AutoSettlementConfig} a builder writes has to mean the same thing in
  * production as it does against in-memory storage in dev.
  *
- * The marker is written *after* a claim lands, not before. A crash in that
- * window leaves claimed funds sitting unsettled until the next claim sets it —
- * the batching model's own latency — where a pessimistic write would leave a
- * marker no settle can ever clear, which is the every-interval settle storm
- * this scheduler exists to end.
+ * The server records each confirmed batch's marker and payout accounting
+ * before starting another batch. Unconfirmed submissions never raise the
+ * marker: a transfer with nothing to settle would fail every interval.
  */
 export function createX402FleetSettlementScheduler(
   opts: X402FleetSettlementSchedulerOpts

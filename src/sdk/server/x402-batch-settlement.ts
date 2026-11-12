@@ -69,6 +69,7 @@ import {
   x402ShutdownClaimSignal,
 } from "./x402-shutdown-claim";
 import { createX402SelfRelay } from "./x402-self-relay";
+import { withX402ClaimBatches } from "./x402-claim-batches";
 import {
   createX402SettlementEvidenceReader,
   type X402SettlementEvidenceReader,
@@ -626,7 +627,7 @@ export async function createX402BatchSettlementServer(
     getSupported: accountingFacilitator.getSupported.bind(accountingFacilitator),
     async settle(payload: PaymentPayload, requirements: PaymentRequirements) {
       const response = await waitForX402ShutdownClaim(() => accountingFacilitator.settle(payload, requirements));
-      if (x402ShutdownClaimSignal.getStore() && response.success && payload.payload.type === "claim") {
+      if (response.success && payload.payload.type === "claim") {
         const claims = payload.payload.claims as { voucher: { channel: Channel["channelConfig"] } }[];
         for (const claim of claims) {
           remaining?.delete(computeChannelId(claim.voucher.channel, opts.network as `${string}:${string}`).toLowerCase());
@@ -716,7 +717,8 @@ export async function createX402BatchSettlementServer(
         300) * 1000,
     ...(postgres ? { listWedgedRefunds: () => listWedgedRefunds(postgres) } : {}),
   });
-  const tracked = opts.payout ? opts.payout.trackManager(manager) : manager;
+  // The payout tracker must finish one batch before upstream can submit the next.
+  const tracked = withX402ClaimBatches(opts.payout ? opts.payout.trackManager(manager) : manager);
   let scheduler: X402FleetSettlementScheduler | undefined;
   if (opts.config.autoSettlement !== false) {
     if (postgres && marker) {
