@@ -259,7 +259,9 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     later.attachX402SettlementStore(current.channelStore);
     expect(await later.reserveX402(CHANNEL, "claim", source("40")))
       .toEqual({ id: reserved!.id, replayed: true });
-    await rejected(source("41"));
+    // A different amount within the charge is a different original while the 40 is unresolved.
+    await expect(later.reserveX402(CHANNEL, "claim", source("41")))
+      .rejects.toThrow("another unresolved original effect");
     expect(await original(restart)).toEqual(exact);
     expect(await later.unresolvedCount()).toBe(1);
   });
