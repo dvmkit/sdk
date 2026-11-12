@@ -342,7 +342,7 @@ export class HostingControl {
         "x402_exact_settlement_intents", "x402_batch_settlements", "x402_batch_settlement_state", "x402_batch_channels",
         "mpp_tempo_channels", "mpp_tempo_close_intents", "tempo_settlement_readiness",
         "mpp_tempo_charge_replays", "sdk_hosted_tempo_charge_intents",
-        "sdk_hosted_settlement_report_history", "sdk_hosted_settlement_report_obligations"];
+        "sdk_hosted_settlement_report_history", "sdk_hosted_settlement_report_obligations", "stripe_checkout_sessions"];
       const present = await client.query<{ name: string; exists: boolean }>(
         `SELECT name, to_regclass(name) IS NOT NULL AS exists FROM unnest($1::text[]) AS name`,
         [tables]
@@ -365,13 +365,21 @@ export class HostingControl {
         [this.dvmId, this.config.scope])) reasons.push("admissions_unresolved");
       if (await count("sdk_hosting_admissions", "dvm_id<>$1 OR scope<>$2",
         [this.dvmId, this.config.scope])) reasons.push("historical_admission_owner_unknown");
+      if (await count("stripe_checkout_sessions", "state IN ('creating','open','refunding')")) {
+        reasons.push("checkout_sessions_unresolved");
+      }
       if (exists.has("sdk_hosting_admissions") && exists.has("credit_fundings")) {
         const unbooked = await client.query<{ n: string }>(
           `SELECT COUNT(*)::text AS n FROM sdk_hosting_admissions a
            WHERE a.dvm_id=$1 AND a.scope=$2 AND a.outcome='accepted'
              AND a.credit_id IS NOT NULL AND a.fund_id IS NOT NULL
              AND NOT EXISTS (SELECT 1 FROM credit_fundings f
-               WHERE f.credit_id=a.credit_id AND f.fund_id=a.fund_id)`,
+               WHERE f.credit_id=a.credit_id AND f.fund_id=a.fund_id)
+             ${exists.has("stripe_checkout_sessions") ? `AND NOT EXISTS (
+               SELECT 1 FROM stripe_checkout_sessions s WHERE s.fund_id=a.fund_id
+                 AND COALESCE(s.record->>'hostingDvmId',s.record->>'dvmId')=a.dvm_id
+                 AND s.record->>'creditId'=a.credit_id AND s.record->>'callerPubkey'=a.caller_pubkey
+                 AND s.state IN ('expired','refunded'))` : ""}`,
           [this.dvmId, this.config.scope]
         );
         if (Number(unbooked.rows[0].n)) reasons.push("funding_intents_unbooked");

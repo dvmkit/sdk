@@ -8,7 +8,8 @@ import type { Pool } from "pg";
  * card charged with no credit behind it. Stripe tags the PaymentIntent with the challenge id
  * (`metadata.mpp_challenge_id`), but nothing in that metadata says which DVM charged it, and
  * several DVMs can share one Stripe account. This journal is what scopes recovery to this
- * DVM: the card-refund sweep looks up only the challenges recorded here.
+ * DVM: the card-refund sweep looks up only the challenges recorded here. Checkout uses
+ * its own session store and never records a challenge or mpp_challenge_id here.
  */
 export interface CardChargeJournal {
   record(challengeId: string): Promise<void>;

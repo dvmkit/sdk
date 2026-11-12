@@ -817,7 +817,10 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       const chargeJournal = pgPool
         ? await (await import("./card-charge-journal")).createPostgresCardChargeJournal(pgPool)
         : undefined;
-      stripeCredit = createStripeCreditRail({ ...stripeCreditConfig, previousHmacSecret, chargeJournal });
+      const checkoutStore = stripeCreditConfig.checkoutSuccessUrl && pgPool
+        ? await (await import("./stripe-checkout-store")).createPostgresStripeCheckoutStore(pgPool)
+        : undefined;
+      stripeCredit = createStripeCreditRail({ ...stripeCreditConfig, previousHmacSecret, chargeJournal, checkoutStore });
     }
 
     // Raw mode string for the boot summary (`"platform"` | a URL | undefined).

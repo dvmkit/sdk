@@ -1061,6 +1061,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
         drainReport: { db: opts.db, dvmId, enqueueCreditDrain },
         ...(server.drainReceiptIssuer && { receiptIssuer: server.drainReceiptIssuer }),
         ...(opts.stripeCredit.chargeJournal && { journal: opts.stripeCredit.chargeJournal }),
+        checkout: opts.stripeCredit.checkout,
       },
       opts.creditExpirySweep
     );
@@ -2485,6 +2486,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       lightningFundingMinSats: this.opts.lightningReceive?.fundingMinSats,
       stripeNetworkId: this.opts.stripeCredit?.networkId,
       stripeMinMicro: this.opts.stripeCredit?.minMicro,
+      stripeCheckout: !!this.opts.stripeCredit?.checkout,
       // Configured, not advertised: `advertisedMints()` is health
       // filtered, and a rail that comes and goes with a mint's uptime is worse
       // product than one that is honestly absent.
@@ -2505,6 +2507,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     let hostingFundingArtifactHash: string | undefined;
     this.maybeSweepTempoSessions();
     return handleCreditRequest(c, {
+      checkoutProductName: `${this.descriptor.name} prepaid credit`,
       hostedSettlementReports: this.opts.hostedTempoReports,
       menu: () => this.creditMenu(this.creditCurrency()),
       creditConfig: this.descriptor.credit,

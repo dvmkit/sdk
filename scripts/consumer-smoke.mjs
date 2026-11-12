@@ -11,7 +11,7 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
   ".": ["configureDVM", "defineCapability", "isConfiguredDVMDescriptor"],
-  "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
+  "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "createPostgresStripeCheckoutStore", "signHostingControl", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
   "./testing": ["createTestContext", "StepCache"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
@@ -313,7 +313,7 @@ function typecheckConsumer(consumer, resolution) {
       `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
       `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
       `import type { JobTerminalReportPayload } from "${manifest.name}/server";`,
-      `import { createStripeCreditRail, type StripeCreditRail, type CardDrainDecision, type CardDrainRecovery, type CardDrainStateArgs } from "${manifest.name}/server";`,
+      `import { createStripeCreditRail, createPostgresStripeCheckoutStore, type StripeCheckoutStore, type StripeCheckoutRecord, type StripeCheckoutState, type LockedStripeCheckout, type StripeCreditRail, type CardDrainDecision, type CardDrainRecovery, type CardDrainStateArgs } from "${manifest.name}/server";`,
       `import { type UpfrontPayment as ServerUpfrontPayment, readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, type CreditFundingEvidence, type FundingRecord, createDVMHost, signHostingControl, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type HostingControlConfig, type HostingControlCommand, type HostingControlStatus, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
       `import { createTestContext } from "${manifest.name}/testing";`,
       `import { MemoryJobStore } from "${manifest.name}/testing";`,
@@ -328,6 +328,11 @@ function typecheckConsumer(consumer, resolution) {
       "export const serverMissingSignature: ServerSignedRequestFailure = missingSignature;",
       "export const legacyTerminalReport: JobTerminalReportPayload = { dvmId: 'example-dvm', jobId: 'example-job', capability: 'work', outcome: 'completed', endedBy: null, paid: true, acceptedAtMs: 1000, terminalAtMs: 2000, callerWaitMs: 0, receiptSeq: null, chargedMicro: 100000, currency: 'usd', stoppedPiece: false };",
       "export const terminalReport: JobTerminalReportPayload = { ...legacyTerminalReport, heldMicro: 300000, finishedPieceCount: 1 };",
+      "export const checkoutStoreFactory = createPostgresStripeCheckoutStore;",
+      "export type CheckoutStoreContract = StripeCheckoutStore;",
+      "export type CheckoutRecordContract = StripeCheckoutRecord;",
+      "export type CheckoutStateContract = StripeCheckoutState;",
+      "export type CheckoutTransactionContract = LockedStripeCheckout;",
       "export const cardRail: StripeCreditRail = createStripeCreditRail({ secretKey: 'sk_test_fake', networkId: 'profile_test', hmacSecret: '44'.repeat(32) });",
       "export const cardRecoveryDecision: CardDrainDecision = { decisionId: 'example-decision', action: 'close', reason: 'Refund unavailable', decidedAt: 1000 };",
       "export const cardRecoveryState: CardDrainRecovery = { revision: 0, blockedReason: 'charges_exhausted', blockedAt: 1000, decisions: [cardRecoveryDecision], writtenOffMicro: 1000000 };",

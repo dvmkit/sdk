@@ -164,7 +164,7 @@ export interface CreditTerms {
    */
   lightning_min_micro?: number;
   /** Card funding profile and minimum in USD micro-units. */
-  stripe?: { network_id: string; min_micro: number; currency: "usd" };
+  stripe?: { network_id: string; min_micro: number; currency: "usd"; checkout?: true };
 }
 
 /** Prepaid-credit funding menu on a quote or 402. Snake_case: wire shape. */
@@ -250,10 +250,13 @@ function parseCreditStripeTerms(raw: unknown): CreditTerms["stripe"] | undefined
     typeof block.min_micro !== "number" ||
     !Number.isSafeInteger(block.min_micro) ||
     block.min_micro <= 0 ||
+    (block.checkout !== undefined && block.checkout !== true) ||
     block.currency !== "usd"
   )
     return undefined;
-  return { network_id: block.network_id, min_micro: block.min_micro, currency: "usd" };
+  return { network_id: block.network_id, min_micro: block.min_micro, currency: "usd",
+    ...(block.checkout === true && { checkout: true }),
+  };
 }
 
 function parseCreditTempoTerms(raw: unknown): CreditTerms["tempo"] | undefined {
