@@ -9,22 +9,6 @@
 - `scope` is now optional in `retryHostedTempoCloseReport` and `writeOffHostedTempoCloseReport`, and the experimental server signatures that carry the report-obligation recorder change with it. See `docs/HOSTING.md`.
 - A Tempo session close broadcast before the upgrade has no reservation, so recovery reports its payout once through the close intent, as a self-hosted close does. An x402 claim reservation now records the amount the claim presents, which trails the channel's stored charge until the deposit is spent, so a partly spent credit can be claimed under reservation.
 
-### Features
-
-- Add opt-in hosted Stripe Checkout for prepaid card credit. Set `DVMKIT_STRIPE_CHECKOUT_SUCCESS_URL` to an HTTPS success page and grant the restricted key Checkout Sessions: Write. The menu advertises `credit.stripe.checkout: true`; signed `fund { method: "stripe", via: "checkout", fund_id, amount_micro }` requests return a hosted URL with HTTP 202 and poll into normal funded credit. The token path is unchanged. See `protocol-fixtures/credit-fund-stripe-checkout-v1.json`.
-- Initialize additive `stripe_checkout_sessions` and `stripe_checkout_store_identity` tables. Booking and the existing card accounting share one transaction; recovery refunds paid, unbooked sessions after 24 hours. Terminal `checkout_expired` prevents late booking once refund recovery has claimed a session. Upgrade every process sharing the Checkout store before enabling the new URL; keep Checkout-aware recovery running until all recorded sessions resolve before rolling back.
-
-- Scope Checkout metadata and idempotency to the server's DVM identity and a durable random store namespace. Remove session adoption; an unshown create expires after 30 minutes without account-wide search or refund. Reject fund ids over 200 characters and return terminal causes for Stripe permission/request failures. Checkout uses the account's API version.
-- Run Stripe outside database connections, reserving create/refund work with short leases and booking with a nonwaiting compare-and-set transaction. Busy polls return retryable errors. Recovery backs off per row and orders work by its next attempt time. Hosting closure now blocks unresolved Checkout sessions and releases terminal unbooked admissions.
-
-### Bug Fixes
-
-- Retry internal Checkout bookkeeping on brief row contention without queueing client booking polls. A session-id save failure also releases its create lease when possible. Abandoned Checkout recovery uses dispute status: won refunds, lost retires the unbooked obligation with a durable reason and releases hosting closure, and open disputes back off. Session read 403/404 failures emit distinct catalogued operator diagnostics with the session id; unresolved obligations remain intact.
-
-### Breaking API changes
-
-- Server declaration fingerprints add optional Checkout configuration, `fund.via`, and `credit.stripe.checkout`, plus the Postgres Checkout store factory and its transaction contract. Existing token-only rail implementations remain compatible. Custom Checkout stores must serialize session transitions and supply the same transaction used for booking, payment markers, and deposit outbox writes; the provided Postgres store implements this contract. Checkout stores now also require a durable namespace, lease/scheduling fields, and nonwaiting locks. Resolve sessions created by earlier experimental Checkout implementations before upgrading; their unscoped metadata cannot be safely adopted or booked. Upgrade all processes sharing the store together.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -38,6 +22,36 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Breaking changes
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
+
+## [0.36.0](https://github.com/dvmkit/sdk/compare/v0.35.2...v0.36.0) (2026-11-12)
+
+
+### Features
+
+* **server:** fund card credit through a hosted Checkout page ([#164](https://github.com/dvmkit/sdk/issues/164)) ([44516ea](https://github.com/dvmkit/sdk/commit/44516ea43637ba086781d2a2631bbdae2024edc9))
+
+- Add opt-in hosted Stripe Checkout for prepaid card credit. Set `DVMKIT_STRIPE_CHECKOUT_SUCCESS_URL` to an HTTPS success page and grant the restricted key Checkout Sessions: Write. The menu advertises `credit.stripe.checkout: true`; signed `fund { method: "stripe", via: "checkout", fund_id, amount_micro }` requests return a hosted URL with HTTP 202 and poll into normal funded credit. The token path is unchanged. See `protocol-fixtures/credit-fund-stripe-checkout-v1.json`.
+- Initialize additive `stripe_checkout_sessions` and `stripe_checkout_store_identity` tables. Booking and the existing card accounting share one transaction; recovery refunds paid, unbooked sessions after 24 hours. Terminal `checkout_expired` prevents late booking once refund recovery has claimed a session. Upgrade every process sharing the Checkout store before enabling the new URL; keep Checkout-aware recovery running until all recorded sessions resolve before rolling back.
+- Scope Checkout metadata and idempotency to the server's DVM identity and a durable random store namespace. Remove session adoption; an unshown create expires after 30 minutes without account-wide search or refund. Reject fund ids over 200 characters and return terminal causes for Stripe permission/request failures. Checkout uses the account's API version.
+- Run Stripe outside database connections, reserving create/refund work with short leases and booking with a nonwaiting compare-and-set transaction. Busy polls return retryable errors. Recovery backs off per row and orders work by its next attempt time. Hosting closure now blocks unresolved Checkout sessions and releases terminal unbooked admissions.
+
+
+### Breaking API changes
+
+- Server declaration fingerprints add optional Checkout configuration, `fund.via`, and `credit.stripe.checkout`, plus the Postgres Checkout store factory and its transaction contract. Existing token-only rail implementations remain compatible. Custom Checkout stores must serialize session transitions and supply the same transaction used for booking, payment markers, and deposit outbox writes; the provided Postgres store implements this contract. Checkout stores now also require a durable namespace, lease/scheduling fields, and nonwaiting locks. Resolve sessions created by earlier experimental Checkout implementations before upgrading; their unscoped metadata cannot be safely adopted or booked. Upgrade all processes sharing the store together.
+
+
+### Bug Fixes
+
+* **server:** preserve accounting for partial x402 claims ([18311c2](https://github.com/dvmkit/sdk/commit/18311c25c83581cfc471bf96c160ddb7a702d1c9))
+* skip excluded payment rail initialization ([1d1c12d](https://github.com/dvmkit/sdk/commit/1d1c12d3b0353e6c4a988bea5ab0d6eb40b6aa48))
+
+- Retry internal Checkout bookkeeping on brief row contention without queueing client booking polls. A session-id save failure also releases its create lease when possible. Abandoned Checkout recovery uses dispute status: won refunds, lost retires the unbooked obligation with a durable reason and releases hosting closure, and open disputes back off. Session read 403/404 failures emit distinct catalogued operator diagnostics with the session id; unresolved obligations remain intact.
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.35.2 ([#159](https://github.com/dvmkit/sdk/issues/159)) ([9db3983](https://github.com/dvmkit/sdk/commit/9db3983183faa86303514491faa19d91ab89a1bb))
 
 ## [0.35.2](https://github.com/dvmkit/sdk/compare/v0.35.1...v0.35.2) (2026-11-11)
 
