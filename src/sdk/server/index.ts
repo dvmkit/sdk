@@ -157,11 +157,6 @@ export type { JobManagerOpts } from "./job-manager";
 /** @stability experimental */
 export { JobManager } from "./job-manager";
 /** @stability experimental */
-export type { HostingControlCommand, HostingControlConfig, HostingControlStatus,
-  HostingClosureCommand, HostingClosureEvidence } from "./hosting-control";
-/** @stability experimental */
-export { signHostingControl, signHostingClosure } from "./hosting-control";
-/** @stability experimental */
 export type { DeclineOutcome, JobRecord, JobStatus, JobStore, StreamableJobStore } from "./job-store";
 /** @stability experimental */
 export { isStreamableJobStore, JobEndedError } from "./job-store";

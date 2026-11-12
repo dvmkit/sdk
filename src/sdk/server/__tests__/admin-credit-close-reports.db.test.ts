@@ -14,7 +14,6 @@ import { installAdminCreditRoutes } from "../admin-credit";
 import { createDVMServer } from "../app";
 import { MemoryConsumedCredentialStore } from "../consumed-credential-store";
 import { CreditLedger } from "../credit-ledger";
-import { HostingControl } from "../hosting-control";
 import { HostedSettlementReportObligations } from "../hosting-settlement-report-obligations";
 import { initLockPubkeyTable, seedLockPubkeyState, toLockPubkey } from "../lock-pubkey-store";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
@@ -89,9 +88,6 @@ describe.skipIf(!RUN_CLOSE_REPORT_DB)("Tempo close-report durable route contract
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();
     });
-    await new HostingControl(db, owner, {
-      secret: "test-only-close-report-secret-32-bytes", scope,
-    }).init();
     const store = new HostedSettlementReportObligations(db, owner, scope);
     await store.init();
     const app = makeHarness(db, store, scope);
@@ -338,7 +334,7 @@ describe.skipIf(!RUN_CLOSE_REPORT_DB)("Tempo close-report durable route contract
   });
 
   it("a hosted app wires working close-report routes through production construction", async () => {
-    const { db, seed, scope } = await reports();
+    const { db, seed } = await reports();
     const jobs = new PostgresJobStore(db);
     const ledger = new CreditLedger(db);
     await jobs.init();
@@ -351,7 +347,6 @@ describe.skipIf(!RUN_CLOSE_REPORT_DB)("Tempo close-report durable route contract
       onJob(ctx) { ctx.complete("done"); },
     }), { env: {}, store: new MemoryKVStore(), jobStore: jobs, db, dvmId: DVM_ID,
       devMode: true, lockPubkey: LOCK_PUBKEY, creditLedger: ledger,
-      hostingControl: { secret: "test-only-close-report-secret-32-bytes", scope },
       adminCashuNonceStore: new MemoryConsumedCredentialStore({ maxEntries: 100 }),
     });
     try {

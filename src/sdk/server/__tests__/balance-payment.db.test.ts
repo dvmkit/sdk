@@ -11,7 +11,6 @@ import { JobManager } from "../job-manager";
 
 import { dropSchemas, pinnedPool, recreateSchema } from "../../../test-support/schema-isolation";
 import { commitBalancePayment } from "../balance-payment";
-import { HostingControl } from "../hosting-control";
 import { CreditLedger } from "../credit-ledger";
 import { PostgresJobStore } from "../postgres-job-store";
 import { PostgresTempoSessionStore } from "../tempo-session-store";
@@ -275,31 +274,6 @@ describe.skipIf(!RUN)("balance payment atomic persistence", () => {
     } finally {
       ledger.useX402SettlementGate({ pendingRefundSettlement: async () => undefined });
     }
-  });
-
-  it("refuses growth after hosted closure through the existing durable intent fence", async () => {
-    const control = new HostingControl(pool, "example-dvm", {
-      secret: "test-only-balance-hosting-secret-32-bytes", scope: "example-scope",
-    });
-    await control.init();
-    await ledger.draw({ creditId: "credit", drawId: "draw", amountMicro: 2_000, jobId: "job" });
-    await pool.query("UPDATE jobs SET dvm_id='example-dvm',credit_id='credit',draw_id='draw' WHERE id='job'");
-    await pool.query(`INSERT INTO sdk_hosting_admissions(id,dvm_id,scope,job_id,admitted_at_ms,outcome)
-      VALUES('admission','example-dvm','example-scope','job',0,'accepted')`);
-    await pool.query("UPDATE sdk_hosting_control SET state='closed',closed_at_ms=1,closed_at_us=1000");
-    const fenced = new CreditLedger(pool);
-    fenced.useHostingCleanupFence(control.cleanupFence);
-    const request = () => commitBalancePayment({ pool, ledger: fenced, auth, domain,
-      jobId: "job", dvmId: "example-dvm", raw: signed() });
-    await expect(request()).rejects.toThrow("Hosted payment has no pre-closure inbound intent");
-    expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.amountMicro).toBe(2_000);
-    expect((await ledger.get("credit"))?.availableMicro).toBe(8_000);
-    expect((await store.get("job"))?.pendingPaymentMsats).toBe(10_000);
-    expect((await pool.query("SELECT * FROM credit_balance_payments")).rowCount).toBe(0);
-    expect((await store.getMessages("job", 0)).filter((message) => message.type === "payment")).toHaveLength(0);
-    await pool.query("UPDATE sdk_hosting_control SET state='draining',closed_at_ms=NULL,closed_at_us=NULL");
-    expect(await request()).toMatchObject({ response: { seq: 2 } });
-    expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.amountMicro).toBe(3_000);
   });
 
   it("rolls debit and verified inbound back when persisting the payment identity fails", async () => {

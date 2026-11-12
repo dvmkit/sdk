@@ -33,7 +33,6 @@ import { MemoryKVStore } from "../store";
 import type { CashuMode, DVMDescriptor, KVStore, PaymentMethod, ZodLike } from "../types";
 import { createDVMServer, revenueReporterBannerState, unknownRouteNotFound } from "./app";
 import type { PostgresKVStore } from "./postgres-kv-store";
-import type { PostgresTempoChargeStore } from "./tempo-charge-store";
 import type { ResolvedCashuOpts } from "./cashu-env";
 import { resolveCashuOptsFromEnv } from "./cashu-env";
 import {
@@ -47,7 +46,6 @@ import type { PostgresTempoSessionStore } from "./tempo-session-store";
 import type { JobStore, StreamableJobStore } from "./job-store";
 import { isStreamableJobStore } from "./job-store";
 import type { JobManagerOpts } from "./job-manager";
-import type { HostingControlConfig } from "./hosting-control";
 import { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import { createPlatformLightningRailHealth } from "./lightning-rail-health";
 import type { LightningReceiveConfig } from "./lightning-receive";
@@ -125,8 +123,6 @@ export interface DVMServeResult {
 }
 
 export interface DVMHostOpts {
-  /** Dedicated hosting-management authority for each mounted DVM. Requires durable Postgres. */
-  hostingControl?: HostingControlConfig;
   /**
    * Postgres connection string. Defaults to `DATABASE_URL` env.
    * Required at runtime. Boot fails when missing unless `jobStore`
@@ -294,7 +290,6 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
   let reportingPool: Pool | undefined;
   let creditLedger: CreditLedgerLike | undefined;
   let tempoSessionStore: PostgresTempoSessionStore | undefined;
-  let tempoChargeStore: PostgresTempoChargeStore | undefined;
   // the Tempo half of payout reporting is host-level state — one
   // session store, one recipient — attached to the mount's reporter once it
   // exists, and fed from mppx's settlement callback through the sink.
@@ -328,13 +323,6 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         )
       ) as Record<string, string>);
     const envMaybe = env as Record<string, string | undefined>;
-    const hostingSecret = envMaybe.DVMKIT_HOSTING_CONTROL_SECRET;
-    const hostingScope = envMaybe.DVMKIT_HOSTING_CONTROL_SCOPE;
-    if (!opts.hostingControl && Boolean(hostingSecret) !== Boolean(hostingScope)) {
-      throw new Error("Hosting control requires both DVMKIT_HOSTING_CONTROL_SECRET and DVMKIT_HOSTING_CONTROL_SCOPE");
-    }
-    const hostingControl = opts.hostingControl ??
-      (hostingSecret && hostingScope ? { secret: hostingSecret, scope: hostingScope } : undefined);
 
     const port = serveOpts?.port ?? opts.port ?? Number(envMaybe.PORT ?? "8080");
 
@@ -452,15 +440,15 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     // Awaited here, ahead of every store below that creates a financial or
     // report table: whichever runs first decides whether history is complete.
     const hostedSettlementReports = settlementDb && cashuOpts.dvmId
-      ? new HostedSettlementReportObligations(settlementDb, cashuOpts.dvmId, hostingControl?.scope)
+      ? new HostedSettlementReportObligations(settlementDb, cashuOpts.dvmId)
       : undefined;
     await hostedSettlementReports?.init();
     // The session runtime reserves reports only where something discharges
-    // them: the platform reporter, or hosting control's closure evidence.
-    const tempoSettlementReports = hostingControl ||
-      ((opts.platformReporter?.token ?? envMaybe.DVMKIT_PLATFORM_TOKEN) &&
-        (opts.platformReporter?.url ?? envMaybe.DVMKIT_PLATFORM_URL))
-      ? hostedSettlementReports : undefined;
+    // them: the platform reporter.
+    const tempoSettlementReports =
+      (opts.platformReporter?.token ?? envMaybe.DVMKIT_PLATFORM_TOKEN) &&
+        (opts.platformReporter?.url ?? envMaybe.DVMKIT_PLATFORM_URL)
+        ? hostedSettlementReports : undefined;
     if (envMaybe.BUILDER_LOCK_PRIVKEY) {
       throw new Error("BUILDER_LOCK_PRIVKEY must not be set on a DVM machine.");
     }
@@ -607,7 +595,6 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       if (pgPool) {
         const { PostgresTempoChargeStore } = await import("./tempo-charge-store");
         const chargeStore = new PostgresTempoChargeStore(pgPool);
-        tempoChargeStore = chargeStore;
         pendingInits.push(chargeStore.init());
         tempoCharge = { store: chargeStore };
       }
@@ -1102,11 +1089,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         lockPubkeyGraceSeconds: cashuOpts.lockPubkeyGraceSeconds,
         canonicalDvmId: cashuOpts.canonicalDvmId,
         db: pgPool ?? cashuOpts.db,
-        hostingControl,
-        hostingCleanupSingleMount: mounts.length === 1,
-        hostingCleanupKnownRailStores: !mpp || tempoChargeBackend === "postgres",
         hostingTempoSessionStore: descMpp ? tempoSessionStore : undefined,
-        hostingTempoChargeStore: descMpp ? tempoChargeStore : undefined,
         dvmId: cashuOpts.dvmId,
         failFast,
         mintHealthTracker: opts.mintHealthTracker,

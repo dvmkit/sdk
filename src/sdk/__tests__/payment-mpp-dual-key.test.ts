@@ -1,16 +1,14 @@
 import { randomBytes } from "node:crypto";
 
-import { Credential, Errors as MppxErrors, Store } from "mppx";
+import { Credential, Errors as MppxErrors } from "mppx";
 import { tempo as tempoClient } from "mppx/client";
 import { Mppx, tempo } from "mppx/server";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 
 import type { MppSecretState } from "../server/mpp-secret-state";
-import type { PostgresTempoChargeStore } from "../server/tempo-charge-store";
 import {
   createDualKeyMppxFromOpts,
-  installHostedTempoChargeGuard,
   type MppOpts,
   type MppxServer,
 } from "../server/mpp-setup";
@@ -111,35 +109,6 @@ describe("createDualKeyMppxFromOpts — verify roundtrip", () => {
     }
     await expect(mpp.validateCredential!(await buildCredential(randomBytes(32).toString("hex"))))
       .rejects.toBeInstanceOf(MppxErrors.InvalidChallengeError);
-  });
-
-  it("reserves the exact mppx proof replay key before active and rotated broadcasts", async () => {
-    const store = Store.memory();
-    const reserveHostedCharge = vi.fn().mockResolvedValue(undefined);
-    const mpp = asMpp(createDualKeyMppxFromOpts(
-      { ...opts, tempoCharge: { store } },
-      { DVMKIT_TEMPO_SECRET_KEY: activeSecret } as NodeJS.ProcessEnv,
-      async () => ({
-        active: activeSecret,
-        previous: { secret: previousSecret, expiresAtMs: Date.now() + 60_000 },
-        rapidRotationAtMs: null,
-      })
-    ));
-    installHostedTempoChargeGuard(mpp, {
-      reserveHostedCharge,
-      completeHostedCharge: vi.fn().mockResolvedValue(undefined),
-    } as unknown as PostgresTempoChargeStore);
-    for (const secret of [activeSecret, previousSecret]) {
-      const credential = await buildCredential(secret);
-      const admissionId = `admission-${credential.challenge.id}`;
-      const receipt = await mpp.broadcastCredential(credential, {
-        hostedPaymentIntent: { admissionId, jobId: `job-${credential.challenge.id}` },
-      });
-      expect(receipt.status).toBe("success");
-      expect(reserveHostedCharge).toHaveBeenLastCalledWith(
-        Credential.serialize(credential), expect.objectContaining({ admissionId })
-      );
-    }
   });
 
   it("rejects a previous-signed credential after the rotation window has expired", async () => {

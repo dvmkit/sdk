@@ -384,8 +384,8 @@ export class HostedSettlementReportObligations {
   /**
    * Establish this scope's reporting identity and count this process's boot
    * once. A scope that predates the identity table inherits the instance its
-   * obligations and hosting-control row already name, so earlier reservations
-   * stay owned and replayable.
+   * obligations already name, so earlier reservations stay owned and
+   * replayable.
    */
   private async bootIdentity(): Promise<string> {
     return transaction(this.pool, async (tx) => {
@@ -408,27 +408,14 @@ export class HostedSettlementReportObligations {
         }
         return scope;
       }
-      const earlier = await tx.query<{ instance_id: string | null; boot_epoch: string }>(
+      const earlier = await tx.query<{ instance_id: string; boot_epoch: string }>(
         `SELECT instance_id,MAX(boot_epoch)::text AS boot_epoch
          FROM sdk_hosted_settlement_report_obligations WHERE dvm_id=$1 AND scope=$2
          GROUP BY instance_id`, [this.dvmId, scope]
       );
-      const control = await tx.query<{ present: boolean }>(
-        "SELECT to_regclass('sdk_hosting_control') IS NOT NULL AS present"
-      );
-      if (control.rows[0]?.present) {
-        // to_jsonb tolerates a control table created before it carried a boot identity.
-        const rows = await tx.query<{ instance_id: string | null; boot_epoch: string }>(
-          `SELECT to_jsonb(hosting)->>'instance_id' AS instance_id,
-                  COALESCE(to_jsonb(hosting)->>'boot_epoch','0') AS boot_epoch
-           FROM sdk_hosting_control hosting WHERE dvm_id=$1 AND scope=$2`, [this.dvmId, scope]
-        );
-        earlier.rows.push(...rows.rows);
-      }
       const instances = new Set<string>();
       let epoch = 0n;
       for (const row of earlier.rows) {
-        if (!row.instance_id) continue;
         instances.add(row.instance_id);
         if (BigInt(row.boot_epoch) > epoch) epoch = BigInt(row.boot_epoch);
       }
@@ -1564,7 +1551,7 @@ export class HostedSettlementReportObligations {
 export async function retryHostedTempoCloseReport(args: {
   db: Pool;
   dvmId: string;
-  /** Defaults to the scope a boot without hosting control reports under. */
+  /** Defaults to the scope a boot reports under. */
   scope?: string;
   obligationId: string;
 }): Promise<boolean> {
@@ -1581,7 +1568,7 @@ export interface HostedTempoCloseReportWriteOff {
 
 interface WriteOffHostedTempoCloseReportArgs {
   db: Pool; dvmId: string;
-  /** Defaults to the scope a boot without hosting control reports under. */
+  /** Defaults to the scope a boot reports under. */
   scope?: string;
   obligationId: string; note: string;
 }

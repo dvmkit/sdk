@@ -3354,7 +3354,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         processedPayments: this.opts.processedPayments,
         enqueueCreditDeposit: this.opts.enqueueCreditDeposit,
         jobId: job.id,
-        hostingPaymentSeq: inboundSeq ?? undefined,
+        paymentSeq: inboundSeq ?? undefined,
         creditTtlMs: this.opts.creditTtlMs,
       },
       { ...incomingPaymentSnapshot(job), ...(landAsBalance && { landAsBalance }) }

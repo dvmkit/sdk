@@ -23,7 +23,7 @@ function service(name: string) {
   });
 }
 
-describe.skipIf(!RUN)("settlement history at boot without hosting control (real Postgres)", () => {
+describe.skipIf(!RUN)("settlement history at boot (real Postgres)", () => {
   const schemas: string[] = [];
   const pools: Pool[] = [];
   const closers: Array<() => Promise<void>> = [];

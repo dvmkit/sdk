@@ -1,8 +1,8 @@
 /**
  * A hosted host's cooperative Tempo close, driven through the real drain route.
  *
- * Real: the Postgres credit ledger, Tempo session store, close intents,
- * hosting control and settlement-report obligations; the mppx handle from
+ * Real: the Postgres credit ledger, Tempo session store, close intents
+ * and settlement-report obligations; the mppx handle from
  * `createMppFromOpts` with its Tempo session runtime, challenge authentication
  * and the stored-channel voucher check; the hosted close guard
  * `createDVMServer` installs; and, for the payout report, the real payout and
@@ -47,7 +47,6 @@ import { installAdminCreditRoutes } from "../admin-credit";
 import { MemoryConsumedCredentialStore } from "../consumed-credential-store";
 import { toLockPubkey } from "../lock-pubkey-store";
 import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
-import { HostingControl, signHostingClosure } from "../hosting-control";
 import { retryHostedTempoCloseReport } from "../index";
 import { HostedSettlementReportObligations, HOSTED_SETTLEMENT_UNRESOLVED_SQL } from "../hosting-settlement-report-obligations";
 import { _testing, createMppFromOpts, type MppxServer } from "../mpp-setup";
@@ -80,7 +79,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
 
 const SCHEMA = `hosted_tempo_close_${process.pid}`;
-const SECRET = "test-only-hosting-close-secret-32-bytes!";
 const CHAIN_ID = 4217;
 const ESCROW = TempoSession.Precompile.Constants.tip20ChannelEscrow;
 const PAYEE = `0x${"22".repeat(20)}`;
@@ -216,8 +214,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     /** Whether a landing close leaves a `ChannelClosed` log for recovery to find. */
     closeLogged?: boolean;
     hosted?: boolean;
-    /** Whether the hosted server also runs the opt-in hosting control. Defaults to `hosted`. */
-    control?: boolean;
+    /** Whether the server delivers platform reports, which engages report reservations. Defaults to `hosted`. */
     reporting?: boolean;
     withoutExitCapability?: boolean;
     head?: bigint;
@@ -231,9 +228,15 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
   } = {}) {
     const modes = [...(options.modes ?? ["lands"])];
     const hosted = options.hosted ?? true;
-    const control = options.control ?? hosted;
+    const reporting = options.reporting ?? hosted;
+    if (reporting) {
+      // A platform-reporting server would otherwise start its timers against the stand-in platform.
+      vi.spyOn(RevenueReporter.prototype, "startRetryLoop").mockImplementation(() => {});
+      vi.spyOn(PayoutReporter.prototype, "start").mockImplementation(() => {});
+    }
     const dvmId = `dvm-${randomUUID()}`;
-    const scope = `deployment-${randomUUID()}`;
+    // A boot with no configured scope reports under the default one.
+    const scope = "default";
     const operator = privateKeyToAccount(generatePrivateKey());
     const descriptor = {
       payer: payer.address, payee: PAYEE as `0x${string}`, operator: operator.address,
@@ -258,14 +261,6 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       basis: { rail: "tempo", paidMsats: 0, nativeAmount: 100_000, nativeAsset: "usdc",
         tempoSession: { channelId, cumulativeAmount: (options.highestVoucherAmount ?? SPENT).toString() } },
     });
-
-    if (control) {
-      const hostingControl = new HostingControl(pool, dvmId, { secret: SECRET, scope });
-      await hostingControl.init();
-      expect(await hostingControl.transition({ action: "resume", version: 2, dvmId, scope,
-        generation: 1, leaseExpiresAtMs: Date.now() + 60_000, deadlineMs: Date.now() + 90_000,
-        timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` })).toBe("ok");
-    }
 
     const head = options.head ?? HEAD;
     const logs: ChainLog[] = [];
@@ -296,8 +291,8 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       }
     };
     // The obligations the host hands its Tempo session runtime, as `host.ts` does.
-    const hostedObligations = new HostedSettlementReportObligations(pool, dvmId, control ? scope : undefined);
-    if (hosted && !control) await hostedObligations.init();
+    const hostedObligations = new HostedSettlementReportObligations(pool, dvmId);
+    if (hosted) await hostedObligations.init();
     const readChannelClose = vi.fn((_client: Client, _channelId: Hex, _txHash: Hex) => Promise.resolve({ settledToPayee: SPENT,
       refundedToPayer: DEPOSIT - SPENT }));
     const runtimeConfig = { ...tempoSession, ...(hosted && { hostedObligations }) };
@@ -380,8 +375,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     }), {
       env: {}, store: new MemoryKVStore(), jobStore: jobs, db: pool, dvmId, fxFetcher: stubFx,
       creditLedger: routeLedger, mpp, hostingTempoSessionStore: sessions,
-      ...(options.reporting && { platformUrl: "https://platform.example.com", platformToken: "local-token" }),
-      ...(control && { hostingControl: { secret: SECRET, scope } }),
+      ...(reporting && { platformUrl: "https://platform.example.com", platformToken: "local-token" }),
     });
 
     /** `payloadDescriptor: null` sends a close credential without a descriptor. */
@@ -420,7 +414,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     /** Close searches started: each one first asks for the chain head. */
     const searches = () => rpc.requests.filter(({ method }) => method === "eth_blockNumber").length;
     return { server, mpp: { ...mpp, sweepTempoSessions: manualSweep }, creditId, channelId, dvmId,
-      scope, reportingScope: control ? scope : undefined, drain, broadcasts, obligations,
+      scope, drain, broadcasts, obligations,
       ageObligations, searches, settlements, logs, chain, operator, rpc, descriptor, readChannelClose, runtimeConfig, chainOps };
   }
 
@@ -579,15 +573,11 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       }
     });
 
-  it.each([
-    ["with hosting control", true], ["without hosting control", false],
-  ])("reports the payout of a close that landed after its receipt wait timed out, once, %s", async (_name, control) => {
+  it("reports the payout of a close that landed after its receipt wait timed out, once", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, creditId, channelId, dvmId, reportingScope, drain, obligations, searches } =
-      await hostedCredit(payer, { modes: ["lands-then-receipt-times-out"], control,
-        // Without control, reports are reserved only for a server that delivers them.
-        ...(!control && { reporting: true }) });
-    const reporting = payoutReporting(dvmId, reportingScope);
+    const { server, creditId, channelId, dvmId, scope, drain, obligations, searches } =
+      await hostedCredit(payer, { modes: ["lands-then-receipt-times-out"] });
+    const reporting = payoutReporting(dvmId, scope);
     try {
       // The drain completes from the landed chain state; its refund is owed
       // whether or not the receipt arrived.
@@ -1179,27 +1169,6 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
         // Releasing the drain deleted its close intent; the search still
         // continued below the first pass rather than starting from the head.
         expect(secondPassLogs[0]).toBe(500_000n);
-        expect(await obligations()).toEqual([{ state: "no_report", tx_hash: null }]);
-      } finally {
-        await server.shutdown();
-      }
-    });
-
-    it("is resolved by the hosting closure check without waiting for traffic", async () => {
-      const { server, dvmId, scope, obligations } =
-        await releasedDuringGrace({ requestBlock: HEAD - 900n });
-      try {
-        const command = { version: 3 as const, action: "certificate" as const, dvmId, scope,
-          generation: 1, operationId: `operation_${randomUUID().replaceAll("-", "")}`,
-          timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` };
-        const response = await server.app.request("/_hosting/closure-certificate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json",
-            "X-DVM-Hosting-Signature": signHostingClosure(SECRET, command) },
-          body: JSON.stringify(command),
-        });
-        // Not closed yet, so no certificate; the obligation resolved before that answer.
-        expect(response.status).toBe(409);
         expect(await obligations()).toEqual([{ state: "no_report", tx_hash: null }]);
       } finally {
         await server.shutdown();

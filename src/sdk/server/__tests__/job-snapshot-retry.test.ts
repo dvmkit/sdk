@@ -2,7 +2,6 @@ import type { Pool, PoolClient } from "pg";
 import { describe, expect, it, vi } from "vitest";
 
 import type { JobRecord } from "../job-store";
-import type { HostingCleanupFence } from "../hosting-cleanup-fence";
 import { PostgresJobStore } from "../postgres-job-store";
 
 const job: JobRecord = {
@@ -58,12 +57,11 @@ describe("snapshot retry classification", () => {
     expect(write).toHaveBeenCalledTimes(8);
   });
 
-  it("rolls back a hosted deadlock and restarts its whole transaction on a released client", async () => {
+  it("rolls back a deadlock and restarts its whole transaction on a released client", async () => {
     const statements: string[] = [];
     let fault = true;
     const query = vi.fn(async (sql: string) => {
       statements.push(sql);
-      if (sql.startsWith("SELECT dvm_id")) return { rows: [{ dvm_id: "snapshot-dvm" }], rowCount: 1 };
       if (sql.includes("INSERT INTO jobs") && fault) {
         fault = false;
         throw Object.assign(new Error("deadlock"), { code: "40P01" });
@@ -73,7 +71,6 @@ describe("snapshot retry classification", () => {
     const release = vi.fn();
     const connect = vi.fn().mockResolvedValue({ query, release } as unknown as PoolClient);
     const store = new PostgresJobStore({ connect } as unknown as Pool);
-    store.useHostingCleanupFence({ dvmId: "snapshot-dvm" } as HostingCleanupFence);
     await store.saveForDvm({ ...job }, "snapshot-dvm");
     expect(statements.filter(sql => ["BEGIN", "ROLLBACK", "COMMIT"].includes(sql)))
       .toEqual(["BEGIN", "ROLLBACK", "BEGIN", "COMMIT"]);

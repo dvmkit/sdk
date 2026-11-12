@@ -42,7 +42,6 @@ import type {
 } from "../../lib/x402/types";
 import { loggers } from "../../observability/loggers";
 import type { CreditLedgerQuerier } from "./credit-ledger";
-import type { HostedFundingReservation } from "./hosting-cleanup-fence";
 import type { HostedSettlementReportObligations, HostedEffectReservation } from "./hosting-settlement-report-obligations";
 import {
   type X402EarnedNative,
@@ -311,7 +310,6 @@ export interface X402BatchSettlementServer {
        * figure, since this one is read before the channel lock is taken.
        */
       refundBoundNative?: number;
-      hostingFunding?: HostedFundingReservation;
       commit: (funding: X402BatchFunding, tx?: CreditLedgerQuerier) => Promise<T>;
       complete?: (settlement: SettleResponse, committed: T, tx?: CreditLedgerQuerier) => Promise<T>;
     } & (
@@ -774,7 +772,6 @@ export async function createX402BatchSettlementServer(
       effectId: string;
       expectedChannelId?: string;
       refundBoundNative?: number;
-      hostingFunding?: HostedFundingReservation;
       commit: (funding: X402BatchFunding, tx?: CreditLedgerQuerier) => Promise<T>;
       complete?: (settlement: SettleResponse, committed: T, tx?: CreditLedgerQuerier) => Promise<T>;
     }) {
@@ -808,18 +805,6 @@ export async function createX402BatchSettlementServer(
           reason: "wrong_channel_operation",
           requirements: requirements as PaymentRequirementsV2[],
         };
-      }
-      if (args.operation === "fund" && postgres) {
-        if (args.hostingFunding &&
-          args.effectId !== `${args.hostingFunding.creditId}:${args.hostingFunding.fundId}`) {
-          throw new Error("x402 funding effect conflicts with its hosted admission");
-        }
-        if (args.hostingFunding &&
-          createHash("sha256").update(args.paymentHeader).digest("hex") !==
-            args.hostingFunding.paymentArtifactHash) {
-          throw new Error("x402 payment differs from its hosted admission artifact");
-        }
-        await postgres.assertHostingFundingReservation(args.hostingFunding);
       }
       if (isRefund && (raw as { amount?: unknown }).amount !== undefined) {
         // Upstream honours a payer-supplied `amount` verbatim, above any
@@ -1105,7 +1090,7 @@ export async function createX402BatchSettlementServer(
             requirements: matched,
             channelBefore: channelBeforeVerify ?? reserved,
             ...(pendingId ? { pendingId } : {}),
-          }, args.hostingFunding);
+          });
           if (intent.status === "settled" && intent.response) {
             const value = await recoverSettledPayment({
               postgres,
@@ -1187,7 +1172,7 @@ export async function createX402BatchSettlementServer(
         }
       };
       const result = postgres
-        ? await postgres.withChannelTransaction(funding.channelId, (tx) => guarded(tx), args.hostingFunding)
+        ? await postgres.withChannelTransaction(funding.channelId, (tx) => guarded(tx))
         : await withLocalChannelLock(inMemoryChannelTails, funding.channelId, () => guarded());
       if ("withdrawalPending" in result) {
         try {

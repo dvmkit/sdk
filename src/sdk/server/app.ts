@@ -29,7 +29,6 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { Pool } from "pg";
 import { toJSONSchema, z } from "zod";
-import { HostedChannelEvidenceReader } from "./hosting-channel-evidence";
 
 import { shortSha } from "../../lib/git-sha";
 import { JOB_IDENTITY_HEADER, isJobIdentityValue } from "../../lib/job-identity-header";
@@ -118,7 +117,6 @@ import type { CreditExpirySweepOpts } from "./credit-expiry-sweep";
 import { startCardRefundSweep } from "./card-refund-sweep";
 import { startCreditExpirySweep } from "./credit-expiry-sweep";
 import { CreditLedger, type CreditLedgerLike, type CreditSnapshot, type DrawRecord } from "./credit-ledger";
-import type { PostgresTempoChargeStore } from "./tempo-charge-store";
 import type { PostgresTempoSessionStore } from "./tempo-session-store";
 import type { CreditMenu } from "./credit-menu";
 import {
@@ -134,15 +132,12 @@ import { devPageHtml } from "./dev-page";
 import type { PriceFiat } from "./funding";
 import {
   deferredX402IntentId,
-  derivedFundCreditId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
   priceFiatMicro,
   resolvePriceFiat,
 } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
-import { HostingControl, type HostingClosureCommand, type HostingClosureSupport,
-  type HostingControlCommand, type HostingControlConfig } from "./hosting-control";
 import { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { BuilderIdentity, OwnerDisplay } from "./host";
 import { createInstrumentedFetch } from "./instrumented-fetch";
@@ -182,8 +177,7 @@ import {
 } from "./cashu-payment-request";
 import { MemoryCreditLedger } from "./memory-credit-ledger";
 import { MintHealthTracker } from "./mint-health-tracker";
-import { advertisedMethods, installHostedTempoChargeGuard,
-  installHostedTempoCloseGuard, type MppxServer } from "./mpp-setup";
+import { advertisedMethods, installHostedTempoCloseGuard, type MppxServer } from "./mpp-setup";
 import type { StripeCreditRail } from "./stripe-credit";
 import type {
   PaymentErrorDetail,
@@ -211,7 +205,7 @@ import {
 import { acceptLatePayment } from "./late-payment";
 import type { PayoutReporter } from "./payout-reporter";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
-import { MemoryProcessedPaymentStore, PostgresProcessedPaymentStore } from "./processed-payment-store";
+import { MemoryProcessedPaymentStore } from "./processed-payment-store";
 import { PostgresJobStore } from "./postgres-job-store";
 import { ReceiptIssuer } from "./receipt-issuer";
 import {
@@ -424,14 +418,7 @@ export interface SDKServerOpts {
   canonicalDvmId?: string;
   /** Postgres pool for builder admin state and wallet accumulator persistence. */
   db?: Pool;
-  /** Enables authenticated, durable hosting admission and bounded drain. Requires Postgres and dvmId. */
-  hostingControl?: HostingControlConfig;
-  /** Internal host wiring: shared ledger rows cannot certify one of several mounts. */
-  hostingCleanupSingleMount?: boolean;
-  /** Internal host wiring: every configured rail uses SDK-owned durable stores. */
-  hostingCleanupKnownRailStores?: boolean;
   hostingTempoSessionStore?: PostgresTempoSessionStore;
-  hostingTempoChargeStore?: PostgresTempoChargeStore;
   /**
    * Host strict-mode flag. Reporter readiness follows hosted context regardless
    * of this value.
@@ -564,10 +551,8 @@ export interface SDKServerOpts {
 
 /** Internal reporter wiring added after the public server options are resolved. */
 interface InternalSDKServerOpts extends SDKServerOpts {
-  hostingControlInstance?: HostingControl;
   hostedSettlementReports?: HostedSettlementReportObligations;
   hostedTempoReports?: HostedSettlementReportObligations;
-  hostingClosureSupport?: HostingClosureSupport;
   enqueueCreditDeposit?: CreditDepositEnqueue;
   enqueueCreditDrain?: CreditDrainEnqueue;
   enqueueCreditDrawRelease?: CreditDrawReleaseEnqueue;
@@ -599,7 +584,6 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   let x402ChannelStorage: PostgresX402ChannelStorage | undefined;
   let x402BatchSettlement: X402BatchSettlementServer | undefined;
   let server: DVMServer<State, InputSchema> | undefined;
-  let hostingControl: HostingControl | undefined;
   let hostedSettlementReports: HostedSettlementReportObligations | undefined;
   /** Set only when this server's Tempo session runtime reserves reports before each effect. */
   let hostedTempoReports: HostedSettlementReportObligations | undefined;
@@ -672,15 +656,11 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   // Settlement history is decided by the first initializer to run: it must
   // precede every store below that creates a financial or report table.
   if (opts.db && dvmId && typeof opts.db.connect === "function") {
-    hostedSettlementReports = new HostedSettlementReportObligations(
-      opts.db, dvmId, opts.hostingControl?.scope
-    );
+    hostedSettlementReports = new HostedSettlementReportObligations(opts.db, dvmId);
     await hostedSettlementReports.init();
-    // Reservations are discharged by the platform reporter or examined by
-    // hosting control. With neither, they would only accumulate and block the
-    // next effect on the same channel.
-    const discharged = !!opts.hostingControl ||
-      (!opts.onJobCompleted && !!platformToken && !!platformUrl);
+    // Only the platform reporter discharges reservations. Without it they
+    // would only accumulate and block the next effect on the same channel.
+    const discharged = !opts.onJobCompleted && !!platformToken && !!platformUrl;
     // `reconcileTempoSessionCloses` exists only on a session runtime built to
     // reserve each settlement before its effect.
     if (discharged && opts.hostingTempoSessionStore && opts.mpp?.tempoConfiguration &&
@@ -706,7 +686,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
       // them, so a database with incomplete history keeps its earlier x402
       // reporting. Only the SDK's own channel storage can reserve atomically.
       if (discharged && !opts.x402.batchSettlement.storage &&
-        (opts.hostingControl || await hostedSettlementReports.hasCompleteHistory())) {
+        await hostedSettlementReports.hasCompleteHistory()) {
         const network = x402NetworkByCaip2(opts.x402.network);
         if (!network) throw new Error("Hosted x402 batch network is unsupported");
         hostedSettlementReports.configureX402({
@@ -980,55 +960,13 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
         })
       : undefined;
 
-  if (opts.hostingControl) {
-    if (!opts.db || !opts.dvmId || !(opts.jobStore instanceof PostgresJobStore)) {
-      throw new Error("Hosting control requires a Postgres pool, dvmId, and PostgresJobStore");
-    }
-    if (descriptor.credit && !opts.creditLedger?.durable) {
-      throw new Error("Hosting control with credit requires a durable credit ledger");
-    }
-    const channelReader = await HostedChannelEvidenceReader.fromServerConfig(opts.db, {
-      ...(x402BatchConfig && x402ChannelStorage && x402Config ? { x402: {
-        network: x402Config.network,
-        ...(x402BatchConfig.rpcUrl ? { rpcUrl: x402BatchConfig.rpcUrl } : {}),
-      } } : {}),
-      ...(opts.hostingTempoSessionStore && opts.mpp ? { tempoEnv: opts.env } : {}),
-    });
-    hostingControl = new HostingControl(opts.db, opts.dvmId, opts.hostingControl, channelReader);
-    await hostingControl.init();
-    if (opts.hostingCleanupSingleMount ?? true) {
-      if (opts.creditLedger instanceof CreditLedger) {
-        opts.creditLedger.useHostingCleanupFence(hostingControl.cleanupFence);
-      }
-      opts.jobStore.useHostingCleanupFence(hostingControl.cleanupFence);
-      x402ExactStore?.useHostingCleanupFence(hostingControl.cleanupFence);
-      x402ChannelStorage?.useHostingCleanupFence(hostingControl.cleanupFence);
-      opts.hostingTempoSessionStore?.useHostingCleanupFence(hostingControl.cleanupFence);
-      opts.hostingTempoChargeStore?.useHostingCleanupFence(hostingControl.cleanupFence);
-      if (opts.mpp && opts.hostingTempoChargeStore) {
-        installHostedTempoChargeGuard(opts.mpp, opts.hostingTempoChargeStore);
-      }
-    }
-  }
-  // The credit drain refuses a hosted close without this guard, and reports
-  // are reserved with or without hosting control.
+  // The credit drain refuses a hosted close without this guard.
   if (opts.mpp && hostedTempoReports) installHostedTempoCloseGuard(opts.mpp, hostedTempoReports);
-  const hostingClosureSupport: HostingClosureSupport | undefined = hostingControl ? {
-    singleMount: opts.hostingCleanupSingleMount ?? true,
-    durableLedger: opts.creditLedger instanceof CreditLedger,
-    durableJobStore: opts.jobStore instanceof PostgresJobStore,
-    durableReporter: !!activeRevenueReporter,
-    durablePaymentReplay: processedPayments instanceof PostgresProcessedPaymentStore,
-    knownRailStores: (opts.hostingCleanupKnownRailStores ?? !opts.mpp) &&
-      (!x402Config || (!!x402ExactStore && (!x402BatchConfig || !!x402ChannelStorage))),
-  } : undefined;
   server = new DVMServer(descriptor, {
     ...opts,
     platformUrl,
-    hostingControlInstance: hostingControl,
     hostedSettlementReports,
     hostedTempoReports,
-    hostingClosureSupport,
     creditLedger,
     processedPayments,
     onJobCompleted: effectiveOnJobCompleted,
@@ -1175,7 +1113,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   private readonly deferredX402?: InProcessDeferredX402Settler;
   /** Withdraws this mount's Tempo session capability from the poll. */
   private undeclareSessionCapability?: () => void;
-  private hostingSweepTimer?: ReturnType<typeof setInterval>;
   private readonly diagnosticCapabilityAuthority: DiagnosticCapabilityAuthority;
   /**
    * Capabilities are offered on x402 but no rail reached this server, as when
@@ -1381,17 +1318,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           cashu_store_missing: !opts.db && !opts.disposableCashu,
         });
       }
-      if (opts.hostingControlInstance) {
-        this.hostingSweepTimer = setInterval(() => {
-          void this.sweepHostingDeadline().catch((error: unknown) => {
-            diagnosticConsole.error("Hosting deadline sweep failed:", error);
-          });
-        }, 1000);
-        this.hostingSweepTimer.unref();
-        void this.sweepHostingDeadline().catch((error: unknown) => {
-          diagnosticConsole.error("Hosting deadline sweep failed:", error);
-        });
-      }
       if (this.ownsMintHealthTracker) this.mintHealthTracker?.start();
       // Refresh after declaring capabilities: host boot primes the client before
       // mounts exist, and a traffic-idle process may otherwise keep that empty probe.
@@ -1426,7 +1352,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    * and host teardown layers can finish later cleanup before surfacing it.
    */
   shutdown(): Promise<void> {
-    if (this.hostingSweepTimer) clearInterval(this.hostingSweepTimer);
     this.jobManager.shutdown();
     // A settlement server still being constructed owns the same pool the moment
     // it resolves, so stop that one too rather than only what is already built.
@@ -1438,79 +1363,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     this.undeclareSessionCapability?.();
     this.undeclareSessionCapability = undefined;
     return stopped;
-  }
-
-  private async sweepHostingDeadline(): Promise<void> {
-    const control = this.opts.hostingControlInstance;
-    if (!control) return;
-    const status = await control.status();
-    const store = this.jobManager.store;
-    if (!(store instanceof PostgresJobStore)) return;
-    for (const jobId of status.activeJobIds) {
-      if (!(await control.dispatchDeadlineReached(jobId))) continue;
-      let cancelled: boolean;
-      try {
-        cancelled = await store.cancelJobForHosting(jobId, "Hosting drain deadline reached");
-      } catch (error) {
-        // A payment being verified holds this job open; a later sweep ends it.
-        if (paymentIntentOpen(error)) continue;
-        throw error;
-      }
-      if (cancelled) await this.jobManager.finalizeStoredTerminal(jobId);
-    }
-  }
-
-  private async handleHostingCommand(c: Context<AppEnv>, statusOnly: boolean): Promise<Response> {
-    const control = this.opts.hostingControlInstance;
-    if (!control) return c.json({ error: "not_found" }, 404);
-    let command: HostingControlCommand;
-    try {
-      command = await c.req.json<HostingControlCommand>();
-    } catch {
-      return c.json({ error: "invalid_hosting_control" }, 400);
-    }
-    if (!command || (statusOnly ? command.action !== "status" :
-      command.action !== "drain" && command.action !== "resume")) {
-      return c.json({ error: "invalid_hosting_control" }, 400);
-    }
-    if (!(await control.authorize(command, c.req.header("X-DVM-Hosting-Signature")))) {
-      return c.json({ error: "hosting_control_unauthorized" }, 401);
-    }
-    if (!statusOnly && command.action === "resume") await this.sweepHostingDeadline();
-    if (!statusOnly && await control.transition(command) === "conflict") {
-      return c.json({ error: "hosting_generation_conflict" }, 409);
-    }
-    if (!statusOnly) await this.sweepHostingDeadline();
-    return c.json(await control.status());
-  }
-
-  private async handleHostingClosure(c: Context<AppEnv>, certificateOnly: boolean): Promise<Response> {
-    const control = this.opts.hostingControlInstance;
-    const support = this.opts.hostingClosureSupport;
-    if (!control || !support) return c.json({ error: "not_found" }, 404);
-    let command: HostingClosureCommand;
-    try {
-      command = await c.req.json<HostingClosureCommand>();
-    } catch {
-      return c.json({ error: "invalid_hosting_closure" }, 400);
-    }
-    if (!command || command.action !== (certificateOnly ? "certificate" : "close")) {
-      return c.json({ error: "invalid_hosting_closure" }, 400);
-    }
-    if (!(await control.authorizeClosure(command, c.req.header("X-DVM-Hosting-Signature")))) {
-      return c.json({ error: "hosting_closure_unauthorized" }, 401);
-    }
-    if (!certificateOnly && await control.close(command, support) === "conflict") {
-      return c.json({ error: "hosting_closure_conflict" }, 409);
-    }
-    // Close obligations otherwise resolve only on the traffic-driven sweep, and
-    // an unresolved one withholds the certificate from a DVM being shut down.
-    await this.opts.mpp?.reconcileTempoSessionCloses?.().catch(() => {
-      diagnosticConsole.warn({ level: "tempo_routine_sweep_failed", dvm_id: this.opts.dvmId, error: undefined });
-    });
-    const evidence = await control.certificate({ ...command, action: "certificate" }, support);
-    if (!evidence) return c.json({ error: "hosting_closure_stale" }, 409);
-    return c.json(evidence);
   }
 
   private registerRoutes(): void {
@@ -1675,12 +1527,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     this.app.post("/v1/job", (c) => this.handleCreateJob(c));
     // `:capability` decodes the segment as the router does when it reads the name.
     this.app.post(`${X402_CHANNEL_PATH_PREFIX}:capability`, (c) => this.handleX402Route(c));
-    if (this.opts.hostingControlInstance) {
-      this.app.post("/_hosting/control", (c) => this.handleHostingCommand(c, false));
-      this.app.post("/_hosting/status", (c) => this.handleHostingCommand(c, true));
-      this.app.post("/_hosting/closure", (c) => this.handleHostingClosure(c, false));
-      this.app.post("/_hosting/closure-certificate", (c) => this.handleHostingClosure(c, true));
-    }
     this.app.post("/v1/request-resume/:requestId", (c) => this.handleCreateJob(c, true));
     this.app.post("/v1/request-result/:requestId", (c) => this.handleRequestResult(c));
     this.app.get("/v1/job/:id", (c) => withJobReadAvailability(() => this.handleGetJob(c)));
@@ -2503,8 +2349,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async handleCredit(c: Context<AppEnv>): Promise<Response> {
-    let hostingFundingAdmissionId: string | undefined;
-    let hostingFundingArtifactHash: string | undefined;
     this.maybeSweepTempoSessions();
     return handleCreditRequest(c, {
       checkoutProductName: `${this.descriptor.name} prepaid credit`,
@@ -2515,11 +2359,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       authDomain: this.authAudience ? this.signedRequestDomain(c, null) : undefined,
       ledger: this.creditLedger,
       fxFetcher: this.fxFetcher,
-      railOpts: async (ctx) => ({
-        ...(await this.railVerifyOpts(ctx)),
-        hostingAdmissionId: hostingFundingAdmissionId,
-        hostingPaymentArtifactHash: hostingFundingArtifactHash,
-      }),
+      railOpts: (ctx) => this.railVerifyOpts(ctx),
       onDeposit: (funding) => {
         this.reportCreditDeposit(funding);
       },
@@ -2532,58 +2372,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       lightning: this.opts.lightningReceive ? { receive: this.opts.lightningReceive } : undefined,
       settleLightning: (callerPubkey, creditId) =>
         this.settleLightningFunding(callerPubkey, creditId),
-      withFundingAdmission: this.opts.hostingControlInstance
-        ? async (ctx, body, run) => {
-            const control = this.opts.hostingControlInstance!;
-            let admissionId: string = randomUUID();
-            const fundId = body.fund?.fund_id ?? admissionId;
-            const creditId = body.credit_id ?? derivedFundCreditId(body.pubkey, fundId);
-            const workId = `credit-fund:${creditId}:${fundId}`;
-            const paymentAuthorization = ctx.req.header("Authorization");
-            const mppArtifact = paymentAuthorization
-              ? (await import("mppx")).Credential.extractPaymentScheme(paymentAuthorization)
-              : undefined;
-            const attachedPayment = ctx.req.header("X-Cashu") ?? ctx.req.header("PAYMENT-SIGNATURE") ??
-              ctx.req.header("X-PAYMENT") ?? mppArtifact;
-            const paymentArtifactHash = attachedPayment
-              ? createHash("sha256").update(attachedPayment).digest("hex") : undefined;
-            hostingFundingArtifactHash = paymentArtifactHash;
-            if (!(await control.admit(admissionId, workId, {
-              creditId, fundId, callerPubkey: body.pubkey,
-              fundingCommitment: body.fund?.commitment,
-              paymentArtifactHash,
-            }))) {
-              const prior = body.fund?.commitment
-                ? await control.acceptedFundingAdmission(
-                    creditId, fundId, body.pubkey, body.fund.commitment,
-                    paymentArtifactHash
-                  ) : undefined;
-              if (!prior) {
-                return ctx.json({
-                  error: "hosting_draining",
-                  message: "This service is draining and is not accepting new credit funding.",
-                  hint: "Balance, reclaim, and already-issued funding recovery remain available.",
-                }, 503);
-              }
-              admissionId = prior;
-            }
-            hostingFundingAdmissionId = admissionId;
-            const authorization = ctx.req.header("Authorization");
-            const paymentArtifact = Boolean(
-              ctx.req.header("X-Cashu") || ctx.req.header("PAYMENT-SIGNATURE") ||
-              ctx.req.header("X-PAYMENT") || (authorization && /^Payment\s/i.test(authorization))
-            );
-            let outcome: "accepted" | "failed" | "unresolved" = paymentArtifact ? "unresolved" : "failed";
-            try {
-              const response = await run();
-              if (response.ok || (body.fund?.method === "lightning" &&
-                await this.creditLedger.getInvoice({ creditId, fundId }))) outcome = "accepted";
-              return response;
-            } finally {
-              await control.finishAdmission(admissionId, outcome);
-            }
-          }
-        : undefined,
       tempoSettlementReadiness: this.opts.tempoSettlementReadiness,
       stripeCredit: this.opts.stripeCredit,
     });
@@ -3758,8 +3546,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
     // A capability with no price at all, a development host that skips
     // payment, or a DVM without Cashu (the only unsigned rail) leaves an
-    // unsigned caller nothing to pay with: refuse it before hosting admission
-    // and pricing, as a signed-only DVM would. Zero dynamic prices are refused below.
+    // unsigned caller nothing to pay with: refuse it before pricing, as a
+    // signed-only DVM would. Zero dynamic prices are refused below.
     if (
       unsignedPaid &&
       ((cap.price === undefined && !cap.onQuote) ||
@@ -3878,43 +3666,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           { stripAuthEnvelope: false }
         )
       : undefined;
-    const authorization = c.req.header("Authorization");
-    const mppArtifact = authorization
-      ? (await import("mppx")).Credential.extractPaymentScheme(authorization)
-      : undefined;
-    const attachedPayment = c.req.header("X-Cashu") ?? c.req.header("PAYMENT-SIGNATURE") ??
-      c.req.header("X-PAYMENT") ?? mppArtifact;
-    const hostingPaymentArtifactHash = attachedPayment
-      ? createHash("sha256").update(attachedPayment).digest("hex") : undefined;
-
-    // A previously accepted payment artifact may recover its original job
-    // while hosting admission is closed. The durable reservation binds the
-    // exact artifact to that job; no rail verifier or new settlement runs here.
-    // Recovering a route job from a presented payment is not offered.
-    if (!resumeOnly && !route && this.opts.hostingControlInstance && hostingPaymentArtifactHash) {
-      const priorId = await this.opts.hostingControlInstance.acceptedJobByPaymentArtifactHash(
-        hostingPaymentArtifactHash
-      );
-      const prior = priorId ? await this.jobManager.store.get(priorId) : undefined;
-      if (prior && prior.requestFingerprint === fingerprint &&
-        prior.requesterId === c.get("requesterId") &&
-        (!this.descriptor.auth || prior.requesterPubkey === authPubkey)) {
-        return await this.submitResponse(c, prior, prior.requesterToken);
-      }
-    }
-    if (!resumeOnly && this.opts.hostingControlInstance && creditEnvelope && authPubkey) {
-      const draw = await this.creditLedger.getDraw({
-        creditId: creditEnvelope.creditId, drawId: creditEnvelope.drawId,
-      });
-      if (draw?.jobId && await this.jobManager.store.get(draw.jobId)) {
-        const recovered = await this.recoverDrawnJob(c, {
-          creditId: creditEnvelope.creditId, drawId: creditEnvelope.drawId,
-          jobId: draw.jobId, fingerprint, callerPubkey: authPubkey,
-        });
-        if (recovered) return recovered;
-      }
-    }
-
     // Bind and lock before pricing and before every rail side effect. The
     // binding survives forever; Postgres owns the live advisory lock, so two
     // machines cannot both reach payment validation and a dead connection
@@ -3922,9 +3673,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // and can therefore pick up a draw committed before the job row landed.
     let publicRequestClaim: RequestIdClaim | undefined;
     let publicRequestClaimResult: RequestIdClaimResult | undefined;
-    let hostingAdmissionId: string | undefined;
-    let hostingAdmissionAccepted = false;
-    let hostingPaymentMayHaveLanded = false;
     if (publicRequestId && authPubkey && recoveryStore) {
       publicRequestClaim = {
         requestId: publicRequestId,
@@ -3963,18 +3711,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // time so the upfront-payment gate has a real `requiredMsats` to enforce —
       // without this, dynamic-priced capabilities let unpaid jobs through
       let jobId = publicRequestClaimResult?.jobId ?? this.jobManager.allocateJobId();
-      if (!resumeOnly && this.opts.hostingControlInstance) {
-        hostingAdmissionId = randomUUID();
-        if (!(await this.opts.hostingControlInstance.admit(hostingAdmissionId, jobId, {
-          paymentArtifactHash: hostingPaymentArtifactHash,
-        }))) {
-          return c.json({
-            error: "hosting_draining",
-            message: "This service is draining and is not accepting new jobs or payments.",
-            hint: "Keep any existing job token to fetch its result or reclaim unused credit. Retry a new job after service resumes.",
-          }, 503);
-        }
-      }
       let payment: PaymentInfo = { paidMsats: 0, receivedProofs: [] };
       let resumedAcceptedPayment = false;
       if (resumeOnly) {
@@ -4113,9 +3849,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             if (this.unsignedFloorAdvertised()) railOpts.cashuLockRefusalHint = UNSIGNED_LOCK_REFUSAL_HINT;
           }
         }
-        hostingPaymentMayHaveLanded = Boolean(
-          creditEnvelope || railOpts.cashuToken || railOpts.x402Payment || railOpts.mppCredential
-        );
         try {
           payment = await loggers.isolate.span(
             "dvm.payment.validate",
@@ -4123,8 +3856,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             async () => {
               const result = await verifyUpfrontPayment({
                 ...railOpts,
-                hostingAdmissionId,
-                hostingPaymentArtifactHash,
                 requiredMsats: priceMsats,
                 priceFiat,
                 jobId,
@@ -4280,13 +4011,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
 
       const exactAdmission = payment.x402ExactAdmission;
-      hostingPaymentMayHaveLanded ||= resumedAcceptedPayment || payment.paidMsats > 0 ||
-        Boolean(payment.funding || exactAdmission);
       if (exactAdmission) {
         jobId = exactAdmission.jobId;
-        if (hostingAdmissionId) {
-          await this.opts.hostingControlInstance!.rebindAdmissionJob(hostingAdmissionId, jobId);
-        }
         const prior = await this.jobManager.store.get(jobId);
         if (prior) {
           if (
@@ -4375,21 +4101,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       );
 
       await jm.persistJob(job);
-      if (hostingAdmissionId) {
-        await this.opts.hostingControlInstance!.finishAdmission(hostingAdmissionId, "accepted", jobId);
-        hostingAdmissionAccepted = true;
-      }
-      await this.opts.hostingControlInstance?.status();
-      if (this.opts.hostingControlInstance &&
-        await this.opts.hostingControlInstance.dispatchDeadlineReached(jobId)) {
-        const store = jm.store;
-        if (store instanceof PostgresJobStore &&
-          await store.cancelJobForHosting(jobId, "Hosting drain deadline reached")) {
-          await jm.finalizeStoredTerminal(jobId);
-        }
-        const terminal = await store.get(jobId);
-        if (terminal) return await respond(terminal, jobToken);
-      }
       if (exactAdmission) {
         await this.x402ExactSettlement?.completeAdmission(
           this.opts.dvmId ?? "",
@@ -4417,12 +4128,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       return await this.withDeferredSettlement(response, payment.creditId);
     } finally {
-      if (hostingAdmissionId && !hostingAdmissionAccepted) {
-        await this.opts.hostingControlInstance!.finishAdmission(
-          hostingAdmissionId,
-          hostingPaymentMayHaveLanded ? "unresolved" : "failed"
-        );
-      }
       if (publicRequestClaim && recoveryStore) {
         await recoveryStore.releaseRequestIdClaim(publicRequestClaim);
       }

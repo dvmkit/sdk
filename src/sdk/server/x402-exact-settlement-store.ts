@@ -5,7 +5,6 @@ import type { Pool } from "pg";
 import { canonicalize, type JsonValue } from "../../lib/cast-auth/canonical-json";
 import type { CreditEnvelope } from "./credit-envelope";
 import { withSdkInitLock } from "./init-lock";
-import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import type { ProcessedPaymentQuerier } from "./processed-payment-store";
 
 export type X402ExactSettlementStatus =
@@ -25,7 +24,9 @@ export interface X402ExactSettlementEffect {
   callerId: string;
   dvmId: string;
   jobId?: string;
-  hostingAdmissionId?: string;
+  /** Durable pending-verification message sequence of a mid-job payment. */
+  paymentSeq?: number;
+  /** Earlier releases stored `paymentSeq` under this name; recovery still reads it. */
   hostingPaymentSeq?: number;
   /** Upfront job request bound to this payment; omitted for credit-only and mid-job effects. */
   jobAdmission?: { requestFingerprint: string; authFingerprint?: string };
@@ -152,11 +153,6 @@ export interface X402ExactSettlementStore {
 }
 
 export class PostgresX402ExactSettlementStore implements X402ExactSettlementStore {
-  private hostingCleanupFence?: HostingCleanupFence;
-
-  useHostingCleanupFence(fence: HostingCleanupFence): void {
-    this.hostingCleanupFence = fence;
-  }
   constructor(private readonly pool: Pick<Pool, "query" | "connect">) {}
 
   async init(): Promise<void> {
@@ -305,17 +301,7 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
       return rowCount === 1;
     };
     let inserted: boolean;
-    if (this.hostingCleanupFence && !existing) {
-      const effect = intent.effect;
-      inserted = await this.hostingCleanupFence.withNewIntent({
-        admissionId: effect?.hostingAdmissionId,
-        jobId: effect?.jobId,
-        paymentSeq: effect?.hostingPaymentSeq,
-        creditId: effect?.jobId ? undefined : effect?.fundOnly?.creditId,
-        fundId: effect?.fundOnly?.fundId,
-        callerPubkey: effect?.jobId ? undefined : effect?.callerId,
-      }, write);
-    } else if (limit !== undefined) {
+    if (limit !== undefined) {
       const tx = await this.pool.connect();
       try {
         await tx.query("BEGIN");

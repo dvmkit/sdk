@@ -30,7 +30,6 @@ import { assertSettleMicro, type DrawSettleRequest, planDrawResolution, settledS
 import { poolForX402ShutdownClaim } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
 import { parseStoreValue } from "./store-json";
-import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import type {
   CreditDepositEnqueue,
   CreditDepositPayload,
@@ -141,8 +140,6 @@ export class CreditLedger {
   private x402Settlements?: X402RefundSettlementGate;
 
   private expiryReleaseOutbox?: CreditExpiryReleaseOutbox;
-  private hostingCleanupFence?: HostingCleanupFence;
-  private readonly invoiceSettlementClients = new WeakSet<CreditLedgerQuerier>();
 
   constructor(
     private readonly pool: CreditLedgerPool,
@@ -164,10 +161,6 @@ export class CreditLedger {
    */
   useCreditExpiryReleaseOutbox(outbox: CreditExpiryReleaseOutbox): void {
     this.expiryReleaseOutbox = outbox;
-  }
-
-  useHostingCleanupFence(fence: HostingCleanupFence): void {
-    this.hostingCleanupFence = fence;
   }
 
   async init(): Promise<void> {
@@ -499,8 +492,6 @@ export class CreditLedger {
         expires_at    BIGINT NOT NULL,
         created_at    BIGINT NOT NULL,
         settled_at    BIGINT,
-        hosting_admission_id TEXT,
-        created_at_db_us BIGINT NOT NULL DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint,
         PRIMARY KEY (credit_id, fund_id)
       );
     `);
@@ -521,13 +512,6 @@ export class CreditLedger {
     );
     await this.pool.query(
       `ALTER TABLE credit_invoices ADD COLUMN IF NOT EXISTS write_off_note TEXT`
-    );
-    await this.pool.query(
-      `ALTER TABLE credit_invoices ADD COLUMN IF NOT EXISTS hosting_admission_id TEXT`
-    );
-    await this.pool.query(
-      `ALTER TABLE credit_invoices ADD COLUMN IF NOT EXISTS created_at_db_us BIGINT NOT NULL
-       DEFAULT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint`
     );
     await this.pool.query(
       `CREATE UNIQUE INDEX IF NOT EXISTS credit_invoices_hash_uidx
@@ -672,22 +656,6 @@ export class CreditLedger {
     nowMs: number,
     creditId: string
   ): Promise<CreditSnapshot> {
-    if (this.hostingCleanupFence &&
-      (args.hostingInvoicePaymentHash || args.hostingInvoiceRepairPaymentHash) &&
-      !this.invoiceSettlementClients.has(q)) {
-      throw new Error("Hosted invoice settlement must use its original locked transaction");
-    }
-    await this.hostingCleanupFence?.assertNewIntent(q, {
-      admissionId: args.hostingAdmissionId,
-      jobId: args.hostingJobId,
-      paymentSeq: args.hostingPaymentSeq,
-      creditId: args.hostingJobId ? undefined : creditId,
-      fundId: args.hostingFundId,
-      callerPubkey: args.hostingJobId ? undefined : args.callerPubkey,
-      invoicePaymentHash: args.hostingInvoicePaymentHash,
-      invoiceRepairPaymentHash: args.hostingInvoiceRepairPaymentHash,
-      amountMicro: args.amountMicro,
-    });
     // Gate the incoming channel before the upsert: a refund may have paid back its escrow,
     // leaving new deposits unclaimable. A basis without that channel is rejected by the
     // symmetric binding guard. Funding never gets the repair effect-ID exemption.
@@ -1072,8 +1040,6 @@ export class CreditLedger {
     drawId: string;
     amountMicro: number;
     jobId?: string;
-    hostingAdmissionId?: string;
-    hostingPaymentSeq?: number;
     /** External transaction handle — caller owns BEGIN/COMMIT (spec condition 3). */
     tx?: CreditLedgerQuerier;
     nowMs?: number;
@@ -1150,10 +1116,6 @@ export class CreditLedger {
       });
       const ledgerSeq = toSafeInt(credit.last_ledger_seq) + 1;
       const balanceAfterMicro = available - args.amountMicro;
-      await this.hostingCleanupFence?.assertNewIntent(client, {
-        admissionId: args.hostingAdmissionId, jobId: args.jobId,
-        paymentSeq: args.hostingPaymentSeq,
-      });
       await client.query(`UPDATE credits SET last_ledger_seq = $2 WHERE credit_id = $1`, [
         args.creditId,
         ledgerSeq,
@@ -1242,7 +1204,6 @@ export class CreditLedger {
   async growDraw(args: {
     /** Apply fresh-spend expiry and channel gates when consuming existing balance. */
     spendExistingBalance?: boolean;
-    hostingPaymentSeq?: number;
     creditId: string;
     drawId: string;
     addAmountMicro: number;
@@ -1366,11 +1327,6 @@ export class CreditLedger {
       const drawMsats = priorMsats + added.drawMsats;
       const drawNative =
         added.drawNative === null ? priorNative : (priorNative ?? 0) + added.drawNative;
-      if (args.spendExistingBalance) {
-        await this.hostingCleanupFence?.assertNewIntent(client, {
-          jobId: args.jobId, paymentSeq: args.hostingPaymentSeq,
-        });
-      }
       await client.query(
         `UPDATE credit_draws
             SET amount_micro = $3, balance_after_micro = $4, draw_msats = $5, draw_native = $6,
@@ -1721,12 +1677,6 @@ export class CreditLedger {
     amountMicro: number;
     /** Rail the money arrived on, for the deposit audit trail. */
     rail?: string;
-    hostingAdmissionId?: string;
-    hostingCallerPubkey?: string;
-    hostingJobId?: string;
-    hostingPaymentSeq?: number;
-    hostingInvoicePaymentHash?: string;
-    hostingInvoiceRepairPaymentHash?: string;
     /** Mid-job draw funding bindings, fixed with the row so a replay or read can reissue its evidence. */
     jobId?: string;
     drawId?: string;
@@ -1736,32 +1686,7 @@ export class CreditLedger {
     nowMs?: number;
   }): Promise<FundingRecord> {
     assertAmount(args.amountMicro, { min: 1 });
-    if (this.hostingCleanupFence &&
-      (args.hostingInvoicePaymentHash || args.hostingInvoiceRepairPaymentHash) &&
-      (!args.tx || !this.invoiceSettlementClients.has(args.tx))) {
-      throw new Error("Hosted invoice settlement must use its original locked transaction");
-    }
-    if (this.hostingCleanupFence && !args.tx) {
-      return this.hostingCleanupFence.withNewIntent({
-        admissionId: args.hostingAdmissionId,
-        jobId: args.hostingJobId, paymentSeq: args.hostingPaymentSeq,
-        creditId: args.hostingJobId ? undefined : args.creditId,
-        fundId: args.hostingJobId ? undefined : args.fundId,
-        callerPubkey: args.hostingJobId ? undefined : args.hostingCallerPubkey,
-        invoicePaymentHash: args.hostingInvoicePaymentHash, amountMicro: args.amountMicro,
-        invoiceRepairPaymentHash: args.hostingInvoiceRepairPaymentHash,
-      }, (tx) => this.recordFunding({ ...args, tx }));
-    }
     const q = args.tx ?? this.pool;
-    if (args.tx) await this.hostingCleanupFence?.assertNewIntent(args.tx, {
-      admissionId: args.hostingAdmissionId,
-      jobId: args.hostingJobId, paymentSeq: args.hostingPaymentSeq,
-      creditId: args.hostingJobId ? undefined : args.creditId,
-      fundId: args.hostingJobId ? undefined : args.fundId,
-      callerPubkey: args.hostingJobId ? undefined : args.hostingCallerPubkey,
-      invoicePaymentHash: args.hostingInvoicePaymentHash, amountMicro: args.amountMicro,
-      invoiceRepairPaymentHash: args.hostingInvoiceRepairPaymentHash,
-    });
     const nowMs = args.nowMs ?? Date.now();
     const { rows } = await q.query<FundingRow>(
       `INSERT INTO credit_fundings
@@ -1892,15 +1817,10 @@ export class CreditLedger {
     const nowMs = args.nowMs ?? Date.now();
     let rows: InvoiceRow[];
     try {
-      const insert = async (q: CreditLedgerQuerier) => {
-        const hostingAdmissionId = this.hostingCleanupFence
-          ? await this.hostingCleanupFence.fundingAdmission(q, args.creditId, args.fundId,
-              args.callerPubkey) : null;
-        return q.query<InvoiceRow>(
+      ({ rows } = await this.pool.query<InvoiceRow>(
         `INSERT INTO credit_invoices (credit_id, fund_id, caller_pubkey, currency, amount_micro,
-                                      amount_msats, payment_hash, bolt11, status, expires_at, created_at,
-                                      hosting_admission_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11)
+                                      amount_msats, payment_hash, bolt11, status, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10)
          ON CONFLICT (credit_id, fund_id) DO NOTHING
          RETURNING *`,
         [
@@ -1914,15 +1834,8 @@ export class CreditLedger {
           args.bolt11,
           args.expiresAt,
           nowMs,
-          hostingAdmissionId,
         ]
-        );
-      };
-      ({ rows } = this.hostingCleanupFence
-        ? await this.hostingCleanupFence.withNewIntent({
-            creditId: args.creditId, fundId: args.fundId, callerPubkey: args.callerPubkey,
-          }, insert)
-        : await insert(this.pool));
+      ));
     } catch (err) {
       // The `ON CONFLICT` target covers the PK only, so a `payment_hash`
       // collision arrives as a raw unique violation: this wallet handed us a
@@ -2037,14 +1950,11 @@ export class CreditLedger {
         ]);
         return { invoice, funding, credit, replayed: true };
       }
-      this.invoiceSettlementClients.add(client);
       const funding = await this.recordFunding({
         creditId: invoice.creditId,
         fundId: invoice.fundId,
         amountMicro: invoice.amountMicro,
         rail: "lightning",
-        hostingInvoicePaymentHash: invoice.paymentHash,
-        hostingCallerPubkey: invoice.callerPubkey,
         tx: client,
         nowMs,
       });
@@ -2055,8 +1965,6 @@ export class CreditLedger {
         amountMicro: invoice.amountMicro,
         expiryMs: args.expiryMs,
         basis: args.basis,
-        hostingInvoicePaymentHash: invoice.paymentHash,
-        hostingFundId: invoice.fundId,
         tx: client,
         nowMs,
       });
@@ -2095,7 +2003,6 @@ export class CreditLedger {
       }
       throw err;
     } finally {
-      this.invoiceSettlementClients.delete(client);
       client.release();
     }
   }
@@ -2239,14 +2146,11 @@ export class CreditLedger {
           `invoice ${args.paymentHash} is ${invoice.status}; only a blocked or written-off invoice can be reconciled`
         );
       }
-      this.invoiceSettlementClients.add(client);
       const funding = await this.recordFunding({
         creditId: args.targetCreditId,
         fundId: invoice.paymentHash,
         amountMicro: invoice.amountMicro,
         rail: "lightning",
-        hostingInvoiceRepairPaymentHash: invoice.paymentHash,
-        hostingCallerPubkey: invoice.callerPubkey,
         tx: client,
         nowMs,
       });
@@ -2257,8 +2161,6 @@ export class CreditLedger {
         amountMicro: invoice.amountMicro,
         expiryMs: args.expiryMs,
         basis: args.basis,
-        hostingInvoiceRepairPaymentHash: invoice.paymentHash,
-        hostingFundId: invoice.paymentHash,
         tx: client,
         nowMs,
       });
@@ -2310,7 +2212,6 @@ export class CreditLedger {
       }
       throw err;
     } finally {
-      this.invoiceSettlementClients.delete(client);
       client.release();
     }
   }
@@ -4102,12 +4003,6 @@ export interface CreditLedgerLike {
     amountMicro: number;
     expiryMs: number;
     basis: CreditFundingBasis;
-    hostingAdmissionId?: string;
-    hostingJobId?: string;
-    hostingFundId?: string;
-    hostingPaymentSeq?: number;
-    hostingInvoicePaymentHash?: string;
-    hostingInvoiceRepairPaymentHash?: string;
     tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<CreditSnapshot>;
@@ -4116,14 +4011,11 @@ export interface CreditLedgerLike {
     drawId: string;
     amountMicro: number;
     jobId?: string;
-    hostingAdmissionId?: string;
-    hostingPaymentSeq?: number;
     tx?: CreditLedgerQuerier;
     nowMs?: number;
   }): Promise<DrawResult>;
   growDraw(args: {
     spendExistingBalance?: boolean;
-    hostingPaymentSeq?: number;
     creditId: string;
     drawId: string;
     addAmountMicro: number;
@@ -4164,12 +4056,6 @@ export interface CreditLedgerLike {
     fundId: string;
     amountMicro: number;
     rail?: string;
-    hostingAdmissionId?: string;
-    hostingCallerPubkey?: string;
-    hostingJobId?: string;
-    hostingPaymentSeq?: number;
-    hostingInvoicePaymentHash?: string;
-    hostingInvoiceRepairPaymentHash?: string;
     jobId?: string;
     drawId?: string;
     paymentSeq?: number;
@@ -5029,12 +4915,6 @@ export interface CreditFundArgs {
    */
   basis: CreditFundingBasis;
   /** Server-verified original hosted admission, never accepted from the caller body. */
-  hostingAdmissionId?: string;
-  hostingJobId?: string;
-  hostingFundId?: string;
-  hostingPaymentSeq?: number;
-  hostingInvoicePaymentHash?: string;
-  hostingInvoiceRepairPaymentHash?: string;
   /**
    * External transaction handle; caller owns BEGIN, COMMIT and ROLLBACK.
    */

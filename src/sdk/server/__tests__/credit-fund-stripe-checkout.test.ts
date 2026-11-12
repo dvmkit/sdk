@@ -1,18 +1,14 @@
 import { readFileSync } from "node:fs";
 
-import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 
 import { parseCreditMenu, parseCreditTerms } from "../../../lib/transport/types";
-import type { AppEnv } from "../app";
-import { handleCreditRequest } from "../credit-routes";
-import { secp256k1Auth } from "../secp256k1-auth";
 import { runCardRefundSweep } from "../card-refund-sweep";
 import { derivedFundCreditId } from "../funding";
 import type { CreditDepositPayload } from "../revenue-reporter";
 import { CHECKOUT_ABANDONED_AFTER_MS, CHECKOUT_RECOVERY_BACKOFF_MS } from "../stripe-checkout-recovery";
 import { stripeCreditConfigFromEnv } from "../stripe-credit";
-import { CALLER, cardServer, noRateFx, drain } from "./__helpers__/card-credit";
+import { CALLER, cardServer, drain } from "./__helpers__/card-credit";
 import { fundStripeCheckout, CHECKOUT_CREATE_WINDOW_MS } from "../stripe-checkout-funding";
 import { checkoutFund, checkoutServer, checkoutTestStore } from "./__helpers__/stripe-checkout";
 
@@ -91,30 +87,6 @@ describe("hosted card top-ups", () => {
     store.create = () => Promise.reject(new Error("Database unavailable"));
     expect((await checkoutFund(server.app)).status).toBe(503);
     expect(server.account.forms).toEqual([]);
-  });
-
-  it("lets a recorded poll finish without charging a fresh hosting admission", async () => {
-    const server = await checkoutServer();
-    await checkoutFund(server.app);
-    const menu = (await (await server.app.request("/v1/info")).json()).credit;
-    let admissions = 0;
-    const app = new Hono<AppEnv>();
-    app.post("/v1/credit", (c) => handleCreditRequest(c, {
-      menu: async () => menu, creditConfig: undefined, auth: secp256k1Auth(),
-      ledger: server.ledger, fxFetcher: noRateFx,
-      railOpts: async () => ({ requiredMsats: 0, creditLedger: server.ledger }),
-      onDeposit: () => {}, drainReport: {}, receiptIssuer: undefined, lightning: undefined,
-      settleLightning: async () => {}, stripeCredit: server.rail,
-      withFundingAdmission: async () => {
-        admissions++;
-        return Response.json({ error: "admission_unavailable" }, { status: 503 });
-      },
-    }));
-    expect((await checkoutFund(app)).status).toBe(202);
-    expect(admissions).toBe(0);
-    expect((await checkoutFund(app, "fresh")).status).toBe(503);
-    expect(admissions).toBe(1);
-    expect(server.account.forms).toHaveLength(1);
   });
 
   it("recovers a lost create reply with identical parameters and key", async () => {

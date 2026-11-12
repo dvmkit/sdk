@@ -6,7 +6,6 @@ import type { Pool, PoolClient } from "pg";
 import { withPostgresTransactionRecovery } from "../../lib/pg-retry";
 import type { CreditLedgerQuerier } from "./credit-ledger";
 import { withSdkInitLock } from "./init-lock";
-import { HostingCleanupFence, type HostedFundingReservation } from "./hosting-cleanup-fence";
 import { parseStoreValue, stringifyStoreValue } from "./store-json";
 
 /** One durable Tempo session-channel row exposed to reconciliation workers. */
@@ -93,11 +92,6 @@ export interface TempoSessionLifecycle {
  * connection-holding window shrinks to the database work it actually covers.
  */
 export class PostgresTempoSessionStore implements Store.AtomicStore {
-  private hostingCleanupFence?: HostingCleanupFence;
-
-  useHostingCleanupFence(fence: HostingCleanupFence): void {
-    this.hostingCleanupFence = fence;
-  }
   private readonly acceptance = new AsyncLocalStorage<AcceptanceContext>();
 
   constructor(private readonly pool: Pool) {
@@ -209,21 +203,10 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
 
   /** Compose voucher acceptance and its ledger mutation under the channel-row lock. */
   async withVoucherAcceptance<value, result>(
-    voucher: { channelId: string; cumulativeAmount: bigint; hostingFunding?: HostedFundingReservation },
+    voucher: { channelId: string; cumulativeAmount: bigint },
     commit: (tx: PoolClient, voucher: TempoVoucherDelta) => Promise<result>,
     operation: () => Promise<value>
   ): Promise<{ value: value; result: result | undefined }> {
-    if (this.hostingCleanupFence) {
-      if (!voucher.hostingFunding) throw new Error("Hosted Tempo voucher has no original funding admission");
-      const reservation = voucher.hostingFunding;
-      await this.hostingCleanupFence.withNewIntent({
-        admissionId: reservation.admissionId,
-        creditId: reservation.creditId,
-        fundId: reservation.fundId,
-        callerPubkey: reservation.callerPubkey,
-        fundingCommitment: reservation.commitment,
-      }, (tx) => this.hostingCleanupFence!.assertFundingReservation(tx, reservation));
-    }
     const context: AcceptanceContext = {
       commit,
       channelId: voucher.channelId.toLowerCase(),
@@ -683,11 +666,6 @@ export class PostgresTempoSessionStore implements Store.AtomicStore {
           "SELECT state_json FROM mpp_tempo_channel_tombstones WHERE channel_key=$1 FOR UPDATE", [key]
         );
         if (prior.rows[0]) assertMonotonicTransition(parseStoreValue(prior.rows[0].state_json), value);
-      }
-      if (!acceptance && this.hostingCleanupFence && (current === null ||
-        (asBigInt((value as Record<string, unknown>).highestVoucherAmount) ?? 0n) >
-          (isRecord(current) ? asBigInt(current.highestVoucherAmount) ?? 0n : 0n))) {
-        await this.hostingCleanupFence.assertNewIntent(client);
       }
       await client.query(
         `INSERT INTO mpp_tempo_channels (channel_key, state_json, updated_at)

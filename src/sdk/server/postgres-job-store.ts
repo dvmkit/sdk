@@ -12,7 +12,6 @@ import type { JobReceipt } from "../../lib/receipt";
 import type { StepRecord } from "../step-cache";
 import type { CapabilityChannel } from "../types";
 import { withSdkInitLock } from "./init-lock";
-import { HostingCleanupFence } from "./hosting-cleanup-fence";
 import { JobEndedError } from "./job-store";
 import type {
   AppendOutgoingOptions,
@@ -55,7 +54,6 @@ interface NotifySubscriber {
 /** Postgres-backed JobStore with cross-machine message streaming via LISTEN/NOTIFY. */
 export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore, PaymentArrivalStore {
   private pool: Pool;
-  private hostingCleanupFence?: HostingCleanupFence;
   private listenChannel: ListenChannel | null = null;
   private messageSubscribers = new Map<string, Set<MessageSubscriber>>();
   private notifySubscribers = new Map<string, Set<NotifySubscriber>>();
@@ -71,10 +69,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
 
   constructor(pool: Pool) {
     this.pool = pool;
-  }
-
-  useHostingCleanupFence(fence: HostingCleanupFence): void {
-    this.hostingCleanupFence = fence;
   }
 
   /** Run the CREATE TABLE migration. Call once at startup. */
@@ -406,7 +400,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     const lockKey = requestIdAdvisoryLockKey(claim.requesterPubkey, claim.requestId);
     let locked = false;
-    let transactional = false;
     try {
       const lock = await client.query<{ acquired: boolean }>(
         "SELECT pg_try_advisory_lock($1::bigint) AS acquired",
@@ -414,11 +407,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       );
       if (!lock.rows[0]?.acquired) return undefined;
       locked = true;
-      if (createBinding && this.hostingCleanupFence) {
-        await client.query("BEGIN");
-        transactional = true;
-        await this.hostingCleanupFence.assertNewIntent(client);
-      }
 
       const now = Date.now();
       const inserted = createBinding
@@ -463,10 +451,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         }
       }
 
-      if (transactional) {
-        await client.query("COMMIT");
-        transactional = false;
-      }
       if (!result) return undefined;
       this.requestIdClaimLocks.set(claim.claimToken, {
         client,
@@ -476,7 +460,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       });
       return result;
     } catch (error) {
-      if (transactional) await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
       if (!this.requestIdClaimLocks.has(claim.claimToken)) {
@@ -745,23 +728,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       // Lock an existing row before speculative insertion touches its unique
       // indexes. Otherwise a concurrent indexed UPDATE can become the deadlock
       // victim, and retrying only this save cannot recover that other writer.
-      const existing = await tx.query<{ dvm_id: string | null; status: JobStatus; pieces: unknown }>(
-        "SELECT dvm_id, status, pieces FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
+      const existing = await tx.query<{ status: JobStatus; pieces: unknown }>(
+        "SELECT status, pieces FROM jobs WHERE id=$1 FOR UPDATE", [record.id]
       );
       const prior = existing.rows[0];
       const ending = isTerminalStatus(record.status) && (!prior || !isTerminalStatus(prior.status));
       if (prior && ending) {
         await this.assertNoOpenPaymentIntent(tx, record.id);
-      }
-      if (this.hostingCleanupFence) {
-        if (existing.rows[0]) {
-          if (existing.rows[0].dvm_id !== null &&
-            existing.rows[0].dvm_id !== this.hostingCleanupFence.dvmId) {
-            throw new Error("Hosted job belongs to another DVM");
-          }
-        } else {
-          await this.hostingCleanupFence.assertNewIntent(tx, { jobId: record.id });
-        }
       }
       ({ rowCount } = await write(tx));
       if (rowCount && ending) {
@@ -909,9 +882,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   }
 
   async delete(id: string): Promise<void> {
-    if (this.hostingCleanupFence) {
-      throw new Error("Hosted job deletion cannot discard obligation evidence");
-    }
     await this.pool.query(
       `WITH deleted AS (DELETE FROM jobs WHERE id=$1 RETURNING id)
        DELETE FROM job_outgoing_appends WHERE job_id IN (SELECT id FROM deleted)`, [id]);
@@ -980,12 +950,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
          AND last_activity_at = $2
          AND redacted_at IS NULL
          AND status IN ('completed', 'failed', 'cancelled')
-         AND NOT EXISTS (SELECT 1 FROM job_content_holds h WHERE h.job_id=jobs.id AND h.data->'cleared_at' = 'null'::jsonb)
-         AND ($4::boolean = false OR NOT EXISTS (
-           SELECT 1 FROM job_messages m WHERE m.job_id=jobs.id
-             AND m.data->>'type'='payment'
-             AND m.status IN ('pending-verification','failed-verify')))`,
-        [args.jobId, args.expectedLastActivityAt, args.redactedAt, !!this.hostingCleanupFence]
+         AND NOT EXISTS (SELECT 1 FROM job_content_holds h WHERE h.job_id=jobs.id AND h.data->'cleared_at' = 'null'::jsonb)`,
+        [args.jobId, args.expectedLastActivityAt, args.redactedAt]
       );
       if (rowCount === 1) {
         // Streamed messages and the job snapshot are one retention unit. If
@@ -1219,7 +1185,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      if (message.type === "payment") await this.hostingCleanupFence?.assertNewIntent(client);
       const { rows } = await client.query<{ seq: number }>(
         `UPDATE jobs SET next_seq = next_seq + 1, last_activity_at = CASE WHEN status IN ('completed','failed','cancelled') THEN last_activity_at ELSE $2 END
            WHERE id = $1 AND redacted_at IS NULL
@@ -1260,7 +1225,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await this.hostingCleanupFence?.assertNewIntent(client);
       // The row lock every terminal write also takes: the disposition below
       // and the intent that holds the job open commit before any cancel or
       // expiry can, or see the job already ended.
@@ -1591,10 +1555,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     return outcome === "ended" ? "declined" : outcome;
   }
 
-  async cancelJobForHosting(jobId: string, reason: string): Promise<boolean> {
-    return (await this.terminateJob(jobId, reason, "cancelled", null, "provider", { kind: "release" })) === "ended";
-  }
-
   async getCounters(jobId: string): Promise<JobCounters | undefined> {
     const { rows } = await this.pool.query<CountersRow>(
       `SELECT status, paid_msats, pending_payment_msats, summary, pieces,
@@ -1901,13 +1861,11 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
 
   private async deleteResolvedMessages(jobId: string): Promise<void> {
     // An HTTP payment admitted before the terminal snapshot may still be
-    // committing its accounting. Keep its CAS row until verification resolves;
-    // hosted cleanup also needs failed payment evidence for reconciliation.
+    // committing its accounting. Keep its CAS row until verification resolves.
     await this.pool.query(
       `DELETE FROM job_messages WHERE job_id=$1 AND NOT (
-         data->>'type'='payment' AND (status='pending-verification'
-           OR ($2::boolean AND status='failed-verify')))`,
-      [jobId, !!this.hostingCleanupFence]
+         data->>'type'='payment' AND status='pending-verification')`,
+      [jobId]
     );
   }
 

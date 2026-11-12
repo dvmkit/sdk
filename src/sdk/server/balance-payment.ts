@@ -103,10 +103,10 @@ export async function commitBalancePayment(args: {
       const existing = await tx.query("SELECT 1 FROM credit_draws WHERE credit_id=$1 AND draw_id=$2", [credit_id, draw_id]);
       if (existing.rowCount) conflict();
       await args.ledger.draw({ creditId: credit_id, drawId: draw_id, amountMicro: 0,
-        jobId: args.jobId, hostingPaymentSeq: seq, tx });
+        jobId: args.jobId, tx });
     }
     const grown = await args.ledger.growDraw({ creditId: credit_id, drawId: draw_id,
-      jobId: args.jobId, spendExistingBalance: true, hostingPaymentSeq: seq, addAmountMicro: amount_micro, capMicro: Number(job.asked_topup_micro), tx });
+      jobId: args.jobId, spendExistingBalance: true, addAmountMicro: amount_micro, capMicro: Number(job.asked_topup_micro), tx });
     if (grown.addedAmountMicro !== amount_micro) conflict("credit_payment_ask_mismatch");
     const basis = grown.railValue;
     const nativeAsset = basis.nativeAsset;
