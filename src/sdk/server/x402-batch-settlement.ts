@@ -632,7 +632,7 @@ export async function createX402BatchSettlementServer(
         for (const claim of claims) {
           remaining?.delete(computeChannelId(claim.voucher.channel, opts.network as `${string}:${string}`).toLowerCase());
         }
-        await marker?.write(true);
+        await marker.write(true);
       }
       return response;
     },
@@ -693,14 +693,18 @@ export async function createX402BatchSettlementServer(
   };
   // Every claim this fleet lands — scheduled or rushed by the withdraw race —
   // leaves funds in the contract until a `settle(receiver, token)` moves them,
-  // and only the marker survives the process that claimed.
+  // and Postgres keeps that marker across processes. Custom stores retain it locally.
   const settleScope = `${opts.network}|${opts.payTo.toLowerCase()}|${token.toLowerCase()}`;
-  const marker: X402SettlePendingMarker | undefined = postgres
+  let pendingSettle = false;
+  const marker: X402SettlePendingMarker = postgres
     ? {
         read: () => postgres.isSettlePending(settleScope),
         write: (pending) => postgres.setSettlePending(settleScope, pending),
       }
-    : undefined;
+    : {
+        read: async () => pendingSettle,
+        write: async (pending) => { pendingSettle = pending; },
+      };
   // the payout tracker sees every claim and settle whichever path
   // runs them — the scheduler, `claimAndSettle()`, the withdraw-race rush
   // claim, and shutdown — because every path goes through `tracked`. It answers the pending
@@ -721,17 +725,18 @@ export async function createX402BatchSettlementServer(
   const tracked = withX402ClaimBatches(opts.payout ? opts.payout.trackManager(manager) : manager);
   let scheduler: X402FleetSettlementScheduler | undefined;
   if (opts.config.autoSettlement !== false) {
-    if (postgres && marker) {
-      scheduler = createX402FleetSettlementScheduler({
-        manager: tracked,
-        storage,
-        config: settlementConfig,
-        withLock: (operation) => postgres.withFleetSettlementLock(operation),
-        marker,
-      });
-    } else {
-      manager.start(settlementConfig);
-    }
+    scheduler = createX402FleetSettlementScheduler({
+      manager: tracked,
+      storage,
+      config: settlementConfig,
+      withLock: async (operation) => {
+        if (postgres) return postgres.withFleetSettlementLock(operation);
+        // The scheduler's queue serializes timer jobs within this process.
+        await operation();
+        return true;
+      },
+      marker,
+    });
   }
 
   const buildRequirements = async (amount: string): Promise<PaymentRequirementsV2[]> => {
@@ -1197,7 +1202,7 @@ export async function createX402BatchSettlementServer(
                   context
                 ),
             });
-            if (results.length > 0) await marker?.write(true);
+            if (results.length > 0) await marker.write(true);
           };
           // Best-effort, and deliberately non-waiting: this branch
           // refuses with `withdrawal_pending` whether or not the claim ran, and
@@ -1269,8 +1274,8 @@ export async function createX402BatchSettlementServer(
           maxClaimsPerBatch: 100,
           selectClaimChannels: claimCeiling,
         });
-        if (claims.length > 0) await marker?.write(true);
-        if (claims.length === 0 && !(await marker?.read())) return;
+        if (claims.length > 0) await marker.write(true);
+        if (claims.length === 0 && !(await marker.read())) return;
         // The raw manager, not `tracked`: the loop below re-tries only
         // upstream's "nothing to settle yet" answer, and each of those would
         // otherwise count as a settle attempt a builder reads as a wedge
@@ -1282,7 +1287,7 @@ export async function createX402BatchSettlementServer(
           await opts.payout?.recordSettleFailure(error);
           throw error;
         }
-        await marker?.write(false);
+        await marker.write(false);
       };
       if (postgres) await postgres.withFleetSettlementLock(operation, true);
       else await operation();
@@ -1291,8 +1296,7 @@ export async function createX402BatchSettlementServer(
       return (stopPromise ??= (async () => {
         selfRelay?.stop();
         scheduler?.stop();
-        // In-memory development uses upstream's timers rather than the fleet scheduler.
-        if (!scheduler) await manager.stop();
+        await manager.stop();
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(new Error("x402 shutdown claim deadline")), shutdownClaimMs);
         let reason: "timeout" | "failed" | "lock_unavailable" | undefined;
@@ -1311,7 +1315,7 @@ export async function createX402BatchSettlementServer(
                 maxClaimsPerBatch: settlementConfig.maxClaimsPerBatch ?? 100,
                 selectClaimChannels: selectRemaining,
               });
-              if (claims.length > 0) await marker?.write(true);
+              if (claims.length > 0) await marker.write(true);
             };
             if (postgres) {
               // A sibling already claiming wins; do not queue shutdown behind it.
@@ -1341,7 +1345,6 @@ export async function createX402BatchSettlementServer(
               : null,
           });
         }
-        if (scheduler) await manager.stop();
         // Idempotent, and deliberately unconditional: an adopted store
         // is torn down by the same `createDVMServer` shutdown that
         // stops this server, so closing it from either side is correct and

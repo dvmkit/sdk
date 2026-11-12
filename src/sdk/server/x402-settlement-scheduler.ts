@@ -43,15 +43,15 @@ export interface X402FleetSettlementScheduler {
 }
 
 /**
- * Start the claim, settle and refund timers for a Postgres-backed DVM.
+ * Start the tracked claim, settle and refund timers for every storage mode.
  *
  * Upstream's `manager.start()` coordinates one process: its timers, its job
  * queue, its `pendingSettle`. A dvmkit fleet shares one database, so every job
  * runs under the fleet settlement lock instead and the settle gate reads a
- * durable {@link X402SettlePendingMarker}. Everything else mirrors upstream's
- * `runClaimJob` / `runSettleJob` / `runRefundJob` — the same
- * {@link AutoSettlementConfig} a builder writes has to mean the same thing in
- * production as it does against in-memory storage in dev.
+ * durable {@link X402SettlePendingMarker}. Custom stores use the same queue
+ * with a local marker, so their timers also pass through the payout tracker.
+ * Everything else mirrors upstream's `runClaimJob` / `runSettleJob` /
+ * `runRefundJob` and {@link AutoSettlementConfig}.
  *
  * The server records each confirmed batch's marker and payout accounting
  * before starting another batch. Unconfirmed submissions never raise the
