@@ -673,6 +673,9 @@ export function installHostedTempoChargeGuard(
 export function installHostedTempoCloseGuard(
   server: MppxServer, obligations: HostedSettlementReportObligations
 ): void {
+  // Mounts share one rail handle; a second wrapper would hold its own permits
+  // and reject every close the first one authorised.
+  if (server.permitHostedTempoClose) return;
   const permits = new Map<string, string>();
   const digest = (input: Credential.Credential | string): string => {
     const credential = typeof input === "string" ? MppCredential.deserialize(input) : input;

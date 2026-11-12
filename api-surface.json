@@ -1059,11 +1059,11 @@
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "e8e6feb9451936c72ff628577943ffcb5d3d7dad31e85326bc3fe4fee246dbe0"
+          "signature": "373d0ca37d12d9a654f7731a523d13e23d8872c70e7a5ef94f410d33f8ad182d"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "38729447cc63cbb02694696b7fb11f02dc9f4684040c117532bd5acb97450410"
+          "signature": "b836c602f186458515fc4df80a0f3b1631ad54d9071fb6882923b1a40c8593a6"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1151,7 +1151,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "dec6defa8dc08bd09e73ab8fb7b0712a495e957e29e923d5890084cb8a494a7f"
+          "signature": "92f9a16d6ee0d924002962ef9ee212bdd05592760bc024bb9ff990817b3036aa"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1243,7 +1243,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "ab5bad703e3b2596fa4d99f23a7c267f319e4c6700fd10b09ef345408ffb55ea"
+          "signature": "d68f7bee62793505694b7d963484293cc2e6ebdbdc2b1a1f9bd6c1d878b329d1"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1531,7 +1531,7 @@
         },
         "retryHostedTempoCloseReport": {
           "stability": "experimental",
-          "signature": "d6e14c7507b37126ce092072580cfd41ecfae5b84bfa62a2bcacc25a0fad3571"
+          "signature": "ddbcd9586d507e02f8987f4394d2df5859aed7d6cf7fa85a29720e101620b2fe"
         },
         "RetryTempoCloseReportResponse": {
           "stability": "experimental",
@@ -1731,7 +1731,7 @@
         },
         "writeOffHostedTempoCloseReport": {
           "stability": "experimental",
-          "signature": "c152f5a377fd9a3e775e953d3189bc5d84da19e1029e4b2b6721261495320203"
+          "signature": "26149ed27c6bc6618d5702083001274773987d685749883482a7364b4c985546"
         },
         "WriteOffTempoCloseReportResponse": {
           "stability": "experimental",

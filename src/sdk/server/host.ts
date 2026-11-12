@@ -290,6 +290,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
   // When the caller injects a pool, it owns the lifecycle — we never end it.
   const ownsPool = !opts.pool;
   let pgPool: Pool | undefined;
+  // Set only when a caller-supplied job store kept the host from adopting the database.
+  let reportingPool: Pool | undefined;
   let creditLedger: CreditLedgerLike | undefined;
   let tempoSessionStore: PostgresTempoSessionStore | undefined;
   let tempoChargeStore: PostgresTempoChargeStore | undefined;
@@ -432,10 +434,33 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       canonicalDvmId: undefined,
       db: undefined,
     } : await resolveCashuOptsFromEnv(env, pgPool, opts.cashuMode);
-    const hostedSettlementReports = hostingControl && pgPool && cashuOpts.dvmId && mounts.length === 1
-      ? new HostedSettlementReportObligations(pgPool, cashuOpts.dvmId, hostingControl.scope)
+    // A caller-supplied job store skips the branch above, but the database it
+    // was configured beside still has to carry settlement history.
+    if (!pgPool && !disposableCashu && cashuOpts.dvmId && (opts.pool || databaseUrl)) {
+      const pg = await import("pg");
+      reportingPool = opts.pool ?? new pg.default.Pool({
+        connectionString: databaseUrl,
+        max: parseHostPoolMax(envMaybe.DVMKIT_POSTGRES_POOL_MAX),
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 10_000,
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10_000,
+      });
+      applyRetryToPool(reportingPool, "dvm-host");
+    }
+    const settlementDb = pgPool ?? reportingPool;
+    // Awaited here, ahead of every store below that creates a financial or
+    // report table: whichever runs first decides whether history is complete.
+    const hostedSettlementReports = settlementDb && cashuOpts.dvmId
+      ? new HostedSettlementReportObligations(settlementDb, cashuOpts.dvmId, hostingControl?.scope)
       : undefined;
     await hostedSettlementReports?.init();
+    // The session runtime reserves reports only where something discharges
+    // them: the platform reporter, or hosting control's closure evidence.
+    const tempoSettlementReports = hostingControl ||
+      ((opts.platformReporter?.token ?? envMaybe.DVMKIT_PLATFORM_TOKEN) &&
+        (opts.platformReporter?.url ?? envMaybe.DVMKIT_PLATFORM_URL))
+      ? hostedSettlementReports : undefined;
     if (envMaybe.BUILDER_LOCK_PRIVKEY) {
       throw new Error("BUILDER_LOCK_PRIVKEY must not be set on a DVM machine.");
     }
@@ -618,9 +643,9 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         const operator = privateKeyToAccount(tempoOperatorKey);
         const tempoNetwork = resolveTempoNetwork(envMaybe);
         const tempoCurrency = tempoNetwork.currency as `0x${string}`;
-        if (hostedSettlementReports) {
+        if (tempoSettlementReports) {
           const { Session: TempoSession } = await import("mppx/tempo");
-          hostedSettlementReports.configureTempo({
+          tempoSettlementReports.configureTempo({
             network: `eip155:${tempoNetwork.chainId}`,
             escrow: TempoSession.Precompile.Constants.tip20ChannelEscrow,
             payee: mppTempoRecipient,
@@ -670,7 +695,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         }
         tempoSession = {
           store: sessionStore,
-          ...(hostedSettlementReports ? { hostedObligations: hostedSettlementReports } : {}),
+          ...(tempoSettlementReports ? { hostedObligations: tempoSettlementReports } : {}),
           account: operator,
           chainId: tempoNetwork.chainId,
           getClient: ({ chainId }) => {
@@ -693,12 +718,12 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
           onInsufficientFunds: (failure) =>
             tempoSettlementReadiness?.recordInsufficientFunds(failure),
           onSessionSettlement: async (settlement) => {
-            if (hostedSettlementReports) {
-              const original = await hostedSettlementReports.findPendingTempo(settlement.channelId,
+            if (tempoSettlementReports) {
+              const original = await tempoSettlementReports.findPendingTempo(settlement.channelId,
                 settlement.trigger === "close" ? "close" : "settle");
               if (original) {
-                await hostedSettlementReports.recordSubmitted(original.id, settlement.txHash);
-              } else if (await hostedSettlementReports.hasCompleteHistory()) {
+                await tempoSettlementReports.recordSubmitted(original.id, settlement.txHash);
+              } else if (await tempoSettlementReports.hasCompleteHistory()) {
                 throw new Error("Hosted Tempo settlement has no original pre-effect reservation");
               }
             }
@@ -1111,6 +1136,8 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
           listChannelDrains: (args) => ledger.listChannelDrains(args),
         });
         payoutSinks.tempoSettled = (event) => payoutReporter.tempoSettled(event);
+      } else if (payoutReporter && tempoPayoutOwner) {
+        payoutReporter.withholdTempo();
       }
 
       // DVM-scoped routes register on the sub-app so they inherit the mount
@@ -1313,6 +1340,11 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       await capture(() => ownedPool.end());
     }
     pgPool = undefined;
+    if (reportingPool && ownsPool) {
+      const ownedPool = reportingPool;
+      await capture(() => ownedPool.end());
+    }
+    reportingPool = undefined;
     creditLedger = undefined;
     processedPayments = undefined;
     if (tempoSettlementReadiness) {

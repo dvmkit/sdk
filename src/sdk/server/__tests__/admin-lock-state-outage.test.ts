@@ -33,6 +33,10 @@ describe("admin lock-state outage", () => {
           rowCount: 1,
         });
       }
+      // Settlement history boots on any pool with a DVM ID; it reads one probe row.
+      if (text.includes("to_regclass('x402_batch_channels')")) {
+        return Promise.resolve({ rows: [{}], rowCount: 1 });
+      }
       if (text.includes("FROM wallet_accumulator")) {
         return Promise.resolve({ rows: [], rowCount: 0 });
       }
@@ -44,7 +48,11 @@ describe("admin lock-state outage", () => {
     };
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const pool = { query, connect: vi.fn(), on: vi.fn(), options: { max: 3 } };
+    const connect = vi.fn(() => Promise.resolve({
+      query: (input: string | { text: string }) => query(typeof input === "string" ? input : input.text),
+      release: vi.fn(), on: vi.fn(),
+    }));
+    const pool = { query, connect, on: vi.fn(), options: { max: 3 } };
     applyRetryToPool(pool as never, "test");
     const dvm = configureDVM({
       name: "admin-lock-state-outage",

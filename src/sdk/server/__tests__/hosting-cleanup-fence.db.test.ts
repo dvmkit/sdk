@@ -314,6 +314,7 @@ describe.skipIf(!RUN)("hosted obligation fence (real Postgres)", () => {
         balance: "1", totalClaimed: "0", withdrawRequestedAt: 0, refundNonce: 0,
         lastRequestTimestamp: Date.now() }));
       const obligations = new HostedSettlementReportObligations(pool, fixture.dvmId, fixture.deployment);
+      await obligations.init();
       obligations.configureX402({ network: "eip155:84532", rpcUrl: "https://rpc.test.invalid",
         receiver: config.receiver, token: config.token });
       obligations.attachX402SettlementStore(hostedStorage);
@@ -513,6 +514,7 @@ describe.skipIf(!RUN)("hosted obligation fence (real Postgres)", () => {
       await tempoSessions.withCloseIntent(channelId, drainId, async () => undefined);
       await tempoSessions.resolveCloseForecast(channelId, drainId, "proceed");
       const obligations = new HostedSettlementReportObligations(pool, fixture.dvmId, fixture.deployment);
+      await obligations.init();
       obligations.configureTempo({ network: `eip155:${network.chainId}`,
         rpcUrl: "https://rpc.test.invalid", escrow, payee, token: network.currency });
       const originalClose = await obligations.reserveTempo(channelId, "close", drainId);

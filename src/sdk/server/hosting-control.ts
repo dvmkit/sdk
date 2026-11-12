@@ -165,11 +165,20 @@ export class HostingControl {
       const client = await this.pool.connect();
       try {
         await client.query("BEGIN");
+        // Settlement reports own their identity. A control row created after it
+        // takes the same instance, so closure still recognises their obligations.
+        const identity = await client.query<{ present: boolean }>(
+          "SELECT to_regclass('sdk_hosted_settlement_report_identity') IS NOT NULL AS present"
+        );
+        const reporting = identity.rows[0]?.present ? await client.query<{ instance_id: string }>(
+          `SELECT instance_id FROM sdk_hosted_settlement_report_identity
+           WHERE dvm_id=$1 AND scope=$2`, [this.dvmId, this.config.scope]
+        ) : { rows: [] };
         const boot = await client.query<{ boot_epoch: string }>(
           `UPDATE sdk_hosting_control
            SET instance_id=COALESCE(instance_id,$3), boot_epoch=boot_epoch+1
            WHERE dvm_id=$1 AND scope=$2 RETURNING boot_epoch`,
-          [this.dvmId, this.config.scope, randomUUID()]
+          [this.dvmId, this.config.scope, reporting.rows[0]?.instance_id ?? randomUUID()]
         );
         if (!boot.rows[0]) throw new Error("Hosting control identity was not initialized");
         this.bootEpoch = Number(boot.rows[0].boot_epoch);
