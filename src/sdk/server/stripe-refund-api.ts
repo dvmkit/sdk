@@ -42,6 +42,8 @@ export interface StripeRefund {
 
 export interface StripeDispute {
   id: string;
+  /** Disputed amount in minor currency units, when reported by Stripe. */
+  amount?: number;
   paymentIntentId: string | null;
   status: string;
   created: number;
@@ -209,6 +211,7 @@ export function createStripeRefundApi(opts: StripeRefundApiOpts): StripeRefundAp
           id: stringOr(d.id, ""),
           paymentIntentId: typeof d.payment_intent === "string" ? d.payment_intent : null,
           status: stringOr(d.status, "unknown"),
+          amount: typeof d.amount === "number" && Number.isSafeInteger(d.amount) && d.amount >= 0 ? d.amount : undefined,
           created: integerOr(d.created, 0),
         })),
         hasMore: page.has_more === true,

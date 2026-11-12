@@ -134,6 +134,10 @@ const CLIENT_VERSION_RE =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.(?:0|[1-9]\d*))?$/;
 const HASH_RE = /^(?:[0-9a-f]{16}|[0-9a-f]{64})$/i;
 const DECIMAL_RE = /^(?:0|[1-9]\d{0,77})$/;
+const CARD_CHECKOUT_EVENTS = new Set([
+  "card_checkout_dispute_lost", "card_checkout_recovery_deferred",
+  "card_checkout_session_permission_denied", "card_checkout_session_missing",
+]);
 const CARD_REFUND_EVENTS = new Set([
   "card_charge_stranded_refunded",
   "card_charge_unsettled",
@@ -460,6 +464,13 @@ function projectField(
     return ownDataEntries(value, 64)
       .filter(([key]) => /^(?:0|[1-9]\d*)$/.test(key))
       .flatMap(([, name]) => typeof name === "string" && /^DVMKIT_X402_[A-Z0-9_]{1,64}$/.test(name) ? [name] : []);
+  }
+  if (eventName !== undefined && CARD_CHECKOUT_EVENTS.has(eventName)) {
+    if (key === "session_id")
+      return typeof value === "string" && /^cs_(?:test_|live_)?[A-Za-z0-9]{1,128}$/.test(value) ? value : undefined;
+    if (key === "payment_intent")
+      return typeof value === "string" && /^pi_[A-Za-z0-9_]{1,128}$/.test(value) ? value : undefined;
+    if (key === "retry_after_ms") return isNonnegativeSafeInteger(value) ? value : undefined;
   }
   if (eventName !== undefined && CARD_REFUND_EVENTS.has(eventName)) {
     const projected = projectCardRefundField(key, value);

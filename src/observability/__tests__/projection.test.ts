@@ -353,6 +353,14 @@ describe("projectSpanRow", () => {
     });
   });
 
+  it("limits Checkout recovery identifiers to its catalogued events and Stripe object shapes", () => {
+    const fields = { session_id: "cs_test_123", payment_intent: "pi_123", retry_after_ms: 3600_000 };
+    expect(projectDiagnosticFields(fields, undefined, undefined, undefined, "card_checkout_session_missing")).toEqual(fields);
+    expect(projectDiagnosticFields(fields, undefined, undefined, undefined, "diagnostic.message")).toEqual({});
+    expect(projectDiagnosticFields({ session_id: "person@example.com", payment_intent: "private request", retry_after_ms: -1 },
+      undefined, undefined, undefined, "card_checkout_session_missing")).toEqual({});
+  });
+
   it("uses fixed fallbacks for unknown event, service, version, host, and sample rate", () => {
     const result = projectSpanRow(
       makeSpan({

@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "description": "Hosted card top-up: freshly sign the same fund block for every poll; no commitment or payment credential is attached. expires_at is a Unix timestamp in seconds. credit_id is derived from the caller and fund_id unless the signed body names an existing caller-owned credit.",
+  "request": {
+    "op": "fund",
+    "fund": {
+      "fund_id": "checkout",
+      "method": "stripe",
+      "via": "checkout",
+      "amount_micro": 5000000
+    }
+  },
+  "pending": {
+    "status": 202,
+    "body": {
+      "status": "pending",
+      "fund_id": "checkout",
+      "checkout": {
+        "url": "https://checkout.stripe.com/c/pay/cs_test_1",
+        "expires_at": "<Unix timestamp in seconds>"
+      },
+      "credit_id": "<derived-credit-id>"
+    }
+  },
+  "funded": {
+    "status": 200,
+    "body": {
+      "op": "fund",
+      "funded_micro": 5000000,
+      "replayed": false,
+      "credit": {
+        "balance_micro": 5000000,
+        "currency": "usd"
+      }
+    }
+  },
+  "checkout_expired": {
+    "status": 409,
+    "body": {
+      "error": "checkout_expired",
+      "retryable": false,
+      "message": "This Checkout top-up has expired; no credit can be booked."
+    },
+    "dispute_lost_hint": "The card dispute was lost; no additional refund is due. Start a new top-up with a new fund_id.",
+    "refunded_hint": "What was still owed on the charge was refunded to the card. Start a new top-up with a new fund_id."
+  },
+  "fund_id": "Caller-generated random id, at most 200 characters; reuse the exact id for every poll.",
+  "stripe_metadata": {
+    "fund_id": "checkout",
+    "credit_id": "<derived-credit-id>",
+    "caller_pubkey": "<caller-public-key>",
+    "dvmkit_dvm_id": "example-dvm",
+    "dvmkit_checkout_store": "<persistent-random-store-namespace>"
+  },
+  "stripe_binding": "Both the Checkout Session and PaymentIntent carry all five metadata fields. The idempotency key binds dvmkit_dvm_id, dvmkit_checkout_store and fund_id. No session is adopted through account-wide lookup.",
+  "permission_error": {
+    "status": 502,
+    "body": {
+      "error": "checkout_unavailable",
+      "retryable": false,
+      "cause": "permission_denied",
+      "stripe_status": 403
+    }
+  },
+  "create_retry_window_ms": 1800000
+}

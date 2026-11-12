@@ -6356,3 +6356,29 @@ function logCredentialRejected(
     }
   );
 }
+
+/** Checkout joins the same marked funding, lot and deposit-outbox commit as a token charge. */
+export async function bookCheckoutFunding(
+  opts: UpfrontPaymentOpts & { creditId: string; fundId: string; callerPubkey: string; amountMicro: number; paymentIntentId: string },
+  tx: CreditLedgerQuerier
+): Promise<CreditFundingReport> {
+  if (!opts.creditLedger) throw new Error("Checkout requires a credit ledger");
+  const committed = await commitMarkedFunding({
+    ledger: opts.creditLedger,
+    processedPayments: opts.processedPayments,
+    enqueueCreditDeposit: opts.enqueueCreditDeposit,
+    priceFiat: { currency: "usd", amountMicro: opts.amountMicro },
+    requiredMsats: 0,
+    callerId: opts.callerPubkey,
+    hostingAdmissionId: opts.hostingAdmissionId,
+    hostingPaymentArtifactHash: opts.hostingPaymentArtifactHash,
+    dvmId: opts.dvmId ?? "",
+    fundOnly: { creditId: opts.creditId, fundId: opts.fundId, commitment: "" },
+    drawBasis: false,
+    ttlMs: opts.creditTtlMs ?? IMPLICIT_CREDIT_TTL_MS,
+  }, {
+    rail: "stripe", paymentId: opts.paymentIntentId, paidMsats: 0,
+    fundedMicro: opts.amountMicro, nativeAmount: opts.amountMicro / 10_000, nativeAsset: "usd-cents",
+  }, tx);
+  return committed.deposit;
+}
