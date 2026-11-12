@@ -28,8 +28,11 @@ describe.skipIf(!RUN)("durable multi-batch claim recovery", () => {
   });
 
   afterEach(async () => {
-    vi.useRealTimers();
-    for (const server of servers) await server.stop();
+    try {
+      for (const server of servers) await server.stop();
+    } finally {
+      vi.useRealTimers();
+    }
     await storage.close();
     await pool.end();
     await dropSchemas(SCHEMA);
@@ -56,16 +59,16 @@ describe.skipIf(!RUN)("durable multi-batch claim recovery", () => {
     let failed!: () => void;
     const failure = new Promise<void>((resolve) => { failed = resolve; });
     const onError = vi.fn(failed);
+    // Fake scheduler intervals before creation; leave Postgres I/O deadlines real.
+    if (path === "scheduled") vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const first = await f.createServer(storage, path === "scheduled" ? {
       maxClaimsPerBatch: 1, claimIntervalSecs: 1, settleIntervalSecs: 3600, onError,
     } : false);
     servers.push(first);
     try {
       if (path === "scheduled") {
-        vi.useFakeTimers();
         await vi.advanceTimersByTimeAsync(1000);
         await failure;
-        vi.useRealTimers();
         expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("rejected") }));
       } else {
         await expect(first.claimAndSettle()).rejects.toThrow("rejected");
@@ -86,15 +89,15 @@ describe.skipIf(!RUN)("durable multi-batch claim recovery", () => {
       expect(await batches.get(SCOPE)).toEqual(open);
       expect(await storage.isSettlePending(SCOPE)).toBe(true);
       const submissionsBeforeRecovery = vi.mocked(f.facilitator.settle).mock.calls.length;
+      let settled!: () => void;
+      const settlement = new Promise<void>((resolve) => { settled = resolve; });
       const next = await f.createServer(storage, path === "scheduled" ? {
-        claimIntervalSecs: 3600, settleIntervalSecs: 1,
+        claimIntervalSecs: 3600, settleIntervalSecs: 1, onSettle: settled,
       } : false);
       servers.push(next);
       if (path === "scheduled") {
-        vi.useFakeTimers();
         await vi.advanceTimersByTimeAsync(1000);
-        await vi.waitFor(async () => expect(await storage.isSettlePending(SCOPE)).toBe(false));
-        vi.useRealTimers();
+        await settlement;
       } else {
         await next.claimAndSettle();
       }
