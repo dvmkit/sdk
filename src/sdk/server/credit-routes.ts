@@ -1,3 +1,4 @@
+import { fundStripeCheckout } from "./stripe-checkout-funding";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { randomBytes } from "node:crypto";
 
@@ -105,6 +106,7 @@ export const CREDIT_REQUEST_SCHEMA = z.object({
        * a card top-up: its MPP `method="stripe"` challenge is issued only here.
        */
       method: z.enum(["lightning", "tempo", "stripe"]).optional(),
+      via: z.string().optional(),
       /** Required with `method: "tempo"`; invalid on every other funding rail. */
       intent: z.enum(["charge", "session"]).optional(),
     })
@@ -184,6 +186,7 @@ export interface CreditRouteDeps {
   tempoSettlementReadiness?: TempoSettlementReadiness;
   /** Card-credit rail; absent refuses `method: "stripe"`. */
   stripeCredit?: StripeCreditRail;
+  checkoutProductName?: string;
 }
 
 export async function handleCreditRequest(
@@ -246,14 +249,17 @@ export async function handleCreditRequest(
     case "fund":
       if (deps.withFundingAdmission && body.fund) {
         const creditId = body.credit_id ?? derivedFundCreditId(callerPubkey, body.fund.fund_id);
-        const [prior, invoice] = await Promise.all([
+        const [prior, invoice, checkout] = await Promise.all([
           deps.ledger.getFunding({ creditId, fundId: body.fund.fund_id }),
           body.fund.method === "lightning"
             ? deps.ledger.getInvoice({ creditId, fundId: body.fund.fund_id })
             : Promise.resolve(undefined),
+          body.fund.via === "checkout"
+            ? deps.stripeCredit?.checkout?.store.get(body.fund.fund_id)
+            : Promise.resolve(undefined),
         ]);
         const priorCredit = prior ? await deps.ledger.get(creditId) : undefined;
-        if (priorCredit?.callerPubkey === callerPubkey || invoice?.callerPubkey === callerPubkey) {
+        if (priorCredit?.callerPubkey === callerPubkey || invoice?.callerPubkey === callerPubkey || (checkout?.callerPubkey === callerPubkey && checkout.state !== "creating")) {
           return handleFund(c, deps, { callerPubkey, body, envelope, menu });
         }
         return deps.withFundingAdmission(c, body, () => handleFund(c, deps, { callerPubkey, body, envelope, menu }));
@@ -1858,11 +1864,20 @@ async function handleFund(
       400
     );
   }
+  if (fund.via !== undefined && (fund.via !== "checkout" || fund.method !== "stripe")) {
+    return c.json({ error: "invalid_request", message: 'fund.via only accepts "checkout" with method "stripe".' }, 400);
+  }
+  if (fund.via === "checkout" && fund.fund_id.length > 200) {
+    return c.json({ error: "invalid_request", message: "Checkout fund_id must be at most 200 characters.", retryable: false }, 400);
+  }
+  if (fund.via === "checkout" && (fund.commitment !== undefined || fund.intent !== undefined)) {
+    return c.json({ error: "invalid_request", message: "Checkout carries no commitment or intent; omit both." }, 400);
+  }
   // Hash header-borne funding into the signed commitment. Lightning instead binds the
   // server-issued invoice by its durable (credit_id, fund_id) row and accepts no artifact
   // hash.
   let commitment = "";
-  if (fund.method === "lightning") {
+  if (fund.method === "lightning" || fund.via === "checkout") {
     if (fund.commitment !== undefined) {
       return c.json(
         {
@@ -1919,7 +1934,7 @@ async function handleFund(
 
   const creditId = body.credit_id ?? derivedFundCreditId(args.callerPubkey, fund.fund_id);
 
-  const replayed = await replayedFunding(c, deps, {
+  const replayed = fund.via === "checkout" ? undefined : await replayedFunding(c, deps, {
     creditId,
     fundId: fund.fund_id,
     callerPubkey: args.callerPubkey,
@@ -1941,7 +1956,7 @@ async function handleFund(
     if (outstanding) return outstanding;
   }
 
-  const sizing = await checkSizing(deps, {
+  const sizingCheck = () => checkSizing(deps, {
     callerPubkey: args.callerPubkey,
     creditId,
     named: body.credit_id !== undefined,
@@ -1951,6 +1966,30 @@ async function handleFund(
     rail: fund.method,
     tempoIntent: fund.method === "tempo" ? fund.intent : undefined,
   });
+  if (fund.via === "checkout") {
+    const rail = deps.stripeCredit?.checkout;
+    if (!rail || !menu.stripe?.checkout) {
+      return c.json({
+        error: "checkout_not_supported",
+        message: "This DVM does not offer hosted card Checkout.",
+        hint: 'Use the token path: omit fund.via and attach the shared payment token credential when challenged.',
+        retryable: false,
+      }, 409);
+    }
+    const result = await fundStripeCheckout({
+      rail, opts: await deps.railOpts(c), creditId, fundId: fund.fund_id,
+      callerPubkey: args.callerPubkey, amountMicro: fund.amount_micro,
+      productName: deps.checkoutProductName ?? "DVM prepaid credit", preflight: sizingCheck,
+    });
+    if (!result.funded) return result.response;
+    if (result.deposit) deps.onDeposit(result.deposit);
+    const rejected = await burnNonce(c, deps, args.envelope);
+    if (rejected) return rejected;
+    return (await replayedFunding(c, deps, {
+      creditId, fundId: fund.fund_id, callerPubkey: args.callerPubkey, replayed: result.replayed,
+    })) ?? creditFundingUnrecorded(c, { creditId, fundId: fund.fund_id, requestedMicro: fund.amount_micro });
+  }
+  const sizing = await sizingCheck();
   if (sizing) return sizing;
 
   if (fund.method === "stripe" && (!menu.stripe || !deps.stripeCredit)) {
@@ -2620,7 +2659,7 @@ async function checkTargetCredit(
 async function replayedFunding(
   c: Context<AppEnv>,
   deps: CreditRouteDeps,
-  args: { creditId: string; fundId: string; callerPubkey: string; method?: string }
+  args: { creditId: string; fundId: string; callerPubkey: string; method?: string; replayed?: boolean }
 ): Promise<Response | undefined> {
   const prior = await deps.ledger.getFunding({ creditId: args.creditId, fundId: args.fundId });
   if (!prior) return undefined;
@@ -2644,7 +2683,7 @@ async function replayedFunding(
   return c.json({
     op: "fund",
     funded_micro: prior.amountMicro,
-    replayed: true,
+    replayed: args.replayed ?? true,
     credit: creditBody(credit),
     ...(fundingReceipt && { funding_receipt: fundingReceipt }),
   });

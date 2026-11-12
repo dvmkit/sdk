@@ -1,3 +1,5 @@
+import { refundAbandonedCheckouts } from "./stripe-checkout-recovery";
+import type { CheckoutRail } from "./stripe-checkout-funding";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { CardChargeJournal } from "./card-charge-journal";
 import type { CreditLedgerLike } from "./credit-ledger";
@@ -31,6 +33,7 @@ export interface CardRefundSweepDeps {
   drainReport: DrainReportWiring;
   receiptIssuer?: ReceiptIssuer;
   journal?: CardChargeJournal;
+  checkout?: CheckoutRail;
 }
 
 export interface CardRefundSweepResult {
@@ -136,6 +139,11 @@ export async function runCardRefundSweep(
   if (journal && deps.ledger.cardFundingBooked) {
     await step("stranded", async () => {
       result.strandedRefunds = await refundStranded(deps, journal, nowMs, limit);
+    });
+  }
+  if (deps.checkout) {
+    await step("checkout", async () => {
+      result.strandedRefunds.push(...await refundAbandonedCheckouts(deps.checkout!, deps.stripe, nowMs, limit));
     });
   }
   return result;
@@ -279,6 +287,8 @@ async function refundStranded(
   const attempts = await journal.listUnresolved({ olderThanMs: nowMs - STRANDED_AFTER_MS, limit });
   for (const attempt of attempts) {
     try {
+      // Checkout writes a separate session record and never mpp_challenge_id; this
+      // journal-scoped search cannot claim its PaymentIntents.
       const intents = await deps.stripe.searchPaymentIntentsByMetadata(
         "mpp_challenge_id",
         attempt.challengeId

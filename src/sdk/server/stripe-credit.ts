@@ -1,3 +1,6 @@
+import { checkoutSuccessUrl, createStripeCheckoutApi, type StripeCheckoutApi } from "./stripe-checkout";
+import type { StripeCheckoutStore } from "./stripe-checkout-store";
+
 import { randomBytes } from "node:crypto";
 
 import type { Challenge } from "mppx";
@@ -49,6 +52,7 @@ export interface StripeCreditConfig {
   hmacSecret: string;
   /** Builder-set card top-up minimum in dollars, from `DVMKIT_STRIPE_MIN_USD`. */
   minUsd?: string;
+  checkoutSuccessUrl?: string;
 }
 
 /**
@@ -59,6 +63,7 @@ export interface StripeCreditConfig {
 export function stripeCreditConfigFromEnv(
   env: Record<string, string | undefined>
 ): StripeCreditConfig | undefined {
+  const successUrl = checkoutSuccessUrl(env.DVMKIT_STRIPE_CHECKOUT_SUCCESS_URL);
   const secretKey = env.DVMKIT_STRIPE_SECRET_KEY?.trim();
   const networkId = env.DVMKIT_STRIPE_NETWORK_ID?.trim();
   if (!secretKey && !networkId) return undefined;
@@ -80,7 +85,7 @@ export function stripeCreditConfigFromEnv(
   }
   const minUsd = env.DVMKIT_STRIPE_MIN_USD?.trim();
   if (minUsd) parseStripeMinUsd(minUsd, "DVMKIT_STRIPE_MIN_USD");
-  return { secretKey, networkId, hmacSecret, ...(minUsd && { minUsd }) };
+  return { secretKey, networkId, hmacSecret, ...(minUsd && { minUsd }), ...(successUrl && { checkoutSuccessUrl: successUrl }) };
 }
 
 /** Stripe's own error classification: enums, never Stripe's free-text message. */
@@ -167,6 +172,7 @@ export interface StripeCreditRail {
   refunds: StripeRefundApi;
   /** The charge-attempt journal the sweep reads to find charges that were never booked. */
   chargeJournal?: CardChargeJournal;
+  checkout?: { api: StripeCheckoutApi; store: StripeCheckoutStore; successUrl: string };
 }
 
 export interface CreateStripeCreditRailOpts extends Omit<StripeCreditConfig, "minUsd"> {
@@ -186,6 +192,8 @@ export interface CreateStripeCreditRailOpts extends Omit<StripeCreditConfig, "mi
    * that is never booked can be found and refunded. See {@link CardChargeJournal}.
    */
   chargeJournal?: CardChargeJournal;
+  /** Durable session and ledger transaction store, required when checkoutSuccessUrl is set. */
+  checkoutStore?: StripeCheckoutStore;
   /** Stripe API origin. Tests point it at a local fake. */
   apiBase?: string;
   fetch?: typeof fetch;
@@ -205,6 +213,10 @@ export interface CreateStripeCreditRailOpts extends Omit<StripeCreditConfig, "mi
  * PaymentIntent id is what stops a replay from booking twice.
  */
 export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): StripeCreditRail {
+  const successUrl = checkoutSuccessUrl(opts.checkoutSuccessUrl);
+  if (successUrl && !opts.checkoutStore?.durable) {
+    throw new Error("DVMKIT_STRIPE_CHECKOUT_SUCCESS_URL requires a durable Checkout store (Postgres).");
+  }
   const apiBase = opts.apiBase ?? "https://api.stripe.com";
   const fetchImpl = opts.fetch ?? fetch;
   const build = (client: StripeClientLike, secretKey: string) =>
@@ -227,6 +239,10 @@ export function createStripeCreditRail(opts: CreateStripeCreditRailOpts): Stripe
       : undefined;
 
   return {
+    ...(successUrl && opts.checkoutStore && { checkout: {
+      api: createStripeCheckoutApi({ secretKey: opts.secretKey, apiBase, fetch: fetchImpl }),
+      store: opts.checkoutStore, successUrl,
+    } }),
     networkId: opts.networkId,
     ...(minMicro !== undefined && { minMicro }),
     refunds: createStripeRefundApi({ secretKey: opts.secretKey, apiBase, fetch: fetchImpl }),

@@ -61,7 +61,7 @@ export interface CreditTerms {
    * the caller's spend request names; the card is charged once, immediately, in `currency`.
    * `min_micro` is the card floor, never below Stripe's $0.50.
    */
-  stripe?: { network_id: string; min_micro: number; currency: "usd" };
+  stripe?: { network_id: string; min_micro: number; currency: "usd"; checkout?: true };
 }
 
 /**
@@ -114,6 +114,7 @@ export interface BuildCreditMenuArgs {
   stripeNetworkId?: string;
   /** Builder's card minimum in USD micro-units; absent means the $5 default. */
   stripeMinMicro?: number;
+  stripeCheckout?: boolean;
   /**
    * Read the configured accepted mint list, not its health-filtered advertisement. Non-channel
    * Bitcoin refunds need a mint, but configuration alone does not establish refund solvency.
@@ -249,6 +250,7 @@ export async function buildCreditMenu(args: BuildCreditMenuArgs): Promise<Credit
       args.stripeNetworkId !== undefined && {
         stripe: {
           network_id: args.stripeNetworkId,
+          ...(args.stripeCheckout && { checkout: true as const }),
           min_micro: Math.min(
             Math.max(
               args.stripeMinMicro ?? STRIPE_CREDIT_DEFAULT_MIN_MICRO,
