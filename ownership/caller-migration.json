@@ -234,6 +234,7 @@
       "src/sdk/server/wallet-accumulator-store.ts",
       "src/sdk/server/x402-batch-settlement.ts",
       "src/sdk/server/x402-channel-store.ts",
+      "src/sdk/server/x402-claim-batches.ts",
       "src/sdk/server/x402-drain-leg.ts",
       "src/sdk/server/x402-exact-settlement-store.ts",
       "src/sdk/server/x402-exact-settlement.ts",
@@ -34192,6 +34193,9 @@
           "module": "src/sdk/server/x402-channel-store.ts"
         },
         {
+          "module": "src/sdk/server/x402-claim-batches.ts"
+        },
+        {
           "module": "src/sdk/server/x402-self-relay.ts"
         },
         {
@@ -35078,6 +35082,19 @@
           "module": "src/observability/diagnostic-console.ts"
         }
       ]
+    },
+    {
+      "module": "src/sdk/server/x402-claim-batches.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Completes each x402 claim batch's accounting before the server submits another batch.",
+          "symbols": ["withX402ClaimBatches"],
+          "consumerEvidence": ["supported:./server#createX402BatchSettlementServer"]
+        }
+      ],
+      "dependencies": []
     },
     {
       "module": "src/sdk/server/x402-shutdown-claim.ts",
