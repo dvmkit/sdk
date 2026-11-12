@@ -212,6 +212,58 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     for (const current of fixtures.splice(0)) await current.cleanup();
   });
 
+  it("reserves the earned amount of a channel charged more than it has earned, and nothing else", async () => {
+    const current = await fixture(); fixtures.push(current);
+    // Charged 100 against a signed maximum of 100, with 10 already claimed.
+    await current.channelStore.updateChannel(CHANNEL, (stored) => ({ ...stored!, totalClaimed: "10" }));
+    const source = (charged: string, overrides: Partial<Parameters<
+      HostedSettlementReportObligations["reserveX402"]>[2]> = {}) => ({
+      authorizationPayload: claimAuthorization(), authorizationRequirements: AUTH_REQUIREMENTS,
+      charged, signature: SIGNATURE, signedMax: "100", ...overrides,
+    });
+    const rejected = async (value: ReturnType<typeof source>) => {
+      await expect(current.obligations.reserveX402(CHANNEL, "claim", value)).rejects.toThrow("claim changed");
+    };
+    // The earned figure must lie above what is claimed and within the charge.
+    await rejected(source("101"));
+    await rejected(source("10"));
+    await rejected(source("9"));
+    await rejected(source("not-a-number"));
+    // The signed voucher is the one the channel holds.
+    await rejected(source("40", { signature: `0x${"66".repeat(65)}` }));
+    await rejected(source("40", { signedMax: "99" }));
+    await expect(current.obligations.reserveX402(CHANNEL, "claim", source("40", {
+      authorizationRequirements: { ...AUTH_REQUIREMENTS, payTo: "0x3333333333333333333333333333333333333333" },
+    }))).rejects.toThrow("another selected rail or recipient");
+    // A voucher for a channel with another recipient finds no stored channel to claim against.
+    expect(await current.obligations.reserveX402(
+      computeChannelId({ ...CONFIG, receiver: "0x3333333333333333333333333333333333333333" }, NETWORK),
+      "claim", source("40")
+    )).toBeNull();
+    expect(await current.obligations.unresolvedCount()).toBe(0);
+
+    const reserved = await current.obligations.reserveX402(CHANNEL, "claim", source("40"));
+    expect(reserved).toMatchObject({ replayed: false });
+    const original = async (pool: pg.Pool) => (await pool.query<{ original: Record<string, string> }>(
+      `SELECT original FROM sdk_hosted_settlement_report_obligations WHERE operation='claim'`
+    )).rows.map((row) => ({ charged: row.original.charged, claimedBefore: row.original.claimedBefore,
+      signed: row.original.signed, signature: row.original.signature }));
+    const exact = [{ charged: "40", claimedBefore: "10", signed: "100", signature: SIGNATURE }];
+    expect(await original(current.pool)).toEqual(exact);
+
+    // A later process finds the same reservation and does not write a second one.
+    const restart = current.restartPool();
+    const later = new HostedSettlementReportObligations(restart, current.dvmId, current.scope);
+    later.configureX402({ network: NETWORK, receiver: RECEIVER, token: TOKEN });
+    await later.init();
+    later.attachX402SettlementStore(current.channelStore);
+    expect(await later.reserveX402(CHANNEL, "claim", source("40")))
+      .toEqual({ id: reserved!.id, replayed: true });
+    await rejected(source("41"));
+    expect(await original(restart)).toEqual(exact);
+    expect(await later.unresolvedCount()).toBe(1);
+  });
+
   it("reserves one exact original voucher before an effect and refuses changed or replayed submissions", async () => {
     const current = await fixture(); fixtures.push(current);
     expect(await current.obligations.hasCompleteHistory()).toBe(true);
