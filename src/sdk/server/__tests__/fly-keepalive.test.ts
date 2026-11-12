@@ -8,48 +8,99 @@ import type { JobManager } from "../job-manager";
 
 const flyEnv = { FLY_APP_NAME: "example-app", FLY_MACHINE_ID: "example-machine" };
 const incompleteEnvs: Record<string, string>[] = [{}, { FLY_APP_NAME: "example-app" }, { FLY_MACHINE_ID: "example-machine" }];
-const managers: JobManager<unknown, undefined>[] = [];
+interface Fixture {
+  active: boolean;
+  JobManager?: typeof import("../job-manager").JobManager;
+  timers: boolean;
+  managers: JobManager<unknown, undefined>[];
+  handlers: Promise<void>[];
+  jobs: ReturnType<JobManager<unknown, undefined>["createJob"]>[];
+  settle: (() => void)[];
+}
 
-async function manager(
+let fixture: Fixture;
+
+function deferred<T>(cleanupValue: T) {
+  const result = Promise.withResolvers<T>();
+  fixture.settle.push(() => result.resolve(cleanupValue));
+  return result;
+}
+
+function handlerGate() {
+  return deferred<void>(undefined);
+}
+
+function manager(
   onJob: (ctx: SDKJobContext<unknown, unknown>) => void | Promise<void>,
   env: Record<string, string> = flyEnv,
 ) {
-  const { JobManager } = await import("../job-manager");
-  const instance = new JobManager(configureDVM({
-    name: "keepalive-test", capability: "work", jobRetentionDays: 0, onJob,
+  const scope = fixture;
+  if (!scope.active || !scope.JobManager) throw new Error("Keepalive fixture is not ready");
+  const instance = new scope.JobManager(configureDVM({
+    name: "keepalive-test", capability: "work", jobRetentionDays: 0,
+    onJob(ctx) {
+      const result = onJob(ctx);
+      if (result) scope.handlers.push(result);
+      return result;
+    },
   }), {
     env, store: new MemoryKVStore(), devMode: true, fxFetcher: createFxFetcher(),
     staleJobTimeoutMs: 0, processingWatchdogMs: 0, heartbeatIntervalMs: 0,
   });
-  managers.push(instance);
+  scope.managers.push(instance);
   return instance;
 }
 
 async function start(instance: JobManager<unknown, undefined>) {
+  const scope = fixture;
   const job = instance.createJob({ input: "" }, "caller", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+  scope.jobs.push(job);
   await instance.persistJob(job);
+  if (!scope.active) throw new Error("Keepalive fixture was disposed before handler start");
   instance.runHandler(job, instance.buildAndAttachContext(job, ""));
   return job;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  const scope: Fixture = { active: true, timers: false, managers: [], handlers: [], jobs: [], settle: [] };
+  fixture = scope;
   vi.resetModules();
+  // Cold imports belong to setup, not the handler lifetime assertion's deadline.
+  const { JobManager } = await import("../job-manager");
+  // A timed-out hook can finish importing after teardown or the next setup.
+  if (!scope.active) return;
+  scope.JobManager = JobManager;
   vi.useFakeTimers();
+  scope.timers = true;
   vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
 });
 
 afterEach(async () => {
-  for (const instance of managers.splice(0)) instance.shutdown();
-  await vi.advanceTimersByTimeAsync(0);
-  vi.useRealTimers();
-  vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
+  const scope = fixture;
+  scope.active = false;
+  try {
+    for (const instance of scope.managers) instance.shutdown();
+    // Also settle handlers/fetches when an assertion failed before their release.
+    for (const settle of scope.settle) settle();
+    await Promise.allSettled(scope.handlers);
+    if (scope.timers) await vi.advanceTimersByTimeAsync(0);
+    await Promise.all(scope.jobs.map(job => job.terminalWork));
+  } finally {
+    // Handler completion can schedule the later job cleanup window.
+    for (const instance of scope.managers) instance.shutdown();
+    if (scope.timers) {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  }
 });
 
 describe("Fly keepalive handler lifetime", () => {
   it("pings at 15 seconds only during execution, stopping before the cleanup window ends", async () => {
-    const gate = Promise.withResolvers<void>();
-    const instance = await manager(async ctx => { await gate.promise; ctx.complete("done"); });
+    const gate = handlerGate();
+    const instance = manager(async ctx => { await gate.promise; ctx.complete("done"); });
     const intervals = vi.spyOn(globalThis, "setInterval");
     await vi.advanceTimersByTimeAsync(30_000);
     expect(fetch).not.toHaveBeenCalled();
@@ -86,15 +137,15 @@ describe("Fly keepalive handler lifetime", () => {
   });
 
   it.each(["same manager", "different managers"])("shares one timer for overlapping handlers in %s", async where => {
-    const first = Promise.withResolvers<void>();
-    const second = Promise.withResolvers<void>();
+    const first = handlerGate();
+    const second = handlerGate();
     const gates = [first, second];
     const onJob = async (ctx: SDKJobContext<unknown, unknown>) => {
       await gates.shift()!.promise;
       ctx.complete("done");
     };
-    const one = await manager(onJob);
-    const two = where === "same manager" ? one : await manager(onJob);
+    const one = manager(onJob);
+    const two = where === "same manager" ? one : manager(onJob);
     const intervals = vi.spyOn(globalThis, "setInterval");
     await start(one);
     await vi.advanceTimersByTimeAsync(5_000);
@@ -111,8 +162,8 @@ describe("Fly keepalive handler lifetime", () => {
   });
 
   it("keeps protecting a terminal job until its handler promise settles", async () => {
-    const tail = Promise.withResolvers<void>();
-    const instance = await manager(async ctx => { ctx.complete("done"); await tail.promise; });
+    const tail = handlerGate();
+    const instance = manager(async ctx => { ctx.complete("done"); await tail.promise; });
     const job = await start(instance);
     await vi.advanceTimersByTimeAsync(15_000);
     expect(job.status).toBe("completed");
@@ -126,8 +177,8 @@ describe("Fly keepalive handler lifetime", () => {
     "creates no timer with incomplete explicit environment %j", async env => {
       vi.stubEnv("FLY_APP_NAME", "ambient-app");
       vi.stubEnv("FLY_MACHINE_ID", "ambient-machine");
-      const gate = Promise.withResolvers<void>();
-      const instance = await manager(() => gate.promise, env);
+      const gate = handlerGate();
+      const instance = manager(() => gate.promise, env);
       const intervals = vi.spyOn(globalThis, "setInterval");
       await start(instance);
       await vi.advanceTimersByTimeAsync(45_000);
@@ -138,8 +189,8 @@ describe("Fly keepalive handler lifetime", () => {
   );
 
   it.each(["synchronous", "asynchronous"])("releases protection when a handler throws %s", async kind => {
-    const gate = Promise.withResolvers<void>();
-    const instance = await manager(kind === "synchronous"
+    const gate = handlerGate();
+    const instance = manager(kind === "synchronous"
       ? () => { throw new Error("handler failed"); }
       : async () => { await gate.promise; throw new Error("handler failed"); });
     const job = await start(instance);
@@ -160,8 +211,8 @@ describe("Fly keepalive handler lifetime", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.mocked(fetch).mockRejectedValueOnce(new Error("ENOTFOUND"))
       .mockResolvedValueOnce(new Response(null, { status: 503 }));
-    const first = Promise.withResolvers<void>();
-    const instance = await manager(async ctx => { await first.promise; ctx.complete("done"); });
+    const first = handlerGate();
+    const instance = manager(async ctx => { await first.promise; ctx.complete("done"); });
     const job = await start(instance);
     await vi.advanceTimersByTimeAsync(45_000);
     expect(fetch).toHaveBeenCalledTimes(3);
@@ -172,8 +223,8 @@ describe("Fly keepalive handler lifetime", () => {
     instance.shutdown();
 
     vi.mocked(fetch).mockRejectedValueOnce(new Error("ENOTFOUND"));
-    const second = Promise.withResolvers<void>();
-    const other = await manager(async ctx => { await second.promise; ctx.complete("done"); });
+    const second = handlerGate();
+    const other = manager(async ctx => { await second.promise; ctx.complete("done"); });
     const next = await start(other);
     await vi.advanceTimersByTimeAsync(15_000);
     second.resolve();
@@ -190,8 +241,8 @@ describe("Fly keepalive handler lifetime", () => {
       signal = init!.signal!;
       signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }));
-    const gate = Promise.withResolvers<void>();
-    const instance = await manager(() => gate.promise);
+    const gate = handlerGate();
+    const instance = manager(() => gate.promise);
     await start(instance);
     await vi.advanceTimersByTimeAsync(19_999);
     expect(signal?.aborted).toBe(false);
@@ -204,10 +255,10 @@ describe("Fly keepalive handler lifetime", () => {
   });
 
   it("does not pile up requests while an aborted fetch is still settling", async () => {
-    const request = Promise.withResolvers<Response>();
+    const request = deferred(new Response(null, { status: 204 }));
     vi.mocked(fetch).mockImplementationOnce(() => request.promise);
-    const gate = Promise.withResolvers<void>();
-    const instance = await manager(() => gate.promise);
+    const gate = handlerGate();
+    const instance = manager(() => gate.promise);
     await start(instance);
     await vi.advanceTimersByTimeAsync(45_000);
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -224,8 +275,8 @@ describe("Fly keepalive handler lifetime", () => {
       signal = init!.signal!;
       signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     }));
-    const gate = Promise.withResolvers<void>();
-    const instance = await manager(() => gate.promise);
+    const gate = handlerGate();
+    const instance = manager(() => gate.promise);
     await start(instance);
     await vi.advanceTimersByTimeAsync(15_000);
     instance.shutdown();
@@ -239,10 +290,10 @@ describe("Fly keepalive handler lifetime", () => {
   });
 
   it("shutting down one manager preserves another manager's active protection", async () => {
-    const first = Promise.withResolvers<void>();
-    const second = Promise.withResolvers<void>();
-    const one = await manager(() => first.promise);
-    const two = await manager(() => second.promise);
+    const first = handlerGate();
+    const second = handlerGate();
+    const one = manager(() => first.promise);
+    const two = manager(() => second.promise);
     await start(one);
     await start(two);
     one.shutdown();
@@ -258,12 +309,12 @@ describe("Fly keepalive handler lifetime", () => {
 
   it("restarts during an intentional abort without warning or overlapping requests", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const request = Promise.withResolvers<Response>();
+    const request = deferred(new Response(null, { status: 204 }));
     vi.mocked(fetch).mockImplementationOnce(() => request.promise);
-    const first = Promise.withResolvers<void>();
-    const second = Promise.withResolvers<void>();
-    const one = await manager(() => first.promise);
-    const two = await manager(() => second.promise);
+    const first = handlerGate();
+    const second = handlerGate();
+    const one = manager(() => first.promise);
+    const two = manager(() => second.promise);
     await start(one);
     await vi.advanceTimersByTimeAsync(15_000);
     one.shutdown();
