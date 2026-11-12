@@ -1059,11 +1059,11 @@
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "373d0ca37d12d9a654f7731a523d13e23d8872c70e7a5ef94f410d33f8ad182d"
+          "signature": "773ae278868f253b8dc938e074c648ad45b47d19692a97175b26ce369a40fb0b"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "b836c602f186458515fc4df80a0f3b1631ad54d9071fb6882923b1a40c8593a6"
+          "signature": "a6d43d50c60e3b502167bf5cbf6a67861e600d0abf5a93627e0346706fbf8f8e"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1151,7 +1151,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "92f9a16d6ee0d924002962ef9ee212bdd05592760bc024bb9ff990817b3036aa"
+          "signature": "50970590f95c8e809e266d5543d728e77d27f816456d3d040650b20f489e66c2"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1243,7 +1243,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "d68f7bee62793505694b7d963484293cc2e6ebdbdc2b1a1f9bd6c1d878b329d1"
+          "signature": "5e1e5b507e0486ae7ee61c248d55e561547718d836e02b796a7a5b9ea181b576"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",

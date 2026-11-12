@@ -695,7 +695,8 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
         ...(envMaybe.DVMKIT_TEMPO_RPC_URL ? { rpcUrl: envMaybe.DVMKIT_TEMPO_RPC_URL } : {}),
       });
       hostedTempoReports = hostedSettlementReports;
-    } else if (opts.mpp && (opts.hostingTempoSessionStore || opts.mpp.sweepTempoSessions)) {
+    } else if (opts.mpp && (opts.hostingTempoSessionStore || opts.mpp.sweepTempoSessions ||
+      (opts.mpp.methods as { intent?: string }[] | undefined)?.some((method) => method.intent === "session"))) {
       // This rail handle settles sessions without reserving their reports, so
       // the database can no longer claim every effect has an original record.
       await hostedSettlementReports.markHistoryIncomplete();

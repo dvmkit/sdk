@@ -2051,6 +2051,15 @@ function attachTempoSessionRuntime(
     return { scanned: rows.length, closeRequested, settled, inFlight };
   };
 
+  /**
+   * Whether a recovered close reports through the close intent's claim-once
+   * reference. That is every self-hosted close, and a close begun before this
+   * DVM reserved its reports: it has no obligation to carry its payout.
+   */
+  const reportsUnreservedClose = async (channelId: string, drainId: string): Promise<boolean> =>
+    !!config.onSessionSettlement && !!store.claimCloseReference &&
+    !(await config.hostedObligations?.hasTempoClose(channelId, drainId));
+
   const recoverTempoSessionClose = async (
     channelId: string,
     drainId: string,
@@ -2093,8 +2102,8 @@ function attachTempoSessionRuntime(
     // obligation then reports the payout once; a self-hosted host fires
     // `onSessionSettlement` once, as a close that returned would have.
     const pending = await config.hostedObligations?.pendingTempoClose(channelId, drainId);
-    const selfHostedReport = !config.hostedObligations && !!config.onSessionSettlement &&
-      !!store.claimCloseReference && !!store.getCloseRecovery;
+    const selfHostedReport = !pending && !!store.getCloseRecovery &&
+      await reportsUnreservedClose(channelId, drainId);
     let reference = pending?.txHash ?? undefined;
     if ((pending && pending.state !== "unmatched" && !reference) || selfHostedReport) {
       const recovery = await store.getCloseRecovery?.(channelId);
@@ -2325,6 +2334,7 @@ function attachTempoSessionRuntime(
       const client = await getClient({ chainId: current.chainId });
       const recovery = await store.getCloseRecovery?.(drain.channelId);
       const pending = await config.hostedObligations?.pendingTempoClose(drain.channelId, drain.drainId);
+      const unreserved = !pending && await reportsUnreservedClose(drain.channelId, drain.drainId);
       const intent = await store.getClose?.(drain.channelId);
       const recorded = intent?.drainId === drain.drainId && isTempoCloseTransaction(intent.reference)
         ? intent.reference : await config.hostedObligations?.tempoCloseTransaction(drain.channelId, drain.drainId);
@@ -2376,8 +2386,8 @@ function attachTempoSessionRuntime(
         if (!backing) {
           throw new Error("Tempo close-aware loss classification is unavailable; upgrade the ledger and retry");
         }
-        if (!config.hostedObligations && config.onSessionSettlement && store.claimCloseReference) {
-          const claimed = await store.claimCloseReference(drain.channelId, drain.drainId, found.txHash);
+        if (unreserved) {
+          const claimed = await store.claimCloseReference!(drain.channelId, drain.drainId, found.txHash);
           if (claimed.claimed) {
             await reportRecoveredClose(current, found.txHash, recovery?.settledBeforeClose ?? null, receipt.settledToPayee);
           }
@@ -2401,7 +2411,7 @@ function attachTempoSessionRuntime(
         }
         reference = `channel:${current.channelId}`;
       } else {
-        if (!config.hostedObligations && config.onSessionSettlement) {
+        if (unreserved) {
           loggers.tempo.warn("tempo_session_close_recovery_unmatched", {
             channel_id: current.channelId, drain_id: drain.drainId,
             amount_at_stake_native: (current.highestVoucherAmount -

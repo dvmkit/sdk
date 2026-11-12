@@ -523,7 +523,13 @@ export class HostedSettlementReportObligations {
         computeChannelId(row.channel_config as Parameters<typeof computeChannelId>[0], config.network).toLowerCase() !== channelId.toLowerCase()) {
         throw new Error("Hosted x402 channel has another recipient or token");
       }
-      if (operation === "claim" && (expected.charged !== row.charged_cumulative_amount ||
+      // A claim presents what the credit has earned, which trails the stored
+      // charge until the deposit is spent, so the reservation records the
+      // presented figure: it is what the transaction carries on chain.
+      const presented = operation === "claim" && /^\d+$/.test(expected.charged ?? "")
+        ? BigInt(expected.charged!) : undefined;
+      if (operation === "claim" && (presented === undefined ||
+        presented > BigInt(row.charged_cumulative_amount) || presented <= BigInt(row.total_claimed) ||
         expected.signature?.toLowerCase() !== row.signature.toLowerCase() ||
         expected.signedMax !== row.signed_max_claimable)) {
         throw new Error("Hosted x402 claim changed after selection");
@@ -536,7 +542,7 @@ export class HostedSettlementReportObligations {
         BigInt(row.charged_cumulative_amount) > BigInt(row.total_claimed)
         ? await this.ensureOpenX402Batch(tx, config) : undefined;
       const original = operation === "claim" ? {
-        charged: row.charged_cumulative_amount, claimedBefore: row.total_claimed,
+        charged: presented!.toString(), claimedBefore: row.total_claimed,
         signed: row.signed_max_claimable, signature: row.signature, batchId,
         authorizationRequirements: requirements,
         authorizationCallData: originalCallData,
@@ -552,7 +558,7 @@ export class HostedSettlementReportObligations {
       };
       return this.insert(tx, identity, "x402", operation, config.network,
         BATCH_SETTLEMENT_ADDRESS, channelId.toLowerCase(), original,
-        operation === "claim" ? [row.charged_cumulative_amount, row.signature.toLowerCase()] :
+        operation === "claim" ? [presented!.toString(), row.signature.toLowerCase()] :
           [refundSettlementId, row.refund_nonce]);
     });
   }
@@ -817,6 +823,17 @@ export class HostedSettlementReportObligations {
     const row = result.rows[0];
     return row && { id: row.id, state: row.state, txHash: row.tx_hash, reservedAtMs: Number(row.created_at_ms),
       searchBefore: searchCursor(row.close_search_before) };
+  }
+
+  /** Whether this drain's close was ever reserved, whatever became of its report. */
+  async hasTempoClose(channelId: string, drainId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM sdk_hosted_settlement_report_obligations
+       WHERE dvm_id=$1 AND scope=$2 AND rail='tempo' AND operation='close' AND channel_id=$3
+         AND original->>'drainId'=$4 LIMIT 1`,
+      [this.dvmId, this.scope, channelId.toLowerCase(), drainId]
+    );
+    return result.rows.length > 0;
   }
 
   /** A recorded close transaction remains refund evidence after its report is delivered. */

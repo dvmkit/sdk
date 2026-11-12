@@ -56,6 +56,7 @@ import { PostgresJobStore } from "../postgres-job-store";
 import { RevenueReporter } from "../revenue-reporter";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
+import { completeTempoChannelDrain } from "../tempo-drain-leg";
 import { PostgresTempoSessionStore } from "../tempo-session-store";
 
 /** The `onSessionSettlement` the SDK last handed mppx's `tempo.session`. */
@@ -940,6 +941,52 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       expect(await drain(payer)).toMatchObject({ status: 200 });
       expect(settlements).toEqual([{ txHash: TX_HASH, channelId, trigger: "close",
         amount: SPENT, delta: SPENT }]);
+      expect(await obligations()).toEqual([]);
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it.each(["drain sweep", "close poll"] as const)(
+    "reports a close begun before reports were reserved once after the upgrade: %s", async (path) => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const { server, creditId, channelId, dvmId, drain, chain, logs, operator, runtimeConfig, chainOps, obligations } =
+      await hostedCredit(payer, { hosted: false, modes: ["submits-then-times-out"] });
+    try {
+      expect((await drain(payer)).status).toBe(402);
+      // The close lands unseen, then the DVM restarts reserving its reports.
+      chain.deposit = 0n;
+      chain.settled = SPENT;
+      logs.push({ event: "ChannelClosed", block: HEAD - 3n, txHash: TX_HASH, from: operator.address });
+      const upgraded = new HostedSettlementReportObligations(pool, dvmId);
+      await upgraded.init();
+      upgraded.configureTempo({ network: `eip155:${CHAIN_ID}`, escrow: ESCROW, payee: PAYEE, token: TOKEN });
+      const reported: unknown[] = [];
+      const restarted = _testing.attachTempoSessionRuntime({} as MppxServer, { ...runtimeConfig,
+        hostedObligations: upgraded, onSessionSettlement: (settlement: unknown) => { reported.push(settlement); } },
+      chainOps);
+      // The ledger wiring the server gives its runtime, so a sweep can complete the drain.
+      restarted.useTempoCreditLedger!(ledger, async (drain, evidence) => !(await completeTempoChannelDrain({
+        deps: { ledger, drainReport: { db: pool, dvmId } },
+        creditId: drain.creditId, drainId: drain.drainId, channelId: drain.channelId!,
+        refundedNative: evidence.refundedNative, debitedNative: drain.drainedNative,
+        reference: evidence.reference,
+        finalization: { outcome: evidence.outcome, creditUnbacked: evidence.creditUnbacked },
+      })).replayed);
+      if (path === "drain sweep") await ledger.requireTempoDrainExit({ creditId, drainId: "d1" });
+      const recover = async () => {
+        if (path === "drain sweep") await restarted.sweepTempoSessions!();
+        else expect(await restarted.recoverTempoSessionClose!(channelId, "d1")).toBe(TX_HASH);
+      };
+      await recover();
+      expect(reported).toEqual([expect.objectContaining({ txHash: TX_HASH, trigger: "close",
+        amount: SPENT, delta: SPENT })]);
+      if (path === "drain sweep") {
+        expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "sent" });
+      }
+      await recover();
+      expect(reported).toHaveLength(1);
+      // The close was never reserved, so its report did not go through an obligation.
       expect(await obligations()).toEqual([]);
     } finally {
       await server.shutdown();
