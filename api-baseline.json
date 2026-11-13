@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.35.2",
+  "version": "0.37.0",
   "storeContracts": {
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean, limit?: number }",
@@ -36,6 +36,9 @@
         "saveCardRefund"
       ],
       "behavior": "Required for card refunds; serialize refund/recovery per credit across machines, honor the callback query connection, persist plans and submission attempts before external calls, and compare expected state/revision. Missing entry revisions mean zero and retain legacy idempotency keys."
+    },
+    "StripeCheckoutStore": {
+      "behavior": "Preserve the random store namespace in the same database/schema as the ledger and replay store. Create after sizing/admission; commit before Stripe. Never call Stripe inside withRecord. Use nonwaiting CAS for client polls, bounded internal contention retries, a short creation/refund lease, and per-row recovery scheduling. Persist dispute_lost as terminalReason when expiring a lost dispute. Booking joins tx with ledger/marker/outbox; refunding commits before Stripe."
     }
   },
   "wireContracts": {
@@ -78,7 +81,7 @@
       ],
       "unit": "integer USD micro-units on the wire; integer cents on the MPP challenge",
       "behavior": "stripe is a credit funding rail only; POST /v1/credit fund with method stripe issues and accepts an MPP method=\"stripe\" charge, booking one funding lot per PaymentIntent; /v1/job never offers it",
-      "callerTerms": "CreditTerms.stripe optionally carries network_id (string), min_micro (positive safe integer USD micro-units), and currency (usd); parseCreditTerms and parseCreditMenu preserve only those fields and reject terms with a malformed stripe block",
+      "callerTerms": "CreditTerms.stripe carries network_id, min_micro, currency usd, and optional checkout true; parseCreditTerms and parseCreditMenu preserve these fields and reject malformed stripe blocks",
       "paymentIntentMetadata": {
         "dvmkit_dvm_id": "server canonicalDvmId, falling back to dvmId; omitted without identity; sent on creation including declined confirmations; credential metadata cannot override it",
         "chargeContext": "StripeCreditRail.charge accepts optional canonicalDvmId supplied by the server; existing mpp_* metadata and idempotency keys are preserved",
@@ -125,6 +128,23 @@
       "fixture": "protocol-fixtures/x402-info-v1.json",
       "path": "GET /v1/info",
       "behavior": "capabilities offered on the x402 channel are listed under x402_capabilities, keyed by published name, apart from the unchanged dvmkit-protocol capabilities map; each entry is the capabilities entry shape with the route's flat body schema as input_schema, the x402 definition's price, and url, the route address including the host's mount prefix; the key is omitted when no capability is offered on x402"
+    },
+    "cardCreditCheckout": {
+      "fixture": "protocol-fixtures/credit-fund-stripe-checkout-v1.json",
+      "optionalFields": [
+        "credit.stripe.checkout",
+        "fund.via"
+      ],
+      "unit": "integer USD micro-units; checkout.expires_at is Unix seconds",
+      "behavior": "Signed stripe fund via checkout creates one hosted session per fund_id and returns 202 pending. Freshly signed polls preserve the binding and book a paid PaymentIntent once through normal card accounting. checkout_expired is terminal after expiry or refund claim; unsupported checkout directs the caller to omit via and use the token path.",
+      "recovery": "Short nonwaiting Postgres CAS transactions book ledger/marker/outbox atomically. Stripe calls never hold a connection. A durable DVM/store binding and create/refund leases scope work; unshown creates expire after 30 minutes without adoption. Paid unbooked sessions refund after 24 hours; failed recovery backs off per row and is ordered by its next attempt time. Internal bookkeeping retries brief row contention. Won, warning_closed and prevented disputes refund what is still owed after prior refunds and lost dispute amounts. Full losses expire with terminalReason dispute_lost and release hosted closure; open and appeal disputes back off. Unreadable sessions retain the obligation and emit permission-denied or missing-session diagnostics.",
+      "metadata": [
+        "fund_id",
+        "credit_id",
+        "caller_pubkey",
+        "dvmkit_dvm_id",
+        "dvmkit_checkout_store"
+      ]
     }
   },
   "exports": [
@@ -276,7 +296,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "714523b89fed598f77048f3d384432d9b23457f1c48e7dbad083f252ca83985d"
+          "signature": "819b19c6ac5596c8c19f149add764b88d5568326972a6fa4213cce69cb8aa3da"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -344,11 +364,11 @@
         },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "6c4b3f3da388fb49c61ed34601d791faffb920319d4e8e5574fdaec7fad0ae30"
+          "signature": "7a55232e19b171d016cf56be9ff119f9eac42beba2ed7b8b8073ec76060f908b"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "4b8634ddfd83bed2fbf83b6e361fe6f509339b3810197096279f60ceebb704ab"
+          "signature": "da52031fb3facf8f314df019e80618b98adf88faf5373250f1ceeee9f38bba00"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -412,7 +432,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "7e7b468765ec519329a34fa751c2534806146043d01626e8fd1de696936b6638"
+          "signature": "98b424dc8ce7908b12c7c419e431fdf6b0c6e8a5cd414037d76daa3d5668f8be"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -731,11 +751,6 @@
         "FundingRecord",
         "GrownDrawResult",
         "HostedTempoCloseReportWriteOff",
-        "HostingClosureCommand",
-        "HostingClosureEvidence",
-        "HostingControlCommand",
-        "HostingControlConfig",
-        "HostingControlStatus",
         "IMPLICIT_CREDIT_TTL_MS",
         "InitLockPool",
         "InstallAdminContentRoutesOpts",
@@ -755,6 +770,7 @@
         "JobTerminalReportPayload",
         "LightningReceive",
         "LightningReceiveConfig",
+        "LockedStripeCheckout",
         "MIN_INVOICE_TTL_SECONDS",
         "MemoryConsumedCredentialStore",
         "MemoryConsumedCredentialStoreOpts",
@@ -812,6 +828,9 @@
         "StreamableJobStore",
         "StripeChargeFacts",
         "StripeChargeOutcome",
+        "StripeCheckoutRecord",
+        "StripeCheckoutState",
+        "StripeCheckoutStore",
         "StripeCreditConfig",
         "StripeCreditRail",
         "StripeDispute",
@@ -865,6 +884,7 @@
         "contentMetadata",
         "createDVMHost",
         "createPinnedFetch",
+        "createPostgresStripeCheckoutStore",
         "createSignedRequestVerifier",
         "createStripeCreditRail",
         "createX402BatchSettlementServer",
@@ -890,8 +910,6 @@
         "secp256k1Auth",
         "selectPrimaryCredit",
         "serve",
-        "signHostingClosure",
-        "signHostingControl",
         "signedRequestInput",
         "signedRequestStatementHeader",
         "stripCreditEnvelope",
@@ -911,7 +929,7 @@
         },
         "attachCreditMenu": {
           "stability": "experimental",
-          "signature": "0a5e8a34756df32e5583f50355fa306b153423d011b8d743d8aa24fa0602f570"
+          "signature": "69603dfff2df48e2ae62d1fa638c851a93d334df75094cb613e2e8464a40a102"
         },
         "baselineContentExpiry": {
           "stability": "experimental",
@@ -927,11 +945,11 @@
         },
         "buildCreditMenu": {
           "stability": "experimental",
-          "signature": "e537d3ee0ec8d7166d0cd93e5f80ff839c5884278f0f0c8c6518169920f9caf5"
+          "signature": "f6be1c53b79ea3cbb29999494823bb5d37fff6abd1fa2d589ec9a29f7ef59469"
         },
         "BuildCreditMenuArgs": {
           "stability": "experimental",
-          "signature": "92a7030f82cff075949dd221744dd6d60e9d7e384b0fb95770c3bf7ba01db9ac"
+          "signature": "1c390f1fc7367d42c84cbd5ed99c6ffa1061afa771629016297d08458491875a"
         },
         "BuilderIdentity": {
           "stability": "experimental",
@@ -1035,11 +1053,15 @@
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "d20e997661fdcacdab3acf8866cac9250c0d140012da033a2fa984c578130dbd"
+          "signature": "cd4a8890bef52e1bf92b433d15604f1e6f55588ccd2378f6236492412e2375ef"
         },
         "createPinnedFetch": {
           "stability": "experimental",
           "signature": "42ab34751a47bbd7f69269847856c3047951d1f521f8fee07a0bc2eb23e16682"
+        },
+        "createPostgresStripeCheckoutStore": {
+          "stability": "experimental",
+          "signature": "0d1675eb6b721e7b4f7d8a9593ff9bab5fba989f8a257883f8414f630885bde8"
         },
         "createSignedRequestVerifier": {
           "stability": "experimental",
@@ -1051,19 +1073,19 @@
         },
         "createStripeCreditRail": {
           "stability": "experimental",
-          "signature": "22b95a5757f378875291c54c7620d1ead41052f8c0c12bd52e8e7d22014ca0bd"
+          "signature": "3f996e82e1705eece34ebc23de1c37c1c08ee99278b7907581fc9b4e898fc20b"
         },
         "CreateStripeCreditRailOpts": {
           "stability": "experimental",
-          "signature": "260a47c8a8829315c65b1230747f0230b23cf8467c8b7731fd58196070427b53"
+          "signature": "bc07f9d2fe35a60ab5cb58a723b9aeed5604795a168b1be3dd199094300e1e7a"
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "e8e6feb9451936c72ff628577943ffcb5d3d7dad31e85326bc3fe4fee246dbe0"
+          "signature": "4c093994bf0e44d9c3ce331fa784e3285d2ad86ee6b29c1a8eefa72d4b12f009"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "38729447cc63cbb02694696b7fb11f02dc9f4684040c117532bd5acb97450410"
+          "signature": "10d00144a11b84ce76c88c53b69ce6fe4e72c34c80a8fc5b9e620e4cce848f75"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1071,7 +1093,7 @@
         },
         "CREDIT_REQUEST_SCHEMA": {
           "stability": "experimental",
-          "signature": "d92276ce39ac598178c7dd716190b213fa4a300f481fb5925e56a8797f391056"
+          "signature": "2ac63ab0ddc51af4cc4e939f09278cdb3e87a1b2375fb320662f3b77017068cb"
         },
         "CreditDrawRefundArgs": {
           "stability": "experimental",
@@ -1115,7 +1137,7 @@
         },
         "CreditLedger": {
           "stability": "experimental",
-          "signature": "22469e29862b5850d587486294fb67dd71f4bf0db8eeafac0cdd322621499291"
+          "signature": "c947928276d52a6002903c3ca605f42a829e2e37fdc15625211deb62f1c02594"
         },
         "CreditLedgerError": {
           "stability": "experimental",
@@ -1131,7 +1153,7 @@
         },
         "CreditLedgerLike": {
           "stability": "experimental",
-          "signature": "eb8baa950a9ef636dfbe252ef20eae6827c288526862088a8e411bcf4ecf9d85"
+          "signature": "4a4257caa9941947e35f62d0523a40c01ce956f1f43095149a51dbdb3bfbe10d"
         },
         "CreditLedgerPool": {
           "stability": "experimental",
@@ -1143,15 +1165,15 @@
         },
         "CreditMenu": {
           "stability": "experimental",
-          "signature": "0d823f00f8a7e457b38e0ce12b789f92b5f80a0ade713ec7db906d110090a08a"
+          "signature": "33f77aa41186d98bf03e90f55b348c6d50721955b1dfa496f0f2969cabc5ebf9"
         },
         "CreditRequest": {
           "stability": "experimental",
-          "signature": "1cc2c5dc416a40393a7bd0420685b1b81f93049974306728fdd19a5da49dbcd5"
+          "signature": "c39e4f726a881310af19a864c456bafbb0a29761dccfc02d50ffe1f37a45a4f8"
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "dec6defa8dc08bd09e73ab8fb7b0712a495e957e29e923d5890084cb8a494a7f"
+          "signature": "16bca7a94b37477a8b55b2e6df36bd114a2cfb2da2f9c05162359e731fb79e76"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1163,7 +1185,7 @@
         },
         "CreditTerms": {
           "stability": "experimental",
-          "signature": "70ea17d65e5e6e77cf8caf6816bfb8d087cb0ed693e75c65aa2b26b8eed8a102"
+          "signature": "685e68b00b5db29b93ec768fe687f3b138070bdc9a41d1c5e01dd4b9012ee4bf"
         },
         "DeclineOutcome": {
           "stability": "experimental",
@@ -1215,11 +1237,11 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "aa8d5bd37f9b9bb48ebbad321e47e5d57c2d2b7349d288f4da1520277fc2d45e"
+          "signature": "fcad789de64c13979ed935a7df6abeef64112915601bf7e1b86b7e9ea98a48cd"
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "1a862491625c48c80293d42e342617adb5336e4597e359b6bfdaecf91dbcca3b"
+          "signature": "8e970d342f567b037791e73ac2b3d17e065dc391a810fc7a585191f03370eada"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1243,7 +1265,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "ab5bad703e3b2596fa4d99f23a7c267f319e4c6700fd10b09ef345408ffb55ea"
+          "signature": "c23cc27a7c3f7588b8af5f7367b3354cba692b263dd85f9c7da816bef5196127"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1252,26 +1274,6 @@
         "HostedTempoCloseReportWriteOff": {
           "stability": "experimental",
           "signature": "b0b14007068f1c4fec113af23d9445bda8f654cea2b2f694f03adc2122b0dba3"
-        },
-        "HostingClosureCommand": {
-          "stability": "experimental",
-          "signature": "6c1b24a0b6a6b67a5efd23cf2d994ea7499a6f95cdeb812e852257b7ea1c807e"
-        },
-        "HostingClosureEvidence": {
-          "stability": "experimental",
-          "signature": "d49d7b09d203c479de3f7fcf67e64a466c9a23adef2c7990e7343eeb01227b7d"
-        },
-        "HostingControlCommand": {
-          "stability": "experimental",
-          "signature": "cf3d18addc38314455553337d1ba6e836342b6452671a0f24c9cf27cbdc9e8db"
-        },
-        "HostingControlConfig": {
-          "stability": "experimental",
-          "signature": "3394980bfcd89401df78c3a7c085dcb365e23da9ffd1bee88e4ae41890312cb8"
-        },
-        "HostingControlStatus": {
-          "stability": "experimental",
-          "signature": "abe5200e1ee0c3eeca2c432b931aff8633c6ce7ababf186ac05f432215ea6f32"
         },
         "IMPLICIT_CREDIT_TTL_MS": {
           "stability": "experimental",
@@ -1323,11 +1325,11 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "14152dd2572cb2bed64619404ebc52db27ebbf5ce725e74f7f5fd226064243b8"
+          "signature": "0195eb867b93c1dc51a5ec91bdaa598132dae38997b5d777db95db84848bc4b1"
         },
         "JobManagerOpts": {
           "stability": "experimental",
-          "signature": "75b65acf68d8575e563b21df91e8512512dfbb421e8a10b75f6ba1617c201f59"
+          "signature": "d2ef55253eef07220f1d27c28f7a01e594427cccabe173da3ef7e95ebd3fd12e"
         },
         "JobPiece": {
           "stability": "experimental",
@@ -1355,11 +1357,15 @@
         },
         "LightningReceive": {
           "stability": "experimental",
-          "signature": "a9ca3091d0346b35f8ece35a0c1e3f7cd23cf3f7e12a066f6232fe175d33a3ea"
+          "signature": "a985f7399ae80c9b65ec39cdbc270f4328fa148b10dc6512950e1befac6c498d"
         },
         "LightningReceiveConfig": {
           "stability": "experimental",
           "signature": "732dacbcb05298ad8f008cfa3e59ca92cdc202a47a5faecb481a0972766360bf"
+        },
+        "LockedStripeCheckout": {
+          "stability": "experimental",
+          "signature": "75ed6d771fd364c4f6550bf1bcef5bff88bddd728fbf4a861e2e72eacba63be6"
         },
         "MemoryConsumedCredentialStore": {
           "stability": "experimental",
@@ -1371,7 +1377,7 @@
         },
         "MemoryCreditLedger": {
           "stability": "experimental",
-          "signature": "b5457bb20759532e69f1193811895092c906826902cc5f4496ef03f9184f759c"
+          "signature": "5293b9dbe99fe651cabd13adc1eecdb05be0a7fdca88b36005ec0c2122fa7305"
         },
         "MemoryProcessedPaymentStore": {
           "stability": "experimental",
@@ -1379,7 +1385,7 @@
         },
         "MemoryX402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "0d208972573e2801028da5c0011cff28639911b546b82839b807f3d4a338b79c"
+          "signature": "ab09d716f74664600f63871389850fe0d760e04b61caa6e5235f08e95381071e"
         },
         "MIN_INVOICE_TTL_SECONDS": {
           "stability": "experimental",
@@ -1443,7 +1449,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "35db1b0d1757f87c553ca67773ef588a3e18f9fb5797fd9283641d5cdc2b9c4a"
+          "signature": "cb9dc8e12737fffd83d3d9fc1eeb7478067670595e0dcd9ffbc6fea1234c829c"
         },
         "PostgresKVStore": {
           "stability": "experimental",
@@ -1467,11 +1473,11 @@
         },
         "PostgresX402ChannelStorage": {
           "stability": "experimental",
-          "signature": "55b00b4b687014b8cee8d00f2e0e33fe1f722c41ed3c027439cc98af1ee7a4ee"
+          "signature": "c2be8f4ca59638024ca97c9bd3620b97398f6b198136e035351a9f337247aecb"
         },
         "PostgresX402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "eb7244a21f42b73da6be7fca5b32067698311965d7d12a64d1ab6a221f59bf09"
+          "signature": "f66d2cad2833d14250a29c95567d6fec0ffb79a3357d41158474782a1fdfd6ca"
         },
         "PriceFiat": {
           "stability": "experimental",
@@ -1531,7 +1537,7 @@
         },
         "retryHostedTempoCloseReport": {
           "stability": "experimental",
-          "signature": "d6e14c7507b37126ce092072580cfd41ecfae5b84bfa62a2bcacc25a0fad3571"
+          "signature": "ddbcd9586d507e02f8987f4394d2df5859aed7d6cf7fa85a29720e101620b2fe"
         },
         "RetryTempoCloseReportResponse": {
           "stability": "experimental",
@@ -1559,11 +1565,11 @@
         },
         "selectPrimaryCredit": {
           "stability": "experimental",
-          "signature": "709b2b633453971df2dad3466680d3865bab6b216596bdee98bbf52e2a168502"
+          "signature": "ede4f8d6d7bf5d427b9f25a724a815e925207397164fdadc9e10c2db5b114053"
         },
         "serve": {
           "stability": "experimental",
-          "signature": "80bda5f768d131e339d67060d28baaf4553af0b157bba515cb8832e9d21fbe5e"
+          "signature": "4b1679a109828a0b38af35199f5d1cf7e3c7f38107953b3f1fc67ecc42eef32b"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
@@ -1613,14 +1619,6 @@
           "stability": "experimental",
           "signature": "ca07521ddab2133ad6b32fecc0df918aa88b38f37c7e5b65fc54ad598631c251"
         },
-        "signHostingClosure": {
-          "stability": "experimental",
-          "signature": "bca1a17c688be0489663298c1ae5a1780406530cf9d2e8a27a925e11edecc229"
-        },
-        "signHostingControl": {
-          "stability": "experimental",
-          "signature": "4daf5f736b2f3446cc683c547cacecce6c5f346887a5cf3d74813afbe131e73d"
-        },
         "SSRFError": {
           "stability": "experimental",
           "signature": "07db34613287edd0cd3bd4552c326c13269864b9d58785471d0ff0b52bc29095"
@@ -1661,17 +1659,29 @@
           "stability": "experimental",
           "signature": "6004a1b81570cc5ddbd3746bd776aaeaa3436f9c7b64906305787f11a28c894e"
         },
+        "StripeCheckoutRecord": {
+          "stability": "experimental",
+          "signature": "2aa8314120e706d5215f83cdd19f928299a2cdf6780f06bf95ef4878fcfc7808"
+        },
+        "StripeCheckoutState": {
+          "stability": "experimental",
+          "signature": "a05b2caedf98b582191fcb003ec05056980689383a8e5264db423005d47c98ea"
+        },
+        "StripeCheckoutStore": {
+          "stability": "experimental",
+          "signature": "08a624b1558eec3c68ca847828e27c2752918b10a70f77c9ed58cf3d60c282eb"
+        },
         "StripeCreditConfig": {
           "stability": "experimental",
-          "signature": "47cf9af372c12fa491baae25c18c79541f05b3dac2e7c035422b5b5cab281614"
+          "signature": "3a121f7aee20a7875479a2acbafc38cdc4ff6a0ef4f74491ae06e5d2c8680521"
         },
         "StripeCreditRail": {
           "stability": "experimental",
-          "signature": "4e0302e49b32ffa3dc185ccc82bf54a9da362a42527c875b1048452d73b679d3"
+          "signature": "51f7ce330a8e6d9e5e6cae80772e33d0cc9e13588180c09affe83ebaf7bc27cb"
         },
         "StripeDispute": {
           "stability": "experimental",
-          "signature": "f2e9a545ce1e3ed11bd9aeed494b3a9411621eacbddc0da226d7d0c76e793929"
+          "signature": "9c468eb054a70e6b6b57a018b4a151f05be574674cb1a2d865e32dbda4fe5053"
         },
         "StripeErrorCodes": {
           "stability": "experimental",
@@ -1687,7 +1697,7 @@
         },
         "StripeRefundApi": {
           "stability": "experimental",
-          "signature": "be9246b80ab8739c675b9758d3e0b8d75d445a78fc903486b189ebc9db18383d"
+          "signature": "c9eb24eefc52ba94e965476f8b27d458561e5e316e2a5a53706c822c307ae986"
         },
         "stripProtocolEnvelope": {
           "stability": "experimental",
@@ -1731,7 +1741,7 @@
         },
         "writeOffHostedTempoCloseReport": {
           "stability": "experimental",
-          "signature": "c152f5a377fd9a3e775e953d3189bc5d84da19e1029e4b2b6721261495320203"
+          "signature": "26149ed27c6bc6618d5702083001274773987d685749883482a7364b4c985546"
         },
         "WriteOffTempoCloseReportResponse": {
           "stability": "experimental",
@@ -1763,7 +1773,7 @@
         },
         "X402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "b2f29747d7de9c83d48e46c45272015bd6c700eaad2caff4505e06670ef019c1"
+          "signature": "82572c24dcdda9370400db67d3c3347148ed47d6e29344b7c54c339b1a59bd74"
         },
         "X402ChannelStorageOpts": {
           "stability": "experimental",
@@ -1771,7 +1781,7 @@
         },
         "X402ExactAcceptance": {
           "stability": "experimental",
-          "signature": "d446c351f2acdaa78e55e4ed15fc64c346e7cf91ae49d47d4716b990c4654294"
+          "signature": "c676f54af28fee91433260c2e65fadac690ee8ac09a71963838090e773945ff5"
         },
         "X402ExactIntentConflictError": {
           "stability": "experimental",
@@ -1787,7 +1797,7 @@
         },
         "X402ExactSettlementEffect": {
           "stability": "experimental",
-          "signature": "105600b0426433e1675a985be12c3e5e0286027ecb34c02114b468f375856207"
+          "signature": "f6749870a0feb17c5965d64fba55475853a09cd8b2adddbac90bcaa940b84188"
         },
         "X402ExactSettlementEvidenceMissingError": {
           "stability": "experimental",
@@ -1795,11 +1805,11 @@
         },
         "X402ExactSettlementEvidenceReader": {
           "stability": "experimental",
-          "signature": "a1dfe4b8da5efdc083d0b187ca5816570357b9f9fe46af2dcbade692a8509bc1"
+          "signature": "98311bfc46dd5e779462726978c0278cf401cce457e52014b14ae64485385c9c"
         },
         "X402ExactSettlementIntent": {
           "stability": "experimental",
-          "signature": "34229f2b6a25e2c8458a7c68f4bb89d7e08a9c89c11a8ae222f1c3747de52a39"
+          "signature": "21be3d8efe07b608829d63c288658ff2a673f44f55bf681a69027b524ec8f105"
         },
         "X402ExactSettlementNotReadyError": {
           "stability": "experimental",
@@ -1807,11 +1817,11 @@
         },
         "X402ExactSettlementServer": {
           "stability": "experimental",
-          "signature": "c2764f6243cea075c5f6fac168c78f6e60f692299a16c640e5ede4e0899ab06e"
+          "signature": "af3a14207ccdfbcafcce15cb34ee787fb91543578fbf183cbbd582b5e2e423ba"
         },
         "X402ExactSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "9d3d302a7d6aceee54dc71d0e8159f0ae33741c70933ef69277362c65b435a37"
+          "signature": "f1bba72ad013f23014a0d624b71dec392f063f5853ffe0ad8a4b1bababd4b314"
         },
         "X402ExactSettlementStatus": {
           "stability": "experimental",
@@ -1819,7 +1829,7 @@
         },
         "X402ExactSettlementStore": {
           "stability": "experimental",
-          "signature": "5076384e21dfa02455e2a718a9ec98535080c8becbef49c6f13260f3b9d00cbf"
+          "signature": "15491be86bcbaea6c002b26bb0169009f4d88c22fbf03760de52d1cecd3bd0ca"
         },
         "X402RelayLockHolder": {
           "stability": "experimental",
@@ -1839,7 +1849,7 @@
         },
         "X402SettlementEvidenceReader": {
           "stability": "experimental",
-          "signature": "04c4baf99eb94de50cb8f8b60c34a3ecc069804c45722ac1fb33973565cd3d80"
+          "signature": "118de2b73ebe1a2cb39e162f6366f13f355f64d38f6a06b2e8db4890390c2dea"
         },
         "X402SettlementSubmissionError": {
           "stability": "experimental",
