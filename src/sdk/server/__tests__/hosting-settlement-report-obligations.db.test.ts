@@ -5,7 +5,7 @@ import { BATCH_SETTLEMENT_ADDRESS } from "@x402/evm";
 import pg from "pg";
 import { Session as TempoSession } from "mppx/tempo";
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, parseAbiItem } from "viem";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const chainClient = vi.hoisted(() => ({
   getChainId: vi.fn(), getBlock: vi.fn(), getTransactionReceipt: vi.fn(),
@@ -18,16 +18,10 @@ vi.mock("viem", async (importOriginal) => ({
 
 import { writeOffHostedTempoCloseReport } from "../index";
 import { loggers } from "../../../observability/loggers";
-import { HostingControl } from "../hosting-control";
-import { HostedChannelEvidenceReader } from "../hosting-channel-evidence";
-import { CreditLedger } from "../credit-ledger";
 import { HostedSettlementReportObligations } from "../hosting-settlement-report-obligations";
-import { PostgresJobStore } from "../postgres-job-store";
-import { PostgresProcessedPaymentStore } from "../processed-payment-store";
 import { PayoutReporter, PostgresX402BatchStore } from "../payout-reporter";
 import { RevenueReporter } from "../revenue-reporter";
 import { PostgresTempoSessionStore } from "../tempo-session-store";
-import { PostgresTempoChargeStore } from "../tempo-charge-store";
 import { PostgresX402ChannelStorage } from "../x402-channel-store";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -92,7 +86,6 @@ interface Fixture {
   pool: pg.Pool;
   dvmId: string;
   scope: string;
-  control: HostingControl;
   obligations: HostedSettlementReportObligations;
   channelStore: PostgresX402ChannelStorage;
   /** Another pool on the same schema, standing in for a later process. */
@@ -122,12 +115,11 @@ async function bookmarkRefund(pool: pg.Pool,
   );
 }
 
-async function prepareFixture(preexistingChannelTable = false, certificateReady = false): Promise<Fixture> {
+async function prepareFixture(preexistingChannelTable = false): Promise<Fixture> {
   const schema = `hosted_effect_${randomUUID().slice(0, 8)}`;
   const admin = new pg.Pool({ connectionString: DATABASE_URL });
   const pool = new pg.Pool({ connectionString: DATABASE_URL, options: `-c search_path=${schema}` });
-  const channelStore = new PostgresX402ChannelStorage(pool,
-    certificateReady ? { hostedNetwork: NETWORK } : undefined);
+  const channelStore = new PostgresX402ChannelStorage(pool);
   let schemaCreated = false;
   const restarts: pg.Pool[] = [];
   const cleanup = async () => {
@@ -146,42 +138,24 @@ async function prepareFixture(preexistingChannelTable = false, certificateReady 
     if (preexistingChannelTable) await channelStore.init();
     const dvmId = `effect-${randomUUID()}`;
     const scope = `deployment-${randomUUID()}`;
-    const channelReader = certificateReady
-      ? await HostedChannelEvidenceReader.fromServerConfig(pool, { x402: { network: NETWORK } })
-      : undefined;
-    const control = new HostingControl(pool, dvmId,
-      { secret: "test-only-hosting-effect-secret-32-bytes", scope }, channelReader);
-    await control.init();
     const obligations = new HostedSettlementReportObligations(pool, dvmId, scope);
     obligations.configureX402({ network: NETWORK, receiver: RECEIVER, token: TOKEN });
     await obligations.init();
-    if (certificateReady) {
-      await new PostgresJobStore(pool).init();
-      await new CreditLedger(pool).init();
-      await new PostgresProcessedPaymentStore(pool).init();
-      await new RevenueReporter(pool, "https://example.com", "test-token").init();
-      await new PostgresTempoChargeStore(pool, { gcSampleRate: 0 }).init();
-      await new PostgresTempoSessionStore(pool).init();
-    }
     if (!preexistingChannelTable) await channelStore.init();
     obligations.attachX402SettlementStore(channelStore);
     await new PostgresX402BatchStore(pool).init();
-    return { pool, dvmId, scope, control, obligations, channelStore, cleanup,
+    return { pool, dvmId, scope, obligations, channelStore, cleanup,
       restartPool: () => {
         const restart = new pg.Pool({ connectionString: DATABASE_URL, options: `-c search_path=${schema}` });
         restarts.push(restart);
         return restart;
       },
       initializeState: async () => {
-        expect(await control.transition({ action: "resume", version: 2, dvmId, scope,
-          generation: 1, leaseExpiresAtMs: Date.now() + 60_000,
-          deadlineMs: Date.now() + 90_000, timestampMs: Date.now(),
-          nonce: `nonce_${randomUUID().replaceAll("-", "")}` })).toBe("ok");
         await channelStore.updateChannel(CHANNEL, () => ({
           channelId: CHANNEL, channelConfig: CONFIG,
-          chargedCumulativeAmount: certificateReady ? "0" : "100",
-          signedMaxClaimable: certificateReady ? "0" : "100",
-          signature: certificateReady ? "0x" : SIGNATURE,
+          chargedCumulativeAmount: "100",
+          signedMaxClaimable: "100",
+          signature: SIGNATURE,
           balance: "300", totalClaimed: "0",
           withdrawRequestedAt: 0, refundNonce: 0, onchainSyncedAt: Date.now(),
           lastRequestTimestamp: Date.now(),
@@ -194,8 +168,8 @@ async function prepareFixture(preexistingChannelTable = false, certificateReady 
   }
 }
 
-async function fixture(preexistingChannelTable = false, certificateReady = false): Promise<Fixture> {
-  const current = await prepareFixture(preexistingChannelTable, certificateReady);
+async function fixture(preexistingChannelTable = false): Promise<Fixture> {
+  const current = await prepareFixture(preexistingChannelTable);
   try {
     await current.initializeState();
     return current;
@@ -313,92 +287,6 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     expect(await current.obligations.unresolvedCount()).toBe(1);
     await expect(current.obligations.observeCanonical(first!.id))
       .rejects.toThrow("original signed authorization is unknown");
-  });
-
-  describe("public terminal certificates", () => {
-    let preparation: Promise<Fixture>;
-    let assertions: Promise<void> | undefined;
-    beforeEach(async () => {
-      assertions = undefined;
-      preparation = prepareFixture(false, true);
-      await preparation;
-    });
-    afterEach(async () => {
-      // A Vitest timeout does not stop pending database work; let it finish before closing the pools.
-      await assertions?.catch(() => undefined);
-      const current = await preparation.catch(() => undefined);
-      await current?.cleanup();
-    });
-
-    it("refuses a public terminal certificate when a discharged row loses its original signed call", () => {
-      assertions = preparation.then(async (current) => {
-        await current.initializeState();
-        await bookmarkRefund(current.pool, CONFIG, CHANNEL, "0", true);
-        const reserved = await current.obligations.reserveX402(CHANNEL, "refund", {
-          authorizationPayload: { type: "refund", channelConfig: CONFIG, amount: "300",
-            refundNonce: "0", claims: [], refundAuthorizerSignature: REFUND_AUTHORIZER },
-          authorizationRequirements: AUTH_REQUIREMENTS,
-          refundNonce: "0", refundAmount: "300", voucherSignature: "0x",
-          signedMax: "0",
-        });
-        await current.obligations.recordSubmitted(reserved!.id, TX);
-        chainClient.getChainId.mockResolvedValue(84532);
-        chainClient.getBlock.mockImplementation(async (args: { blockTag?: string; blockNumber?: bigint }) =>
-          args.blockTag === "finalized" || args.blockNumber === 11n
-            ? { number: 11n, hash: `0x${"cc".repeat(32)}` }
-            : { number: 10n, hash: BLOCK });
-        chainClient.readContract.mockImplementation(async (args: { functionName: string }) =>
-          args.functionName === "channels" ? [0n, 0n] :
-            args.functionName === "pendingWithdrawals" ? [0n, 0] : 1n);
-        chainClient.getTransactionReceipt.mockResolvedValue({
-          status: "success", blockNumber: 10n, blockHash: BLOCK, transactionHash: TX,
-          logs: [{ address: BATCH_SETTLEMENT_ADDRESS,
-            topics: encodeEventTopics({ abi: [parseAbiItem(
-              "event Refunded(bytes32 indexed channelId,address indexed sender,uint128 amount)"
-            )], eventName: "Refunded", args: { channelId: CHANNEL, sender: CONFIG.payer } }),
-            data: encodeAbiParameters([{ type: "uint128" }], [300n]) }],
-        });
-        chainClient.getTransaction.mockResolvedValue({ to: BATCH_SETTLEMENT_ADDRESS,
-          input: encodeFunctionData({ abi: REFUND_ABI, functionName: "refundWithSignature",
-            args: [CONFIG, 300n, 0n, REFUND_AUTHORIZER as `0x${string}`] }) });
-        expect(await current.obligations.observeCanonical(reserved!.id))
-          .toMatchObject({ blockHash: BLOCK, deltaNative: "0" });
-        await current.pool.query(
-          "UPDATE x402_batch_settlements SET status='complete' WHERE channel_id=$1 AND operation='refund'",
-          [CHANNEL]
-        );
-        await current.channelStore.updateChannel(CHANNEL, () => undefined);
-        const support = { singleMount: true, durableLedger: true, durableJobStore: true,
-          durableReporter: true, durablePaymentReplay: true, knownRailStores: true };
-        const command = { version: 3 as const, action: "close" as const,
-          dvmId: current.dvmId, scope: current.scope, generation: 2,
-          operationId: `operation_${randomUUID().replaceAll("-", "")}`,
-          timestampMs: Date.now(), nonce: `nonce_${randomUUID().replaceAll("-", "")}` };
-        expect(await current.control.close(command, support)).toBe("ok");
-        const certificate = () => current.control.certificate(
-          { ...command, action: "certificate" }, support
-        );
-        expect(await certificate()).toMatchObject({ complete: true, eligible: true,
-          dvmId: current.dvmId, scope: current.scope, operationId: command.operationId });
-        const original = (await current.pool.query<{ original: Record<string, unknown> }>(
-          "SELECT original FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [reserved!.id]
-        )).rows[0].original;
-        for (const state of ["no_report", "delivered"] as const) {
-          await current.pool.query(
-            "UPDATE sdk_hosted_settlement_report_obligations SET state=$2,original=original-'authorizationCallData' WHERE id=$1",
-            [reserved!.id, state]
-          );
-          expect(await certificate()).toMatchObject({ complete: false, eligible: false,
-            reasons: expect.arrayContaining(["settlement_reports_unresolved"]) });
-        }
-        await current.pool.query(
-          "UPDATE sdk_hosted_settlement_report_obligations SET state='no_report',original=$2 WHERE id=$1",
-          [reserved!.id, JSON.stringify(original)]
-        );
-        expect(await certificate()).toMatchObject({ complete: true, eligible: true });
-      });
-      return assertions;
-    });
   });
 
   it("does not deliver or acknowledge a report from submitted hashes without canonical proof", async () => {
@@ -529,7 +417,7 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     }
   });
 
-  it("delivers an obligation reserved before the upgrade once hosting control is no longer configured", async () => {
+  it("delivers an obligation reserved before the identity table existed", async () => {
     const current = await fixture(); fixtures.push(current);
     const claimSource = { authorizationPayload: claimAuthorization(),
       authorizationRequirements: AUTH_REQUIREMENTS, charged: "100", signature: SIGNATURE, signedMax: "100" };
@@ -547,12 +435,12 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
     const settle = await current.obligations.reserveOpenX402Settlement();
     await current.obligations.recordSubmitted(settle.id, `0x${"cd".repeat(32)}`);
     const owner = (await current.pool.query<{ instance_id: string }>(
-      "SELECT instance_id FROM sdk_hosting_control WHERE dvm_id=$1", [current.dvmId]
+      "SELECT instance_id FROM sdk_hosted_settlement_report_identity WHERE dvm_id=$1", [current.dvmId]
     )).rows[0].instance_id;
     const reservedEpoch = (await current.pool.query<{ boot_epoch: string }>(
       "SELECT boot_epoch FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
     )).rows[0].boot_epoch;
-    // Before the upgrade, ownership lived only on the control row and the obligations themselves.
+    // Before the upgrade, ownership lived only on the obligations themselves.
     await current.pool.query("DROP TABLE sdk_hosted_settlement_report_identity");
 
     const restart = current.restartPool();
@@ -589,6 +477,31 @@ async function fixture(preexistingChannelTable = false, certificateReady = false
       "SELECT id,state FROM sdk_hosted_settlement_report_obligations ORDER BY created_at_ms,id"
     )).rows.map((row) => row.state)).toEqual(["delivered", "delivered"]);
     expect(await upgraded.unresolvedCount()).toBe(0);
+  });
+
+  it("ignores a leftover hosting-control table when inheriting ownership", async () => {
+    const current = await fixture(); fixtures.push(current);
+    const claim = await current.obligations.reserveX402(CHANNEL, "claim", {
+      authorizationPayload: claimAuthorization(),
+      authorizationRequirements: AUTH_REQUIREMENTS,
+      charged: "100", signature: SIGNATURE, signedMax: "100",
+    });
+    const owner = (await current.pool.query<{ instance_id: string }>(
+      "SELECT instance_id FROM sdk_hosted_settlement_report_obligations WHERE id=$1", [claim!.id]
+    )).rows[0].instance_id;
+    // A database that once ran the removed control layer keeps its table, with another instance.
+    await current.pool.query(
+      `CREATE TABLE sdk_hosting_control (dvm_id TEXT, scope TEXT, instance_id TEXT, boot_epoch BIGINT)`);
+    await current.pool.query(
+      "INSERT INTO sdk_hosting_control VALUES ($1,$2,$3,99)", [current.dvmId, current.scope, randomUUID()]);
+    await current.pool.query("DROP TABLE sdk_hosted_settlement_report_identity");
+
+    const restart = current.restartPool();
+    await new HostedSettlementReportObligations(restart, current.dvmId).init();
+    expect((await restart.query<{ instance_id: string; boot_epoch: string }>(
+      "SELECT instance_id,boot_epoch FROM sdk_hosted_settlement_report_identity WHERE dvm_id=$1",
+      [current.dvmId]
+    )).rows).toEqual([{ instance_id: owner, boot_epoch: expect.not.stringMatching(/^100$/) }]);
   });
 
   it("refuses to pick an owner when earlier obligations sit under more than one scope", async () => {

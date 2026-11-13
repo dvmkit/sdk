@@ -115,7 +115,7 @@ describe.skipIf(!RUN)("mid-job draw funding rows", () => {
         x402Config: X402,
         dvmId: DVM_ID,
         jobId: JOB_ID,
-        hostingPaymentSeq: paymentSeq,
+        paymentSeq,
         fxFetcher: fetcher,
         creditLedger: ledger,
         processedPayments: payments,

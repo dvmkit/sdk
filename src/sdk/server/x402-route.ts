@@ -266,7 +266,7 @@ export function classifyX402RouteOutcome(args: {
   const { status, intent } = args;
   // A job that did not complete never sends its authorization.
   if (status === "failed") return args.runtimeLimitExceeded ? "runtime_bound" : "handler_failed";
-  // Only the service cancels a route job (a hosting drain): its caller holds no job token yet.
+  // Only the service cancels a route job: its caller holds no job token yet.
   if (status === "cancelled") return "runtime_bound";
   // Released unsent once the budget ran out, whether or not the job's end is recorded yet.
   if (intent?.status === "released" && intent.lastOutcome === DEFERRED_X402_SETTLE_WINDOW_CLOSED) return "runtime_bound";

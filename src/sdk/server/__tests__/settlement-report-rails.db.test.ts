@@ -64,7 +64,7 @@ const stubFx: FxFetcher = {
 
 type Effect = { type: string; obligations: { operation: string; state: string; tx_hash: string | null }[] };
 
-describe.skipIf(!RUN)("settlement-report rails without hosting control (real Postgres)", () => {
+describe.skipIf(!RUN)("settlement-report rails (real Postgres)", () => {
   const schemas: string[] = [];
   const pools: Pool[] = [];
   const closers: Array<() => Promise<void>> = [];

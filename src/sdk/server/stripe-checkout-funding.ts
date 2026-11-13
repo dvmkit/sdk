@@ -138,7 +138,7 @@ export async function fundStripeCheckout(args: {
       if (await args.opts.creditLedger?.getFunding({ creditId: args.creditId, fundId: args.fundId })) return { funded: false, response: mismatch() };
       if (!snapshot) {
         await rail.store.create({
-          storeNamespace: rail.store.namespace, dvmId, hostingDvmId: args.opts.dvmId,
+          storeNamespace: rail.store.namespace, dvmId,
           fundId: args.fundId, creditId: args.creditId, callerPubkey: args.callerPubkey,
           amountMicro: args.amountMicro, createdAt: nowMs, expiresAt: nowMs + CHECKOUT_LIFETIME_MS,
           successUrl: rail.successUrl, productName: args.productName, state: "creating",

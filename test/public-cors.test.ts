@@ -69,7 +69,7 @@ describe("public route CORS", () => {
 
   it.each([false, true])("keeps admin, internal, and health routes private with devMode=%s", async (devMode) => {
     const app = await productionApp(devMode);
-    for (const path of ["/admin/credit/pending-drains", "/_internal/tempo-close-event", "/_hosting/control", "/health", "/healthz"]) {
+    for (const path of ["/admin/credit/pending-drains", "/_internal/tempo-close-event", "/health", "/healthz"]) {
       for (const method of ["OPTIONS", "GET", "POST"]) {
         const response = await app.request(path, {
           method,

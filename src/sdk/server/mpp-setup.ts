@@ -5,9 +5,7 @@ import type { Challenge, Credential, Method, Receipt, Store } from "mppx";
 import { Credential as MppCredential, Errors as MppxErrors, PaymentRequest } from "mppx";
 import { Mppx, tempo } from "mppx/server";
 import { Session as TempoSession } from "mppx/tempo";
-import type { HostedIntent } from "./hosting-cleanup-fence";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
-import type { PostgresTempoChargeStore } from "./tempo-charge-store";
 import type { Account, Client, Hex } from "viem";
 
 import { loggers } from "../../observability/loggers";
@@ -240,7 +238,6 @@ export interface MppxServer {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     options?: any
   ): Promise<Method.Validation>;
-  completeHostedTempoCharge?: (challengeId: string) => Promise<void>;
   permitHostedTempoClose?: (credential: Credential.Credential | string, reservationId: string) => void;
   /**
    * Typed dispatcher over `mppx.challenge.<method>.<intent>(opts)`. Localizes
@@ -640,32 +637,6 @@ export function createDualKeyMppxFromOpts(
     broadcastCredential: verifyWithDualKey,
     verifyCredential: verifyWithDualKey,
     validateCredential: validateWithDualKey,
-  });
-}
-
-/** Install the hosted charge reservation ahead of either active or rotated-key broadcast. */
-export function installHostedTempoChargeGuard(
-  server: MppxServer, store: PostgresTempoChargeStore
-): void {
-  const broadcast = server.broadcastCredential.bind(server);
-  const guarded: MppxServer["broadcastCredential"] = async (input, options) => {
-    const credential = typeof input === "string"
-      ? (await import("mppx")).Credential.deserialize(input) : input;
-    if (credential.challenge.intent !== "charge") return broadcast(input, options);
-    const intent = (options as { hostedPaymentIntent?: HostedIntent } | undefined)?.hostedPaymentIntent;
-    if (!intent || (intent.jobId === undefined && intent.admissionId === undefined)) {
-      throw new Error("Hosted Tempo charge has no original payment intent");
-    }
-    const serialized = typeof input === "string"
-      ? input : (await import("mppx")).Credential.serialize(input);
-    await store.reserveHostedCharge(serialized, intent);
-    const { hostedPaymentIntent: _reserved, ...railOptions } = options ?? {};
-    return broadcast(input, railOptions);
-  };
-  Object.assign(server, {
-    broadcastCredential: guarded,
-    verifyCredential: guarded,
-    completeHostedTempoCharge: (id: string) => store.completeHostedCharge(id),
   });
 }
 
@@ -2280,10 +2251,10 @@ function attachTempoSessionRuntime(
   /**
    * Resolve close obligations no drain poll will revisit. A drain released
    * while the payer's timed exit was pending, or after a close attempt that
-   * failed definitively, stops reaching recovery, yet its reservation still
-   * blocks the hosting closure until the chain shows how the channel ended.
-   * A channel the store still holds open is read from the chain first, as
-   * recovery reads it, so the hosting closure can run this on its own.
+   * failed definitively, stops reaching recovery, yet its reservation
+   * stays unresolved until the chain shows how the channel ended. A channel
+   * the store still holds open is read from the chain first, as recovery
+   * reads it.
    */
   const reconcileUnsubmittedCloses = async (): Promise<void> => {
     const obligations = config.hostedObligations;

@@ -181,8 +181,6 @@ export interface CreditRouteDeps {
    * invoice on the same credit is swept with it.
    */
   settleLightning: (callerPubkey: string, creditId?: string) => Promise<void>;
-  /** Hosting gate around a fresh funding operation, after caller auth and before any rail effect. */
-  withFundingAdmission?: (c: Context<AppEnv>, body: CreditRequest, run: () => Promise<Response>) => Promise<Response>;
   tempoSettlementReadiness?: TempoSettlementReadiness;
   /** Card-credit rail; absent refuses `method: "stripe"`. */
   stripeCredit?: StripeCreditRail;
@@ -247,23 +245,6 @@ export async function handleCreditRequest(
       await deps.settleLightning(callerPubkey, body.credit_id);
       return handleDrain(c, deps, { callerPubkey, body, envelope });
     case "fund":
-      if (deps.withFundingAdmission && body.fund) {
-        const creditId = body.credit_id ?? derivedFundCreditId(callerPubkey, body.fund.fund_id);
-        const [prior, invoice, checkout] = await Promise.all([
-          deps.ledger.getFunding({ creditId, fundId: body.fund.fund_id }),
-          body.fund.method === "lightning"
-            ? deps.ledger.getInvoice({ creditId, fundId: body.fund.fund_id })
-            : Promise.resolve(undefined),
-          body.fund.via === "checkout"
-            ? deps.stripeCredit?.checkout?.store.get(body.fund.fund_id)
-            : Promise.resolve(undefined),
-        ]);
-        const priorCredit = prior ? await deps.ledger.get(creditId) : undefined;
-        if (priorCredit?.callerPubkey === callerPubkey || invoice?.callerPubkey === callerPubkey || (checkout?.callerPubkey === callerPubkey && checkout.state !== "creating")) {
-          return handleFund(c, deps, { callerPubkey, body, envelope, menu });
-        }
-        return deps.withFundingAdmission(c, body, () => handleFund(c, deps, { callerPubkey, body, envelope, menu }));
-      }
       return handleFund(c, deps, { callerPubkey, body, envelope, menu });
   }
 }

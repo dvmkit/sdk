@@ -11,7 +11,6 @@ export type StripeCheckoutState = "creating" | "open" | "booked" | "expired" | "
 export interface StripeCheckoutRecord {
   storeNamespace: string;
   dvmId: string;
-  hostingDvmId?: string;
   leaseToken?: string;
   leaseUntil?: number;
   nextRecoveryAt?: number;

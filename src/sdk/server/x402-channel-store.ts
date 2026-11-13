@@ -15,7 +15,6 @@ import { x402NetworkByCaip2 } from "../../lib/x402/networks";
 import { X402_BATCH_SETTLEMENT_RESOURCE } from "../../lib/x402/spec";
 import { connectForX402ShutdownClaim, poolForX402ShutdownClaim, waitForX402ShutdownClaim } from "./x402-shutdown-claim";
 import { withSdkInitLock } from "./init-lock";
-import { HostingCleanupFence, type HostedFundingReservation } from "./hosting-cleanup-fence";
 
 /** Query surface shared by the pool and an open Postgres transaction. */
 export type X402ChannelQuerier = Pick<Pool, "query">;
@@ -298,23 +297,7 @@ const LOCK_NOT_AVAILABLE = "55P03";
  * other two nesting sites and are bounded a different way — see their docs.
  */
 export class PostgresX402ChannelStorage implements ChannelStorage {
-  private hostingCleanupFence?: HostingCleanupFence;
-
-  useHostingCleanupFence(fence: HostingCleanupFence): void {
-    this.hostingCleanupFence = fence;
-  }
-
-  async assertHostingFundingReservation(reservation: HostedFundingReservation | undefined): Promise<void> {
-    if (!this.hostingCleanupFence) return;
-    if (!reservation) throw new Error("Hosted x402 funding requires an original admission");
-    await this.hostingCleanupFence.withNewIntent({
-      admissionId: reservation.admissionId, creditId: reservation.creditId,
-      fundId: reservation.fundId, callerPubkey: reservation.callerPubkey,
-      fundingCommitment: reservation.commitment,
-    }, (tx) => this.hostingCleanupFence!.assertFundingReservation(tx, reservation));
-  }
   private readonly transaction = new AsyncLocalStorage<PoolClient>();
-  private readonly hostedFunding = new WeakMap<PoolClient, HostedFundingReservation>();
   private readonly refundBase = new AsyncLocalStorage<string>();
   private settlementPool?: Promise<Pool>;
   private fleetLock: Promise<unknown> = Promise.resolve();
@@ -702,13 +685,11 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
   }
 
   /** Persist the reconciliation identity, refreshing a prepared retry's transient reservation. */
-  async prepareSettlement(
-    identity: X402SettlementIdentity, hostingFunding?: HostedFundingReservation
-  ): Promise<X402SettlementIntent> {
+  async prepareSettlement(identity: X402SettlementIdentity): Promise<X402SettlementIntent> {
     // Stored and compared in the same form every stored row is read in.
     const intent = { ...identity, payload: withBatchSettlementResource(identity.payload) };
     const settlements = await this.settlementWriter();
-    const insert = (q: X402ChannelQuerier) => q.query(
+    await settlements.query(
       `INSERT INTO x402_batch_settlements (
          settlement_id, channel_id, operation, effect_id, payment_id,
          payment_payload, payment_requirements, channel_before, pending_id, status
@@ -726,25 +707,6 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
         intent.pendingId ?? null,
       ]
     );
-    if (this.hostingCleanupFence && intent.operation === "fund") {
-      if (!hostingFunding || intent.effectId !== `${hostingFunding.creditId}:${hostingFunding.fundId}`) {
-        throw new Error("Hosted x402 settlement has no matching original funding admission");
-      }
-      await this.hostingCleanupFence.withNewIntentOn(
-        await this.settlementPoolRef(), {
-          admissionId: hostingFunding.admissionId,
-          creditId: hostingFunding.creditId,
-          fundId: hostingFunding.fundId,
-          callerPubkey: hostingFunding.callerPubkey,
-          fundingCommitment: hostingFunding.commitment,
-        }, async (tx) => {
-          await this.hostingCleanupFence!.assertFundingReservation(tx, hostingFunding);
-          await insert(tx);
-        }
-      );
-    } else {
-      await insert(settlements);
-    }
     const { rows } = await settlements.query<X402SettlementRow>(
       `SELECT * FROM x402_batch_settlements
         WHERE settlement_id = $1
@@ -985,16 +947,11 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
 
   async withChannelTransaction<T>(
     channelId: string,
-    operation: (tx: PoolClient) => Promise<T>,
-    hostingFunding?: HostedFundingReservation
+    operation: (tx: PoolClient) => Promise<T>
   ): Promise<T> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      if (this.hostingCleanupFence && hostingFunding) {
-        await this.hostingCleanupFence.assertFundingReservation(client, hostingFunding);
-        this.hostedFunding.set(client, hostingFunding);
-      }
       await lockChannel(client, channelId);
       const result = await this.transaction.run(client, () => operation(client));
       await client.query("COMMIT");
@@ -1003,7 +960,6 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      this.hostedFunding.delete(client);
       client.release();
     }
   }
@@ -1216,13 +1172,6 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
     }
 
     assertChannelTransition(current, next, normalized, this.refundBase.getStore());
-    if (this.hostingCleanupFence &&
-      (!current || BigInt(next.chargedCumulativeAmount) > BigInt(current.chargedCumulativeAmount) ||
-        BigInt(next.signedMaxClaimable) > BigInt(current.signedMaxClaimable))) {
-      const funding = this.hostedFunding.get(client);
-      if (funding) await this.hostingCleanupFence.assertFundingReservation(client, funding);
-      else await this.hostingCleanupFence.assertNewIntent(client);
-    }
     if (
       this.terminalizeUnbackedCredit &&
       next.onchainSyncedAt !== undefined &&

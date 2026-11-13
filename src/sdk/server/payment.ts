@@ -267,9 +267,6 @@ export interface TempoChannelReport {
 }
 
 export interface UpfrontPaymentOpts {
-  /** Server-created hosted admission that predates rail side effects. */
-  hostingAdmissionId?: string;
-  hostingPaymentArtifactHash?: string;
   cashuToken?: string;
   requiredMsats?: number;
   mints?: string[];
@@ -811,8 +808,6 @@ async function verifyCardFundingInScope(
     // A card charge is valued in cents, never through a sats quote.
     requiredMsats: 0,
     callerId: opts.callerPubkey ?? opts.requesterId ?? "anonymous",
-    hostingAdmissionId: opts.hostingAdmissionId,
-    hostingPaymentArtifactHash: opts.hostingPaymentArtifactHash,
     dvmId: opts.dvmId ?? "",
     fundOnly,
     drawBasis: false,
@@ -1281,9 +1276,6 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     if (!ledgerCtx?.fundOnly?.creditId) {
       throw new Error("x402 batch settlement requires a named credit funding effect");
     }
-    if (ledgerCtx.hostingAdmissionId && !ledgerCtx.hostingPaymentArtifactHash) {
-      throw new Error("Hosted x402 funding lacks its original payment artifact");
-    }
     const requiredUsdcMicro = x402RequiredUsdcMicro(x402PriceFiat);
     try {
       const accepted = await opts.x402BatchSettlement.accept({
@@ -1291,16 +1283,6 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         amount: String(requiredUsdcMicro),
         operation: "fund",
         effectId: `${ledgerCtx.fundOnly.creditId}:${ledgerCtx.fundOnly.fundId}`,
-        ...(ledgerCtx.hostingAdmissionId && {
-          hostingFunding: {
-            admissionId: ledgerCtx.hostingAdmissionId,
-            creditId: ledgerCtx.fundOnly.creditId,
-            fundId: ledgerCtx.fundOnly.fundId,
-            callerPubkey: ledgerCtx.callerId,
-            commitment: ledgerCtx.fundOnly.commitment,
-            paymentArtifactHash: ledgerCtx.hostingPaymentArtifactHash ?? "",
-          },
-        }),
         commit: async (funding, tx) => {
           return commitMarkedFunding(
             ledgerCtx,
@@ -1753,19 +1735,6 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           () =>
             withPaymentStage("verifier_broadcast", () => mpp.broadcastCredential(mppCredential, {
               request: { amount: expectedAmount },
-              ...(opts.hostingAdmissionId && {
-                hostedPaymentIntent: {
-                  admissionId: opts.hostingAdmissionId,
-                  jobId: opts.jobId,
-                  paymentArtifactHash: opts.hostingPaymentArtifactHash,
-                  ...(ledgerCtx?.fundOnly && {
-                    creditId: ledgerCtx.fundOnly.creditId,
-                    fundId: ledgerCtx.fundOnly.fundId,
-                    callerPubkey: ledgerCtx.callerId,
-                    fundingCommitment: ledgerCtx.fundOnly.commitment,
-                  }),
-                },
-              }),
               meta: {
                 path: resourcePath ?? "/v1/job",
                 nonce: challengeMeta(cred.challenge)?.nonce ?? "",
@@ -1787,23 +1756,9 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           nativeAsset: methodNativeAsset(cred.challenge.method),
         };
         try {
-          if (ledgerCtx.hostingAdmissionId && ledgerCtx.fundOnly &&
-            !ledgerCtx.hostingPaymentArtifactHash) {
-            throw new Error("Hosted Tempo funding lacks its original payment artifact");
-          }
           const voucherAcceptance = {
             channelId: sessionBasis.channelId,
             cumulativeAmount: BigInt(sessionBasis.cumulativeAmount),
-            ...(ledgerCtx.hostingAdmissionId && ledgerCtx.fundOnly && {
-              hostingFunding: {
-                admissionId: ledgerCtx.hostingAdmissionId,
-                creditId: ledgerCtx.fundOnly.creditId,
-                fundId: ledgerCtx.fundOnly.fundId,
-                callerPubkey: ledgerCtx.callerId,
-                commitment: ledgerCtx.fundOnly.commitment,
-                paymentArtifactHash: ledgerCtx.hostingPaymentArtifactHash ?? "",
-              },
-            }),
           };
           const accepted = await mpp.withTempoSessionAcceptance(
             voucherAcceptance,
@@ -1938,11 +1893,6 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           });
         });
       }
-      if (credited) {
-        await mpp.completeHostedTempoCharge?.(cred.challenge.id).catch((error: unknown) => {
-          console.warn("Hosted Tempo charge completion remains unresolved", error);
-        });
-      }
       if (credited?.drawRefusal) {
         return creditLedgerErrorResult(credited.drawRefusal, x402Requirements, credited.deposit);
       }
@@ -2002,8 +1952,6 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         drawId: creditEnv.drawId,
         amountMicro: ledgerCtx.priceFiat.amountMicro,
         jobId: ledgerCtx.jobId,
-        hostingAdmissionId: ledgerCtx.hostingAdmissionId,
-        hostingPaymentSeq: ledgerCtx.hostingPaymentSeq,
       });
       if (draw.replayed) {
         // Lost the race with a concurrent identical request — same recovery
@@ -2890,7 +2838,7 @@ export function buildPaymentErrorResponse(
 
 export interface IncomingPaymentOpts {
   /** Durable pending-verification message sequence written before this rail is touched. */
-  hostingPaymentSeq?: number;
+  paymentSeq?: number;
   mints?: string[];
   x402Config?: X402Config;
   /** Declared DVM pricing currency. x402 is accepted only when this is USD. */
@@ -3395,9 +3343,6 @@ async function verifyIncomingPaymentInScope(
         () =>
           withPaymentStage("verifier_broadcast", () => mppServer.broadcastCredential(credential, {
             request: { amount: expectedAmount },
-            ...(opts.hostingPaymentSeq !== undefined && {
-              hostedPaymentIntent: { jobId: opts.jobId, paymentSeq: opts.hostingPaymentSeq },
-            }),
             ...(expectedMeta && { meta: expectedMeta }),
           })),
         { onError: paymentFailureFields }
@@ -3420,11 +3365,6 @@ async function verifyIncomingPaymentInScope(
           };
         }
         throw err;
-      }
-      if (credited) {
-        await mppServer.completeHostedTempoCharge?.(credential.challenge.id).catch((error: unknown) => {
-          console.warn("Hosted Tempo charge completion remains unresolved", error);
-        });
       }
       const info = withDrawBasis(
         {
@@ -4313,9 +4253,7 @@ interface LedgerContext {
   /** Funder identity: verified caller pubkey, else requester id, else "anonymous". */
   callerId: string;
   jobId?: string;
-  hostingAdmissionId?: string;
-  hostingPaymentSeq?: number;
-  hostingPaymentArtifactHash?: string;
+  paymentSeq?: number;
   jobAdmission?: { requestFingerprint: string; authFingerprint?: string };
   dvmId: string;
   creditEnvelope?: CreditEnvelope;
@@ -4415,8 +4353,6 @@ function resolveLedgerContext(opts: UpfrontPaymentOpts): LedgerContext | undefin
     requiredMsats: opts.requiredMsats,
     callerId: opts.callerPubkey ?? opts.requesterId ?? "anonymous",
     jobId: opts.jobId,
-    hostingAdmissionId: opts.hostingAdmissionId,
-    hostingPaymentArtifactHash: opts.hostingPaymentArtifactHash,
     jobAdmission:
       opts.jobId && opts.requestFingerprint
         ? {
@@ -4657,7 +4593,7 @@ async function resolveTopUpLedgerContext(
       requiredMsats: priceBasisMsats,
       callerId,
       jobId: opts.jobId,
-      hostingPaymentSeq: opts.hostingPaymentSeq,
+      paymentSeq: opts.paymentSeq,
       dvmId,
       topUp,
       topUpCapMicro,
@@ -5085,15 +5021,11 @@ async function fundAndDrawInScope(
       fundId: ctx.fundOnly.fundId,
       amountMicro: fundedMicro,
       rail: funding.rail,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingCallerPubkey: ctx.callerId,
       tx,
     });
     const credit = await ctx.ledger.fund({
       creditId,
       callerPubkey: ctx.callerId,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingFundId: ctx.fundOnly.fundId,
       currency: ctx.priceFiat.currency,
       amountMicro: fundedMicro,
       expiryMs,
@@ -5122,20 +5054,14 @@ async function fundAndDrawInScope(
       fundId: funding.paymentId,
       amountMicro: fundedMicro,
       rail: funding.rail,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingJobId: ctx.jobId,
-      hostingPaymentSeq: ctx.hostingPaymentSeq,
       jobId: ctx.jobId,
       drawId,
-      paymentSeq: ctx.hostingPaymentSeq,
+      paymentSeq: ctx.paymentSeq,
       tx,
     });
     const credit = await ctx.ledger.fund({
       creditId,
       callerPubkey: ctx.callerId,
-      hostingJobId: ctx.jobId,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingPaymentSeq: ctx.hostingPaymentSeq,
       currency: ctx.priceFiat.currency,
       amountMicro: fundedMicro,
       expiryMs,
@@ -5231,18 +5157,12 @@ async function fundAndDrawInScope(
       fundId: funding.paymentId,
       amountMicro: fundedMicro,
       rail: funding.rail,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingJobId: ctx.jobId,
-      hostingPaymentSeq: ctx.hostingPaymentSeq,
       tx,
     });
   }
   const fundedCredit = await ctx.ledger.fund({
     creditId,
     callerPubkey: ctx.callerId,
-    hostingJobId: ctx.jobId,
-    hostingAdmissionId: ctx.hostingAdmissionId,
-    hostingPaymentSeq: ctx.hostingPaymentSeq,
     currency: ctx.priceFiat.currency,
     amountMicro: fundedMicro,
     expiryMs,
@@ -5263,8 +5183,6 @@ async function fundAndDrawInScope(
       drawId,
       amountMicro: drawMicro,
       jobId: ctx.jobId,
-      hostingAdmissionId: ctx.hostingAdmissionId,
-      hostingPaymentSeq: ctx.hostingPaymentSeq,
       tx,
     });
   } catch (err) {
@@ -5391,8 +5309,7 @@ export async function repairX402ExactSettlementEffect(args: {
     callerId: effect.callerId,
     dvmId: effect.dvmId,
     jobId: effect.jobId,
-    hostingAdmissionId: effect.hostingAdmissionId,
-    hostingPaymentSeq: effect.hostingPaymentSeq,
+    paymentSeq: effect.paymentSeq ?? effect.hostingPaymentSeq,
     jobAdmission: effect.jobAdmission,
     creditEnvelope: effect.creditEnvelope,
     fundOnly: effect.fundOnly,
@@ -5694,8 +5611,7 @@ function exactSettlementEffect(
     callerId: ctx.callerId,
     dvmId: ctx.dvmId,
     jobId: ctx.jobId,
-    hostingAdmissionId: ctx.hostingAdmissionId,
-    hostingPaymentSeq: ctx.hostingPaymentSeq,
+    paymentSeq: ctx.paymentSeq,
     jobAdmission: ctx.jobAdmission,
     creditEnvelope: ctx.creditEnvelope,
     fundOnly: ctx.fundOnly,
@@ -6370,8 +6286,6 @@ export async function bookCheckoutFunding(
     priceFiat: { currency: "usd", amountMicro: opts.amountMicro },
     requiredMsats: 0,
     callerId: opts.callerPubkey,
-    hostingAdmissionId: opts.hostingAdmissionId,
-    hostingPaymentArtifactHash: opts.hostingPaymentArtifactHash,
     dvmId: opts.dvmId ?? "",
     fundOnly: { creditId: opts.creditId, fundId: opts.fundId, commitment: "" },
     drawBasis: false,
