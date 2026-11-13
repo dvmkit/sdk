@@ -75,6 +75,9 @@ vi.mock("mppx/server", async (importOriginal) => {
   ) };
 });
 
+/** The real timer start, kept because `hostedCredit` stubs the prototype for the servers it builds. */
+const realPayoutReporterStart = PayoutReporter.prototype.start;
+
 const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
 
@@ -476,7 +479,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
         await reporterObligations.bindPersistedScope();
         await transport.init();
         await reporter.init();
-        reporter.start();
+        realPayoutReporterStart.call(reporter);
       },
       stop: () => {
         reporter.stop();
