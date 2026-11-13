@@ -4914,7 +4914,6 @@ export interface CreditFundArgs {
    * Rail value contributed by this funding; required on writes.
    */
   basis: CreditFundingBasis;
-  /** Server-verified original hosted admission, never accepted from the caller body. */
   /**
    * External transaction handle; caller owns BEGIN, COMMIT and ROLLBACK.
    */
