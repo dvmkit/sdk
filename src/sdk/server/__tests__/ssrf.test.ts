@@ -111,6 +111,83 @@ describe("assertSafeUrl — IPv6 ranges", () => {
   });
 });
 
+describe.each(["literal", "DNS"] as const)("assertSafeUrl — embedded IPv4 via %s", (source) => {
+  const check = (address: string, extraUnsafeIPv4?: (ip: string) => boolean) =>
+    assertSafeUrl(source === "literal" ? `https://[${address}]/` : "https://example.com/", {
+      resolver: stubResolver([address]),
+      extraUnsafeIPv4,
+    });
+
+  it.each([
+    "64:ff9b::a9fe:a9fe", // NAT64: 169.254.169.254
+    "64:ff9b::a00:1", // NAT64: 10.0.0.1
+    "64:ff9b::7f00:1", // NAT64: 127.0.0.1
+    "0064:FF9B:0000:0000:0000:0000:A9FE:A9FE",
+    "64:ff9b::169.254.169.254",
+    "64:ff9b::6440:1", // NAT64: 100.64.0.1 (CGNAT)
+    "64:ff9b::ac10:1", // NAT64: 172.16.0.1
+    "64:ff9b::c0a8:1", // NAT64: 192.168.0.1
+    "64:ff9b::e000:1", // NAT64: 224.0.0.1 (multicast)
+    "64:ff9b::f000:1", // NAT64: 240.0.0.1 (reserved)
+    "::ffff:a9fe:a9fe", // IPv4-mapped
+    "0000:0000:0000:0000:0000:FFFF:0A00:0001",
+    "::ffff:10.0.0.1",
+    "::a9fe:a9fe", // IPv4-compatible
+    "::10.0.0.1",
+    "0000:0000:0000:0000:0000:0000:7F00:0001",
+    "2002:a9fe:a9fe::1", // 6to4 gateway: 169.254.169.254
+    "2002:a00:1::1",
+    "2002:7f00:1::1",
+    // Teredo: public server 1.1.1.1, inverted client 169.254.169.254 / 10.0.0.1 / 127.0.0.1.
+    "2001:0:101:101:8000:ffff:5601:5601",
+    "2001:0:101:101:8000:ffff:f5ff:fffe",
+    "2001:0:101:101:8000:ffff:80ff:fffe",
+    // Teredo: private server 10.0.0.1, public client 93.184.216.34.
+    "2001:0:a00:1:8000:ffff:a247:27dd",
+  ])("rejects unsafe embedded IPv4 in %s", async (address) => {
+    await expect(check(address)).rejects.toMatchObject({ code: "ssrf_blocked", reason: "private_address" });
+  });
+
+  it.each([
+    "64:ff9b::5db8:d822", // 93.184.216.34
+    "0064:FF9B:0000:0000:0000:0000:5DB8:D822",
+    "64:ff9b::93.184.216.34",
+    "::ffff:5db8:d822",
+    "0000:0000:0000:0000:0000:FFFF:5DB8:D822",
+    "::ffff:93.184.216.34",
+    "::5db8:d822",
+    "::93.184.216.34",
+    "2002:5db8:d822::1",
+    "2001:0:101:101:8000:ffff:a247:27dd",
+    "2606:2800:220:1::1", // ordinary global IPv6
+    "64:ff9b:2::a00:1", // outside both NAT64 prefixes
+    "2001:1::a00:1", // outside Teredo
+  ])("accepts public embedded IPv4 or ordinary IPv6 in %s", async (address) => {
+    await expect(check(address)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "64:ff9b:1:a00:1::", // RFC 6052 /48 layout: 10.0.0.1
+    "0064:FF9B:0001:0000:0000:0000:A9FE:A9FE",
+    "64:ff9b:1::5db8:d822", // public tail does not establish the site's prefix length
+  ])("refuses ambiguous local-use NAT64 address %s", async (address) => {
+    await expect(check(address)).rejects.toMatchObject({ reason: "private_address" });
+  });
+
+  it.each([
+    "64:ff9b::5db8:d822",
+    "::ffff:5db8:d822",
+    "::5db8:d822",
+    "2002:5db8:d822::1",
+    "2001:0:101:101:8000:ffff:a247:27dd", // client
+    "2001:0:5db8:d822:8000:ffff:fefe:fefe", // server
+  ])("applies additional IPv4 policy to %s", async (address) => {
+    await expect(check(address, (ip) => ip === "93.184.216.34")).rejects.toMatchObject({
+      reason: "private_address",
+    });
+  });
+});
+
 describe("assertSafeUrl — DNS resolution", () => {
 
   it("rejects when any address among many is private (DNS-rebinding shape)", async () => {
@@ -119,6 +196,12 @@ describe("assertSafeUrl — DNS resolution", () => {
     });
     await expect(promise).rejects.toThrow(SSRFError);
     await expect(promise).rejects.toMatchObject({ reason: "private_address" });
+  });
+
+  it("rejects an unsafe NAT64 answer among public IPv4 and IPv6 answers", async () => {
+    await expect(assertSafeUrl("https://example.com/", {
+      resolver: stubResolver(["93.184.216.34", "2606:2800:220:1::1", "64:ff9b::a9fe:a9fe"]),
+    })).rejects.toMatchObject({ reason: "private_address" });
   });
 
   it("rejects when DNS resolution fails (NXDOMAIN-shaped) with dns_failed", async () => {
@@ -350,6 +433,23 @@ describe("createPinnedFetch — DNS-rebind closure", () => {
 });
 
 describe("pinned redirects", () => {
+  it("rejects a NAT64 metadata redirect before dispatching the target", async () => {
+    const calls: string[] = [];
+    const pinned = await createPinnedFetch("https://example.com/", {
+      resolver: stubResolver(["93.184.216.34"]),
+      baseFetch: async (input) => {
+        calls.push((input as Request).url);
+        return new Response(null, { status: 302, headers: { location: "https://[64:ff9b::a9fe:a9fe]/" } });
+      },
+    });
+    try {
+      await expect(pinned.fetch("https://example.com/")).rejects.toMatchObject({ reason: "private_address" });
+      expect(calls).toEqual(["https://example.com/"]);
+    } finally {
+      await pinned.close();
+    }
+  });
+
   it.each(["validation", "wrapper"])("cancels an unsent upload after %s failure", async (failure) => {
     let canceled = false;
     const pinned = await createPinnedFetch("https://source.example.com/", {

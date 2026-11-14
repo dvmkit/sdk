@@ -474,7 +474,7 @@ function isUnsafeAddress(address: string, opts: SSRFGuardOpts | undefined): bool
     return opts?.extraUnsafeIPv4?.(address) === true;
   }
   if (isIPv6(address)) {
-    if (isUnsafeIPv6(address)) return true;
+    if (isUnsafeIPv6(address, opts)) return true;
     return opts?.extraUnsafeIPv6?.(address) === true;
   }
   return true;
@@ -512,41 +512,46 @@ function isUnsafeIPv4(address: string): boolean {
   return false;
 }
 
-function isUnsafeIPv6(address: string): boolean {
-  const lower = address.toLowerCase();
-  // ::1 — loopback
-  if (lower === "::1") return true;
-  // :: — unspecified
-  if (lower === "::") return true;
-  // fe80::/10 — link-local
-  if (
-    lower.startsWith("fe8") ||
-    lower.startsWith("fe9") ||
-    lower.startsWith("fea") ||
-    lower.startsWith("feb")
-  ) {
+function isUnsafeIPv6(address: string, opts: SSRFGuardOpts | undefined): boolean {
+  let canonical: string;
+  try {
+    // DNS answers need not use URL's compressed, lowercase, hexadecimal spelling.
+    // Scoped addresses cannot be URL hosts and fail closed here as well.
+    canonical = new URL(`https://[${address}]/`).hostname.slice(1, -1);
+  } catch {
     return true;
   }
-  // fc00::/7 — unique local
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
-  // ::ffff:0:0/96 — IPv4-mapped. Node's URL parser canonicalises the dotted
-  // form (`::ffff:10.0.0.1`) to compressed hex (`::ffff:a00:1`), so we
-  // handle both shapes.
-  if (lower.startsWith("::ffff:")) {
-    const tail = lower.slice("::ffff:".length);
-    if (isIPv4(tail)) return isUnsafeIPv4(tail);
-    const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
-    if (m) {
-      const high = parseInt(m[1], 16);
-      const low = parseInt(m[2], 16);
-      const a = (high >> 8) & 0xff;
-      const b = high & 0xff;
-      const c = (low >> 8) & 0xff;
-      const d = low & 0xff;
-      return isUnsafeIPv4(`${a.toString()}.${b.toString()}.${c.toString()}.${d.toString()}`);
-    }
+  const [left, right] = canonical.split("::");
+  const head = left ? left.split(":").map((word) => parseInt(word, 16)) : [];
+  const tail = right ? right.split(":").map((word) => parseInt(word, 16)) : [];
+  const words = right === undefined ? head : [...head, ...Array<number>(8 - head.length - tail.length).fill(0), ...tail];
+  const first = words[0];
+
+  // fe80::/10 — link-local; fc00::/7 — unique local; ff00::/8 — multicast.
+  if ((first & 0xffc0) === 0xfe80 || (first & 0xfe00) === 0xfc00 || (first & 0xff00) === 0xff00) {
+    return true;
   }
-  // ff00::/8 — multicast
-  if (lower.startsWith("ff")) return true;
+
+  // RFC 8215 permits site-specific translation prefix lengths inside this /48.
+  // Without that configuration, the embedded IPv4 layout is ambiguous.
+  if (first === 0x64 && words[1] === 0xff9b && words[2] === 1) return true;
+
+  const unsafeIPv4 = (high: number, low: number): boolean =>
+    isUnsafeAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`, opts);
+
+  // RFC 6052 well-known NAT64 prefix, 64:ff9b::/96.
+  if (first === 0x64 && words[1] === 0xff9b && words.slice(2, 6).every((word) => word === 0)) {
+    return unsafeIPv4(words[6], words[7]);
+  }
+  // IPv4-compatible ::/96 (including unspecified and loopback) and mapped ::ffff:0:0/96.
+  if (words.slice(0, 5).every((word) => word === 0) && (words[5] === 0 || words[5] === 0xffff)) {
+    return unsafeIPv4(words[6], words[7]);
+  }
+  // RFC 3056 6to4 embeds the IPv4 gateway immediately after 2002::/16.
+  if (first === 0x2002) return unsafeIPv4(words[1], words[2]);
+  // RFC 4380 Teredo embeds a server and a bitwise-inverted client IPv4 address.
+  if (first === 0x2001 && words[1] === 0) {
+    return unsafeIPv4(words[2], words[3]) || unsafeIPv4(words[6] ^ 0xffff, words[7] ^ 0xffff);
+  }
   return false;
 }
