@@ -15,6 +15,7 @@ import { fiatToSatsCeil, fxRateFor } from "../pricing/index";
 import type { ResolvedCreditConfig } from "../types";
 import type { AppEnv } from "./app";
 import { authErrorBody } from "./auth-error";
+import { clientUpgradeRequired, clientVersionBelowMinimum } from "./client-compatibility";
 import { DrainRefundFloorError, refundFloorEvidence } from "./credit-drain-floor";
 import type { DrainReportWiring } from "./credit-drain-report";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
@@ -77,6 +78,9 @@ import { completeX402ChannelDrain } from "./x402-drain-leg";
  * this signed operation schema.
  */
 const CREDIT_SCHEMA_DOC_URL = "https://dvmkit.com/docs/protocol#post-v1credit";
+
+// First dvm CLI release that sends fund.via: "checkout" for hosted card top-ups.
+const STRIPE_CHECKOUT_MINIMUM_CLIENT_VERSION = "0.19.0";
 
 /**
  * Authenticate the raw body, including op. Its schema is independent of job-input credit/draw
@@ -2031,6 +2035,26 @@ async function handleFund(
   }
 
   const railOpts = await deps.railOpts(c);
+  const compatibility = c.get("clientCompatibility");
+  if (
+    fund.method === "stripe" &&
+    fund.via === undefined &&
+    deps.stripeCredit?.checkout &&
+    menu.stripe?.checkout &&
+    !railOpts.mppCredential &&
+    !c.req.header("X-Cashu") &&
+    !c.req.header("X-PAYMENT") &&
+    !c.req.header("PAYMENT-SIGNATURE") &&
+    compatibility?.clientVersion &&
+    clientVersionBelowMinimum(compatibility.clientVersion, STRIPE_CHECKOUT_MINIMUM_CLIENT_VERSION)
+  ) {
+    return clientUpgradeRequired(c, compatibility, {
+      minimumClientVersion: STRIPE_CHECKOUT_MINIMUM_CLIENT_VERSION,
+    }, {
+      display: "Card top-ups now open a Stripe checkout page, which this version of dvm cannot do. Nothing was charged.",
+      hint: "Run npm i -g @dvmkit/dvm-cli@latest, then re-run the same dvm credit fund command. The new version returns a link your human opens to pay by card; no Stripe Link account is needed.",
+    });
+  }
   let error: PaymentErrorDetail | undefined;
   let x402SettleResponseHeader: string | undefined;
   try {

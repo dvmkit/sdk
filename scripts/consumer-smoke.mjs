@@ -11,7 +11,7 @@ const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const surface = JSON.parse(readFileSync(join(root, "api-surface.json"), "utf8"));
 const runtimeProbes = {
   ".": ["configureDVM", "defineCapability", "isConfiguredDVMDescriptor"],
-  "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "createPostgresStripeCheckoutStore", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport"],
+  "./server": ["readPendingImplicitDraws", "createDVMHost", "createStripeCreditRail", "createPostgresStripeCheckoutStore", "retryHostedTempoCloseReport", "writeOffHostedTempoCloseReport", "clientUpgradeRequired", "parseClientCompatibility"],
   "./testing": ["createTestContext", "StepCache"],
   // `./internal` is unsupported and undocumented, but the dvmkit platform imports it from the
   // published package like any other consumer, so an install that cannot resolve it is broken.
@@ -312,6 +312,7 @@ function typecheckConsumer(consumer, resolution) {
     [
       `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
       `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
+      `import { clientUpgradeRequired, parseClientCompatibility } from "${manifest.name}/server";`,
       `import type { JobTerminalReportPayload } from "${manifest.name}/server";`,
       `import { createStripeCreditRail, createPostgresStripeCheckoutStore, type StripeCheckoutStore, type StripeCheckoutRecord, type StripeCheckoutState, type LockedStripeCheckout, type StripeCreditRail, type CardDrainDecision, type CardDrainRecovery, type CardDrainStateArgs } from "${manifest.name}/server";`,
       `import { type UpfrontPayment as ServerUpfrontPayment, readPendingImplicitDraws, type PendingImplicitDrawSummary, type PendingImplicitDrawGroup, type CreditLedgerQuerier, type CreditDrawRefundArgs, type CreditDrawRefundResult, CreditLedger, MemoryCreditLedger, type TempoDrainDecision, type TempoDrainDecisionArgs, type TempoDrainDecisionResult, type TempoDrainHoldReason, type CreditFundingEvidence, type FundingRecord, createDVMHost, retryHostedTempoCloseReport, writeOffHostedTempoCloseReport, type DVMServeResult, type PaidJobCompletion, type PaymentMode, type TempoCloseReportSummary, type TempoCloseReportsResponse, type RetryTempoCloseReportResponse, type WriteOffTempoCloseReportResponse, type HostedTempoCloseReportWriteOff } from "${manifest.name}/server";`,
@@ -322,6 +323,7 @@ function typecheckConsumer(consumer, resolution) {
       "",
       `import { x402WalletFromConfig, tempoAccountFromConfig, type WalletCredentialConfig } from "${manifest.name}/internal";`,
       "export const acceptedUpfront: UpfrontPayment = { amount_msats: 150000, amount_micro: 100000, currency: 'usd', credit_id: 'example-credit', draw_id: 'example-draw' };",
+      "export const upgradeResponse = (c: Parameters<typeof clientUpgradeRequired>[0]) => clientUpgradeRequired(c, parseClientCompatibility(new Headers({ 'DVM-Client': 'dvm/0.15.3' })), { minimumClientVersion: '0.19.0' }, { display: 'Upgrade the caller.', hint: 'Install a current release.' });",
       "export const originalUpfront: JobRecord['upfrontPayment'] = acceptedUpfront;",
       "export const serverUpfront: ServerUpfrontPayment = acceptedUpfront;",
       "export const missingSignature: SignedRequestFailure = 'signature_required';",

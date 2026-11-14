@@ -1013,7 +1013,7 @@
         },
         "clientUpgradeRequired": {
           "stability": "experimental",
-          "signature": "2d09370c382dc07ef15e0e3da42345b25da18b7df92ec79526f0361d3554e96d"
+          "signature": "64b098d9058fe7539d95af8d4bcbf991a411f090ced932a900f8f52f23c10bff"
         },
         "ConsumedCredentialStore": {
           "stability": "experimental",

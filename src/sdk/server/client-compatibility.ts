@@ -152,18 +152,21 @@ export const requireClientCompatibility: ClientCompatibilityGate = (requirement)
   };
 };
 
+/** Build an upgrade response with optional endpoint-specific display and hint text. */
 export function clientUpgradeRequired(
   c: Context,
   compatibility: ClientCompatibility,
-  requirement: ClientCompatibilityRequirement
+  requirement: ClientCompatibilityRequirement,
+  copy?: { display: string; hint: string }
 ): Response {
-  return renderClientUpgradeRequired(c, compatibility, normalizeRequirement(requirement));
+  return renderClientUpgradeRequired(c, compatibility, normalizeRequirement(requirement), copy);
 }
 
 function renderClientUpgradeRequired(
   c: Context,
   compatibility: ClientCompatibility,
-  normalized: NormalizedClientCompatibilityRequirement
+  normalized: NormalizedClientCompatibilityRequirement,
+  copy?: { display: string; hint: string }
 ): Response {
   c.header(CLIENT_COMPATIBILITY_HEADERS.protocolVersion, DVM_PROTOCOL_VERSION);
   const minimum = normalized.minimumClientVersion?.version;
@@ -180,11 +183,17 @@ function renderClientUpgradeRequired(
       required_capabilities: normalized.requiredCapabilities,
       ...(minimum ? { minimum_client_version: minimum } : {}),
       ...(current ? { current_client_version: current } : {}),
-      display: "This request needs a newer dvm client.",
-      hint: `Upgrade or reinstall dvm with support for ${needs.join(" and ")}, then retry this request.`,
+      display: copy?.display ?? "This request needs a newer dvm client.",
+      hint: copy?.hint ?? `Upgrade or reinstall dvm with support for ${needs.join(" and ")}, then retry this request.`,
     },
     426
   );
+}
+
+export function clientVersionBelowMinimum(clientVersion: ClientSemVer, minimumVersion: string): boolean {
+  const minimum = parseSemVer(minimumVersion);
+  if (!minimum) throw new Error("minimum client version must be a valid SemVer value");
+  return compareSemVer(clientVersion, minimum) < 0;
 }
 
 interface NormalizedClientCompatibilityRequirement {

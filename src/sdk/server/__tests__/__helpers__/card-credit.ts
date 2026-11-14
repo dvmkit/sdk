@@ -120,6 +120,7 @@ export function fakeStripe(mode: FakeStripeMode = "succeed", idPrefix = "pi_test
 
 export async function cardServer(
   opts: {
+    auth?: ReturnType<typeof secp256k1Auth>;
     stripe?: ReturnType<typeof fakeStripe> | null;
     ledger?: CreditLedgerLike;
     deposits?: CreditDepositPayload[];
@@ -136,7 +137,7 @@ export async function cardServer(
     name: "card-credit",
     capability: "run",
     input: jobInput,
-    auth: secp256k1Auth(),
+    auth: opts.auth ?? secp256k1Auth(),
     price: "$0.10",
     credit: opts.credit ?? { min: "$0.10", max: "$5.00" },
     onJob(ctx) {
