@@ -76,7 +76,7 @@ export interface ReceiptSettlement {
   charged: number;
   /** `held - charged`, returned to the caller's credit. */
   released: number;
-  /** Empty on a job accepted before piece charging, which settled as one piece. */
+  /** Empty before piece charging or when the job's piece totals disagree with the recorded draw. */
   pieces: ReceiptPiece[];
 }
 

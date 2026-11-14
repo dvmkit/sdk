@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { endPieces, type JobPiece } from "../pieces";
+import { receiptSettlementFor } from "../piece-settlement";
 
 const running = (paidSeq: number, amountMicro: number): JobPiece => ({ amountMicro, paidSeq, state: "running" });
 
@@ -21,4 +22,15 @@ describe("ending a job's pieces", () => {
     expect(endPieces(undefined, { kind: "finish" }).settlement).toEqual({ whole: "settle", stoppedPiece: false });
     expect(endPieces(undefined, { kind: "release" }).settlement).toEqual({ whole: "release", stoppedPiece: false });
   });
+});
+
+it("withholds a receipt breakdown that matches the charge but omits part of the hold", () => {
+  const settlement = receiptSettlementFor({ pieces: [
+    { amountMicro: 40_000, paidSeq: 0, state: "finished" },
+    { amountMicro: 20_000, paidSeq: 2, state: "released" },
+  ] }, {
+    amountMicro: 40_000, status: "settled",
+    partialSettle: { heldMicro: 100_000, releasedMicro: 60_000, releasedNative: null },
+  });
+  expect(settlement).toEqual({ held: 100_000, charged: 40_000, released: 60_000, pieces: [] });
 });
