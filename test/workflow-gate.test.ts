@@ -4,10 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
 
 import { startCashuMint } from "../scripts/start-cashu-mint.mjs";
-import { assertGateJob } from "../scripts/workflow-gate.mjs";
+import { assertGateJob, assertReleaseRolloverJobs } from "../scripts/workflow-gate.mjs";
 
-type Step = { name?: string; run?: string; uses?: string; shell?: string; if?: string; with?: Record<string, unknown> };
-type Job = { "timeout-minutes"?: unknown; steps: Step[] };
+type Step = { name?: string; run?: string; uses?: string; shell?: string; if?: string; "continue-on-error"?: unknown; with?: Record<string, unknown> };
+type Job = { "timeout-minutes"?: unknown; "continue-on-error"?: unknown; steps: Step[] };
 
 function job(workflow: string, name: string): Job {
   const document = parse(readFileSync(new URL(`../.github/workflows/${workflow}`, import.meta.url), "utf8")) as {
@@ -85,6 +85,35 @@ describe("gate job contract", () => {
     const build = releaseBuild();
     mutate(build);
     expect(() => assertGateJob(build, "release")).toThrow(message);
+  });
+});
+
+describe("release rollover workflow contract", () => {
+  it("accepts both committed release rollover checks", () => {
+    expect(() => assertReleaseRolloverJobs(job("verify.yml", "verify"), job("release.yml", "prepare"))).not.toThrow();
+  });
+
+  it.each<[string, (verify: Job, prepare: Job) => void, string]>([
+    ["no release PR check", (verify) => { verify.steps = verify.steps.filter((step) => step.name !== "Check release rollover"); }, "verify must run"],
+    ["no tag check", (_, prepare) => { prepare.steps = prepare.steps.filter((step) => step.name !== "Check release rollover"); }, "prepare must run"],
+    ["swallowed rollover failure", (_, prepare) => { named(prepare, "Check release rollover").run += " || true"; }, "prepare must run"],
+    ["conditional tag check", (_, prepare) => { named(prepare, "Check release rollover").if = "false"; }, "required release context"],
+    ["check on ordinary development PRs", (verify) => { delete named(verify, "Check release rollover").if; }, "required release context"],
+    ["check only on pushes", (verify) => { named(verify, "Check release rollover").if = "github.event_name == 'push'"; }, "required release context"],
+    ["tolerated step failure", (_, prepare) => { named(prepare, "Check release rollover")["continue-on-error"] = true; }, "must fail its job"],
+    ["tolerated job failure", (_, prepare) => { prepare["continue-on-error"] = true; }, "must fail its job"],
+    ["shallow PR checkout", (verify) => { named(verify, "Check out repository").with!["fetch-depth"] = 1; }, "complete tags"],
+    ["shallow tag checkout", (_, prepare) => { named(prepare, "Check out exact tag").with!["fetch-depth"] = 1; }, "complete tags"],
+    ["rollover before exact-tag checkout", (_, prepare) => {
+      const check = named(prepare, "Check release rollover");
+      prepare.steps = prepare.steps.filter((step) => step !== check);
+      prepare.steps.splice(2, 0, check);
+    }, "after checking out the verified exact tag"],
+  ])("rejects %s", (_, mutate, message) => {
+    const verify = job("verify.yml", "verify");
+    const prepare = job("release.yml", "prepare");
+    mutate(verify, prepare);
+    expect(() => assertReleaseRolloverJobs(verify, prepare)).toThrow(message);
   });
 });
 

@@ -9,6 +9,8 @@ const GATE_LOG = ".artifacts/verify.log";
 const MINT_LOG_CAPTURE = "mkdir -p .artifacts\ndocker logs sdk-cashu-mint > .artifacts/cashu-mint.log 2>&1 || true\n";
 // Verify's limit; a passing release build takes about eight minutes.
 const MAX_TIMEOUT_MINUTES = 30;
+const CHECK_ROLLOVER = "node scripts/check-release-rollover.mjs";
+const RELEASE_PR = "github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')";
 
 /** @typedef {{ name?: string, run?: string, uses?: string, shell?: string, if?: string, "continue-on-error"?: unknown, with?: Record<string, unknown> }} WorkflowStep */
 /** @typedef {{ "timeout-minutes"?: unknown, "continue-on-error"?: unknown, steps?: WorkflowStep[] }} WorkflowJob */
@@ -50,6 +52,34 @@ export function assertGateJob(job, label) {
   }
 
   assertGateStepFailsClosed(gate, label);
+}
+
+/** @param {WorkflowJob | undefined} verify @param {WorkflowJob | undefined} prepare */
+export function assertReleaseRolloverJobs(verify, prepare) {
+  for (const [job, label, condition] of /** @type {const} */ ([[verify, "verify", RELEASE_PR], [prepare, "prepare", undefined]])) {
+    const steps = job?.steps ?? [];
+    const rolloverIndex = steps.findIndex((step) => step.run?.trim() === CHECK_ROLLOVER);
+    if (rolloverIndex < 0) throw new Error(`${label} must run the release rollover check`);
+    const rollover = steps[rolloverIndex];
+    if (job?.["continue-on-error"] !== undefined || rollover["continue-on-error"] !== undefined || rollover.if !== condition || (rollover.shell !== undefined && rollover.shell !== "bash")) {
+      throw new Error(`${label} release rollover must fail its job and run in its required release context`);
+    }
+    const checkoutIndex = steps.findIndex((step) => step.uses?.startsWith("actions/checkout@") && step.with?.["fetch-depth"] === 0);
+    if (checkoutIndex < 0 || checkoutIndex >= rolloverIndex) {
+      throw new Error(`${label} release rollover requires a checkout with complete tags before the check`);
+    }
+    if (label === "prepare") {
+      const tagIndex = steps.findIndex((step) => step.run?.includes('git checkout --detach "$release_commit"'));
+      if (tagIndex < 0 || tagIndex >= rolloverIndex) {
+        throw new Error("prepare must check release rollover after checking out the verified exact tag");
+      }
+    } else {
+      const gateIndex = steps.findIndex((step) => step.run?.includes(GATE));
+      if (gateIndex < 0 || rolloverIndex >= gateIndex) {
+        throw new Error("verify must check release rollover before the full gate");
+      }
+    }
+  }
 }
 
 /** @param {WorkflowStep} step @param {string} label */

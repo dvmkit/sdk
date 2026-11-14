@@ -7,7 +7,7 @@ import { parse } from "yaml";
 import { SAFE_DATABASE_NAME } from "./safe-database-name.mjs";
 import { assertCleanInstallDispatch, dispatchCleanInstall } from "./clean-install-dispatch.mjs";
 import { assertReleaseDispatch, dispatchVerification } from "./verify-dispatch.mjs";
-import { assertGateJob } from "./workflow-gate.mjs";
+import { assertGateJob, assertReleaseRolloverJobs } from "./workflow-gate.mjs";
 
 const rootArgument = process.argv.indexOf("--root");
 const root =
@@ -156,6 +156,7 @@ assertFullHistoryWhereScanned(release, "release workflow");
 try {
   assertGateJob(parse(verify)?.jobs?.verify, "verify workflow job verify");
   assertGateJob(parse(release)?.jobs?.build, "release workflow job build");
+  assertReleaseRolloverJobs(parse(verify)?.jobs?.verify, parse(release)?.jobs?.prepare);
 } catch (error) {
   fail(error instanceof Error ? error.message : String(error));
 }
