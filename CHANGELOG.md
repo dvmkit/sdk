@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix an SSRF bypass in `assertSafeUrl` and `createPinnedFetch`: NAT64, IPv4-mapped, IPv4-compatible, 6to4, and Teredo addresses now apply the IPv4 denylist and additional IPv4 policy to embedded addresses. Public IPv4 destinations in the well-known NAT64 prefix remain allowed; the local-use `64:ff9b:1::/48` prefix is refused because its translation layout depends on site configuration.
+
 - On servers advertising hosted card Checkout, unpaid Stripe top-ups from identified `dvm` clients older than `0.19.0` return `426 client_upgrade_required` with upgrade instructions instead of a Stripe Link challenge. Completed funding still replays, credential-bearing requests remain accepted, and callers with absent or invalid client headers keep the existing discovery response. See `protocol-fixtures/credit-fund-stripe-upgrade-v1.json`.
 
 ### Breaking API changes
