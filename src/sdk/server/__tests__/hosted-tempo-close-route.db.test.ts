@@ -2429,13 +2429,13 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
 
   it("shares one close search between a caller poll and the concurrent sweep", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, mpp, creditId, channelId, drain, chain, logs, operator, rpc, searches, obligations } =
+    const { server, mpp, creditId, drain, chain, logs, operator, rpc, searches, obligations } =
       await hostedCredit(payer, { modes: ["submits-then-times-out"] });
     let release!: () => void;
     let started!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     const searching = new Promise<void>((resolve) => { started = resolve; });
-    const recoveryRead = vi.spyOn(sessions, "getCloseRecovery");
+    const pollWrite = vi.spyOn(sessions, "update");
     let sweep: Promise<void> | undefined;
     let poll: ReturnType<typeof drain> | undefined;
     try {
@@ -2447,11 +2447,11 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       rpc.searchGate.wait = async () => { started(); await blocked; };
       sweep = mpp.reconcileTempoSessionCloses!();
       await searching;
-      recoveryRead.mockClear();
+      pollWrite.mockClear();
       poll = drain(payer);
-      await vi.waitFor(() => expect(recoveryRead).toHaveBeenCalledWith(channelId));
-      // Flush the poll's continuation after its last store read; both paths
-      // now await the blocked chain search, rather than a timer-based race.
+      await vi.waitFor(() => expect(pollWrite.mock.settledResults.some((result) => result.type === "fulfilled")).toBe(true));
+      // The finalized-state write completes after the poll's reads. Flush its
+      // continuation so the poll joins the search before the RPC is released.
       await new Promise<void>((resolve) => setImmediate(resolve));
       release();
       const [result] = await Promise.all([poll, sweep]);
@@ -2466,7 +2466,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     } finally {
       release();
       await Promise.allSettled([poll, sweep]);
-      recoveryRead.mockRestore();
+      pollWrite.mockRestore();
       await server.shutdown();
     }
   });

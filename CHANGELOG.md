@@ -1,15 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Fix an SSRF bypass in `assertSafeUrl` and `createPinnedFetch`: NAT64, IPv4-mapped, IPv4-compatible, 6to4, and Teredo addresses now apply the IPv4 denylist and additional IPv4 policy to embedded addresses. Public IPv4 destinations in the well-known NAT64 prefix remain allowed; the local-use `64:ff9b:1::/48` prefix is refused because its translation layout depends on site configuration.
-
-- On servers advertising hosted card Checkout, unpaid Stripe top-ups from identified `dvm` clients older than `0.19.0` return `426 client_upgrade_required` with upgrade instructions instead of a Stripe Link challenge. Completed funding still replays, credential-bearing requests remain accepted, and callers with absent or invalid client headers keep the existing discovery response. See `protocol-fixtures/credit-fund-stripe-upgrade-v1.json`.
-
-### Breaking API changes
-
-- `clientUpgradeRequired` accepts an optional fourth argument `{ display, hint }` for endpoint-specific upgrade instructions. Existing calls retain their default response text; this is an additive signature change.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -27,11 +17,31 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ## [0.38.0](https://github.com/dvmkit/sdk/compare/v0.37.0...v0.38.0) (2026-11-14)
 
 
+### Breaking API changes
+
+- On servers advertising hosted card Checkout, unpaid Stripe top-ups from identified `dvm` clients older than `0.19.0` return `426 client_upgrade_required` with upgrade instructions instead of a Stripe Link challenge. Completed funding still replays, credential-bearing requests remain accepted, and callers with absent or invalid client headers keep the existing discovery response. See `protocol-fixtures/credit-fund-stripe-upgrade-v1.json`.
+- `clientUpgradeRequired` accepts an optional fourth argument `{ display, hint }` for endpoint-specific upgrade instructions. Existing calls retain their default response text; this is an additive signature change. No public exports are added or removed.
+
+### Migrations
+
+- No database or configuration migration from `0.37.0`. Agents using `dvm` older than `0.19.0` must upgrade with `npm i -g @dvmkit/dvm-cli@latest` before retrying an unpaid card top-up on a Checkout-enabled server. The new client returns a payment link the human opens; no Stripe Link account is needed.
+
+### Compatibility requirements
+
+- Node.js 22 or newer, unchanged. No dependency floor changes from `0.37.0`. Servers without hosted Checkout and callers without a valid `dvm/<semver>` header retain their existing card-funding discovery behavior.
+
+### dvmctl and platform prerequisites
+
+- None added by this release. Existing hosted Checkout prerequisites from `0.36.0` still apply. Deploy this SDK in the DVM for the upgrade notice to reach callers.
+
+
 ### ⚠ BREAKING CHANGES
 
 * **server:** guide older card clients to hosted checkout
 
 ### Bug Fixes
+
+- Fix an SSRF bypass in `assertSafeUrl` and `createPinnedFetch`: NAT64, IPv4-mapped, IPv4-compatible, 6to4, and Teredo addresses now apply the IPv4 denylist and additional IPv4 policy to embedded addresses. Public IPv4 destinations in the well-known NAT64 prefix remain allowed; the local-use `64:ff9b:1::/48` prefix is refused because its translation layout depends on site configuration.
 
 * **server:** block unsafe IPv4 destinations embedded in IPv6 ([e63a5b0](https://github.com/dvmkit/sdk/commit/e63a5b07527a49e6038b1f28312171b3f38b4de3))
 * **server:** guide older card clients to hosted checkout ([ffe6816](https://github.com/dvmkit/sdk/commit/ffe681621e79993a720c5e4740723ec429bc0a13))
