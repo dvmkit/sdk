@@ -14,6 +14,213 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.12.0](https://github.com/dvmkit/sdk/compare/v0.38.0...v0.12.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** guide older card clients to hosted checkout
+* **server:** the hostingControl option, the DVMKIT_HOSTING_CONTROL_SECRET
+* **server:** x402 claim reservations record the presented claim
+* **server:** answer 422 on the x402 route when a handler marks a failure as the caller's ([#146](https://github.com/dvmkit/sdk/issues/146))
+* **server:** offer a refund_delay on the NUT-24 payment request ([#140](https://github.com/dvmkit/sdk/issues/140))
+* **server:** LightningReceive gains ensureFresh(), and the railHealth option of LightningReceiveConfig gains an optional ensureFresh(). Both are additive; declarations that reference these types change signature with them.
+* declare capability channels and x402 Bazaar listings
+* **server:** a `name` or `channels` key on a capability entry, previously ignored, now takes effect, so it either changes the capability's published name or fails configuration with a message naming the field.
+* **x402:** bound every caller-facing settle response and cap the x402 deadline at the gateway's limit
+* **server:** processX402BatchResponseForWallet requires channelId, and processX402BatchResponse drops the answer's channel state when no channel was passed or recorded by createX402BatchPayment.
+* **kv:** a directly constructed PostgresKVStore runs a sweep timer from init() and must be closed with close() before its pool ends; otherwise each later sweep logs kv_expiry_sweep_failed.
+* **sdk:** Test contexts cache successful step results by default. Use a fresh context and cache for independent executions, and reuse a cache only for replay of the same job.
+* **stripe:** default the card top-up minimum to $5 and let builders set it
+* **credit:** a caller's cancel charges the paid pieces including the one in progress, and an ask is never covered by the upfront payment. CreditLedgerLike.resolveDraw is required. StreamableJobStore.appendOutgoing refuses an ask on a terminal job with JobEndedError and finishes the running piece on a payment-request; verifyAndCredit appends PaymentCreditDelta.piece; terminal writes freeze JobRecord.settlement, which the built-in stores own after insert. Postgres initialization adds jobs.pieces and jobs.settlement. A second open ask rejects with ask_already_open, and receipt credit.amount is the charged amount.
+* **payment:** StreamableJobStore.verifyAndCredit takes landing options and may report creditRefused; job_messages gains the balance row status; custom job stores must implement payment intents.
+* Default prepaid and implicit credit lifetimes increase from 30 to 90 days. Set credit.ttl to 2592000 seconds to retain 30 days.
+* Custom CreditLedgerLike stores must implement transactional refundDraw accounting and report enqueueing.
+
+### Features
+
+* add admin routes for hosted Tempo close reports ([#16](https://github.com/dvmkit/sdk/issues/16)) ([a86a85d](https://github.com/dvmkit/sdk/commit/a86a85d6e2ac2d4474629d021bd05d6b88e750de))
+* add operator decisions for held Tempo drains ([c0e1841](https://github.com/dvmkit/sdk/commit/c0e18418df914c13633a485c8abe01621c15a3b8))
+* add trusted no-DVM span resolution marks ([5e0b7cf](https://github.com/dvmkit/sdk/commit/5e0b7cfd9ce290930f3a6074f9544923923149cd))
+* advertise Cashu payment as a NUT-24 payment request and accept NUT-24 payments ([#66](https://github.com/dvmkit/sdk/issues/66)) ([f3a5982](https://github.com/dvmkit/sdk/commit/f3a5982dd4fea16091e9965e851072b62bc81cad))
+* **api:** enforce public signature release disclosures ([c4b3ad6](https://github.com/dvmkit/sdk/commit/c4b3ad6866e735bf1a12939fb7d2bd7428e02266))
+* **credit:** charge mid-job work by the piece ([#100](https://github.com/dvmkit/sdk/issues/100)) ([9dd3d63](https://github.com/dvmkit/sdk/commit/9dd3d63eed096fd0872059139f7111379af222e1))
+* **credit:** fund prepaid credit by card through Stripe shared payment tokens ([#92](https://github.com/dvmkit/sdk/issues/92)) ([e3f9ae0](https://github.com/dvmkit/sdk/commit/e3f9ae0541f57b5dc3f00cf4775311fbdf1a9024))
+* **credit:** refund card-funded credit to the card ([#94](https://github.com/dvmkit/sdk/issues/94)) ([e3259ac](https://github.com/dvmkit/sdk/commit/e3259ac26088183b6af4ac74af9b5611ab38ddaf))
+* **credit:** settle part of a credit draw ([#95](https://github.com/dvmkit/sdk/issues/95)) ([d468aac](https://github.com/dvmkit/sdk/commit/d468aacbc2eff035d7712769a1c937618478c139))
+* declare capability channels and x402 Bazaar listings ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* expose accepted upfront payments on job responses ([5eee6e4](https://github.com/dvmkit/sdk/commit/5eee6e4d47cad4ea0d56a15e9033580ef117dc82))
+* extend default prepaid credit lifetime to 90 days ([312e7ae](https://github.com/dvmkit/sdk/commit/312e7ae2df30351bd5e7666f88b2b95a30afcb9a))
+* inline artifact messages on paid NUT-24 retries ([#87](https://github.com/dvmkit/sdk/issues/87)) ([64cd56a](https://github.com/dvmkit/sdk/commit/64cd56acf3c5c768090854e94be9abccc5a1556a))
+* let builders set the Cashu refund-locktime floor ([#71](https://github.com/dvmkit/sdk/issues/71)) ([5f09f3d](https://github.com/dvmkit/sdk/commit/5f09f3db9b8d8ed40cb6d53b9b64e1a965270f72))
+* **observability:** export the diagnostic catalogue and keep span routes, events, and codes it should admit ([#143](https://github.com/dvmkit/sdk/issues/143)) ([ebeba7f](https://github.com/dvmkit/sdk/commit/ebeba7fdd5f62a4fa1c7d04c7fbb6506eb21df8e))
+* pay mid-job requests from prepaid balance ([768178f](https://github.com/dvmkit/sdk/commit/768178f13297e5145b730f3d4f3fcf3fc3e4fb88))
+* **reports:** include paid-piece totals in terminal evidence ([28db581](https://github.com/dvmkit/sdk/commit/28db581817fcaa2e3e52c705cca34dd804215604))
+* return short NUT-24 job results inline ([a125413](https://github.com/dvmkit/sdk/commit/a125413eb1c3ef9f41bd8ee3248f7d2f4807e11f))
+* **sdk:** support handler replay tests and typed capabilities ([0aa92c7](https://github.com/dvmkit/sdk/commit/0aa92c7589975b9e64d5efbba96c1d3cd430e1b0))
+* serve unsigned paid per-call jobs behind secp256k1Auth({ allowUnsignedPaid: true }) ([#62](https://github.com/dvmkit/sdk/issues/62)) ([25b0076](https://github.com/dvmkit/sdk/commit/25b0076636e0dcde0ee1c4c89a0ab2ee4841cf4c))
+* **server:** add Fly keepalive during handler execution ([beb637c](https://github.com/dvmkit/sdk/commit/beb637c4b87cf3bd94462dc455c9ec04dd07444d))
+* **server:** allow an opt-in spend-capable Lightning receive connection ([#127](https://github.com/dvmkit/sdk/issues/127)) ([6e23fc2](https://github.com/dvmkit/sdk/commit/6e23fc223f9c52cc656d32c96d28f9c2f7efb730))
+* **server:** answer 422 on the x402 route when a handler marks a failure as the caller's ([#146](https://github.com/dvmkit/sdk/issues/146)) ([5d76564](https://github.com/dvmkit/sdk/commit/5d765647e27180ad481672a05bb919cf4cd4da99))
+* **server:** answer a paid x402 request at POST /v1/x402/&lt;capability&gt; in one response ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **server:** fund card credit through a hosted Checkout page ([#164](https://github.com/dvmkit/sdk/issues/164)) ([44516ea](https://github.com/dvmkit/sdk/commit/44516ea43637ba086781d2a2631bbdae2024edc9))
+* **server:** keep idle job-message LISTEN connections active with a heartbeat ([d64dd14](https://github.com/dvmkit/sdk/commit/d64dd141829006381d8984125eeb3647acffdc1d))
+* **server:** list x402 capabilities in discovery catalogs and own every facilitator payload ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **server:** offer a refund_delay on the NUT-24 payment request ([#140](https://github.com/dvmkit/sdk/issues/140)) ([cd9abe2](https://github.com/dvmkit/sdk/commit/cd9abe20869a8b7827eb4ce6c7b424cc900db9d7))
+* **server:** start without x402 routes when no x402 rail is configured ([#151](https://github.com/dvmkit/sdk/issues/151)) ([f253be4](https://github.com/dvmkit/sdk/commit/f253be47f9e0da2dd3cf694832e587b40032f836))
+* settle unsigned x402 payments only after the job succeeds ([8d03541](https://github.com/dvmkit/sdk/commit/8d03541e0b33bc80dda051a87465f7331077cca1))
+* sign mid-job funding evidence and reconcile funded draws ([d1aed67](https://github.com/dvmkit/sdk/commit/d1aed6734f0956197f5221c5ed0437a4f8a2221b))
+* **stripe:** attribute card-credit charges to the server identity ([355ae40](https://github.com/dvmkit/sdk/commit/355ae40f1009908eb3afcb02609703bc64a5f787))
+* **stripe:** default the card top-up minimum to $5 and let builders set it ([d5ae56b](https://github.com/dvmkit/sdk/commit/d5ae56b54da732e3a1fc217df62977f9060108c5))
+* summarize pending implicit credit draws ([4edeae0](https://github.com/dvmkit/sdk/commit/4edeae05bacd047d0cf624882cef6db112d0ef90))
+* support completed credit draw refunds ([ffd3334](https://github.com/dvmkit/sdk/commit/ffd3334101a1b9f9792a87b0b29b251906f987bd))
+* terminalize hosted Tempo close obligations ([#9](https://github.com/dvmkit/sdk/issues/9)) ([3f306d4](https://github.com/dvmkit/sdk/commit/3f306d46f7a9adb378c577f6efb911de96dcc386))
+
+
+### Bug Fixes
+
+* accept only Cashu locks the DVM alone can spend and melt ([#60](https://github.com/dvmkit/sdk/issues/60)) ([b8a62b8](https://github.com/dvmkit/sdk/commit/b8a62b839dac1062e03c71322c1c56dd907bf60b))
+* accept unsigned paid calls on Cashu only ([#64](https://github.com/dvmkit/sdk/issues/64)) ([58904ba](https://github.com/dvmkit/sdk/commit/58904bab938e4447d2287fcd9e3ee6041d5b1a0f))
+* align terminal job reads with durable receipts ([1b6ffd2](https://github.com/dvmkit/sdk/commit/1b6ffd2201cd8af17a1870153fda9a8f018f88ed))
+* **auth:** distinguish missing request signatures ([ca3ba0a](https://github.com/dvmkit/sdk/commit/ca3ba0ae72b8f5a1f6aa12c70302826eb5e77b15))
+* **auth:** validate signed envelope preservation ([1cb4ab5](https://github.com/dvmkit/sdk/commit/1cb4ab552afa5fcac4c89535d620b5fcb0791b4c))
+* book a Cashu payment after a paid ask as credit balance ([#68](https://github.com/dvmkit/sdk/issues/68)) ([ec16aeb](https://github.com/dvmkit/sdk/commit/ec16aebec75bc4f4e5b401fdb3cd60e70d3982c4))
+* bound streamed upload memory in pinned fetch ([7a2a213](https://github.com/dvmkit/sdk/commit/7a2a2135d451624e9b5a1d23eb92fead46159a1b))
+* bring every hosted Tempo close obligation to a terminal state ([#7](https://github.com/dvmkit/sdk/issues/7)) ([8fc12f9](https://github.com/dvmkit/sdk/commit/8fc12f9f8d10621eaeaab68a29aabc416a52d16b))
+* classify finalized Tempo backing loss from close evidence ([c5b17f3](https://github.com/dvmkit/sdk/commit/c5b17f3fb2ba27dc6ab62ee9b050f8082482460d))
+* contain closed NWC relay publish failures ([16e43de](https://github.com/dvmkit/sdk/commit/16e43dee923a45b61caa87cffc1c82ccd269b50c))
+* **credit:** book revenue for a credit-backed job that ends without completing ([#113](https://github.com/dvmkit/sdk/issues/113)) ([a8ef404](https://github.com/dvmkit/sdk/commit/a8ef404362cf94d383b65ed2e16606b986db3ab5))
+* **credit:** preserve card terms in caller parsing ([f4e6507](https://github.com/dvmkit/sdk/commit/f4e650720e9893fd6029724b753756e2385b09e3))
+* **credit:** recover permanently refused card refunds ([7cb0319](https://github.com/dvmkit/sdk/commit/7cb0319813b761525310463d779b793fc09c294c))
+* **credit:** release a draw held on a closed x402 channel in both ledgers ([#97](https://github.com/dvmkit/sdk/issues/97)) ([221c338](https://github.com/dvmkit/sdk/commit/221c338f80171410da9428f5be903c0031e5de65))
+* **deps:** move Hono, Undici, and Zod to patched releases ([#59](https://github.com/dvmkit/sdk/issues/59)) ([6532767](https://github.com/dvmkit/sdk/commit/653276767dadb1a60b3f33782d2153a11738d09c))
+* enable browser wallet access on public routes ([d660b17](https://github.com/dvmkit/sdk/commit/d660b17695a88075e333b46adc41cef0232e776c))
+* handle signed-request errors across SDK installations ([d599d5a](https://github.com/dvmkit/sdk/commit/d599d5ad849f69fbba4d94c5cd29386aaeec2609))
+* honor explicit payment methods in discovery and credit menus ([3cd47c6](https://github.com/dvmkit/sdk/commit/3cd47c66d2dd10718ce530fa1c703af56d2b8f6e))
+* ignore older receipt replay under the credit lock ([755d35a](https://github.com/dvmkit/sdk/commit/755d35a3ae7de8bd6734f47c5087f8671b790352))
+* keep pending prompts awaiting input after duplicate rail payments ([f632c62](https://github.com/dvmkit/sdk/commit/f632c62f254ddfa9baaf0307100df8362223ee8f))
+* keep pre-1.0 releases on the development line ([aa0d33d](https://github.com/dvmkit/sdk/commit/aa0d33df14a3fdbcf70b8516a168df0e2dd2eb85))
+* **kv:** delete expired rows from the Postgres KV store ([#119](https://github.com/dvmkit/sdk/issues/119)) ([414718c](https://github.com/dvmkit/sdk/commit/414718cb08a8ba1b2c68aa339a966daa9b1c5dcd))
+* limit idle timeouts to caller response windows ([2474705](https://github.com/dvmkit/sdk/commit/2474705f48215dd5eef9e61d0656e49b81965924))
+* make concurrent job snapshots safe ([92a17a1](https://github.com/dvmkit/sdk/commit/92a17a1ce25fa801aa315beb90c41acd0e69c0d2))
+* **nwc:** survive a relay that never completes the WebSocket handshake ([#102](https://github.com/dvmkit/sdk/issues/102)) ([177f182](https://github.com/dvmkit/sdk/commit/177f1828fb4e232f8e3f84f495ac7bc58aee402c))
+* park JIT refunds without enabling Cashu receiving ([238bf6a](https://github.com/dvmkit/sdk/commit/238bf6a828664cb1803fc54f7d67a0095c3a970e))
+* **payment:** decide what a mid-job payment pays for when it arrives ([#99](https://github.com/dvmkit/sdk/issues/99)) ([f16cb02](https://github.com/dvmkit/sdk/commit/f16cb02780221977a84aafcb17e906454a6d3be2))
+* persist completed steps before returning to handlers ([8ae1591](https://github.com/dvmkit/sdk/commit/8ae1591c3c54906df522322b62e5e2a2f2eee288))
+* persist terminal output before settling credit ([4b9f7c6](https://github.com/dvmkit/sdk/commit/4b9f7c67daf0de3a37bdc60137e4b7741045ff98))
+* **pieces:** quote the lowered finished-piece charge in charged_if_declined_micro ([#114](https://github.com/dvmkit/sdk/issues/114)) ([3a2dcc4](https://github.com/dvmkit/sdk/commit/3a2dcc4831dd43e6f40d031b47793023e59eede6))
+* preserve locally running jobs during stale sweeps ([297aa66](https://github.com/dvmkit/sdk/commit/297aa66b0f42e71ebcb43d2dcecfdbedd0671197))
+* preserve pending prompts during development payments ([35cd6ad](https://github.com/dvmkit/sdk/commit/35cd6ad537bfc830f8878728faa06863b75d8a51))
+* prevent duplicate Tempo settlements from stale reads ([12bbbe1](https://github.com/dvmkit/sdk/commit/12bbbe191306139d3b8534560973fed89a8b0995))
+* publish payment history only after acceptance ([d818fb8](https://github.com/dvmkit/sdk/commit/d818fb8de06f82d610fd632e19e78c7809f8c28d))
+* recommend latest caller release in credential hint ([a3d3b0a](https://github.com/dvmkit/sdk/commit/a3d3b0a6fa9f3498236e1ed56c9ed55a35d3490d))
+* recover a replayed Cashu job only under the request id its proofs were accepted with ([#65](https://github.com/dvmkit/sdk/issues/65)) ([ef7394e](https://github.com/dvmkit/sdk/commit/ef7394e9c80bd9e9def02ac452c40b6a2a4def4a))
+* recover stale Postgres pools on ordinary requests ([40922e6](https://github.com/dvmkit/sdk/commit/40922e6c69b89c1759af3036a6c1fb03421c2932))
+* require Tempo drain proof and share close searches ([#18](https://github.com/dvmkit/sdk/issues/18)) ([cb8df3e](https://github.com/dvmkit/sdk/commit/cb8df3e9eabb50d68c99419867ecc6bc86a7c5e5))
+* return retryable errors for temporary job-read outages ([c76edf8](https://github.com/dvmkit/sdk/commit/c76edf8e814be12fd6310ab04d6e67160196f792))
+* **server:** allow host-supplied x402 rails for capability channels ([#133](https://github.com/dvmkit/sdk/issues/133)) ([165fb6b](https://github.com/dvmkit/sdk/commit/165fb6b45ddeb5c003f51be5c08e0244dc78b76d))
+* **server:** block unsafe IPv4 destinations embedded in IPv6 ([e63a5b0](https://github.com/dvmkit/sdk/commit/e63a5b07527a49e6038b1f28312171b3f38b4de3))
+* **server:** bound inline result message reads ([2cc9acb](https://github.com/dvmkit/sdk/commit/2cc9acb43eb4d8eedfbf779689de4cb92684d4b8))
+* **server:** catch up job subscriptions after reconnect ([6d643a5](https://github.com/dvmkit/sdk/commit/6d643a5761424a9f0e352ed8c6a0f1fcc1cdcbe9))
+* **server:** claim earned x402 vouchers during shutdown ([9b58776](https://github.com/dvmkit/sdk/commit/9b5877624ac787d99110de02bb48ef3f90c90275))
+* **server:** guide older card clients to hosted checkout ([ffe6816](https://github.com/dvmkit/sdk/commit/ffe681621e79993a720c5e4740723ec429bc0a13))
+* **server:** initialize settlement-report history without hosting control ([475389e](https://github.com/dvmkit/sdk/commit/475389e0559fe13b7715bb84e1f52b68c9a322ea))
+* **server:** keep Lightning in the credit funding menu after the DVM has been idle ([#130](https://github.com/dvmkit/sdk/issues/130)) ([56100d3](https://github.com/dvmkit/sdk/commit/56100d3bedbbd8775e54e542263d2c684f31bebc))
+* **server:** preserve accounting for partial x402 claims ([18311c2](https://github.com/dvmkit/sdk/commit/18311c25c83581cfc471bf96c160ddb7a702d1c9))
+* **server:** preserve mount paths in schema hints ([4124399](https://github.com/dvmkit/sdk/commit/4124399bafb2d2a779aa92efb024cb86d6311a07))
+* **server:** refuse interactive asks on deferred x402 jobs and reserve x402d credit ids ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **server:** start without x402 when the payout address is missing ([#153](https://github.com/dvmkit/sdk/issues/153)) ([b81d46d](https://github.com/dvmkit/sdk/commit/b81d46dbd426fb0d2a49f76c0e45f1066f2be364))
+* skip excluded payment rail initialization ([1d1c12d](https://github.com/dvmkit/sdk/commit/1d1c12d3b0353e6c4a988bea5ab0d6eb40b6aa48))
+* **tempo:** honour proven charges when replay marking fails ([02292e5](https://github.com/dvmkit/sdk/commit/02292e5df9d26467f17685a7d726f8a47ba64804))
+* **x402:** bound every caller-facing settle response and cap the x402 deadline at the gateway's limit ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **x402:** keep an unsigned job's settlement unknown until evidence resolves it ([7087478](https://github.com/dvmkit/sdk/commit/7087478eccb3909d998740cb04761ab833d2adf3))
+* **x402:** withhold an unsigned job's output until its payment settles ([1a0e693](https://github.com/dvmkit/sdk/commit/1a0e69341ecfb1ab33cc1141b043fa686c43a509))
+
+
+### Documentation
+
+* clarify message acknowledgement cursor semantics ([d4a1241](https://github.com/dvmkit/sdk/commit/d4a124157b9fb51b139248fdf35513ad4dee43b4))
+* document stable release graduation ([1a9460b](https://github.com/dvmkit/sdk/commit/1a9460be9dd700f09b5f46b6ee48156136725827))
+* **sdk:** describe the x402 deadline and env-configured rail accurately ([#150](https://github.com/dvmkit/sdk/issues/150)) ([ea97096](https://github.com/dvmkit/sdk/commit/ea9709683b0601b80e3c8edbf866138c8f443f4f))
+* **server:** narrow the claim about a rail configured later ([#152](https://github.com/dvmkit/sdk/issues/152)) ([21bed78](https://github.com/dvmkit/sdk/commit/21bed7880f4e6f53911308f8435492b0c8f1223a))
+
+
+### Continuous Integration
+
+* upgrade artifact downloads to Node 24 ([#49](https://github.com/dvmkit/sdk/issues/49)) ([518e2c7](https://github.com/dvmkit/sdk/commit/518e2c7b1d7d81eb0f1c4a0b3a71c7c8dbb27732))
+* upgrade artifact uploads to Node 24 ([#46](https://github.com/dvmkit/sdk/issues/46)) ([92c0f88](https://github.com/dvmkit/sdk/commit/92c0f88551988440cf8396eed681e21f2f3f578f))
+* validate workflows on Ubuntu 26.04 ([#19](https://github.com/dvmkit/sdk/issues/19)) ([d29a8db](https://github.com/dvmkit/sdk/commit/d29a8db95d125bebbd129e1f9ff3f5cc5039ad0d))
+
+
+### Miscellaneous Chores
+
+* **api:** advance the comparison baseline to v0.26.0 ([#116](https://github.com/dvmkit/sdk/issues/116)) ([5291567](https://github.com/dvmkit/sdk/commit/5291567aaeee9bbfc7f46693b2d323a804c0613b))
+* **api:** advance the comparison baseline to v0.26.1 ([#117](https://github.com/dvmkit/sdk/issues/117)) ([d7f85ce](https://github.com/dvmkit/sdk/commit/d7f85ce2a1ea363090a10d11af7bea6cd2573de8))
+* **api:** advance the comparison baseline to v0.27.0 ([#120](https://github.com/dvmkit/sdk/issues/120)) ([9fdd561](https://github.com/dvmkit/sdk/commit/9fdd561a4b94cc042b43252c8a76d124312eae33))
+* **api:** advance the comparison baseline to v0.31.0 ([#135](https://github.com/dvmkit/sdk/issues/135)) ([af5e69d](https://github.com/dvmkit/sdk/commit/af5e69d837f734933651d25c07a35de16b8d0f02))
+* **api:** advance the comparison baseline to v0.31.1 ([#138](https://github.com/dvmkit/sdk/issues/138)) ([5e8d11a](https://github.com/dvmkit/sdk/commit/5e8d11a992d3bfe890a42657dc54fa9937656935))
+* **api:** advance the comparison baseline to v0.32.0 ([#141](https://github.com/dvmkit/sdk/issues/141)) ([32ce136](https://github.com/dvmkit/sdk/commit/32ce136a1b5097e5449c92b0b901b35a475fa9f9))
+* **api:** advance the comparison baseline to v0.33.0 ([#144](https://github.com/dvmkit/sdk/issues/144)) ([ac7110a](https://github.com/dvmkit/sdk/commit/ac7110a12bd378e58d991c27032285dcf13e79fd))
+* **api:** advance the comparison baseline to v0.34.0 ([#147](https://github.com/dvmkit/sdk/issues/147)) ([58fe913](https://github.com/dvmkit/sdk/commit/58fe91365c127f74c2720063cd570e43b1da628c))
+* **api:** advance the comparison baseline to v0.35.0 ([#155](https://github.com/dvmkit/sdk/issues/155)) ([5d043ed](https://github.com/dvmkit/sdk/commit/5d043edeaf7b83523f411abbe54161c1e41be4e5))
+* **api:** advance the comparison baseline to v0.35.2 ([#159](https://github.com/dvmkit/sdk/issues/159)) ([9db3983](https://github.com/dvmkit/sdk/commit/9db3983183faa86303514491faa19d91ab89a1bb))
+* **api:** advance the comparison baseline to v0.37.0 ([#168](https://github.com/dvmkit/sdk/issues/168)) ([aeeae44](https://github.com/dvmkit/sdk/commit/aeeae440bb18924b60abf040012ac5c77c4ea9c3))
+* **api:** record the job type's handler deadline in the declaration surface ([d62d1ee](https://github.com/dvmkit/sdk/commit/d62d1ee845db90dee0c1ceda52d7c0a53b0d7d7b))
+* **claude:** block Claude attribution in commits and PRs ([#22](https://github.com/dvmkit/sdk/issues/22)) ([cd58d28](https://github.com/dvmkit/sdk/commit/cd58d2813a96c7d176af05a538f23c7a80df6001))
+* configure the first stable release ([#5](https://github.com/dvmkit/sdk/issues/5)) ([b795a23](https://github.com/dvmkit/sdk/commit/b795a23775c4134124fd6da88c2f2e36bdcacd6c))
+* **master:** release 0.10.0 ([#17](https://github.com/dvmkit/sdk/issues/17)) ([c59b219](https://github.com/dvmkit/sdk/commit/c59b2193b613a00bee98ca1a9ab7850cf9aaaec6))
+* **master:** release 0.10.1 ([#20](https://github.com/dvmkit/sdk/issues/20)) ([c965bee](https://github.com/dvmkit/sdk/commit/c965bee126a0c46c91cc99fdccb3bac009a9e248))
+* **master:** release 0.11.0-rc.1 ([eff1b83](https://github.com/dvmkit/sdk/commit/eff1b8396757f0818e98b8f39803124d1f404775))
+* **master:** release 0.12.0-rc.1 ([eebb93b](https://github.com/dvmkit/sdk/commit/eebb93bbe9faffbddbbd89e7f41bc060a623decf))
+* **master:** release 0.13.0 ([#37](https://github.com/dvmkit/sdk/issues/37)) ([462ae04](https://github.com/dvmkit/sdk/commit/462ae04c7fce88fc0ff22a415651c70674419803))
+* **master:** release 0.14.0 ([#40](https://github.com/dvmkit/sdk/issues/40)) ([a6e67fb](https://github.com/dvmkit/sdk/commit/a6e67fbf7cfefd6db0d13595b854ed81337592a1))
+* **master:** release 0.14.1 ([#44](https://github.com/dvmkit/sdk/issues/44)) ([c2cb672](https://github.com/dvmkit/sdk/commit/c2cb6726d0aaaab2c88d4834dd866cccc82be4dd))
+* **master:** release 0.14.2 ([#48](https://github.com/dvmkit/sdk/issues/48)) ([0e2adf4](https://github.com/dvmkit/sdk/commit/0e2adf4e52665150f4df9f8bc6e344974af84a62))
+* **master:** release 0.15.0 ([3f97038](https://github.com/dvmkit/sdk/commit/3f97038cb73bebf331fcd5c50aa98ccc36928cfb))
+* **master:** release 0.16.0 ([#56](https://github.com/dvmkit/sdk/issues/56)) ([71caac6](https://github.com/dvmkit/sdk/commit/71caac6ddecc3fae46c08ab6e93cfe332f4d5c88))
+* **master:** release 0.16.1 ([#58](https://github.com/dvmkit/sdk/issues/58)) ([451a5e1](https://github.com/dvmkit/sdk/commit/451a5e1438bc2e3f59b5c1a62a86661220deb335))
+* **master:** release 0.16.2 ([#61](https://github.com/dvmkit/sdk/issues/61)) ([68d2a2f](https://github.com/dvmkit/sdk/commit/68d2a2f3322ef7c567af658f08fc164a0b5fbdb1))
+* **master:** release 0.17.0 ([#63](https://github.com/dvmkit/sdk/issues/63)) ([22feef8](https://github.com/dvmkit/sdk/commit/22feef846d989f3b30cae40a4c135a3d7fe34e36))
+* **master:** release 0.17.1 ([#69](https://github.com/dvmkit/sdk/issues/69)) ([f11d6b5](https://github.com/dvmkit/sdk/commit/f11d6b58d1e44155790d65a9ed033b8addbbe7b8))
+* **master:** release 0.18.0 ([#72](https://github.com/dvmkit/sdk/issues/72)) ([15aa947](https://github.com/dvmkit/sdk/commit/15aa947743e4d0f416993236f680f13e573cbb1c))
+* **master:** release 0.20.0 ([#84](https://github.com/dvmkit/sdk/issues/84)) ([d7ef2d4](https://github.com/dvmkit/sdk/commit/d7ef2d4f734a0a5ce023c5f7feea4a8c08dda8b3))
+* **master:** release 0.21.0 ([#86](https://github.com/dvmkit/sdk/issues/86)) ([cdfc6a3](https://github.com/dvmkit/sdk/commit/cdfc6a3eccd1ac5452ddd956991f6892f248a7c9))
+* **master:** release 0.21.1 ([ba9ecf6](https://github.com/dvmkit/sdk/commit/ba9ecf69dc06813ddfbc8b979a3c7579a6e038ff))
+* **master:** release 0.21.2 ([fe40c4c](https://github.com/dvmkit/sdk/commit/fe40c4c1870824a9f0a7ffd224b0c0a2758a71d0))
+* **master:** release 0.22.0 ([#93](https://github.com/dvmkit/sdk/issues/93)) ([2a101ec](https://github.com/dvmkit/sdk/commit/2a101ec9db33df9b298b11f35f8efe51995622bf))
+* **master:** release 0.23.0 ([#96](https://github.com/dvmkit/sdk/issues/96)) ([5719c5a](https://github.com/dvmkit/sdk/commit/5719c5aab2fa7d9da3e82d234ea27fb5c9b18daa))
+* **master:** release 0.24.0 ([#103](https://github.com/dvmkit/sdk/issues/103)) ([9a76a39](https://github.com/dvmkit/sdk/commit/9a76a39eb0979df7e7f3081c86c25ca0e5b31572))
+* **master:** release 0.25.0 ([7bc7add](https://github.com/dvmkit/sdk/commit/7bc7add3e4b9b477aa628cd9350d464764193170))
+* **master:** release 0.26.0 ([#108](https://github.com/dvmkit/sdk/issues/108)) ([76e3265](https://github.com/dvmkit/sdk/commit/76e3265bca42c912117f7479469c41cab299acae))
+* **master:** release 0.26.1 ([#115](https://github.com/dvmkit/sdk/issues/115)) ([c25961b](https://github.com/dvmkit/sdk/commit/c25961b5b891cf1b62d0a523a62070c36e34ff1c))
+* **master:** release 0.27.0 ([#118](https://github.com/dvmkit/sdk/issues/118)) ([7ef8900](https://github.com/dvmkit/sdk/commit/7ef8900dd20dfe4482101f280461959ec8522383))
+* **master:** release 0.28.0 ([#121](https://github.com/dvmkit/sdk/issues/121)) ([6574b83](https://github.com/dvmkit/sdk/commit/6574b83c3cfcdc7f56c21a9120e6cfbbc0107f05))
+* **master:** release 0.29.0 ([#126](https://github.com/dvmkit/sdk/issues/126)) ([f416050](https://github.com/dvmkit/sdk/commit/f4160506d4d8edf933bcd0f03e4160d93f0c0936))
+* **master:** release 0.30.0 ([#129](https://github.com/dvmkit/sdk/issues/129)) ([00cb87d](https://github.com/dvmkit/sdk/commit/00cb87de4a9f31baf0d0d1990fbbd9de0d3ea83b))
+* **master:** release 0.31.0 ([#131](https://github.com/dvmkit/sdk/issues/131)) ([73c30d5](https://github.com/dvmkit/sdk/commit/73c30d57e5a0d7f5aae870b49030e6f32ec20485))
+* **master:** release 0.31.1 ([#134](https://github.com/dvmkit/sdk/issues/134)) ([b562330](https://github.com/dvmkit/sdk/commit/b5623309b298b3f427c4198eaf0da3dfc4c18f03))
+* **master:** release 0.32.0 ([#136](https://github.com/dvmkit/sdk/issues/136)) ([2c4d845](https://github.com/dvmkit/sdk/commit/2c4d845bcc0dd1552840f16355280055a25a8be8))
+* **master:** release 0.33.0 ([#142](https://github.com/dvmkit/sdk/issues/142)) ([528c385](https://github.com/dvmkit/sdk/commit/528c385f205d094049a7c2bff1536f653883ec6d))
+* **master:** release 0.34.0 ([#145](https://github.com/dvmkit/sdk/issues/145)) ([f193d9e](https://github.com/dvmkit/sdk/commit/f193d9eeb8176a63cbe74f7969754a7e8efb1171))
+* **master:** release 0.35.0 ([#148](https://github.com/dvmkit/sdk/issues/148)) ([0c373bc](https://github.com/dvmkit/sdk/commit/0c373bcc5002f9ae2c2d7c9f6fb89c01340f4853))
+* **master:** release 0.35.1 ([#154](https://github.com/dvmkit/sdk/issues/154)) ([ebcb740](https://github.com/dvmkit/sdk/commit/ebcb7408e05ac84fbf0db3398508db09d5325cb8))
+* **master:** release 0.35.2 ([#157](https://github.com/dvmkit/sdk/issues/157)) ([b68756a](https://github.com/dvmkit/sdk/commit/b68756ae4e05f6ab1e2b0646d8c3a1a2c3448415))
+* **master:** release 0.36.0 ([#160](https://github.com/dvmkit/sdk/issues/160)) ([de4d5eb](https://github.com/dvmkit/sdk/commit/de4d5ebf26e309f7af2119762885e5efed0d7eef))
+* **master:** release 0.37.0 ([#165](https://github.com/dvmkit/sdk/issues/165)) ([e565499](https://github.com/dvmkit/sdk/commit/e5654996e6ad655426800ebf3f9dbfb4e113951e))
+* **master:** release 0.38.0 ([6995a8b](https://github.com/dvmkit/sdk/commit/6995a8b4c1598c560737c564538d2cea32a9ad86))
+* **master:** release 0.8.0 ([#6](https://github.com/dvmkit/sdk/issues/6)) ([33d7b34](https://github.com/dvmkit/sdk/commit/33d7b3401f139263e6e545a925ddf1fd5481365f))
+* **master:** release 0.8.1 ([#8](https://github.com/dvmkit/sdk/issues/8)) ([51995ca](https://github.com/dvmkit/sdk/commit/51995cadbd194200defc731a8ab7c9aee0b2dccd))
+* **master:** release 0.9.0 ([#10](https://github.com/dvmkit/sdk/issues/10)) ([bf8a89c](https://github.com/dvmkit/sdk/commit/bf8a89c057806c77e62a7adc5a4c50cff8b6af34))
+* **master:** release 1.0.0-rc.1 ([1b62f1e](https://github.com/dvmkit/sdk/commit/1b62f1e5b4438eebf7fea87e5f88d3fa69cd6349))
+* release 0.12.0 ([a6aafb1](https://github.com/dvmkit/sdk/commit/a6aafb1ec0d73cfd0f74c7092ba95475a947ed80))
+* release 0.19.0 ([6119cf3](https://github.com/dvmkit/sdk/commit/6119cf399d0cf66581590b78400ae93a8fcf7678))
+* release 0.19.1 ([f64fc6b](https://github.com/dvmkit/sdk/commit/f64fc6ba10577f7449e63df24fe606f638158238))
+
+
+### Code Refactoring
+
+* **server:** remove the hosting-control layer ([950571d](https://github.com/dvmkit/sdk/commit/950571dae4bffff0bca33337c4a1e7f177f39f8f))
+
 ## [0.38.0](https://github.com/dvmkit/sdk/compare/v0.37.0...v0.38.0) (2026-11-14)
 
 
