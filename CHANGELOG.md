@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- On servers advertising hosted card Checkout, unpaid Stripe top-ups from identified `dvm` clients older than `0.19.0` return `426 client_upgrade_required` with upgrade instructions instead of a Stripe Link challenge. Completed funding still replays, credential-bearing requests remain accepted, and callers with absent or invalid client headers keep the existing discovery response. See `protocol-fixtures/credit-fund-stripe-upgrade-v1.json`.
+
+### Breaking API changes
+
+- `clientUpgradeRequired` accepts an optional fourth argument `{ display, hint }` for endpoint-specific upgrade instructions. Existing calls retain their default response text; this is an additive signature change.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

@@ -1,0 +1,25 @@
+{
+  "request_headers": {
+    "DVM-Client": "dvm/0.15.3",
+    "DVM-Protocol-Version": "1",
+    "DVM-Client-Capabilities": "credit-recovery,request-resume"
+  },
+  "fund": {
+    "method": "stripe",
+    "fund_id": "upgrade",
+    "amount_micro": 5000000,
+    "commitment": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "response": {
+    "status": 426,
+    "headers": { "DVM-Protocol-Version": "1" },
+    "body": {
+      "error": "client_upgrade_required",
+      "required_capabilities": [],
+      "minimum_client_version": "0.19.0",
+      "current_client_version": "0.15.3",
+      "display": "Card top-ups now open a Stripe checkout page, which this version of dvm cannot do. Nothing was charged.",
+      "hint": "Run npm i -g @dvmkit/dvm-cli@latest, then re-run the same dvm credit fund command. The new version returns a link your human opens to pay by card; no Stripe Link account is needed."
+    }
+  }
+}

@@ -138,7 +138,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `clientCompatibilityMiddleware` | function | runtime | experimental | Parse request metadata and advertise the server protocol version on every response. |
 | `ClientCompatibilityRequirement` | interface | type-only | experimental | Exported declaration from the built public entry point. |
 | `ClientSemVer` | interface | type-only | experimental | Exported declaration from the built public entry point. |
-| `clientUpgradeRequired` | function | runtime | experimental | Exported declaration from the built public entry point. |
+| `clientUpgradeRequired` | function | runtime | experimental | Build an upgrade response with optional endpoint-specific display and hint text. |
 | `ConsumedCredentialStore` | interface | type-only | experimental | Tracks MPP challenge ids that have already been consumed by an upfront-flow request, scoped per-DVM realm. |
 | `ContentHold` | interface | type-only | experimental | Exported declaration from the built public entry point. |
 | `ContentHoldError` | class | runtime | experimental | Exported declaration from the built public entry point. |
