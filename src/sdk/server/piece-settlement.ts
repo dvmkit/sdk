@@ -55,22 +55,27 @@ export function receiptCreditFor(
   };
 }
 
-/** The receipt's settlement block: the ledger's hold and charge, and the job's pieces. */
+/** The ledger's settlement totals, with the job's pieces only when their totals agree. */
 export function receiptSettlementFor(
   record: Pick<JobRecord, "pieces">,
   draw: Pick<DrawResult, "amountMicro" | "status" | "partialSettle">
 ): ReceiptSettlement {
   const held = drawHeldMicro(draw);
   const charged = drawChargedMicro(draw);
+  const pieces = (record.pieces ?? []).map((piece) => ({
+    amount: piece.amountMicro,
+    charged: pieceCharge(piece),
+    paid_seq: piece.paidSeq,
+    state: piece.state,
+  }));
+  // A conflicting draw resolution records no per-piece allocation. Keep its totals without
+  // signing the losing job snapshot's breakdown or inventing which pieces the ledger charged.
+  const consistent = pieces.reduce((sum, piece) => sum + piece.amount, 0) === held &&
+    pieces.reduce((sum, piece) => sum + piece.charged, 0) === charged;
   return {
     held,
     charged,
     released: held - charged,
-    pieces: (record.pieces ?? []).map((piece) => ({
-      amount: piece.amountMicro,
-      charged: pieceCharge(piece),
-      paid_seq: piece.paidSeq,
-      state: piece.state,
-    })),
+    pieces: consistent ? pieces : [],
   };
 }

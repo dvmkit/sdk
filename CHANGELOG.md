@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- Credit receipts keep the recorded draw's totals when another finalizer resolved it differently. If the job's piece totals disagree with the draw's hold or charge, `settlement.pieces` is empty rather than signing a contradictory breakdown. Receipt schema version 1, existing signatures, and write-once persistence are unchanged; no migration is required.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

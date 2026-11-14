@@ -14,6 +14,7 @@ import fixture from "../../../../../protocol-fixtures/piece-settlement-v1.json";
 import type { JobReceipt } from "../../../../lib/receipt";
 import { verifyReceipt } from "../../../../lib/receipt";
 import { encodePayment } from "../../../../lib/x402/spec";
+import { diagnosticConsole } from "../../../../observability/diagnostic-console";
 import { configureDVM } from "../../../configure";
 import type { SDKJobContext } from "../../../types";
 import { MemoryKVStore } from "../../../store";
@@ -197,6 +198,10 @@ const SCRIPTS: Record<string, Script> = {
   single: async (ctx, control) => {
     await control.wait("work", ctx.signal);
     ctx.complete("done");
+  },
+  "fail-single": async (ctx, control) => {
+    await control.wait("work", ctx.signal);
+    ctx.fail("the provider broke");
   },
 };
 
@@ -632,6 +637,59 @@ export function pieceSettlementSuite(
       expect(await h.ledger.getDraw({ creditId: job.creditId, drawId: job.drawId })).toMatchObject({ amountMicro: UPFRONT, status: "pending" });
       await h.pay(job);
       expectSettlement(await h.settled(job), UPFRONT + 50_000, 0);
+    });
+
+    it.each([
+      { scenario: "settled before a release attempt", action: "fail-single", charged: UPFRONT, requested: 0, beforeFinalization: false },
+      { scenario: "released before a settle attempt", action: "single", charged: 0, requested: UPFRONT, beforeFinalization: false },
+      { scenario: "partly settled before a different settle attempt", action: "single", charged: 40_000, requested: UPFRONT, beforeFinalization: false },
+      { scenario: "already settled when finalization reads the draw", action: "fail-single", charged: UPFRONT, requested: 0, beforeFinalization: true },
+    ])("attests the recorded draw when $scenario", async ({ action, charged, requested, beforeFinalization }) => {
+      const h = await host();
+      const job = await h.submit(action);
+      await h.control.reached("work");
+      const args = { creditId: job.creditId, drawId: job.drawId };
+      const realResolve = h.ledger.resolveDraw.bind(h.ledger);
+      if (beforeFinalization) await realResolve({ ...args, settleMicro: charged });
+      const resolve = vi.spyOn(h.ledger, "resolveDraw");
+      if (!beforeFinalization) {
+        // Another machine commits after the manager reads a pending draw, before it resolves it.
+        resolve.mockImplementationOnce(async (attempt) => {
+          await realResolve({ ...attempt, settleMicro: charged });
+          return realResolve(attempt);
+        });
+      }
+      const warn = vi.spyOn(diagnosticConsole, "warn");
+      h.control.open("work");
+      const outcome = await h.settled(job);
+
+      if (beforeFinalization) {
+        expect(resolve).not.toHaveBeenCalled();
+      } else {
+        expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ ...args, settleMicro: requested }));
+        await expect(resolve.mock.results[0].value).rejects.toMatchObject({ code: "invalid_draw_state" });
+        expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+          event: "credit_resolve_state_mismatch", jobId: job.job_id,
+          drawStatus: charged === 0 ? "released" : "settled",
+        }));
+      }
+      expect(outcome.draw).toMatchObject({
+        status: charged === 0 ? "released" : "settled",
+        amountMicro: charged === 0 ? UPFRONT : charged,
+      });
+      expect(outcome.available).toBe(UPFRONT - charged);
+      expect(outcome.row.settlement?.chargedMicro).toBe(requested);
+      expect(outcome.receipt.outcome).toBe(action === "single" ? "completed" : "failed");
+      expect(outcome.receipt.credit?.amount).toBe(charged);
+      expect(outcome.receipt.credit?.amount).toBe(outcome.ledger.charged);
+      expect(outcome.receipt.settlement).toEqual({ held: UPFRONT, charged, released: UPFRONT - charged, pieces: [] });
+      expect(outcome.receipt.settlement?.charged).toBe(outcome.ledger.charged);
+      expect(verifyReceipt(outcome.receipt)).toBe(true);
+
+      const replay = await h.settled(job);
+      expect(replay.receipt).toEqual(outcome.receipt);
+      expect(replay.draw).toEqual(outcome.draw);
+      expect(replay.available).toBe(outcome.available);
     });
 
     it("the inline finaliser and the late reconciler settle the same frozen figure and book one revenue row", async () => {
