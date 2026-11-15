@@ -4,6 +4,8 @@
 
 ### Bug Fixes
 
+- Ship PostgreSQL types with the SDK so server pool parameters retain type checking without a separate `@types/pg` install, including when library checks are skipped.
+
 - Credit receipts keep the recorded draw's totals when another finalizer resolved it differently. If the job's piece totals disagree with the draw's hold or charge, `settlement.pieces` is empty rather than signing a contradictory breakdown. Receipt schema version 1, existing signatures, and write-once persistence are unchanged; no migration is required.
 
 ## Upgrade details
