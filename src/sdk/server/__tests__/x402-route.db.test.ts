@@ -706,7 +706,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     const response = await call(`${url}${prefix}`, { payment: authorization(60) });
     expect(response.status).toBe(fixture.charged.status);
     const body = await response.json() as { job_id: string; job_token: string; messages_url: string; display: string; hint: string };
-    expect(body).toMatchObject(fixture.charged.overCap.body);
+    expect(body).toMatchObject({ ...fixture.charged.overCap.body, has_artifacts: true });
     for (const field of fixture.charged.overCap.requiredFields) expect(body).toHaveProperty(field);
     for (const field of fixture.charged.overCap.omittedFields) expect(body).not.toHaveProperty(field);
     expect(body.messages_url).toBe(`${prefix}/v1/job/${body.job_id}/messages`);
