@@ -86,6 +86,8 @@ jobs:
           echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+      - name: Check release rollover
+        run: node scripts/check-release-rollover.mjs
 
   build:
     name: build immutable package artifact

@@ -58,6 +58,9 @@ jobs:
           package-manager-cache: false
       - name: Install locked dependencies
         run: npm ci
+      - name: Check release rollover
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+        run: node scripts/check-release-rollover.mjs
       - name: Start local Cashu mint
         run: node scripts/start-cashu-mint.mjs
       - name: Stage the pull request body for the public-safety scan
