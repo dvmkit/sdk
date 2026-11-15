@@ -256,6 +256,7 @@ function importThroughEntryPoints(consumer) {
       `const probes = ${JSON.stringify(runtimeProbes)};`,
       `const loaded = [${Object.keys(runtimeProbes).map((_, index) => `entry${index}`).join(", ")}];`,
       "const summary = [];",
+      "if (entry0.INLINE_RESULT_MESSAGES_MAX_BYTES !== 1_048_576) throw new Error('inline messages limit must be 1 MiB');",
       "for (const [index, entry] of Object.keys(probes).entries()) {",
       "  for (const name of probes[entry]) {",
       "    if (typeof loaded[index][name] !== 'function') {",
@@ -310,7 +311,7 @@ function typecheckConsumer(consumer, resolution) {
   writeFileSync(
     entry,
     [
-      `import { configureDVM, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
+      `import { configureDVM, INLINE_RESULT_MESSAGES_MAX_BYTES, type UpfrontPayment, type JobRecord, type SignedRequestFailure } from "${manifest.name}";`,
       `import type { SignedRequestFailure as ServerSignedRequestFailure } from "${manifest.name}/server";`,
       `import { clientUpgradeRequired, parseClientCompatibility } from "${manifest.name}/server";`,
       `import type { JobTerminalReportPayload } from "${manifest.name}/server";`,
@@ -322,6 +323,7 @@ function typecheckConsumer(consumer, resolution) {
       `import { bindDiagnosticCapabilityAuthority, bindDiagnosticIdentityAuthority, createDiagnosticCapabilityAuthority, type CreditDepositPayload, type CreditDrainPayload, type DiagnosticCapabilityAuthority, type DiagnosticIdentityAuthority, extendDiagnosticIdentityAuthority, readX402ChannelGuardFacts, tempoChallengeAmountMicro, type StoredX402ChannelMetadata, readCompletedCreditHistory, type CompletedCreditHistoryQuery, type CompletedCreditHistoryPage, type CompletedCreditHistoryRecord, type CompletedRefundHistoryRecord, type ExpiredCreditLossHistoryRecord, toLockPubkey, isDrawFundingReceipt, verifyDrawFundingReceipt, verifyDrawFundingReceiptChain, recordDrawFunding, applyReceiptCredit, type DrawFundingReceipt, type DrawFundingReceiptVerifyResult, type RecordDrawFundingResult, type StoredDrawFunding, type SendMessageResult } from "${manifest.name}/internal";`,
       "",
       `import { x402WalletFromConfig, tempoAccountFromConfig, type WalletCredentialConfig } from "${manifest.name}/internal";`,
+      "export const inlineMessagesLimit: number = INLINE_RESULT_MESSAGES_MAX_BYTES;",
       "export const acceptedUpfront: UpfrontPayment = { amount_msats: 150000, amount_micro: 100000, currency: 'usd', credit_id: 'example-credit', draw_id: 'example-draw' };",
       "export const upgradeResponse = (c: Parameters<typeof clientUpgradeRequired>[0]) => clientUpgradeRequired(c, parseClientCompatibility(new Headers({ 'DVM-Client': 'dvm/0.15.3' })), { minimumClientVersion: '0.19.0' }, { display: 'Upgrade the caller.', hint: 'Install a current release.' });",
       "export const originalUpfront: JobRecord['upfrontPayment'] = acceptedUpfront;",

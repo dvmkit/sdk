@@ -16,6 +16,7 @@ import type { X402Config } from "../../../lib/x402/types";
 import { dropSchemas, pinnedPool, recreateSchema } from "../../../test-support/schema-isolation";
 import { servedApps } from "../../../test-support/served-app";
 import { configureDVM } from "../../configure";
+import { INLINE_RESULT_MESSAGES_MAX_BYTES } from "../../index";
 import { MemoryKVStore } from "../../store";
 import type { SDKJobContext, X402Listing } from "../../types";
 import { createDVMServer } from "../app";
@@ -26,10 +27,18 @@ import { secp256k1Auth } from "../secp256k1-auth";
 import { PostgresX402ExactSettlementStore, type X402ExactSettlementIntent } from "../x402-exact-settlement-store";
 import { SETTLE_WINDOW_CLOSED_REASON, X402_ROUTE_COPY } from "../x402-route";
 
+interface RouteFixtureRow {
+  status: number;
+  body: Record<string, unknown>;
+  requiredFields: string[];
+  omittedFields: string[];
+}
+
 const fixture = JSON.parse(
   readFileSync(new URL("../../../../protocol-fixtures/x402-route-v1.json", import.meta.url), "utf8")
-) as Record<string, { status: number; body: Record<string, unknown>; requiredFields: string[]; omittedFields: string[] }> & {
+) as Record<string, RouteFixtureRow> & {
   identityHeader: string;
+  charged: RouteFixtureRow & { overCap: Omit<RouteFixtureRow, "status"> };
 };
 const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
@@ -375,6 +384,8 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     const body = await paid.json() as Record<string, unknown>;
     expect(body).toMatchObject(fixture.charged.body);
     for (const field of fixture.charged.requiredFields) expect(body).toHaveProperty(field);
+    expect(body.payload_in).toBe("messages");
+    expect(body).not.toHaveProperty("messages_url");
     expect(JSON.stringify(body.messages)).toContain("paid-for output");
     expect(paid.headers.get(fixture.identityHeader)).toBe(body.job_id);
     expect(settleHeader(paid)).toMatchObject({ success: true, transaction: TRANSACTION });
@@ -689,16 +700,30 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     expect(facilitatorCalls).toEqual(["/verify", "/settle", "/settle"]);
   }, 20_000);
 
-  it("leaves a result over the inline cap on the messages endpoint and says so", async () => {
-    const big = "x".repeat(1_100_000);
-    const url = await start({ behaviour: async (ctx) => { ctx.artifact({ name: "page", data: big }); ctx.complete("done"); } });
-    const response = await call(url, { payment: authorization(60) });
-    expect(response.status).toBe(200);
-    const body = await response.json() as { job_id: string; job_token: string };
-    expect(body).toMatchObject({ ...fixture.charged.body, payload_in: "messages", has_artifacts: true });
-    expect(body).not.toHaveProperty("messages");
-    const messages = await fetch(`${url}/v1/job/${body.job_id}/messages`, { headers: { "X-Job-Token": body.job_token } });
-    expect(await messages.text()).toContain(big);
+  it.each(["", "/feed"])("points to retrievable, charged output over the inline cap under '%s'", async (prefix) => {
+    const big = "x".repeat(INLINE_RESULT_MESSAGES_MAX_BYTES + 1);
+    const url = await start({ prefix, behaviour: async (ctx) => { ctx.artifact({ name: "page", data: big }); ctx.complete("done"); } });
+    const response = await call(`${url}${prefix}`, { payment: authorization(60) });
+    expect(response.status).toBe(fixture.charged.status);
+    const body = await response.json() as { job_id: string; job_token: string; messages_url: string; display: string; hint: string };
+    expect(body).toMatchObject(fixture.charged.overCap.body);
+    for (const field of fixture.charged.overCap.requiredFields) expect(body).toHaveProperty(field);
+    for (const field of fixture.charged.overCap.omittedFields) expect(body).not.toHaveProperty(field);
+    expect(body.messages_url).toBe(`${prefix}/v1/job/${body.job_id}/messages`);
+    expect(body.display).toMatch(/messages.*too large/i);
+    expect(body.hint).toMatch(/messages.*inline.*limit/i);
+    expect(body.hint).toContain(`GET ${body.messages_url}`);
+    expect(body.hint).toContain("X-Job-Token");
+    expect(body.hint).toMatch(/do not pay again/i);
+    expect(settleHeader(response)).toMatchObject({ success: true, transaction: TRANSACTION });
+    expect(await intentStatus(body.job_id)).toMatchObject({ status: "complete" });
+
+    const messages = await fetch(`${url}${body.messages_url}`, { headers: { "X-Job-Token": body.job_token } });
+    expect(messages.status).toBe(200);
+    expect(await messages.json()).toMatchObject({
+      messages: expect.arrayContaining([expect.objectContaining({ type: "artifact", content: expect.objectContaining({ data: big }) })]),
+    });
+    expect(facilitatorCalls).toEqual(["/verify", "/settle"]);
   }, 20_000);
 
   it.each([

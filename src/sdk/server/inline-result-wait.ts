@@ -70,9 +70,13 @@ export function waitForInlineResult(
   });
 }
 
-// A held paid retry and its generic client both buffer the body. Keep large
-// results on the messages endpoint to limit server memory and client/context load.
-const INLINE_RESULT_MESSAGES_MAX_BYTES = 1_048_576;
+/**
+ * Maximum UTF-8 bytes of the complete JSON messages array in an inline paid
+ * response (1 MiB). Includes message envelopes, escaping, brackets and commas;
+ * leave room for these when trimming artifacts. Larger results use job reads
+ * to limit response buffering for servers and clients.
+ */
+export const INLINE_RESULT_MESSAGES_MAX_BYTES = 1_048_576;
 const INLINE_RESULT_MESSAGES_PAGE_SIZE = 16;
 
 export async function inlineResultMessages(store: JobStore, job: JobRecord): Promise<Message[] | undefined> {

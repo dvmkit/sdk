@@ -117,7 +117,7 @@
     "x402Route": {
       "fixture": "protocol-fixtures/x402-route-v1.json",
       "path": "POST /v1/x402/{capability}",
-      "behavior": "capabilities offered on the x402 channel take one unsigned x402 request each, with the definition's input as the flat JSON body; an unpaid request is quoted from its body, and on a listed capability an empty or invalid unpaid body is quoted from listing.example; an invalid paid body, signed-request fields or any other payment rail answer 400 before verification; a paid request answers once within the capability's maxRuntimeSeconds plus the facilitator timeout from arrival: 200 charged with messages when their serialized UTF-8 array is at most 1048576 bytes, 500 or 503 not_charged, 402 not_charged with PAYMENT-RESPONSE success false, or 202 payment_pending with charge_outcome unknown and Retry-After; every response carries DVM-Job-Identity-V1"
+      "behavior": "capabilities offered on the x402 channel take one unsigned x402 request each, with the definition's input as the flat JSON body; an unpaid request is quoted from its body, and on a listed capability an empty or invalid unpaid body is quoted from listing.example; an invalid paid body, signed-request fields or any other payment rail answer 400 before verification; a paid request answers once within the capability's maxRuntimeSeconds plus the facilitator timeout from arrival: 200 charged with messages when their serialized UTF-8 array is at most 1048576 bytes, or payload_in messages_endpoint with a mount-aware messages_url and retrieval instructions using job_token when too large; oversized results remain charged because the output is retrievable without further payment; other outcomes are 500 or 503 not_charged, 402 not_charged with PAYMENT-RESPONSE success false, or 202 payment_pending with charge_outcome unknown and Retry-After; every response carries DVM-Job-Identity-V1"
     },
     "x402Listing": {
       "fixture": "protocol-fixtures/x402-listing-v1.json",
@@ -181,6 +181,7 @@
         "FxRateUnavailableError",
         "FxSourceFailure",
         "FxSourceFailureCategory",
+        "INLINE_RESULT_MESSAGES_MAX_BYTES",
         "IncomingMessage",
         "InputType",
         "InvalidCurrencyError",
@@ -417,6 +418,10 @@
         "IncomingMessage": {
           "stability": "stable",
           "signature": "a5726e756fe55da629b6980b242efeb0e39acf40f92daedec877c5692c3a39bc"
+        },
+        "INLINE_RESULT_MESSAGES_MAX_BYTES": {
+          "stability": "stable",
+          "signature": "08af4bf921451e072776e62a4009350ebf7f1718f89efc7d932fc5abaf0a5bf2"
         },
         "InputType": {
           "stability": "stable",

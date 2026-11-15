@@ -11,6 +11,8 @@ export type { ProgressHeartbeatOpts } from "./heartbeat";
 /** @stability stable */
 export { withProgressHeartbeat } from "./heartbeat";
 /** @stability stable */
+export { INLINE_RESULT_MESSAGES_MAX_BYTES } from "./server/inline-result-wait";
+/** @stability stable */
 export type {
   CreateFxFetcherOpts,
   Currency,
