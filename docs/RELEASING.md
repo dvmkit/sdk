@@ -72,6 +72,8 @@ Before the signed-tag pipeline publishes, compare its actual packed tarball byte
 
 ### Builder-facing release notes
 
+When editing builder-facing notes, preserve release-please's generated PR-body header, footer and structural markers; edit inside that envelope. Release-please parses this structure to recognize prior release pull requests, so replacing it with a free-form summary can break release discovery and replay historical version directives.
+
 The generated changelog is the starting point, not the release note. Before merging a release pull request, edit its body so a builder upgrading this SDK can decide whether to take the version without reading the diff. Four headings, each either filled in or explicitly marked "none":
 
 - **Breaking API changes** — disclose public surface and behavior changes under the [compatibility policy](PROTOCOL-NOTES.md#compatibility-and-versioning). A removed export or changed signature also needs a `!` marker or `BREAKING CHANGE:` commit footer so release-please preserves the disclosure. List additive public exports explicitly too.
