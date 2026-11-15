@@ -426,11 +426,13 @@ function typecheckConsumer(consumer, resolution) {
   );
   const capabilityTypes = join(consumer, `capability-types-${resolution}.ts`);
   cpSync(join(root, "scripts", "fixtures", "capability-types.ts"), capabilityTypes);
+  const poolTypes = join(consumer, `postgres-pool-types-${resolution}.ts`);
+  cpSync(join(root, "scripts", "fixtures", "postgres-pool-types.ts"), poolTypes);
   const moduleKind = resolution === "node16" ? ts.ModuleKind.Node16 : ts.ModuleKind.ESNext;
   const moduleResolution =
     resolution === "node16" ? ts.ModuleResolutionKind.Node16 : ts.ModuleResolutionKind.Bundler;
   const program = ts.createProgram({
-    rootNames: [entry, capabilityTypes],
+    rootNames: [entry, capabilityTypes, poolTypes],
     options: {
       module: moduleKind,
       moduleResolution,
@@ -456,6 +458,7 @@ function typecheckConsumer(consumer, resolution) {
   }
   rmSync(entry, { force: true });
   rmSync(capabilityTypes, { force: true });
+  rmSync(poolTypes, { force: true });
 }
 
 /**
@@ -467,6 +470,8 @@ function typecheckConsumer(consumer, resolution) {
  */
 function libCheckInstalledDeclarations(consumer, installedRoot, installedManifest) {
   const entry = join(consumer, "consumer-lib-check.ts");
+  const poolTypes = join(consumer, "postgres-pool-types-lib-check.ts");
+  cpSync(join(root, "scripts", "fixtures", "postgres-pool-types.ts"), poolTypes);
   writeFileSync(
     entry,
     Object.keys(installedManifest.exports)
@@ -474,7 +479,7 @@ function libCheckInstalledDeclarations(consumer, installedRoot, installedManifes
       .join("\n") + "\n"
   );
   const program = ts.createProgram({
-    rootNames: [entry],
+    rootNames: [entry, poolTypes],
     options: {
       module: ts.ModuleKind.ESNext,
       moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -483,18 +488,17 @@ function libCheckInstalledDeclarations(consumer, installedRoot, installedManifes
       strict: true,
       target: ts.ScriptTarget.ES2024,
       lib: ["lib.esnext.d.ts", "lib.dom.d.ts"],
-      // A consumer brings Node's types. Installing the optional pg dependency brings no types,
-      // so the mapping stands in for @types/pg, which a consumer currently adds itself.
-      typeRoots: [join(root, "node_modules", "@types")],
+      // Resolve ambient types from the clean install, never the repository's devDependencies.
+      typeRoots: [join(consumer, "node_modules", "@types")],
       types: ["node"],
-      paths: { pg: [join(root, "node_modules", "@types", "pg")] },
     },
   });
   const diagnostics = [...program.getSyntacticDiagnostics(), ...program.getSemanticDiagnostics()];
   // The compiler reports resolved paths, which differ from a symlinked temporary directory.
   const packageRoot = realpathSync(installedRoot);
+  const consumerFiles = new Set([entry, poolTypes].map((file) => realpathSync(file)));
   const sdkFile = (/** @type {ts.Diagnostic} */ item) =>
-    item.file === undefined || realpathSync(item.file.fileName) === realpathSync(entry) || item.file.fileName.startsWith(`${packageRoot}/`);
+    item.file === undefined || consumerFiles.has(realpathSync(item.file.fileName)) || item.file.fileName.startsWith(`${packageRoot}/`);
   const own = diagnostics.filter(sdkFile);
   const declarationFiles = program.getSourceFiles().filter((file) => file.fileName.startsWith(`${packageRoot}/`));
   if (declarationFiles.length === 0) fail("the library check loaded none of the installed declarations");
@@ -507,6 +511,7 @@ function libCheckInstalledDeclarations(consumer, installedRoot, installedManifes
     fail(`the installed declarations do not compile with skipLibCheck: false:\n${formatted}`);
   }
   rmSync(entry, { force: true });
+  rmSync(poolTypes, { force: true });
 }
 
 /** @param {string[]} args @param {string} cwd */

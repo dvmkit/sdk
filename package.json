@@ -87,6 +87,7 @@
     "@scure/base": "2.0.0",
     "@scure/bip32": "2.2.0",
     "@scure/bip39": "2.0.1",
+    "@types/pg": "8.18.0",
     "@x402/core": "2.21.0",
     "@x402/evm": "2.21.0",
     "hono": "4.13.14",
@@ -105,7 +106,6 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "25.3.4",
-    "@types/pg": "8.18.0",
     "@types/proper-lockfile": "4.1.4",
     "@types/ws": "8.18.1",
     "@x402/extensions": "2.21.0",
