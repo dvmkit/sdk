@@ -4580,6 +4580,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       res.status = "completed";
       Object.assign(res, terminalResponseFields(snapshot), fields);
       if (messages) res.messages = messages;
+      else if (fields.content_available !== false && snapshot.redactedAt === undefined) {
+        const messagesUrl = `${route.mountPrefix}/v1/job/${snapshot.id}/messages`;
+        res.payload_in = "messages_endpoint";
+        res.messages_url = messagesUrl;
+        res.display = "The service completed this request, but its messages were too large to include in this response.";
+        res.hint = `The messages exceeded the inline size limit. Fetch the output with GET ${messagesUrl}, passing job_token as the X-Job-Token header. The payment has already settled; do not pay again.`;
+      }
       res.charge_outcome = "charged";
       removeUnavailableContent(res);
       return c.json(res, 200, { ...identity, "PAYMENT-RESPONSE": settlement, "X-PAYMENT-RESPONSE": settlement });
