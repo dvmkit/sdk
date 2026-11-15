@@ -4,6 +4,8 @@
 
 ### Bug Fixes
 
+- Oversized x402 route results now return `payload_in: "messages_endpoint"`, a mount-aware `messages_url`, and instructions to fetch with the returned `job_token`, instead of claiming absent inline messages. These retrievable completed results remain charged; fetching does not require another payment. Builders can import `INLINE_RESULT_MESSAGES_MAX_BYTES` from `@dvmkit/sdk` to budget the complete serialized messages array; the 1 MiB limit is unchanged. Clients must handle the new `payload_in` value when `messages` is absent. No database or configuration migration is required.
+
 - Credit receipts keep the recorded draw's totals when another finalizer resolved it differently. If the job's piece totals disagree with the draw's hold or charge, `settlement.pieces` is empty rather than signing a contradictory breakdown. Receipt schema version 1, existing signatures, and write-once persistence are unchanged; no migration is required.
 
 ## Upgrade details
