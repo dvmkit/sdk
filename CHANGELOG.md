@@ -4,6 +4,8 @@
 
 ### Bug Fixes
 
+- `formatUsd` preserves fractional digits instead of rounding displayed prices, with at least two decimal places (`0.015` → `"$0.015"`, `0.1` → `"$0.10"`).
+
 - Ship PostgreSQL types with the SDK so server pool parameters retain type checking without a separate `@types/pg` install, including when library checks are skipped.
 
 - Oversized x402 route results now return `payload_in: "messages_endpoint"`, a mount-aware `messages_url`, and instructions to fetch with the returned `job_token`, instead of claiming absent inline messages. These retrievable completed results remain charged; fetching does not require another payment. Builders can import `INLINE_RESULT_MESSAGES_MAX_BYTES` from `@dvmkit/sdk` to budget the complete serialized messages array; the 1 MiB limit is unchanged. Clients must handle the new `payload_in` value when `messages` is absent. No database or configuration migration is required.
