@@ -137,17 +137,21 @@ export function roundUsd(usd: number): number {
 }
 
 /**
- * Format a USD amount with adaptive precision so sub-cent amounts don't
- * render as `$0.00`. The 2dp/4dp boundary at $0.01 is **human-render**
- * precision and is intentionally coarser than {@link roundUsd}'s storage
- * precision: a value like `0.015` keeps four decimals through `roundUsd`
- * (storage / multiplier inputs) but renders as `$0.02` here (human display).
- * Don't try to unify the two — they serve different surfaces.
+ * Format a USD amount without rounding, preserving its decimal representation
+ * with at least two fractional digits: `0.015` renders as `$0.015`, and `0.1`
+ * as `$0.10`. Scientific notation is expanded to plain decimal notation.
  */
 export function formatUsd(usd: number): string {
-  if (usd === 0) return "$0.00";
-  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
-  return `$${usd.toFixed(4)}`;
+  if (!Number.isFinite(usd)) return `$${usd}`;
+
+  const [mantissa, exponent = "0"] = Math.abs(usd).toString().split("e");
+  const [whole, fraction = ""] = mantissa.split(".");
+  const digits = whole + fraction;
+  const decimalPoint = whole.length + Number(exponent);
+  const integer = decimalPoint <= 0 ? "0" : digits.padEnd(decimalPoint, "0").slice(0, decimalPoint);
+  const decimals = decimalPoint < 0 ? "0".repeat(-decimalPoint) + digits : digits.slice(decimalPoint);
+
+  return `$${usd < 0 ? "-" : ""}${integer}.${decimals.padEnd(2, "0")}`;
 }
 
 /**

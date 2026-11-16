@@ -46,7 +46,7 @@ Builder declarations, handler context, schemas, pricing, and safe request helper
 | `envFlag` | function | runtime | stable | Exported declaration from the built public entry point. |
 | `fiatToSatsCeil` | function | runtime | stable | Convert a fiat amount to integer sats at the supplied fiat-per-BTC rate. |
 | `formatFiat` | function | runtime | stable | Format a fiat amount with currency-aware symbol, precision, and ISO code. |
-| `formatUsd` | function | runtime | stable | Format a USD amount with adaptive precision so sub-cent amounts don't render as `$0.00`. |
+| `formatUsd` | function | runtime | stable | Format a USD amount without rounding, preserving its decimal representation with at least two fractional digits: `0.015` renders as `$0.015`, and `0.1` as `$0.10`. |
 | `FxFetcher` | interface | type-only | stable | Snapshot fetcher for BTC against one or more fiat currencies. |
 | `fxRateFor` | function | runtime | stable | Look up `currency`'s rate in `snapshot`. |
 | `FxRateSnapshot` | interface | type-only | stable | Quote-time FX snapshot. |
