@@ -51,16 +51,37 @@ describe("roundUsd", () => {
 });
 
 describe("formatUsd", () => {
-  it("uses 2 decimals when >= $0.01, 4 decimals below", () => {
-    expect(formatUsd(0)).toBe("$0.00");
-    expect(formatUsd(0.01)).toBe("$0.01");
-    expect(formatUsd(1)).toBe("$1.00");
-    expect(formatUsd(0.005)).toBe("$0.0050");
+  it.each<[number, string]>([
+    [0, "$0.00"],
+    [0.01, "$0.01"],
+    [1, "$1.00"],
+    [0.005, "$0.005"],
+    [0.015, "$0.015"],
+    [0.025, "$0.025"],
+    [0.1, "$0.10"],
+    [1.234567, "$1.234567"],
+    [0.000001, "$0.000001"],
+    [1.23e-7, "$0.000000123"],
+    [1.234e21, "$1234000000000000000000.00"],
+    [-0.015, "$-0.015"],
+    [-1.23e-7, "$-0.000000123"],
+    [-1, "$-1.00"],
+    [-0, "$0.00"],
+  ])("formats %s as %s without rounding", (amount, expected) => {
+    expect(formatUsd(amount)).toBe(expected);
+  });
+
+  it.each<[number, string]>([
+    [NaN, "$NaN"],
+    [Infinity, "$Infinity"],
+    [-Infinity, "$-Infinity"],
+  ])("preserves the diagnostic display for %s", (amount, expected) => {
+    expect(formatUsd(amount)).toBe(expected);
   });
 });
 
 describe("formatFiat", () => {
-  it("renders USD with the $ symbol and adaptive precision matching formatUsd", () => {
+  it("renders USD with the $ symbol and adaptive precision", () => {
     expect(formatFiat(0, "usd")).toBe("$0.00 USD");
     expect(formatFiat(0.01, "usd")).toBe("$0.01 USD");
     expect(formatFiat(0.05, "usd")).toBe("$0.05 USD");
