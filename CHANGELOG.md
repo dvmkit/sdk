@@ -38,6 +38,24 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.39.0](https://github.com/dvmkit/sdk/compare/v0.38.0...v0.39.0) (2026-11-16)
+
+
+### Bug Fixes
+
+* **deps:** update Hono dependencies to patched versions ([82c877c](https://github.com/dvmkit/sdk/commit/82c877c281efee43e673c0b8072046cdb7ef7b9c))
+* **pricing:** preserve fractional digits in USD formatting ([36d96bc](https://github.com/dvmkit/sdk/commit/36d96bc698f289a9b9f791e7a3f90ab6892b49f0))
+* **receipts:** omit piece breakdowns that conflict with recorded draws ([c18f6e3](https://github.com/dvmkit/sdk/commit/c18f6e341ac5f9448a1bfadf3e81dc04f89734ae))
+* **release:** enforce API baseline and changelog rollover ([dcd95c8](https://github.com/dvmkit/sdk/commit/dcd95c822a3adb3972a4a13169dcbec66760ef51))
+* **server:** report unsigned credit payments without a caller ([33294f5](https://github.com/dvmkit/sdk/commit/33294f57da6374ea69e129631708195afcab0020))
+* **types:** ship PostgreSQL pool types to consumers ([cd58bc7](https://github.com/dvmkit/sdk/commit/cd58bc729028a751a8b4e9aeb3e3b3182bc47707))
+* **x402:** explain oversized result retrieval ([c9b99e2](https://github.com/dvmkit/sdk/commit/c9b99e227968d135be093bf86fd13fe4bf507c1b))
+
+
+### Miscellaneous Chores
+
+* release 0.39.0 ([61324a8](https://github.com/dvmkit/sdk/commit/61324a811835e193e79bcc83999e6398f6d1760d))
+
 ## [0.38.0](https://github.com/dvmkit/sdk/compare/v0.37.0...v0.38.0) (2026-11-14)
 
 
