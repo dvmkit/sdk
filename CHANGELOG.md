@@ -2,28 +2,6 @@
 
 ## Unreleased
 
-### Bug Fixes
-
-- Unsigned per-call payments, including development-mode calls, store and report a null caller instead of a placeholder public key. Credit rows, funding, draws, and expiry accounting remain intact. Rejected platform reports now emit `platform_report_rejected` with the report kind and HTTP status after becoming stale; retry rules are unchanged.
-
-- `formatUsd` preserves fractional digits instead of rounding displayed prices, with at least two decimal places (`0.015` → `"$0.015"`, `0.1` → `"$0.10"`).
-
-- Ship PostgreSQL types with the SDK so server pool parameters retain type checking without a separate `@types/pg` install, including when library checks are skipped.
-
-- Oversized x402 route results now return `payload_in: "messages_endpoint"`, a mount-aware `messages_url`, and instructions to fetch with the returned `job_token`, instead of claiming absent inline messages. These retrievable completed results remain charged; fetching does not require another payment. Builders can import `INLINE_RESULT_MESSAGES_MAX_BYTES` from `@dvmkit/sdk` to budget the complete serialized messages array; the 1 MiB limit is unchanged. Clients must handle the new `payload_in` value when `messages` is absent. No database or configuration migration is required.
-
-- Credit receipts keep the recorded draw's totals when another finalizer resolved it differently. If the job's piece totals disagree with the draw's hold or charge, `settlement.pieces` is empty rather than signing a contradictory breakdown. Receipt schema version 1, existing signatures, and write-once persistence are unchanged; no migration is required.
-
-### Breaking API changes
-
-- `CreditSnapshot.callerPubkey`, credit funding inputs, funding callbacks, and expiry-release owners now allow `null`. Custom credit ledgers must accept null ownership and compare owners without treating null as a wildcard. Signed-only credit access and reclaim still require an authenticated owner. Caller-bound funding receipts are withheld for unsigned funding; terminal job receipts continue to carry `requester_pubkey: null`, with no receipt schema version change.
-
-### Migration and platform prerequisites
-
-- Before upgrading the SDK, deploy dvmctl/platform report routes that accept a missing or null caller on credit deposits and expiry releases, including expiry reversals. No placeholder mapping is required on those routes after upgrading.
-- Initialization drops the caller non-null constraints on credits and expiry releases and clears historical `anonymous` and `dev-anonymous` owners in credits, funding records, and expiry releases. Balances, draws, and stored signed receipts are preserved. Stop monetary writers and retry workers sharing the database before upgrading all of them; older versions cannot safely read or write nullable ownership. Assess state compatibility before rolling back.
-- Delivery clears sentinel callers in older queued reports, and unfinished x402 exact-payment intents accept ownerless retries without a second settlement. Existing stale rows remain stale and require accounting review; this upgrade does not redeliver reports already rejected by the platform.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -55,6 +33,37 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Miscellaneous Chores
 
 * release 0.39.0 ([61324a8](https://github.com/dvmkit/sdk/commit/61324a811835e193e79bcc83999e6398f6d1760d))
+
+### Breaking API changes
+
+- `CreditSnapshot.callerPubkey`, credit funding inputs, funding callbacks, and expiry-release owners now allow `null`. Custom credit ledgers must accept null ownership and compare owners without treating null as a wildcard. Signed-only credit access and reclaim still require an authenticated owner. Caller-bound funding receipts are withheld for unsigned funding; terminal job receipts continue to carry `requester_pubkey: null`, with no receipt schema version change.
+- Oversized x402 route results now return `payload_in: "messages_endpoint"` with a `messages_url`; clients must handle this value when `messages` is absent. Additive export: `INLINE_RESULT_MESSAGES_MAX_BYTES`.
+
+### Migrations
+
+- Initialization drops the caller non-null constraints on credits and expiry releases and clears historical `anonymous` and `dev-anonymous` owners in credits, funding records, and expiry releases. Balances, draws, and stored signed receipts are preserved. Stop monetary writers and retry workers sharing the database before upgrading all of them; older versions cannot safely read or write nullable ownership. Assess state compatibility before rolling back.
+- Delivery clears sentinel callers in older queued reports, and unfinished x402 exact-payment intents accept ownerless retries without a second settlement. Existing stale rows remain stale and require accounting review; this upgrade does not redeliver reports already rejected by the platform.
+- No configuration migration.
+
+### Compatibility requirements
+
+- Node.js 22 or newer, unchanged. `hono` moves to 4.13.18 and `@hono/node-server` to 2.1.8; the server now answers `400 Bad Request` to a request path containing a raw backslash, and cancels a response body when the client has already disconnected. PostgreSQL types ship with the SDK, so `@types/pg` is no longer needed for pool parameters.
+
+### dvmctl and platform prerequisites
+
+- Before upgrading the SDK, deploy dvmctl/platform report routes that accept a missing or null caller on credit deposits and expiry releases, including expiry reversals. No placeholder mapping is required on those routes after upgrading.
+
+### Fix details
+
+- Unsigned per-call payments, including development-mode calls, store and report a null caller instead of a placeholder public key. Credit rows, funding, draws, and expiry accounting remain intact. Rejected platform reports now emit `platform_report_rejected` with the report kind and HTTP status after becoming stale; retry rules are unchanged.
+
+- `formatUsd` preserves fractional digits instead of rounding displayed prices, with at least two decimal places (`0.015` → `"$0.015"`, `0.1` → `"$0.10"`).
+
+- Ship PostgreSQL types with the SDK so server pool parameters retain type checking without a separate `@types/pg` install, including when library checks are skipped.
+
+- Oversized x402 route results now return `payload_in: "messages_endpoint"`, a mount-aware `messages_url`, and instructions to fetch with the returned `job_token`, instead of claiming absent inline messages. These retrievable completed results remain charged; fetching does not require another payment. Builders can import `INLINE_RESULT_MESSAGES_MAX_BYTES` from `@dvmkit/sdk` to budget the complete serialized messages array; the 1 MiB limit is unchanged. Clients must handle the new `payload_in` value when `messages` is absent. No database or configuration migration is required.
+
+- Credit receipts keep the recorded draw's totals when another finalizer resolved it differently. If the job's piece totals disagree with the draw's hold or charge, `settlement.pieces` is empty rather than signing a contradictory breakdown. Receipt schema version 1, existing signatures, and write-once persistence are unchanged; no migration is required.
 
 ## [0.38.0](https://github.com/dvmkit/sdk/compare/v0.37.0...v0.38.0) (2026-11-14)
 
