@@ -1761,7 +1761,10 @@ export class CreditLedger {
     const q = args.tx ?? this.pool;
     const { rows } = await q.query<FundingRow>(
       `UPDATE credit_fundings
-          SET caller_pubkey = COALESCE(caller_pubkey, $3),
+          SET caller_pubkey = CASE
+                WHEN balance_after_micro IS NULL AND ledger_seq IS NULL THEN COALESCE(caller_pubkey, $3)
+                ELSE caller_pubkey
+              END,
               balance_after_micro = COALESCE(balance_after_micro, $4),
               ledger_seq = COALESCE(ledger_seq, $5)
         WHERE credit_id = $1 AND fund_id = $2

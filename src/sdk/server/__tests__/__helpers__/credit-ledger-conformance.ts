@@ -36,6 +36,14 @@ export function describeCreditLedgerConformance(
       expect(await ledger.get(funding.creditId, { nowMs: 1_000 })).toMatchObject({
         callerPubkey: null, balanceMicro: 1_400, availableMicro: 1_400,
       });
+      await ledger.recordFunding({ creditId: funding.creditId, fundId: "unsigned-fund", amountMicro: 2_000,
+        rail: "cashu", nowMs: 1_000 });
+      await ledger.completeFunding({ creditId: funding.creditId, fundId: "unsigned-fund", callerPubkey: null,
+        balanceAfterMicro: 1_400, ledgerSeq: 1 });
+      await ledger.completeFunding({ creditId: funding.creditId, fundId: "unsigned-fund", callerPubkey: CALLER_A,
+        balanceAfterMicro: 9_000, ledgerSeq: 9 });
+      expect(await ledger.getFunding({ creditId: funding.creditId, fundId: "unsigned-fund" }))
+        .toMatchObject({ callerPubkey: null, balanceAfterMicro: 1_400, ledgerSeq: 1 });
       expect(await ledger.getForCaller(CALLER_A)).toEqual([]);
       for (const callerPubkey of [CALLER_A, null as unknown as string]) {
         await expect(ledger.requestDrain({ creditId: funding.creditId, drainId: "claim", callerPubkey,

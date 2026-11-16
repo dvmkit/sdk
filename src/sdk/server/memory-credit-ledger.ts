@@ -325,7 +325,10 @@ export class MemoryCreditLedger implements CreditLedgerLike {
           `funding ${args.fundId} on credit ${args.creditId} was not recorded`
         );
       }
-      record.callerPubkey ??= args.callerPubkey;
+      // A completed null owner is a recorded fact, not an unfilled receipt field.
+      if (record.balanceAfterMicro === null && record.ledgerSeq === null) {
+        record.callerPubkey ??= args.callerPubkey;
+      }
       record.balanceAfterMicro ??= args.balanceAfterMicro;
       record.ledgerSeq ??= args.ledgerSeq;
       return record;
