@@ -188,8 +188,8 @@ export interface CreditDepositPayload {
   /** Platform DVM record ID (`dvms.id`); must match the bearer token's DVM. */
   dvmId: string;
   creditId: string;
-  /** Canonical owner of the funded credit. */
-  callerPubkey: string;
+  /** Authenticated owner, or null for an unsigned per-call payment. */
+  callerPubkey: string | null;
   /** The rail's settlement reference — the deposit's idempotency key. */
   fundingId: string;
   /** Payment rail (`"cashu"`, `"tempo"`, `"x402"`). */
@@ -419,7 +419,7 @@ export interface CreditExpiryReleasePayload {
   creditId: string;
   /** Per-expiry-episode key; the platform idempotency key with DVM and credit. */
   releaseId: string;
-  callerPubkey: string;
+  callerPubkey: string | null;
   /** Funding rail. `null` on a credit funded before the basis became mandatory. */
   rail: string | null;
   /** Fiat micro released — the liability this expiry extinguishes. */
@@ -1250,7 +1250,7 @@ export class RevenueReporter {
     await q.query(
       `INSERT INTO ${PENDING_DVM_REPORTS_TABLE} (id, payload, created_at, kind)
        VALUES ($1, $2, $3, $4)`,
-      [id, JSON.stringify(payload), Date.now(), kind]
+      [id, JSON.stringify(withoutSentinelCaller(payload)), Date.now(), kind]
     );
     return id;
   }
@@ -1275,7 +1275,7 @@ export class RevenueReporter {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.platformToken}`,
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(withoutSentinelCaller(payload)),
         signal: AbortSignal.timeout(10_000),
       });
     } catch (err) {
@@ -1321,9 +1321,7 @@ export class RevenueReporter {
 
     if (res.status === 401) {
       await this.markStale(id, "token_rotated");
-      diagnosticConsole.warn(
-        `[revenue-reporter] Report ${id} got 401 — marking stale (token likely rotated)`
-      );
+      diagnosticConsole.warn({ event: "platform_report_rejected", report_kind: kind, status_code: res.status });
       return;
     }
 
@@ -1332,9 +1330,7 @@ export class RevenueReporter {
     // do not throw, or the retry loop would pointlessly bump retry_count on a dead row.
     if (res.status >= 400 && res.status < 500) {
       await this.markStale(id, `client_error:${res.status}`);
-      diagnosticConsole.warn(
-        `[revenue-reporter] Report ${id} got HTTP ${res.status} — marking stale (permanent client error, will not retry)`
-      );
+      diagnosticConsole.warn({ event: "platform_report_rejected", report_kind: kind, status_code: res.status });
       return;
     }
 
@@ -1349,4 +1345,12 @@ export class RevenueReporter {
       [reason, id]
     );
   }
+}
+
+/** Older queued reports may outlive the ledger migration that clears these owners. */
+function withoutSentinelCaller(payload: object): object {
+  const caller = (payload as { callerPubkey?: unknown }).callerPubkey;
+  return caller === "anonymous" || caller === "dev-anonymous"
+    ? { ...payload, callerPubkey: null }
+    : payload;
 }

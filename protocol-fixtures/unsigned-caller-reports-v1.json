@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "Unsigned payments retain their accounting records with a null caller. Platform report routes must accept null callerPubkey. Draw and revenue reports omit caller identity; terminal job receipts use requester_pubkey: null.",
+  "deposit": {
+    "endpoint": "/_internal/credit-deposit",
+    "body": {
+      "dvmId": "test-dvm",
+      "creditId": "imp:cashu:upfront",
+      "callerPubkey": null,
+      "fundingId": "upfront",
+      "rail": "cashu",
+      "paidMsats": 100000,
+      "amountMicro": 100000,
+      "creditCurrency": "usd",
+      "grossPaidMsats": 100000,
+      "cashuInputFeeMsats": 0,
+      "fundedAt": 1790000000000,
+      "expiryMs": 1797776000000
+    }
+  },
+  "expiry_release": {
+    "endpoint": "/_internal/credit-expiry-release",
+    "body": {
+      "dvmId": "test-dvm",
+      "creditId": "imp:cashu:upfront",
+      "releaseId": "xrel:1800000000000:1",
+      "callerPubkey": null,
+      "rail": "cashu",
+      "amountMicro": 400,
+      "creditCurrency": "usd",
+      "expiryMs": 1800000000000,
+      "releasedAt": 1800000001000,
+      "reversedAt": null
+    }
+  }
+}

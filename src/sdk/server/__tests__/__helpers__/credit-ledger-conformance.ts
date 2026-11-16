@@ -15,6 +15,43 @@ import { TEST_FUNDING_BASIS } from "./credit-fixtures.js";
 export function describeCreditLedgerConformance(
   makeLedger: () => CreditLedgerLike | Promise<CreditLedgerLike>
 ): void {
+  describe("CreditLedgerLike unsigned ownership", () => {
+    it("keeps ownerless funding and settlement separate from signed callers", async () => {
+      const ledger = await makeLedger();
+      const funding = {
+        creditId: "contract-unsigned",
+        callerPubkey: null,
+        currency: "usd",
+        amountMicro: 1_000,
+        expiryMs: 10_000,
+        nowMs: 1_000,
+        basis: TEST_FUNDING_BASIS,
+      };
+      await ledger.fund(funding);
+      await ledger.fund(funding);
+      await expect(ledger.fund({ ...funding, callerPubkey: CALLER_A }))
+        .rejects.toMatchObject({ code: "caller_mismatch" });
+      await ledger.draw({ creditId: funding.creditId, drawId: "unsigned-draw", amountMicro: 600, nowMs: 1_000 });
+      await ledger.settle({ creditId: funding.creditId, drawId: "unsigned-draw" });
+      expect(await ledger.get(funding.creditId, { nowMs: 1_000 })).toMatchObject({
+        callerPubkey: null, balanceMicro: 1_400, availableMicro: 1_400,
+      });
+      expect(await ledger.getForCaller(CALLER_A)).toEqual([]);
+      for (const callerPubkey of [CALLER_A, null as unknown as string]) {
+        await expect(ledger.requestDrain({ creditId: funding.creditId, drainId: "claim", callerPubkey,
+          method: "cashu", payout: {}, nowMs: 1_000 })).rejects.toMatchObject({ code: "caller_mismatch" });
+      }
+      expect(await ledger.get(funding.creditId, { nowMs: 1_000 })).toMatchObject({ balanceMicro: 1_400 });
+      expect(await ledger.getForCaller(null as unknown as string)).toEqual([]);
+
+      if (ledger.sweepExpiredCredits) {
+        const expired = await ledger.sweepExpiredCredits({ nowMs: 20_000 });
+        expect(expired.released).toEqual([expect.objectContaining({ creditId: funding.creditId,
+          callerPubkey: null, amountMicro: 1_400 })]);
+      }
+    });
+  });
+
   describe("CreditLedgerLike funding-expiry conformance", () => {
     it("retains a persisted 30-day expiry until top-up and never shortens a longer expiry", async () => {
       const ledger = await makeLedger();

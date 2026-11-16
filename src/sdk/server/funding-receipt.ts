@@ -18,10 +18,9 @@ export async function fundingReceiptFor(
   issuer: ReceiptIssuer | undefined,
   funding: FundingRecord
 ): Promise<FundingReceipt | undefined> {
-  if (!issuer) return undefined;
+  if (!issuer || funding.callerPubkey === null) return undefined;
   if (funding.receipt) return isFundingReceipt(funding.receipt) ? funding.receipt : undefined;
   if (
-    funding.callerPubkey === null ||
     funding.balanceAfterMicro === null ||
     funding.ledgerSeq === null ||
     isDrawBound(funding)
@@ -63,10 +62,9 @@ export async function drawFundingReceiptFor(
   funding: FundingRecord,
   currency: string
 ): Promise<DrawFundingReceipt | undefined> {
-  if (!issuer) return undefined;
+  if (!issuer || funding.callerPubkey === null) return undefined;
   if (funding.receipt) return isDrawFundingReceipt(funding.receipt) ? funding.receipt : undefined;
   if (
-    funding.callerPubkey === null ||
     funding.balanceAfterMicro === null ||
     funding.ledgerSeq === null ||
     !funding.jobId ||
