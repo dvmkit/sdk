@@ -155,6 +155,25 @@ describe("durable exact x402 settlement", () => {
     ).toMatchObject({ status: "complete", transaction: TRANSACTION });
   });
 
+  it.each(["anonymous", "dev-anonymous"])("recovers a legacy %s effect as ownerless without resettling or accepting a signed owner", async (callerId) => {
+    const store = new MemoryX402ExactSettlementStore();
+    const fetch = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(response({ isValid: true }))
+      .mockResolvedValueOnce(response({ success: true, transaction: TRANSACTION }));
+    const server = new X402ExactSettlementServer({ store, evidence: evidence() });
+    const commit = vi.fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error("database unavailable"))
+      .mockResolvedValue("booked");
+    const effect = { ...jobEffect("legacy-job"), callerId };
+    await expect(accept(server, commit, header(), { effect })).rejects.toThrow("database unavailable");
+    await expect(accept(server, commit, header(), { effect: { ...effect, callerId: null } }))
+      .resolves.toMatchObject({ outcome: "accepted", receipt: { txHash: TRANSACTION } });
+    await expect(accept(server, commit, header(), { effect: { ...effect, callerId: "ab".repeat(32) } }))
+      .rejects.toBeInstanceOf(X402ExactIntentConflictError);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenCalledTimes(2);
+  });
+
   it("puts only the allowed, bounded settle fields into a fresh, recovered and replayed receipt", async () => {
     const store = new MemoryX402ExactSettlementStore();
     vi.spyOn(globalThis, "fetch")

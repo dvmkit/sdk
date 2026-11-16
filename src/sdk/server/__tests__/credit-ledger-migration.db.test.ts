@@ -46,6 +46,40 @@ describe.skipIf(!RUN)(
       });
     });
 
+    it("migrates sentinel owners without losing signed ownership or accounting history", async () => {
+      const ledger = new CreditLedger(pool);
+      await ledger.init();
+      const signedCaller = "ab".repeat(32);
+      for (const [creditId, callerPubkey] of [["legacy-unsigned", "anonymous"],
+        ["legacy-dev", "dev-anonymous"], ["legacy-signed", signedCaller]]) {
+        await fundCredit(ledger, { creditId, callerPubkey, currency: "usd", amountMicro: 1_000,
+          expiryMs: 10_000, nowMs: 1_000 });
+        await ledger.recordFunding({ creditId, fundId: "fund", amountMicro: 1_000, rail: "cashu" });
+        await ledger.completeFunding({ creditId, fundId: "fund", callerPubkey, balanceAfterMicro: 1_000, ledgerSeq: 0 });
+        await ledger.draw({ creditId, drawId: "served", amountMicro: 600, nowMs: 1_000 });
+        await ledger.settle({ creditId, drawId: "served" });
+      }
+      await ledger.sweepExpiredCredits({ nowMs: 20_000 });
+      // Recreate the old constraints: a fresh CREATE TABLE would miss this upgrade.
+      await pool.query("ALTER TABLE credits ALTER COLUMN caller_pubkey SET NOT NULL");
+      await pool.query("ALTER TABLE credit_expiry_releases ALTER COLUMN caller_pubkey SET NOT NULL");
+      await new CreditLedger(pool).init();
+      await new CreditLedger(pool).init();
+      for (const [creditId, callerPubkey] of [["legacy-unsigned", null], ["legacy-dev", null], ["legacy-signed", signedCaller]]) {
+        expect(await ledger.get(creditId!)).toMatchObject({ callerPubkey, balanceMicro: 0, lastLedgerSeq: 1 });
+        expect(await ledger.getDraw({ creditId: creditId!, drawId: "served" }))
+          .toMatchObject({ status: "settled", amountMicro: 600 });
+        expect(await ledger.getFunding({ creditId: creditId!, fundId: "fund" })).toMatchObject({ callerPubkey, amountMicro: 1_000 });
+        const { rows } = await pool.query("SELECT caller_pubkey, amount_micro FROM credit_expiry_releases WHERE credit_id = $1", [creditId]);
+        expect(rows).toEqual([{ caller_pubkey: callerPubkey, amount_micro: "400" }]);
+      }
+      const funded = await fundCredit(ledger, { creditId: "legacy-unsigned", callerPubkey: null,
+        currency: "usd", amountMicro: 100, expiryMs: 30_000, nowMs: 21_000 });
+      expect(funded).toMatchObject({ callerPubkey: null, balanceMicro: 500 });
+      const { rows } = await pool.query("SELECT reversed_at FROM credit_expiry_releases WHERE credit_id = 'legacy-unsigned'");
+      expect(rows[0].reversed_at).toBe("21000");
+    });
+
     it("backfills credit_drains.balance_after_micro and credit_fundings.rail onto a pre-existing table, and requestDrain succeeds", async () => {
       const ledger = new CreditLedger(pool);
       await ledger.init();

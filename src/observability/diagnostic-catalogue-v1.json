@@ -320,6 +320,7 @@
     "platform_db_health_endpoint_failed",
     "platform_db_health_recovery_failed",
     "platform_hosted_test_mint_allowed",
+    "platform_report_rejected",
     "postgres_client_error",
     "postgres_pool_error",
     "postgres_transport_recovery",

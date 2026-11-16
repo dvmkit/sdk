@@ -2035,6 +2035,9 @@ async function resolveDrainEffect(
       ),
     };
   }
+  if (credit.callerPubkey === null) {
+    return { response: c.json({ error: "caller_mismatch", message: "Channel credit has no authenticated owner." }, 422) };
+  }
   const prefix = `${credit.creditId}:`;
   if (!intent.effectId.startsWith(prefix)) {
     return {

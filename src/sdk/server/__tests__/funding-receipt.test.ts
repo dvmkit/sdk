@@ -47,6 +47,22 @@ describe("credit funding receipts", () => {
     expect(JSON.stringify(replayed)).toBe(JSON.stringify(first));
   });
 
+  it("withholds caller-bound receipts for migrated unsigned funding without rewriting old signatures", async () => {
+    const ledger = new MemoryCreditLedger();
+    const issuer = new ReceiptIssuer({ secret: "12".repeat(32), dvm: "funding-test", dvmId: "test-dvm" });
+    await ledger.recordFunding({ creditId: "unsigned", fundId: "fund", amountMicro: 500, rail: "cashu" });
+    const funding = await ledger.completeFunding({ creditId: "unsigned", fundId: "fund", callerPubkey: null,
+      balanceAfterMicro: 500, ledgerSeq: 0 });
+    const oldReceipt = issuer.issueFunding({ creditId: "unsigned", fundId: "fund", fundedMicro: 500,
+      balanceAfterMicro: 500, ledgerSeq: 0, callerPubkey: "anonymous" });
+    await ledger.saveFundingReceipt({ creditId: "unsigned", fundId: "fund", receipt: oldReceipt });
+    const migrated = (await ledger.getFunding({ creditId: "unsigned", fundId: "fund" }))!;
+    expect(await fundingReceiptFor(ledger, issuer, migrated)).toBeUndefined();
+    expect(await drawFundingReceiptFor(ledger, issuer, { ...funding, jobId: "job", drawId: "draw" }, "usd"))
+      .toBeUndefined();
+    expect((await ledger.getFunding({ creditId: "unsigned", fundId: "fund" }))?.receipt).toEqual(oldReceipt);
+  });
+
   // The receipt slot is write-once. A mid-job row reaches the opening-receipt
   // path through the fund replay routes, and signing it there would misstate
   // the draw's sequence and the post-growth balance while making the draw

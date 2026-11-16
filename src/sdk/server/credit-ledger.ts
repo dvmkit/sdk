@@ -171,7 +171,7 @@ export class CreditLedger {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS credits (
         credit_id        TEXT PRIMARY KEY,
-        caller_pubkey    TEXT NOT NULL,
+        caller_pubkey    TEXT,
         currency         TEXT NOT NULL,
         balance_micro    BIGINT NOT NULL,
         expiry_ms        BIGINT NOT NULL,
@@ -535,7 +535,7 @@ export class CreditLedger {
       CREATE TABLE IF NOT EXISTS credit_expiry_releases (
         credit_id     TEXT NOT NULL,
         release_id    TEXT NOT NULL,
-        caller_pubkey TEXT NOT NULL,
+        caller_pubkey TEXT,
         currency      TEXT NOT NULL,
         rail          TEXT,
         amount_micro  BIGINT NOT NULL,
@@ -552,6 +552,13 @@ export class CreditLedger {
       `CREATE INDEX IF NOT EXISTS idx_credit_expiry_releases_open
          ON credit_expiry_releases(credit_id) WHERE reversed_at IS NULL;`
     );
+    // Unsigned per-call payments still need accounting rows, but have no owner key.
+    // Clear only the historical sentinels; signed receipt bytes remain immutable.
+    for (const table of ["credits", "credit_expiry_releases", "credit_fundings"]) {
+      await this.pool.query(`ALTER TABLE ${table} ALTER COLUMN caller_pubkey DROP NOT NULL`);
+      await this.pool.query(`UPDATE ${table} SET caller_pubkey = NULL
+        WHERE caller_pubkey IN ('anonymous', 'dev-anonymous')`);
+    }
     // A partial settle rewrites the draw down to its settled part. These keep the hold it
     // replaced and what went back to the credit; NULL on every draw resolved whole.
     await this.pool.query(`ALTER TABLE credit_draws
@@ -690,7 +697,7 @@ export class CreditLedger {
                ELSE COALESCE(credits.native_remaining, 0) + EXCLUDED.native_remaining
              END,
              x402_channel_id = COALESCE(credits.x402_channel_id, EXCLUDED.x402_channel_id)
-         WHERE credits.caller_pubkey = EXCLUDED.caller_pubkey
+         WHERE credits.caller_pubkey IS NOT DISTINCT FROM EXCLUDED.caller_pubkey
            AND credits.status = 'active'
            AND credits.currency = EXCLUDED.currency
            AND (credits.rail IS NULL OR credits.rail = EXCLUDED.rail)
@@ -1746,7 +1753,7 @@ export class CreditLedger {
   async completeFunding(args: {
     creditId: string;
     fundId: string;
-    callerPubkey: string;
+    callerPubkey: string | null;
     balanceAfterMicro: number;
     ledgerSeq: number;
     tx?: CreditLedgerQuerier;
@@ -1754,7 +1761,10 @@ export class CreditLedger {
     const q = args.tx ?? this.pool;
     const { rows } = await q.query<FundingRow>(
       `UPDATE credit_fundings
-          SET caller_pubkey = COALESCE(caller_pubkey, $3),
+          SET caller_pubkey = CASE
+                WHEN balance_after_micro IS NULL AND ledger_seq IS NULL THEN COALESCE(caller_pubkey, $3)
+                ELSE caller_pubkey
+              END,
               balance_after_micro = COALESCE(balance_after_micro, $4),
               ledger_seq = COALESCE(ledger_seq, $5)
         WHERE credit_id = $1 AND fund_id = $2
@@ -2590,7 +2600,7 @@ export class CreditLedger {
   }): Promise<DrainRequestResult> {
     const nowMs = args.nowMs ?? Date.now();
     const run = async (client: CreditLedgerQuerier, credit: CreditRow) => {
-      if (credit.caller_pubkey !== args.callerPubkey) {
+      if (credit.caller_pubkey === null || credit.caller_pubkey !== args.callerPubkey) {
         throw new CreditLedgerError(
           "caller_mismatch",
           `credit ${args.creditId} belongs to a different caller pubkey`
@@ -3998,7 +4008,7 @@ export interface CreditLedgerLike {
   ): Promise<X402UnresolvedRefund | undefined>;
   fund(args: {
     creditId?: string;
-    callerPubkey: string;
+    callerPubkey: string | null;
     currency: string;
     amountMicro: number;
     expiryMs: number;
@@ -4072,7 +4082,7 @@ export interface CreditLedgerLike {
   completeFunding(args: {
     creditId: string;
     fundId: string;
-    callerPubkey: string;
+    callerPubkey: string | null;
     balanceAfterMicro: number;
     ledgerSeq: number;
     tx?: CreditLedgerQuerier;
@@ -4281,7 +4291,7 @@ export interface CreditExpiryRelease {
    * Key derived from expiry instant and the release sequence counted under the credit lock.
    */
   releaseId: string;
-  callerPubkey: string;
+  callerPubkey: string | null;
   currency: string;
   /** Funding rail, or `null` on a credit funded before the basis was mandatory. */
   rail: string | null;
@@ -4657,7 +4667,8 @@ export interface DrainRequestResult {
  */
 export interface CreditSnapshot {
   creditId: string;
-  callerPubkey: string;
+  /** Authenticated owner, or null for an unsigned per-call payment. */
+  callerPubkey: string | null;
   currency: string;
   /** Funded balance, 1e-6 currency units. Pending holds are NOT subtracted. */
   balanceMicro: number;
@@ -4904,7 +4915,7 @@ export interface CreditFundArgs {
    * caller’s responsibility.
    */
   creditId?: string;
-  callerPubkey: string;
+  callerPubkey: string | null;
   /** The DVM's pricing currency; `amountMicro` is 1e-6 of it. */
   currency: string;
   amountMicro: number;
@@ -5329,7 +5340,7 @@ interface CreditBasisRow {
 /** Raw `credits` row. BIGINTs arrive as strings from pg. */
 interface CreditRow extends CreditBasisRow {
   credit_id: string;
-  caller_pubkey: string;
+  caller_pubkey: string | null;
   currency: string;
   balance_micro: string;
   expiry_ms: string;
@@ -5345,7 +5356,7 @@ interface CreditRow extends CreditBasisRow {
 interface CreditExpiryReleaseRow {
   credit_id: string;
   release_id: string;
-  caller_pubkey: string;
+  caller_pubkey: string | null;
   currency: string;
   rail: string | null;
   amount_micro: string;
@@ -5674,6 +5685,9 @@ function x402CreditLossFromRow(row: X402CreditLossRow): X402CreditLoss {
 }
 
 function drainRecordFromRow(row: DrainRow, credit: DrainCreditJoin): CreditDrainRecord {
+  if (credit.caller_pubkey === null) {
+    throw new CreditLedgerError("caller_mismatch", "A drain requires an authenticated credit owner");
+  }
   return {
     creditId: row.credit_id,
     drainId: row.drain_id,

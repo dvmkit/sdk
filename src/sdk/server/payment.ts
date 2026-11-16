@@ -226,8 +226,8 @@ export interface PaymentInfo {
  */
 export interface CreditFundingReport {
   creditId: string;
-  /** Canonical owner returned by the ledger after applying the funding. */
-  callerPubkey: string;
+  /** Authenticated owner returned by the ledger, or null for unsigned funding. */
+  callerPubkey: string | null;
   /** The rail's own settlement reference — the deposit's idempotency key. */
   fundingId: string;
   rail: FundingMethod;
@@ -425,7 +425,7 @@ export interface UpfrontPaymentOpts {
   requestAuthFingerprint?: string;
   /** Verified caller pubkey from the signed-request envelope, when the DVM has auth. */
   callerPubkey?: string;
-  /** Requester id — funder identity fallback for DVMs without descriptor auth. */
+  /** Requester id used for job access; never a credit owner key. */
   requesterId?: string;
   /**
    * Explicit credit fields extracted from the signed body (the signed credit contract). Their
@@ -807,7 +807,7 @@ async function verifyCardFundingInScope(
     priceFiat: { currency: "usd", amountMicro },
     // A card charge is valued in cents, never through a sats quote.
     requiredMsats: 0,
-    callerId: opts.callerPubkey ?? opts.requesterId ?? "anonymous",
+    callerId: opts.callerPubkey ?? null,
     dvmId: opts.dvmId ?? "",
     fundOnly,
     drawBasis: false,
@@ -4250,8 +4250,8 @@ interface LedgerContext {
   enqueueCreditDeposit?: CreditDepositEnqueue;
   priceFiat: PriceFiat;
   requiredMsats: number;
-  /** Funder identity: verified caller pubkey, else requester id, else "anonymous". */
-  callerId: string;
+  /** Authenticated funder key, or null for an unsigned per-call payment. */
+  callerId: string | null;
   jobId?: string;
   paymentSeq?: number;
   jobAdmission?: { requestFingerprint: string; authFingerprint?: string };
@@ -4351,7 +4351,7 @@ function resolveLedgerContext(opts: UpfrontPaymentOpts): LedgerContext | undefin
     enqueueCreditDeposit: opts.enqueueCreditDeposit,
     priceFiat: opts.priceFiat,
     requiredMsats: opts.requiredMsats,
-    callerId: opts.callerPubkey ?? opts.requesterId ?? "anonymous",
+    callerId: opts.callerPubkey ?? null,
     jobId: opts.jobId,
     jobAdmission:
       opts.jobId && opts.requestFingerprint
@@ -4450,7 +4450,7 @@ async function resolveTopUpLedgerContext(
   const landAsBalance = snapshot.landAsBalance ?? (requiredMsats <= 0 ? "no_open_ask" : undefined);
 
   let topUp: { creditId: string; drawId: string; ledgerSeq?: number } | undefined;
-  let callerId = snapshot.requesterPubkey ?? snapshot.requesterId ?? "anonymous";
+  let callerId: string | null = snapshot.requesterPubkey ?? null;
   let currency = snapshot.pendingPaymentFiatCurrency ?? opts.pricingCurrency ?? "usd";
   let drawBasis = false;
   let growsDraw = false;
@@ -5306,7 +5306,7 @@ export async function repairX402ExactSettlementEffect(args: {
     enqueueCreditDeposit: args.enqueueCreditDeposit,
     priceFiat: effect.priceFiat,
     requiredMsats: effect.requiredMsats,
-    callerId: effect.callerId,
+    callerId: effect.callerId === "anonymous" || effect.callerId === "dev-anonymous" ? null : effect.callerId,
     dvmId: effect.dvmId,
     jobId: effect.jobId,
     paymentSeq: effect.paymentSeq ?? effect.hostingPaymentSeq,

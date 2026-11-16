@@ -21,7 +21,7 @@ export type X402ExactSettlementStatus =
 export interface X402ExactSettlementEffect {
   priceFiat: { currency: string; amountMicro: number };
   requiredMsats: number;
-  callerId: string;
+  callerId: string | null;
   dvmId: string;
   jobId?: string;
   /** Durable pending-verification message sequence of a mid-job payment. */
@@ -956,7 +956,15 @@ function sameIntentBinding(
         }
       : incoming.effect;
   return (
-    canonicalize((stored.effect ?? null) as JsonValue) ===
-    canonicalize((incomingEffect ?? null) as JsonValue)
+    canonicalize(comparableEffect(stored.effect) as JsonValue) ===
+    canonicalize(comparableEffect(incomingEffect) as JsonValue)
   );
+}
+
+/** A pre-upgrade unsigned intent must bind to its retry without changing any signed owner. */
+function comparableEffect(effect: X402ExactSettlementEffect | undefined): X402ExactSettlementEffect | null {
+  if (!effect) return null;
+  return (effect.callerId === "anonymous" || effect.callerId === "dev-anonymous"
+    ? { ...effect, callerId: null }
+    : effect);
 }

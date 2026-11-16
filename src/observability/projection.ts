@@ -431,6 +431,10 @@ function projectField(
   identityAuthority?: DiagnosticIdentityAuthority,
   eventName?: string,
 ): unknown {
+  if (eventName === "platform_report_rejected" && key === "report_kind") {
+    return typeof value === "string" && ["job_terminal", "revenue", "cost", "deposit", "refund", "release", "drain", "payout", "expiry_release"].includes(value)
+      ? value : undefined;
+  }
   if (eventName === "x402_shutdown_claim_incomplete") {
     if (key === "unclaimed_channels") return value === null || isNonnegativeSafeInteger(value) ? value : undefined;
     if (key === "unclaimed_amount_native") return value === null || typeof value === "string" && DECIMAL_RE.test(value) ? value : undefined;

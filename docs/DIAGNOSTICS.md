@@ -55,3 +55,9 @@ Catalogue version 1 includes the additive identity field `dvm_resolution`, whose
 Trusted instrumentation sets the mark with `pinDimension("dvm_resolution", "none")` inside a trace context, or extends and binds a process-local `DiagnosticIdentityAuthority` with `extendDiagnosticIdentityAuthority`. Ordinary dimensions and attributes cannot grant this authority. Projection ignores input values and retains only the bound authority's value; it drops the field when authority is missing, forged, or does not carry the mark. Authority bindings survive in-process projection and buffering, but do not serialize: receiving a JSON row with the mark grants no authority to retain it.
 
 When an authority carries both `dvm_id` and `dvm_resolution`, projection retains the DVM identity and omits `dvm_resolution` from dimensions and attributes, regardless of pinning order or whether the input includes `dvm_id`. All diagnostic sinks apply this rule, including stdout, HTTP serialization, and direct PostgreSQL insertion. Invalid mark values do not extend or replace the existing authority.
+
+## Permanently rejected platform reports
+
+`platform_report_rejected` is a warning emitted after a queued report becomes stale on a permanent client error, including an unauthorized response. `report_kind` is one of `job_terminal`, `revenue`, `cost`, `deposit`, `refund`, `release`, `drain`, `payout`, or `expiry_release`; `status_code` is the HTTP status. It carries no report payload, response text, token, or caller key.
+
+The row remains in the outbox with its existing stale reason and is not retried. Inspect the rejected accounting fact and correct the platform compatibility or authorization problem before arranging reconciliation. A refund waiting for its original revenue report (status 409) and transient server failures keep their existing retry behavior and do not emit this event.

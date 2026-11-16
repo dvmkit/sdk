@@ -325,7 +325,10 @@ export class MemoryCreditLedger implements CreditLedgerLike {
           `funding ${args.fundId} on credit ${args.creditId} was not recorded`
         );
       }
-      record.callerPubkey ??= args.callerPubkey;
+      // A completed null owner is a recorded fact, not an unfilled receipt field.
+      if (record.balanceAfterMicro === null && record.ledgerSeq === null) {
+        record.callerPubkey ??= args.callerPubkey;
+      }
       record.balanceAfterMicro ??= args.balanceAfterMicro;
       record.ledgerSeq ??= args.ledgerSeq;
       return record;
@@ -643,7 +646,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
 
   private fundSync(args: {
     creditId?: string;
-    callerPubkey: string;
+    callerPubkey: string | null;
     currency: string;
     amountMicro: number;
     expiryMs: number;
@@ -960,7 +963,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     const nowMs = opts?.nowMs ?? Date.now();
     return Promise.resolve(
       [...this.credits.values()]
-        .filter((c) => c.callerPubkey === callerPubkey)
+        .filter((c) => c.callerPubkey !== null && c.callerPubkey === callerPubkey)
         .sort((a, b) => a.createdAt - b.createdAt || a.creditId.localeCompare(b.creditId))
         .map((c) => this.snapshot(c, nowMs))
     );
@@ -1075,6 +1078,9 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         const consumedServiceMicro = [...credit.draws.values()]
           .filter((draw) => draw.status === "settled")
           .reduce((sum, draw) => sum + draw.amountMicro, 0);
+        if (credit.callerPubkey === null) {
+          throw new CreditLedgerError("caller_mismatch", "A channel requires an authenticated credit owner");
+        }
         this.tempoLosses.set(credit.creditId, {
           creditId: credit.creditId,
           channelId,
@@ -1130,6 +1136,9 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         const consumedServiceMicro = [...credit.draws.values()]
           .filter((draw) => draw.status === "settled")
           .reduce((sum, draw) => sum + draw.amountMicro, 0);
+        if (credit.callerPubkey === null) {
+          throw new CreditLedgerError("caller_mismatch", "A channel requires an authenticated credit owner");
+        }
         this.x402Losses.set(credit.creditId, {
           creditId: credit.creditId,
           channelId,
@@ -1176,7 +1185,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
     return run(() => {
       const nowMs = args.nowMs ?? Date.now();
       const credit = this.requireCredit(args.creditId);
-      if (credit.callerPubkey !== args.callerPubkey) {
+      if (credit.callerPubkey === null || credit.callerPubkey !== args.callerPubkey) {
         throw new CreditLedgerError(
           "caller_mismatch",
           `credit ${args.creditId} belongs to a different caller pubkey`
@@ -1780,7 +1789,7 @@ export class MemoryCreditLedger implements CreditLedgerLike {
 
 interface MemoryCredit {
   creditId: string;
-  callerPubkey: string;
+  callerPubkey: string | null;
   currency: string;
   balanceMicro: number;
   expiryMs: number;
@@ -2020,6 +2029,9 @@ function compareToCursor(invoice: CreditInvoiceRecord, cursor: BlockedInvoiceCur
  * observations are not cloned or authenticated.
  */
 function drainRecord(drain: MemoryDrain, credit: MemoryCredit): CreditDrainRecord {
+  if (credit.callerPubkey === null) {
+    throw new CreditLedgerError("caller_mismatch", "A drain requires an authenticated credit owner");
+  }
   return {
     creditId: credit.creditId,
     drainId: drain.drainId,

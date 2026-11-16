@@ -12,6 +12,12 @@ An unsigned `POST /v1/job` or `POST /v1/quote` that requires authentication retu
 
 A body is unsigned only when its raw structured input contains none of `pubkey`, `signature`, `timestamp`, `nonce` or `auth_statement`. A partial or malformed envelope, or a wrong signature, retains `signature_invalid` and its existing display. Input-schema violations retain their existing precedence. This adds an auth sub-reason; clients that enumerate sub-reasons must accept the new value. It does not change which requests require signing: eligible unsigned paid submits still receive their 402 challenge, while free capabilities, quotes and unsigned calls refused before payment require signing. No storage migration is required.
 
+## Unsigned payment accounting
+
+Unsigned per-call jobs have no authenticated credit owner. Their credit-deposit and expiry-release reports (including reversals) send `callerPubkey: null`; draws and revenue carry no caller field. The [portable examples](../protocol-fixtures/unsigned-caller-reports-v1.json) show the nullable owner on both report routes. Terminal job receipts retain `requester_pubkey: null`. Caller-bound opening and draw-funding receipts are omitted for unsigned funding, including historical funding whose sentinel owner was migrated; stored signed bytes remain unchanged.
+
+Credit rows and draws still account for each payment. A null owner cannot claim signed credit access or reclaim. Custom ledgers must accept null funding ownership and use null-safe equality for top-ups, keeping null distinct from every signed owner. Before deploying this SDK, update dvmctl/platform deposit and expiry-release routes to accept absent or null callers. Upgrade every writer and retry worker sharing the ledger together; initialization clears historical sentinel owners without changing balances or settled draws. Stale reports are not automatically revived.
+
 ## Temporary job-read failures
 
 `GET /v1/job/:id` and `GET /v1/job/:id/messages` return HTTP 503 with `Retry-After: 1` and the [portable `job_read_unavailable` envelope](../protocol-fixtures/job-read-unavailable-v1.json) when a storage connection, startup, or capacity failure prevents a read. The body has `retryable: true`, `display`, and `hint`. Retry the same read after one second, preserving the job ID, credentials, and `after` cursor. Missing credentials remain 401; an unknown job or wrong owner remains 404 when storage can be read. Other internal errors remain 500 without a retry hint.

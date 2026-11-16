@@ -276,7 +276,7 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         expect(await paid.json()).toMatchObject({ credit: { credit_id: own, credited_micro: STEP_MICRO } });
         const credit = await h.ledger.get(own);
         expect(credit?.availableMicro).toBe(STEP_MICRO);
-        expect(credit?.callerPubkey).not.toMatch(/^[0-9a-f]{64}$/);
+        expect(credit?.callerPubkey).toBeNull();
         expect((await h.ledger.get(job.creditId))?.availableMicro).toBe(0);
       }, 30_000);
 
