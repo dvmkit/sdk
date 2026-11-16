@@ -90,25 +90,26 @@ describe("loggers", () => {
     expect(span.error_message).toBeNull();
   });
 
-  it("timer() emits a span with real wall-clock duration", async () => {
-    const before = Date.now();
+  it("timer() records creation and disposal timestamps", async () => {
+    const createdAt = 1_716_062_100_000;
+    const disposedAt = 1_716_062_100_020;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(createdAt);
     {
       using _timer = loggers.platform.timer("phase", { count: 3 });
-      await new Promise((r) => setTimeout(r, 20));
+      clock.mockReturnValue(disposedAt);
     }
-    // Timer dispose fires withSpan async
-    await new Promise((r) => setTimeout(r, 10));
+    // Asynchronous emission must retain the timestamp captured at disposal.
+    clock.mockReturnValue(disposedAt + 1_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const span = captured[0];
     expect(span).toBeDefined();
     expect(span.name).toBe("phase");
     expect(span.attributes).toEqual({ count: 3 });
-    // started_at_ms should reflect timer creation, not dispose time
-    expect(span.started_at_ms).toBeGreaterThanOrEqual(before);
-    expect(span.started_at_ms).toBeLessThanOrEqual(before + 5);
-    // duration should reflect the actual wall-clock time (~20ms), not ~0
+    expect(span.started_at_ms).toBe(createdAt);
+    expect(span.ended_at_ms).toBe(disposedAt);
     const duration = span.ended_at_ms - span.started_at_ms;
-    expect(duration).toBeGreaterThanOrEqual(15);
+    expect(duration).toBe(20);
   });
 
   it("plain context and logger dimensions cannot mint diagnostic identity", async () => {
