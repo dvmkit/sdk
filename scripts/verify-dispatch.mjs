@@ -28,6 +28,7 @@ export function dispatchVerification(options) {
     { name: "README quickstart", args: ["run", "check:readme-quickstart"] },
     { name: "repository safety", args: ["run", "check:public-safety", "--", "--skip-pack"] },
     { name: "clean source gate", args: ["run", "clean-install-smoke", ...(options.requireDatabase ? ["--", "--require-database"] : [])] },
+    ...(options.requireDatabase ? [{ name: "Tempo close concurrency stress", args: ["run", "test:tempo-close-stress"] }] : []),
   ];
   const steps = options.cleanSource ? sourceSteps : outerSteps;
   for (const step of steps) options.run(step);
@@ -48,6 +49,7 @@ export function assertReleaseDispatch(dispatch) {
     ["run", "check:readme-quickstart"],
     ["run", "check:public-safety", "--", "--skip-pack"],
     ["run", "clean-install-smoke", "--", "--require-database"],
+    ["run", "test:tempo-close-stress"],
   ], "outer verification");
 
   const source = record(dispatch, { cleanSource: true, requireDatabase: true, databaseUrl: "postgres://localhost/dvmkit_test", packedSafetyReport: "/tmp/packed-report.json" });

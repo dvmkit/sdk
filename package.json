@@ -74,6 +74,7 @@
     "test:examples": "node --test examples/quickstart/handler.test.ts examples/authenticated-route/handler.test.ts examples/payments-and-lifecycle/handler.test.ts",
     "test:server": "vitest run --config vitest.server.config.ts",
     "test:db": "vitest run --config vitest.db.config.ts",
+    "test:tempo-close-stress": "node scripts/stress-tempo-close.mjs",
     "typecheck": "tsc --noEmit",
     "typecheck:scripts": "tsc --noEmit --project tsconfig.scripts.json",
     "verify": "node scripts/verify.mjs",
