@@ -89,7 +89,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     expect((await (await fetch(`${url}/v1/info`)).json()).credit.standing_mandate).toBe(true);
     const creditId = `mandate-credit-${priced}`;
     await fund(creditId);
-    const mandate = { max_total_micro: 5000, max_ask_micro: 1000, expires_at_ms: Date.now() + 86_400_000 };
+    // Below the handler's ask, so the mandate leaves it open and the job stays unbound.
+    const mandate = { max_total_micro: 5000, max_ask_micro: 999, expires_at_ms: Date.now() + 86_400_000 };
     const data = signer.signRequest(key, { action: "run", credit_id: creditId, draw_id: "mandate-draw", mandate },
       undefined, { audience, method: "POST", path: "/v1/job", capability: "run" });
     const created = await post(`${url}/v1/job`, { capability: "run", data });
@@ -111,7 +112,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     const drawId = `draw-${creditId}`;
     await fund(creditId);
     const data = signer.signRequest(key, { action: "run", credit_id: creditId, draw_id: drawId,
-      mandate: { max_total_micro: 5000, max_ask_micro: 1000, expires_at_ms: Date.now() + 86_400_000 } },
+      // Below the ask, so the mandate leaves it for the caller's signed payment.
+      mandate: { max_total_micro: 5000, max_ask_micro: 999, expires_at_ms: Date.now() + 86_400_000 } },
       undefined, { audience, method: "POST", path: "/v1/job", capability: "run" });
     const created = await post(`${url}/v1/job`, { capability: "run", data });
     expect(created.status).toBe(202);

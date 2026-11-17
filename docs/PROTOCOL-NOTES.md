@@ -517,9 +517,8 @@ retry can recover even when the draw committed before the original job row was s
 The stored mandate includes `credit_id` and `draw_id`, but a zero-upfront job's accounting
 fields remain unset until an ask actually creates a draw. This admission does not reserve the
 intended draw id: two zero-upfront admissions may name the same unused pair. Once a draw exists,
-another job must never pay from it. The ask-payment implementation must create or verify the
-job's own draw and leave an ask open for ordinary payment if the intended draw already belongs
-to another job. Custom job stores must persist
+another job must never pay from it: the first mandate-paid ask creates the job's own draw, and an
+ask whose intended draw already exists for another job stays open for ordinary payment. Custom job stores must persist
 `JobRecord.mandate` unchanged after creation; its public type is `StandingMandate` from
 `@dvmkit/sdk/server`. Existing credit ownership, currency, and signature checks still apply. The portable admission contract is
 `protocol-fixtures/standing-mandate-v1.json`; its timestamp is illustrative and callers must
@@ -534,5 +533,27 @@ The SDK always strips it before handler input parsing. Admission currently check
 window on each submit, including an idempotent retry or `request_id` resume. After expiry,
 a retry returns 400 `invalid_mandate`; use the existing job id and token to read the job instead.
 Do not modify the mandate on a retry, because that changes the signed request's identity.
-Mandate acceptance and the complete mandate-payment implementation must be deployed together;
-acceptance alone does not mean an unadvertised provider will automatically pay later asks.
+Callers must not rely on an unadvertised provider paying later asks, even if it accepted the mandate.
+
+### Mandate-paid asks
+
+When a mandated job's handler calls `ctx.requestPayment`, the provider writes the usual `payment-request` and then, if every limit holds, pays it at once from the mandate's credit. Builder code is unchanged: `requestPayment` resolves as if the caller had paid. The payment is the next message in the job's history, written by the provider on the caller's behalf and carrying no signature; the stored mandate is the authorization:
+
+```json
+{"from":"requester","type":"payment","content":{"credit":{"mandate":true,"credit_id":"example-credit","draw_id":"example-draw","payment_id":"mandate:b760d987033f4635e36af50da52021993b89d7f2c85f2b0a09fe1236d43f09c0","request_seq":3,"amount_micro":550000,"currency":"usd"}}}
+```
+
+`request_seq` is the seq of the `payment-request` it pays and `amount_micro`/`currency` repeat that ask's `content.credit`. `payment_id` gives each ask exactly one mandate payment identity. It is `mandate:` followed by the lowercase hex SHA-256 of the UTF-8 bytes of a compact JSON array: the string `"mandate"`, the job id as a JSON string, and `request_seq` as a JSON integer, with no whitespace between tokens. For job `example-job` and `request_seq` 3 the hashed bytes are `["mandate","example-job",3]` and the result is the `payment_id` above; the fixture carries the same vector. The ledger move is the signed balance payment's: the job's draw grows by the ask, the ask buys the next piece, and the payment is recorded in the same transaction. A zero-upfront job's first mandate-paid ask creates its draw with the mandate's `credit_id` and `draw_id` and binds the job to it. A caller cannot send a `mandate: true` payment; an inbound credit payment must be signed.
+
+The provider evaluates the limits when the ask is written, not at admission, and again by its stale-job sweep while the ask stays open. The ask stays open, exactly as without a mandate, when any of these holds:
+
+- `mandate_expired`: the current time is at or after `expires_at_ms`.
+- `mandate_ask_cap`: the ask's `amount_micro` exceeds `max_ask_micro`.
+- `mandate_total_cap`: the job's draw, upfront and earlier asks included, plus this ask would exceed `max_total_micro`.
+- `mandate_balance`: the credit's available balance does not cover the ask.
+- `mandate_currency`: the ask's currency is not the credit's.
+- `mandate_draw_owned_elsewhere`: the intended draw exists for another job, or the job is bound to a different draw.
+- `mandate_ask_unpriced`: the ask carries no credit price the job's ask total covers.
+- `mandate_credit_unavailable`: the credit is missing, not the caller's, expired, closed, or otherwise refuses the spend.
+
+The provider emits the `mandate_payment_skipped` diagnostic with the reason. The caller can still pay the open ask with a signed balance payment or any other offered rail; for a zero-upfront job whose intended draw is taken, the signed payment must name a fresh `draw_id`. A signed payment and a mandate payment for the same ask are serialized on the job: exactly one is charged, and the other is refused or does nothing. Replaying a job after a restart treats a mandate payment in its history as paid and never charges it again. The mandate payment commits in its own transaction after the ask, so a provider worker can stop between the two, or after paying but before the handler resumes. The provider's stale-job sweep covers both: a mandated job still suspended on its ask after a short grace period has the ask settled (a no-op if it already was) and the job resumed, with no caller message, and exactly one worker runs it. The sweep leaves alone a job with an unanswered prompt, which the caller's answer resumes. Until then it is an ordinary open ask that the caller may pay. The portable message and reason list are in `protocol-fixtures/standing-mandate-v1.json`.

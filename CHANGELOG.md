@@ -6,7 +6,13 @@
 
 - `data.mandate` is now reserved protocol metadata on job submission, including when a capability schema declares that key. Builders using `mandate` for application data must rename it. It is always removed from handler input and requires the signed credit envelope; this avoids passing payment authorization to application code.
 
-- Accept signed standing credit limits on job submission and persist them immutably with the job. The additive nullable `jobs.mandate` JSONB column is initialized automatically. `/v1/info` advertises `credit.standing_mandate: true` alongside durable balance-payment support; callers must check this field because older providers silently strip unknown data fields. Invalid mandates return HTTP 400 `invalid_mandate`. See `protocol-fixtures/standing-mandate-v1.json` and the protocol notes. This adds admission and storage; later ask authorization uses the persisted limits.
+- Accept signed standing credit limits on job submission and persist them immutably with the job. The additive nullable `jobs.mandate` JSONB column is initialized automatically. `/v1/info` advertises `credit.standing_mandate: true` alongside durable balance-payment support; callers must check this field because older providers silently strip unknown data fields. Invalid mandates return HTTP 400 `invalid_mandate`. See `protocol-fixtures/standing-mandate-v1.json` and the protocol notes. Stored mandates then pay later asks: see the next entry.
+
+- Pay a mandated job's later asks from the caller's credit without a caller message. After each `payment-request`, the provider writes a `payment` from `requester` whose `content.credit` carries `mandate: true`, `request_seq`, `amount_micro`, `currency`, `credit_id`, `draw_id`, and a deterministic `payment_id`, with the same draw growth, piece, and `credit_balance_payments` record as a signed balance payment. An expired mandate, an ask above `max_ask_micro`, a job total above `max_total_micro`, a short balance, a currency mismatch, or an intended draw that belongs to another job leaves the ask open for a signed payment and emits `mandate_payment_skipped` with the reason. `PaymentContent.credit` is now a union of the signed authorization and this unsigned mandate shape. The stale-job sweep settles and resumes a mandated job still suspended on its ask after a 10-second grace period, so a provider worker that stops between the ask and its payment, or before the handler wakes, does not strand the job.
+
+### Fixes
+
+- A job replayed on another worker after a restart now wakes when a signed balance payment for its open ask arrives on that worker. Previously the replayed handler refused the claim for an ask written by an earlier process and stayed suspended although the payment was accepted.
 
 ## Upgrade details
 

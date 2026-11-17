@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 
 import type { SignedRequestDomain } from "../../lib/signed-request-statement";
@@ -94,38 +94,9 @@ export async function commitBalancePayment(args: {
       "SELECT caller_pubkey,currency FROM credits WHERE credit_id=$1", [credit_id]);
     if (!credit || credit.caller_pubkey !== pubkey) conflict("credit_payment_owner_mismatch");
     if (credit.currency !== currency) conflict("credit_payment_currency_mismatch");
-    const seq = Number(job.next_seq);
-    const message = { seq, from: "requester", type: "payment", timestamp: Math.floor(Date.now() / 1000), content: { credit: args.raw } };
-    await tx.query(`INSERT INTO job_messages (job_id,seq,data,status,created_at_ms)
-      VALUES ($1,$2,$3,'pending-verification',$4)`, [args.jobId, seq, JSON.stringify(message), Date.now()]);
-    if (job.credit_id === null) {
-      // Never bind a pre-existing draw: it could belong to another job or authorization.
-      const existing = await tx.query("SELECT 1 FROM credit_draws WHERE credit_id=$1 AND draw_id=$2", [credit_id, draw_id]);
-      if (existing.rowCount) conflict();
-      await args.ledger.draw({ creditId: credit_id, drawId: draw_id, amountMicro: 0,
-        jobId: args.jobId, tx });
-    }
-    const grown = await args.ledger.growDraw({ creditId: credit_id, drawId: draw_id,
-      jobId: args.jobId, spendExistingBalance: true, addAmountMicro: amount_micro, capMicro: Number(job.asked_topup_micro), tx });
-    if (grown.addedAmountMicro !== amount_micro) conflict("credit_payment_ask_mismatch");
-    const basis = grown.railValue;
-    const nativeAsset = basis.nativeAsset;
-    await tx.query(`UPDATE jobs SET next_seq=next_seq+1,
-      paid_msats=paid_msats+$2, pending_payment_msats=NULL,
-      pending_payment_fiat_micro=NULL, pending_payment_fiat_currency=NULL,
-      pending_mpp_challenge_ids=NULL, pending_x402_nonce=NULL, pending_x402_amount_usdc_micro=NULL,
-      credit_id=$3, draw_id=$4, payment_rail=$5, payment_mint=$6, payment_tx_hash=$7,
-      native_amount=$8, native_asset=$9, last_activity_at=$10,
-      -- The paid ask buys the next piece; a job with no piece list settles as one piece.
-      pieces = CASE WHEN pieces IS NULL THEN NULL ELSE pieces || $11::jsonb END WHERE id=$1`,
-    [args.jobId, grown.addedRailValue.drawMsats, credit_id, draw_id, basis.rail, basis.mint,
-      drawSettlementRef(args.dvmId, credit_id, draw_id), basis.drawNative, nativeAsset, Date.now(),
-      JSON.stringify(appendPiece([], amount_micro, seq))]);
-    await tx.query("UPDATE job_messages SET status='verified' WHERE job_id=$1 AND seq=$2", [args.jobId, seq]);
-    const response = { seq };
-    await tx.query("INSERT INTO credit_balance_payments(payment_id,fingerprint,response,job_id,request_seq) VALUES($1,$2,$3,$4,$5)",
-      [payment_id, fingerprint, JSON.stringify(response), args.jobId, request_seq]);
-    await tx.query("SELECT pg_notify('job_messages', $1)", [args.jobId]);
+    const response = await settleAskFromBalance({ tx, ledger: args.ledger, jobId: args.jobId, dvmId: args.dvmId, job,
+      creditId: credit_id, drawId: draw_id, amountMicro: amount_micro, credit: args.raw, paymentId: payment_id,
+      fingerprint, requestSeq: request_seq });
     await tx.query("COMMIT");
     return { response, replayed: false };
   } catch (error) {
@@ -142,4 +113,60 @@ export async function commitBalancePayment(args: {
   } finally {
     tx.release();
   }
+}
+
+/**
+ * The ledger move both credit payments share, run under the caller's job row lock after the ask
+ * has been matched: verified payment message, draw growth from existing balance, the piece the ask
+ * buys, and the durable payment identity, all in the caller's transaction. An unbound job's first
+ * payment creates its draw; a draw that already exists is refused because it could belong to
+ * another job or authorization.
+ */
+export async function settleAskFromBalance(args: {
+  tx: PoolClient;
+  ledger: CreditLedger;
+  jobId: string;
+  dvmId: string;
+  job: { credit_id: string | null; asked_topup_micro: string | null; next_seq: number };
+  creditId: string;
+  drawId: string;
+  amountMicro: number;
+  /** Stored as the payment message's `content.credit`. */
+  credit: unknown;
+  paymentId: string;
+  fingerprint: string;
+  requestSeq: number;
+}): Promise<{ seq: number }> {
+  const { tx, job, creditId, drawId, amountMicro } = args;
+  const seq = Number(job.next_seq);
+  const message = { seq, from: "requester", type: "payment", timestamp: Math.floor(Date.now() / 1000), content: { credit: args.credit } };
+  await tx.query(`INSERT INTO job_messages (job_id,seq,data,status,created_at_ms)
+    VALUES ($1,$2,$3,'pending-verification',$4)`, [args.jobId, seq, JSON.stringify(message), Date.now()]);
+  if (job.credit_id === null) {
+    const existing = await tx.query("SELECT 1 FROM credit_draws WHERE credit_id=$1 AND draw_id=$2", [creditId, drawId]);
+    if (existing.rowCount) conflict();
+    await args.ledger.draw({ creditId, drawId, amountMicro: 0, jobId: args.jobId, tx });
+  }
+  const grown = await args.ledger.growDraw({ creditId, drawId,
+    jobId: args.jobId, spendExistingBalance: true, addAmountMicro: amountMicro, capMicro: Number(job.asked_topup_micro), tx });
+  if (grown.addedAmountMicro !== amountMicro) conflict("credit_payment_ask_mismatch");
+  const basis = grown.railValue;
+  const nativeAsset = basis.nativeAsset;
+  await tx.query(`UPDATE jobs SET next_seq=next_seq+1,
+    paid_msats=paid_msats+$2, pending_payment_msats=NULL,
+    pending_payment_fiat_micro=NULL, pending_payment_fiat_currency=NULL,
+    pending_mpp_challenge_ids=NULL, pending_x402_nonce=NULL, pending_x402_amount_usdc_micro=NULL,
+    credit_id=$3, draw_id=$4, payment_rail=$5, payment_mint=$6, payment_tx_hash=$7,
+    native_amount=$8, native_asset=$9, last_activity_at=$10,
+    -- The paid ask buys the next piece; a job with no piece list settles as one piece.
+    pieces = CASE WHEN pieces IS NULL THEN NULL ELSE pieces || $11::jsonb END WHERE id=$1`,
+  [args.jobId, grown.addedRailValue.drawMsats, creditId, drawId, basis.rail, basis.mint,
+    drawSettlementRef(args.dvmId, creditId, drawId), basis.drawNative, nativeAsset, Date.now(),
+    JSON.stringify(appendPiece([], amountMicro, seq))]);
+  await tx.query("UPDATE job_messages SET status='verified' WHERE job_id=$1 AND seq=$2", [args.jobId, seq]);
+  const response = { seq };
+  await tx.query("INSERT INTO credit_balance_payments(payment_id,fingerprint,response,job_id,request_seq) VALUES($1,$2,$3,$4,$5)",
+    [args.paymentId, args.fingerprint, JSON.stringify(response), args.jobId, args.requestSeq]);
+  await tx.query("SELECT pg_notify('job_messages', $1)", [args.jobId]);
+  return response;
 }

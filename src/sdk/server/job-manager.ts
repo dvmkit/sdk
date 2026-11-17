@@ -43,6 +43,7 @@ import { capabilityForChannel } from "../capability-channels";
 import type { CreditRail, DrawPool } from "./context";
 import { buildContext } from "./context";
 import {
+  CreditLedger,
   CreditLedgerError,
   type CreditLedgerLike,
   type DrawRecord,
@@ -51,6 +52,7 @@ import {
   type StalePendingDrawCursor,
 } from "./credit-ledger";
 import { deferredX402IntentId } from "./funding";
+import { findQuietMandatedAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -179,6 +181,9 @@ const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
  * stuck job.
  */
 const DEFAULT_REACTIVATION_CLAIM_GRACE_MS = 150;
+// The asking worker settles within milliseconds of its yield snapshot. Well past that, a quiet
+// mandated ask means the worker died or its wake-up was lost.
+const DEFAULT_MANDATE_RESUME_GRACE_MS = 10_000;
 
 /** Poll interval while waiting out the reactivation claim grace window. */
 const REACTIVATION_CLAIM_POLL_MS = 25;
@@ -546,6 +551,16 @@ export interface JobManagerOpts {
    * tests for speed.
    */
   reactivationClaimGraceMs?: number;
+  /**
+   * Resume an `awaiting-input` job whose ask a standing mandate has paid but no worker here is
+   * running. The app supplies its reactivation path; the job manager cannot replay on its own.
+   */
+  resumePaidAsk?: (jobId: string) => Promise<void>;
+  /**
+   * How long a mandated ask may sit unsettled or unclaimed before the stale sweep settles and
+   * resumes it. Default: `DEFAULT_MANDATE_RESUME_GRACE_MS`.
+   */
+  mandateResumeGraceMs?: number;
 }
 
 type ResolvedInput<I extends ZodLike | undefined> = I extends ZodLike<infer O> ? O : string;
@@ -761,6 +776,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   private readonly monotonicNowMs = createMonotonicClock();
   private sweepInFlight = false;
+  private mandateSweepInFlight = false;
   private orphanSweepInFlight = false;
   private terminalCostRecoveryInFlight = false;
   private terminalRevenueRecoveryInFlight = false;
@@ -877,6 +893,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               error: undefined,
             }
           );
+        });
+        void this.sweepMandateAsks().catch((err: unknown) => {
+          diagnosticConsole.error({ level: "mandate_ask_sweep_failed", error_code: errorCodeOf(err) });
         });
       }, intervalMs);
       this.staleSweepTimer.unref();
@@ -1409,6 +1428,62 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       await tx.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally { tx.release(); }
+  }
+
+  /** Pay the job's open ask under its standing mandate; any failed limit leaves the ask open. */
+  private async payAskFromMandate(job: ServerJob, reportSkip = true): Promise<MandateSettlement | undefined> {
+    const ledger = this.opts.creditLedger;
+    if (!job.mandate || !this.opts.db || !(ledger instanceof CreditLedger) || this.opts.env.DVMKIT_BALANCE_PAYMENTS === "false") return;
+    await job.messageAppenderTail;
+    if (!job.pendingPayment || isTerminal(job.status)) return;
+    const settlement = await settleMandateAsk({ pool: this.opts.db, ledger, jobId: job.id, dvmId: this.opts.dvmId ?? "" });
+    if (reportSkip) reportMandateSkip(settlement);
+    return settlement;
+  }
+
+  /**
+   * The stale sweep's mandate arm. A mandated ask settles in its own transaction after the ask
+   * commits, so a worker that dies between the two, or whose wake-up is lost, leaves a paid-for
+   * job suspended with no caller message coming to move it. Past the grace window this settles
+   * the ask (idempotently) and resumes the job: through the live resolver when it runs here,
+   * otherwise through the app's reactivation, whose claim keeps it to one execution.
+   */
+  async sweepMandateAsks(nowMs = Date.now()): Promise<void> {
+    const db = this.opts.db;
+    const ledger = this.opts.creditLedger;
+    if (!db || !(ledger instanceof CreditLedger) || !(this.jobStore instanceof PostgresJobStore) ||
+        this.opts.env.DVMKIT_BALANCE_PAYMENTS === "false" || this.mandateSweepInFlight) return;
+    this.mandateSweepInFlight = true;
+    try {
+      const dvmId = this.opts.dvmId ?? "";
+      const beforeMs = nowMs - (this.opts.mandateResumeGraceMs ?? DEFAULT_MANDATE_RESUME_GRACE_MS);
+      // Paged to the end: asks a limit keeps open stay oldest and would otherwise hide newer ones.
+      let after: { lastActivityAt: number; id: string } | undefined;
+      for (;;) {
+        const page = await findQuietMandatedAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
+        for (const { id: jobId } of page) {
+          try {
+            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
+            const local = this._activeJobs.get(jobId);
+            const settlement = local
+              ? await this.payAskFromMandate(local, false)
+              : await settleMandateAsk({ pool: db, ledger, jobId, dvmId });
+            if (local) {
+              // A settlement whose notification was missed wakes the resolver here.
+              if (settlement?.outcome !== "skipped") await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+            } else if (settlement?.outcome === "paid") {
+              await this.opts.resumePaidAsk?.(jobId);
+            }
+          } catch (err) {
+            diagnosticConsole.error({ level: "mandate_ask_resume_failed", jobId, error_code: errorCodeOf(err) });
+          }
+        }
+        if (page.length < 50) break;
+        after = page[page.length - 1];
+      }
+    } finally {
+      this.mandateSweepInFlight = false;
+    }
   }
 
   private async adoptPaymentMetadata(job: ServerJob, pending: ServerJob["pendingPayment"]): Promise<boolean> {
@@ -3954,6 +4029,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
         : undefined,
+      onAskOpen: job.mandate && this.opts.db && this.opts.creditLedger instanceof CreditLedger && jobStore instanceof PostgresJobStore
+        ? async () => { await this.payAskFromMandate(job); }
+        : undefined,
+      onReplayedAsk: (askSeq) => {
+        if (job.pendingPayment) this.paymentAskSeqs.set(job.pendingPayment, askSeq);
+      },
       acceptedBalancePayment: this.opts.db && jobStore instanceof PostgresJobStore
         ? async (seq, amountMicro, currency) => {
             const { rowCount } = await this.opts.db!.query(
@@ -5357,4 +5438,10 @@ export async function retryJobSnapshot(persist: () => Promise<void>): Promise<vo
       await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
     }
   }
+}
+
+/** A diagnostic-safe code for a thrown value: its string `code` when it has one. */
+function errorCodeOf(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : "unknown_error";
 }

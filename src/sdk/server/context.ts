@@ -105,6 +105,18 @@ export interface BuildContextOpts {
    * resolver re-reads counters and decides whether to wake.
    */
   getCounters?: () => Promise<JobCounters | undefined>;
+  /**
+   * Called once an ask is open and its yield snapshot has been written, after a fresh ask and
+   * after a replay reaches an ask that history holds unpaid. A standing mandate pays the ask
+   * here; the handler then wakes through the same notification as a caller payment.
+   */
+  onAskOpen?: () => Promise<void>;
+  /**
+   * Called synchronously when a replay re-opens an ask that history holds unpaid, before the
+   * resolver can wake. That ask was written by an earlier process, so the single-execution
+   * claim learns its seq here rather than from this process's append.
+   */
+  onReplayedAsk?: (askSeq: number) => void;
   /** Durable acceptance of this cached balance payment for the replayed fiat ask. */
   acceptedBalancePayment?: (seq: number, amountMicro: number | undefined, currency: string | undefined) => Promise<boolean>;
   /**
@@ -904,6 +916,7 @@ export function buildContext(
           reject(err);
         };
         job.pendingPayment = { resolve: doResolve, reject: doReject };
+        if (originalAsk && replayedPaymentRequest) opts.onReplayedAsk?.(replayedPaymentRequest.seq);
 
         if (opts.subscribeNotifications && opts.getCounters) {
           const subscribeNotifications = opts.subscribeNotifications;
@@ -975,9 +988,15 @@ export function buildContext(
             });
         }
       });
-      if (opts.onYield) {
-        void opts.onYield().catch((err: unknown) => {
-          log.error("Failed to persist job at yield", { error: String(err) });
+      const yielded = opts.onYield
+        ? opts.onYield().catch((err: unknown) => {
+            log.error("Failed to persist job at yield", { error: String(err) });
+          })
+        : Promise.resolve();
+      if (opts.onAskOpen) {
+        const onAskOpen = opts.onAskOpen;
+        void yielded.then(() => onAskOpen()).catch((err: unknown) => {
+          log.error("Failed to settle ask from standing mandate", { error: String(err) });
         });
       }
       return p;

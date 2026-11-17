@@ -281,7 +281,7 @@
         },
         "CapabilityConfig": {
           "stability": "stable",
-          "signature": "7566b8af1b7d9dd536c3b550bbcae1585da4fedd1ca62fc0efec0d921fa1bca5"
+          "signature": "04f00d8e09c5772095719acd38ea722dceacddf9d04e7ba8bad3cc1fd3451e91"
         },
         "CapabilityRate": {
           "stability": "stable",
@@ -297,7 +297,7 @@
         },
         "configureDVM": {
           "stability": "stable",
-          "signature": "7a21a7590e1a86f6c85db75bf04e3f15cfb844c2b398667efd957c3e3d65f7c6"
+          "signature": "78c655f6a71ba252a5e049672681c339f318e0dab6b322dc28f1731f7d804cbd"
         },
         "createFxFetcher": {
           "stability": "stable",
@@ -361,15 +361,15 @@
         },
         "defineCapability": {
           "stability": "stable",
-          "signature": "10071ed5c60654c79b287b5df12891201df97cb56a69a760d854839007c1164e"
+          "signature": "78740df9931bdf30d19c13eba09d1fbae31b5f60f1094a52c7689de76d511783"
         },
         "DVMConfig": {
           "stability": "stable",
-          "signature": "e581df6d93f1665be76d322b068656847a75c9797cbbfb4ca634dcda6e7d7d71"
+          "signature": "995152dd5901f4225eda15068f0e3115e6479f73aa869838b7a1c4e0ede6049d"
         },
         "DVMDescriptor": {
           "stability": "stable",
-          "signature": "450ad3bf36659918b1cf0e8d56c52544a4906513c591fe15833b3e067cbdbfea"
+          "signature": "07c9815cb10e7858c7c5305d7ab7aeab845a1fce1734ebcb06559c6483d70db6"
         },
         "DVMRouteContext": {
           "stability": "stable",
@@ -437,7 +437,7 @@
         },
         "isConfiguredDVMDescriptor": {
           "stability": "stable",
-          "signature": "8bc88b7171aff77c558a5d32ad647cbee60cae09343b6a0acf259255cad9e104"
+          "signature": "a8b29d065393d91883bc729a22af1da02aec3b7d4ca3b8fd98bdc46a6f6d86e5"
         },
         "isZodSchema": {
           "stability": "stable",
@@ -449,7 +449,7 @@
         },
         "JobRecord": {
           "stability": "stable",
-          "signature": "b8f7701c337cc4ed2b56f1a34f4139ad6af9aa9a81a2fedc8f4b19673b472b92"
+          "signature": "9dcd011ff0b4f98bab37702e7b7fe2d76e1db35d7425a02c1ba758b4d81bda50"
         },
         "JobStatus": {
           "stability": "stable",
@@ -457,7 +457,7 @@
         },
         "JobStore": {
           "stability": "stable",
-          "signature": "760acd540d42ea63fa3a9ef242752bc27bc5be48655212d2decf4be196883cd2"
+          "signature": "8a8b639dc9df2615c96c80979d9cbd9bffd3be97477540b2f4b3053056d60893"
         },
         "KVStore": {
           "stability": "stable",
@@ -469,7 +469,7 @@
         },
         "PaymentContent": {
           "stability": "stable",
-          "signature": "5541012f4ec531e45862772634567f5fdbc0deb4067a9af89d311e526945c3e6"
+          "signature": "174b27838dd923b8215e73fdeec9e74d8ef42ecc81abf43a9a211ccb78226eb7"
         },
         "PaymentMethod": {
           "stability": "stable",
@@ -537,7 +537,7 @@
         },
         "SDKJobContext": {
           "stability": "stable",
-          "signature": "124ff65e84592776ba1f3dcd5bc9f03c1ad5b0505239983e17a75e615fc0c204"
+          "signature": "260aeeaf2af1ab49ae16dad1f5fedad152c566c4315b6ddc93289ea8ae4db996"
         },
         "SDKPaymentRequestOpts": {
           "stability": "stable",
@@ -656,11 +656,11 @@
       "signatures": {
         "createTestContext": {
           "stability": "stable",
-          "signature": "cb50731484b40fa0cc0eefe41e40fd762741ca8b58572290f30373718d456feb"
+          "signature": "a0e78ba65155c21b0b54d68eef3aef69a60777cc8a1bec45d03a5d1b0b8b937e"
         },
         "MemoryJobStore": {
           "stability": "stable",
-          "signature": "b450b0fa9877cf4cb570b4a2d3f6f9dc094b1d963af5481dc5efc27f7f57198f"
+          "signature": "28d09e2ca593545f07b703c92410109a05ae87f610bed03aab223d7f7b426a11"
         },
         "RecordedMessage": {
           "stability": "stable",
@@ -676,11 +676,11 @@
         },
         "TestContextOpts": {
           "stability": "stable",
-          "signature": "b2f19a06e705ce179bbf12ffd00d01864f23edfd4a343b091ddc32b33658ec36"
+          "signature": "8f3d06f06abf769acdf1a6ac7f8949c7bf92c53be46de56fa106c6150a5e47d7"
         },
         "TestJobContext": {
           "stability": "stable",
-          "signature": "22642d4fa3a1d42b8f74f84666fab2594c8b360390539a9c6983654c9fd8cd97"
+          "signature": "b18f3ea3db2cb1cc936e57dc59986d39de3fa1677d6d78d7cecb4f15e8f8d797"
         }
       }
     },
@@ -939,7 +939,7 @@
         },
         "baselineContentExpiry": {
           "stability": "experimental",
-          "signature": "00a37838fddd456612e4a5bcae9b08cdf89bd55212846e9e7af3bc2c72ccfd1f"
+          "signature": "681b7604f54d0dc2c761ecb3130c44fd88095cf05006202bc829eda46deccdf9"
         },
         "BitcoinDepositLiability": {
           "stability": "experimental",
@@ -1051,15 +1051,15 @@
         },
         "ContentHoldStore": {
           "stability": "experimental",
-          "signature": "6fb3f48445c8d28338d373501e8a6534bb9fe87e6260f60a6833a7053a35eeab"
+          "signature": "8a3ae42b3f42be911139b8958c5b5c15d18c083dc035634394ae495662880a62"
         },
         "contentMetadata": {
           "stability": "experimental",
-          "signature": "2f57d236fe34b3c494427eee0ab608a70194c5c6155d0114a20421c0534e1483"
+          "signature": "3c22024128aabd804eca1bbbe7078076d33968fdd03fb91eb5d1c8a43594ead0"
         },
         "createDVMHost": {
           "stability": "experimental",
-          "signature": "011708cee64568cf63350c9ed5dac2bf023d6dd1a7471ab24b9f2713b7a78923"
+          "signature": "ed025525c616bc7ea17d512effcef8071840869a17429cc0306f9f9278d79cc6"
         },
         "createPinnedFetch": {
           "stability": "experimental",
@@ -1179,7 +1179,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "b7144d09e6b381e2f9404298c7d424bb9e183e7f15952f6a6a0e2fb27d4037fd"
+          "signature": "d39632ba2183c0fd670a6fc056bf3c5126d61434a278f00bdc6beced0ab921ed"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1243,11 +1243,11 @@
         },
         "DVMHost": {
           "stability": "experimental",
-          "signature": "0acaedb12f45157cd61d9a9a14437478e656f05903ad8a9100d1f9ba456d0a75"
+          "signature": "3d741e890cda56a939e39ebcca7032840bba67b3dce6165a661083b209fcb88c"
         },
         "DVMHostOpts": {
           "stability": "experimental",
-          "signature": "37752ccce644dbe03d2245baee9476bff58e11a2ef2be794a8d276ea653b0a4b"
+          "signature": "dde433956bfdc696fa01fb124fa80686920e3094860fc8889735caf84ba9f4d0"
         },
         "DVMServeResult": {
           "stability": "experimental",
@@ -1271,7 +1271,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "830eeccaf437940ade80fdb188d96c3d00b2e9e806cf7be7057b080617d679bc"
+          "signature": "3c76d49cf328a869d268f75aca23a4a525d431bba9ba63af28861c1cc46fcb37"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1291,11 +1291,11 @@
         },
         "installAdminContentRoutes": {
           "stability": "experimental",
-          "signature": "3201045b000b394767070d9b89d442e88e76a37f5c7b41c08a71ef10dcc724a5"
+          "signature": "ac73ff05622ebca58198a505f3466ec1428cdc095cee86b284fac95531ffa2ce"
         },
         "InstallAdminContentRoutesOpts": {
           "stability": "experimental",
-          "signature": "314dfb5d13699d82231b2cee31b7fb6cc90dd7f403b84838df079d683da3bba8"
+          "signature": "38be8a882ebfcc9c2c5477a79ab35cdd497b61a73996d38eaa3aa1384bd2c7a5"
         },
         "InvoiceReconciliation": {
           "stability": "experimental",
@@ -1311,11 +1311,11 @@
         },
         "isContentHoldStore": {
           "stability": "experimental",
-          "signature": "2d73fdd283528491dcef4a865523ee59a310023cdbe621bc9d2e4af8065b6fc6"
+          "signature": "fc21d0c2a2cb4003a1d2a78770c521012cc5596434bd311bbcbeb6867352a763"
         },
         "isStreamableJobStore": {
           "stability": "experimental",
-          "signature": "0ec2d254355c00933d438cd7ba095d9eb78947f92cebdea8f5ce1b77149f61ef"
+          "signature": "2c2c9ab6e9136e21e561030f8bd06e885e53d689f10be9bd0556e430b0b98d7c"
         },
         "JobContentMetadata": {
           "stability": "experimental",
@@ -1331,11 +1331,11 @@
         },
         "JobManager": {
           "stability": "experimental",
-          "signature": "2aa4f3700943a1b93c0e5545660ac56a1a049cacc9e4fac227fd13562ff0b194"
+          "signature": "3b532b36490b14a3b740e8d1dfefaf6d9d1ac572b843a2c2b74d0b6aced3c559"
         },
         "JobManagerOpts": {
           "stability": "experimental",
-          "signature": "7cdd1736d9538923f55ca749ab8dc370642313939a3e5086f542347f93944636"
+          "signature": "13fcaefd726b645fdbdcebad115c8ee3c4855acb98841cd472795cd75c69f9cd"
         },
         "JobPiece": {
           "stability": "experimental",
@@ -1343,7 +1343,7 @@
         },
         "JobRecord": {
           "stability": "experimental",
-          "signature": "b8f7701c337cc4ed2b56f1a34f4139ad6af9aa9a81a2fedc8f4b19673b472b92"
+          "signature": "9dcd011ff0b4f98bab37702e7b7fe2d76e1db35d7425a02c1ba758b4d81bda50"
         },
         "JobSettlement": {
           "stability": "experimental",
@@ -1355,7 +1355,7 @@
         },
         "JobStore": {
           "stability": "experimental",
-          "signature": "760acd540d42ea63fa3a9ef242752bc27bc5be48655212d2decf4be196883cd2"
+          "signature": "8a8b639dc9df2615c96c80979d9cbd9bffd3be97477540b2f4b3053056d60893"
         },
         "JobTerminalReportPayload": {
           "stability": "experimental",
@@ -1455,7 +1455,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "5735326ce5f376a240891442bdf9b70e10ac6d06fd928b06eebe665a55d6ae5f"
+          "signature": "e4bae26d8594a5df0453520e5671762970aff731b019b3a0445f8cc2724aaea8"
         },
         "PostgresKVStore": {
           "stability": "experimental",
@@ -1575,7 +1575,7 @@
         },
         "serve": {
           "stability": "experimental",
-          "signature": "4e8b9247a20d4d145f5bc9464870aed8870d1617bfb7aa8915f7604a4498e7aa"
+          "signature": "d334fd619368c91c23c640b024cf5f4ea5e19ff189eed2fb4c329eaaea50fb9a"
         },
         "SIGNED_REQUEST_AUTH_ID": {
           "stability": "experimental",
@@ -1651,7 +1651,7 @@
         },
         "StreamableJobStore": {
           "stability": "experimental",
-          "signature": "69815178ff42a87733c5fcff9d18951ae127ff6595c90bf31fadf683dee7bb77"
+          "signature": "9f857689af9850082e6915bbd895e33d1a2d244844b0e4ca5ff82d9b44d7c0ee"
         },
         "stripCreditEnvelope": {
           "stability": "experimental",

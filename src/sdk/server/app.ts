@@ -1306,6 +1306,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       onJobRetentionSweepFailed: opts.onJobRetentionSweepFailed,
       onJobRetentionSweepRecovered: opts.onJobRetentionSweepRecovered,
       reactivationClaimGraceMs: opts.reactivationClaimGraceMs,
+      resumePaidAsk: (jobId) => this.resumePaidAsk(this.jobManager, jobId),
     });
     this.app = new Hono<AppEnv>();
     try {
@@ -2346,6 +2347,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     });
     if (menu && this.balancePaymentSupported()) {
       menu.balance_payment = true;
+      // Balance payments need a Postgres job store, and the app leaves the stale timeouts at
+      // their positive defaults, so the sweep that resumes stranded mandated asks always runs here.
       menu.standing_mandate = true;
     }
     if (menu && this.adminCreditRoutesMounted()) menu.jit_refund_park = true;
@@ -5018,21 +5021,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           // Wake the existing claim/resume owner. A COMMIT acknowledgement may
           // arrive after NOTIFY has already advanced the handler to another ask.
           await this.opts.db.query("SELECT pg_notify('job_messages', $1)", [id]);
-          if (!activeJob) {
-            const fresh = await jm.store.get(id);
-            if (fresh?.status === "awaiting-input" && isStreamableJobStore(jm.store)) {
-              fresh.messages = await jm.store.getMessages(id, 0);
-              fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
-              const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
-              const authorized = wire.content.credit as { request_seq: number };
-              if (ask?.seq === authorized.request_seq && !jm.activeJobs.has(id)) {
-                const { job } = jm.reactivateJob(fresh);
-                const lock = await jm.store.tryReactivationLock(id, () =>
-                  this.runReactivation(jm, job, { type: "payment", content: wire.content! }, fresh.status));
-                if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
-              }
-            }
-          }
+          if (!activeJob) await this.resumePaidAsk(jm, id, (wire.content.credit as { request_seq: number }).request_seq);
         } catch {
           // The accepted outcome is durable. A progress failure must never ask
           // the caller to spend again; a non-payment resume can recover it.
@@ -5356,6 +5345,28 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       ...(unappliedCredit && { credit: unappliedCredit }),
       ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
     }, 503);
+  }
+
+  /**
+   * Replay an `awaiting-input` job no worker here is running, once its open ask has been paid from
+   * balance. `requestSeq` names the ask the payment answered; a later ask means the job has moved
+   * on. The reactivation claim keeps a live worker elsewhere, or a concurrent resumer, from
+   * running it twice.
+   */
+  private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
+    if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
+    const fresh = await jm.store.get(id);
+    if (fresh?.status !== "awaiting-input") return;
+    fresh.messages = await jm.store.getMessages(id, 0);
+    fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
+    const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
+    const payment = ask && fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
+      message.seq > ask.seq);
+    if (!ask || !payment || (requestSeq !== undefined && ask.seq !== requestSeq) || jm.activeJobs.has(id)) return;
+    const { job } = jm.reactivateJob(fresh);
+    const lock = await jm.store.tryReactivationLock(id, () =>
+      this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status));
+    if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
   }
 
   /**
