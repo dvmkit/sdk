@@ -19,6 +19,8 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ## [0.40.0](https://github.com/dvmkit/sdk/compare/v0.40.0-rc.1...v0.40.0) (2026-11-17)
 
 
+Promotes `0.40.0-rc.1` unchanged. Its notes below, including the breaking `./internal` changes and the move to x402 2.31, apply to this release.
+
 ### Miscellaneous Chores
 
 * release 0.40.0 ([#186](https://github.com/dvmkit/sdk/issues/186)) ([7b43c9a](https://github.com/dvmkit/sdk/commit/7b43c9aca0115e07772d6e82d78445d82c4e17f1))
