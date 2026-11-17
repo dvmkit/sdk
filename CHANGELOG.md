@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
