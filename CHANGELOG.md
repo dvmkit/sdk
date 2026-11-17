@@ -21,6 +21,14 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 Promotes `0.40.0-rc.1` unchanged. Its notes below, including the breaking `./internal` changes and the move to x402 2.31, apply to this release.
 
+### Breaking API changes
+
+Against `0.39.0`, the same as `0.40.0-rc.1` (details in its section below):
+
+- `createX402BatchSettlementServer`, `CreateX402BatchSettlementServerOpts`, `CreditRouteDeps` and `handleCreditRequest` change signature through x402 2.31's `Channel` type, which drops `pendingRequest`; `PostgresX402ChannelStorage` implements x402 2.31's `ChannelLockStorage`.
+- A builder's own batch-settlement `storage` must implement `ChannelLockStorage` for fleet-wide channel admission.
+- `@dvmkit/sdk/internal`: `processX402BatchResponseForWallet` requires `paymentHeader`; `processX402BatchResponse` throws on an unsigned or mismatched channel; `DvmX402ChannelStorage` gains `stageRefundResidual`.
+
 ### Miscellaneous Chores
 
 * release 0.40.0 ([#186](https://github.com/dvmkit/sdk/issues/186)) ([7b43c9a](https://github.com/dvmkit/sdk/commit/7b43c9aca0115e07772d6e82d78445d82c4e17f1))
