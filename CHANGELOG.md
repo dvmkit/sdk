@@ -2,13 +2,30 @@
 
 ## Unreleased
 
+## Upgrade details
+
+The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
+
+- Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
+
+- Add authenticated `POST /admin/credit/refund-draw` to restore all or part of a completed credit draw to its original open credit, with durable refund IDs, original-result replay, ownership checks, and original-asset restoration. The `refund` report kind posts `/_internal/credit-draw-refund` with `dvmId`, `creditId`, `drawId`, `jobId`, `refundId`, `amountMicro`, `creditCurrency`, `ledgerSeq`, `refundedAt`, and optional `reason`. The portable fixture is `protocol-fixtures/credit-draw-refund.json`.
+- Initialize the additive `credit_draw_refunds` history table, nullable `credits.last_funding_ledger_seq`, nullable `credit_draws.settled_sats` and `credit_draws.refund_dvm_id`, and `credit_funding_lots.sats_basis_known` defaulting to false. Financial evidence exports retain these facts without request or free-text reason content. Bitcoin restoration requires authoritative actual-settlement `settled_sats`, including zero. Historical `allocated_msats` markers alone are insufficient; missing basis returns `credit_refund_basis_unavailable`. Both historical evidence refusals direct an operator to inspect independent payment/funding/drain evidence before arranging a repair, because retry alone supplies no proof. Zero-sat rounding stays distinct from missing basis.
+- Before the first refund, deploy the platform endpoint, pause monetary writes, and upgrade every process sharing the ledger and outbox, including funding writers and retry workers. Older writers can invalidate the funding watermark, and older readers cannot interpret the new report kind or known-zero lots. Mixed-version monetary history after new metadata is written needs a state compatibility assessment. Assess state compatibility before rolling back after refund state exists; additive DDL alone does not make rolling activation or rollback safe. Ambiguous historical full-drain reopening returns HTTP 422 `credit_refund_state_unavailable`; known closure remains `credit_not_open`, proven reopening remains eligible, and exact replay retains its original result.
+
+### Breaking changes
+
+- The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
+
+## [0.40.0-rc.1](https://github.com/dvmkit/sdk/compare/v0.39.0...v0.40.0-rc.1) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **x402:** ./internal processX402BatchResponseForWallet requires the journalled paymentHeader; see CHANGELOG for the other ./internal changes.
+
 ### Bug Fixes
 
-- Run on `@x402/core`, `@x402/evm` and `@x402/extensions` 2.31.0, pinned exactly. The production dependency graph no longer carries an advisory-affected Zod.
-- Reusable-channel (`batch-settlement`) payments use x402 2.31's per-channel admission lock. On a Postgres-backed DVM the lock is a row in the new `x402_batch_channel_locks` table, so every machine sharing the database sees it, and a request on a channel another request holds is refused with `invalid_batch_settlement_evm_channel_busy`, as before. A lock lasts the payment requirements' `maxTimeoutSeconds` (60 seconds); a machine that stops while holding one blocks that channel for at most that long. A request keeps its own lock past that time until another request takes it over. When the lock store itself fails, x402 2.31 continues without a lock and its charge compare-and-set still admits one charge per voucher; the request's ledger work commits normally. A lock that cannot be released logs `x402_channel_lock_release_failed` and expires on its own.
-- `/v1/credit` reusable-channel answers carry `extra.chargedAmount` in `PAYMENT-RESPONSE` beside the kept `extra.channelState`, including a deposit the DVM recovers from chain evidence after a crash, which also carries the charged total as `extra.channelState.chargedCumulativeAmount`. An x402 2.31 client advances its channel record by that amount and cannot advance it without one. The SDK's paying client takes the charge from the voucher it signed when an older DVM sends only the cumulative and that cumulative is exactly the one the voucher signed.
-- A fleet that has lost a channel's row and meets a voucher during the payer's withdrawal now refuses it as `invalid_batch_settlement_evm_cumulative_amount_mismatch` and stores nothing: x402 2.31 checks a rowless voucher against the on-chain claimed total. Charges recorded only on the lost row and never claimed are no longer recoverable through that voucher.
-- A cooperative refund that leaves money in the channel keeps the paying client's channel record with the DVM's reported remaining balance, as before; x402 2.31 would otherwise delete it.
+* **x402:** run on x402 2.31 with a shared channel admission lock ([#184](https://github.com/dvmkit/sdk/issues/184)) ([9679760](https://github.com/dvmkit/sdk/commit/96797606d8a4badb13f7bdddb9a8a06aa3b0526a))
 
 ### Breaking API changes
 
@@ -31,19 +48,14 @@
 
 - A platform that projects SDK diagnostics must admit the catalogue events `x402_channel_lock_in_process` and `x402_channel_lock_release_failed`; until then they are stored as `diagnostic.unknown`.
 
-## Upgrade details
+### Fix details
 
-The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
+- Run on `@x402/core`, `@x402/evm` and `@x402/extensions` 2.31.0, pinned exactly. The production dependency graph no longer carries an advisory-affected Zod.
+- Reusable-channel (`batch-settlement`) payments use x402 2.31's per-channel admission lock. On a Postgres-backed DVM the lock is a row in the new `x402_batch_channel_locks` table, so every machine sharing the database sees it, and a request on a channel another request holds is refused with `invalid_batch_settlement_evm_channel_busy`, as before. A lock lasts the payment requirements' `maxTimeoutSeconds` (60 seconds); a machine that stops while holding one blocks that channel for at most that long. A request keeps its own lock past that time until another request takes it over. When the lock store itself fails, x402 2.31 continues without a lock and its charge compare-and-set still admits one charge per voucher; the request's ledger work commits normally. A lock that cannot be released logs `x402_channel_lock_release_failed` and expires on its own.
+- `/v1/credit` reusable-channel answers carry `extra.chargedAmount` in `PAYMENT-RESPONSE` beside the kept `extra.channelState`, including a deposit the DVM recovers from chain evidence after a crash, which also carries the charged total as `extra.channelState.chargedCumulativeAmount`. An x402 2.31 client advances its channel record by that amount and cannot advance it without one. The SDK's paying client takes the charge from the voucher it signed when an older DVM sends only the cumulative and that cumulative is exactly the one the voucher signed.
+- A fleet that has lost a channel's row and meets a voucher during the payer's withdrawal now refuses it as `invalid_batch_settlement_evm_cumulative_amount_mismatch` and stores nothing: x402 2.31 checks a rowless voucher against the on-chain claimed total. Charges recorded only on the lost row and never claimed are no longer recoverable through that voucher.
+- A cooperative refund that leaves money in the channel keeps the paying client's channel record with the DVM's reported remaining balance, as before; x402 2.31 would otherwise delete it.
 
-- Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
-
-- Add authenticated `POST /admin/credit/refund-draw` to restore all or part of a completed credit draw to its original open credit, with durable refund IDs, original-result replay, ownership checks, and original-asset restoration. The `refund` report kind posts `/_internal/credit-draw-refund` with `dvmId`, `creditId`, `drawId`, `jobId`, `refundId`, `amountMicro`, `creditCurrency`, `ledgerSeq`, `refundedAt`, and optional `reason`. The portable fixture is `protocol-fixtures/credit-draw-refund.json`.
-- Initialize the additive `credit_draw_refunds` history table, nullable `credits.last_funding_ledger_seq`, nullable `credit_draws.settled_sats` and `credit_draws.refund_dvm_id`, and `credit_funding_lots.sats_basis_known` defaulting to false. Financial evidence exports retain these facts without request or free-text reason content. Bitcoin restoration requires authoritative actual-settlement `settled_sats`, including zero. Historical `allocated_msats` markers alone are insufficient; missing basis returns `credit_refund_basis_unavailable`. Both historical evidence refusals direct an operator to inspect independent payment/funding/drain evidence before arranging a repair, because retry alone supplies no proof. Zero-sat rounding stays distinct from missing basis.
-- Before the first refund, deploy the platform endpoint, pause monetary writes, and upgrade every process sharing the ledger and outbox, including funding writers and retry workers. Older writers can invalidate the funding watermark, and older readers cannot interpret the new report kind or known-zero lots. Mixed-version monetary history after new metadata is written needs a state compatibility assessment. Assess state compatibility before rolling back after refund state exists; additive DDL alone does not make rolling activation or rollback safe. Ambiguous historical full-drain reopening returns HTTP 422 `credit_refund_state_unavailable`; known closure remains `credit_not_open`, proven reopening remains eligible, and exact replay retains its original result.
-
-### Breaking changes
-
-- The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
 ## [0.39.0](https://github.com/dvmkit/sdk/compare/v0.38.0...v0.39.0) (2026-11-16)
 
