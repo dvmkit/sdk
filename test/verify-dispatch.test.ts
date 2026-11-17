@@ -51,6 +51,18 @@ describe("verification dispatcher", () => {
     expect(() => assertReleaseDispatch(missingQuickstart)).toThrow("outer verification");
   });
 
+  it("rejects missing Tempo close stress in mandatory database mode", () => {
+    const missingStress = (options: Parameters<typeof dispatchVerification>[0]) => {
+      dispatchVerification({
+        ...options,
+        run: (step) => {
+          if (step.args[1] !== "test:tempo-close-stress") options.run(step);
+        },
+      });
+    };
+    expect(() => assertReleaseDispatch(missingStress)).toThrow("outer verification");
+  });
+
   it("rejects missing database forwarding across the clean-install bridge", () => {
     const missingDatabaseForwarding = (options: Parameters<typeof dispatchVerification>[0]) => {
       dispatchVerification({

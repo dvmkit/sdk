@@ -25,6 +25,8 @@ The public-safety checks read what Git would carry into a public repository — 
 
 The database suite is skipped when `DATABASE_URL` is unset, and the summary says so — a skipped suite verified nothing, so never report it as green. Pass `npm run verify -- --require-database` to make a missing `DATABASE_URL` a failure; both CI workflows do. That mode also requires the FakeWallet test mint on `localhost:3338` that the Cashu integration suites pay against; `node scripts/start-cashu-mint.mjs` starts it with the same command both workflows use, and `docker rm --force sdk-cashu-mint` removes it.
 
+After clean-source verification, mandatory database mode also runs `npm run test:tempo-close-stress`. It requires permission to create a temporary test database, runs the hosted Tempo close-sharing case twenty consecutive times while full database suites run against the original database, and rejects skipped cases or failed suites. Before those runs, it disables search sharing in an isolated source copy and requires the case to detect two searches. Per-run reports and logs go to `.artifacts/tempo-close-stress`; failures print their logs into the verification log, which also records each successful repetition.
+
 Locally, point it at a throwaway Postgres whose database is named `dvmkit_test` (or `dvmkit_test_` followed by 8 lowercase hex characters) — every migrated database suite refuses to run against any other name. Within that database the suite creates and drops its own randomly named schema, so it is safe to run against a `dvmkit_test` database that already holds other things:
 
 ```sh

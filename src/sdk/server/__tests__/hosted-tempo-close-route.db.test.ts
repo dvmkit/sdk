@@ -578,7 +578,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
 
   it("reports the payout of a close that landed after its receipt wait timed out, once", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, creditId, channelId, dvmId, scope, drain, obligations, searches } =
+    const { server, creditId, channelId, dvmId, scope, drain, obligations, searches, rpc } =
       await hostedCredit(payer, { modes: ["lands-then-receipt-times-out"] });
     const reporting = payoutReporting(dvmId, scope);
     try {
@@ -595,6 +595,9 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
       // A retried drain neither searches again nor rewrites the obligation.
       expect((await drain(payer)).status).toBe(200);
       expect(searches()).toBe(1);
+      const closeTopic = encodeEventTopics({ abi: TempoSession.Precompile.escrowAbi, eventName: "ChannelClosed" })[0];
+      expect(rpc.requests.filter(({ method, params }) => method === "eth_getLogs" &&
+        (params[0] as { topics: Hex[] }).topics[0] === closeTopic)).toHaveLength(1);
       expect(await obligations()).toEqual([{ state: "reserved", tx_hash: TX_HASH }]);
 
       await observeFinal(channelId);
@@ -2429,36 +2432,41 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
 
   it("shares one close search between a caller poll and the concurrent sweep", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
-    const { server, mpp, creditId, drain, chain, logs, operator, rpc, searches, obligations } =
-      await hostedCredit(payer, { modes: ["submits-then-times-out"] });
     let release!: () => void;
     let started!: () => void;
+    let deadline!: () => number;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     const searching = new Promise<void>((resolve) => { started = resolve; });
-    const pollWrite = vi.spyOn(sessions, "update");
+    const search = vi.fn<NonNullable<NonNullable<Parameters<typeof _testing.attachTempoSessionRuntime>[2]>["findChannelClose"]>>(
+      async (_client, _channelId, _escrow, _notBefore, _startBlock, deadlineMs) => {
+        if (typeof deadlineMs !== "function") throw new Error("Shared search requires a live deadline");
+        deadline = deadlineMs;
+        started();
+        await blocked;
+        return { outcome: "closed", txHash: TX_HASH, sender: PAYEE as Hex };
+      }
+    );
+    const { server, mpp, creditId, drain, chain, obligations } =
+      await hostedCredit(payer, { modes: ["submits-then-times-out"], findChannelClose: search });
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
     let sweep: Promise<void> | undefined;
     let poll: ReturnType<typeof drain> | undefined;
     try {
       expect((await drain(payer)).status).toBe(402);
       chain.deposit = 0n;
       chain.settled = SPENT;
-      logs.push({ event: "ChannelClosed", block: HEAD - 3n, txHash: TX_HASH, from: operator.address });
-      const before = searches();
-      rpc.searchGate.wait = async () => { started(); await blocked; };
+      clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
       sweep = mpp.reconcileTempoSessionCloses!();
       await searching;
-      pollWrite.mockClear();
+      const sweepDeadline = deadline();
       poll = drain(payer);
-      await vi.waitFor(() => expect(pollWrite.mock.settledResults.some((result) => result.type === "fulfilled")).toBe(true));
-      // The finalized-state write completes after the poll's reads. Flush its
-      // continuation so the poll joins the search before the RPC is released.
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      // Joining the shared search shortens its deadline to the caller's budget.
+      // A completed store write or an event-loop tick cannot prove that join.
+      await vi.waitFor(() => expect(deadline()).toBeLessThan(sweepDeadline));
+      expect(search).toHaveBeenCalledTimes(1);
       release();
       const [result] = await Promise.all([poll, sweep]);
-      expect(searches() - before).toBe(1);
-      const closeTopic = encodeEventTopics({ abi: TempoSession.Precompile.escrowAbi, eventName: "ChannelClosed" })[0];
-      expect(rpc.requests.filter(({ method, params }) => method === "eth_getLogs" &&
-        (params[0] as { topics: Hex[] }).topics[0] === closeTopic)).toHaveLength(1);
+      expect(search).toHaveBeenCalledTimes(1);
       expect(result.status).toBe(200);
       expect(await obligations()).toEqual([{ state: "reserved", tx_hash: TX_HASH }]);
       expect(await ledger.getDrain({ creditId, drainId: "d1" })).toMatchObject({ status: "sent" });
@@ -2466,7 +2474,7 @@ describe.skipIf(!RUN)("hosted Tempo close through the drain route (real Postgres
     } finally {
       release();
       await Promise.allSettled([poll, sweep]);
-      pollWrite.mockRestore();
+      clock?.mockRestore();
       await server.shutdown();
     }
   });
