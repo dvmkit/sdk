@@ -154,7 +154,11 @@ export interface SettleResponse {
   network?: string;
   amount?: string;
   extensions?: Record<string, unknown>;
-  extra?: { channelState?: SettleResponseChannelState };
+  extra?: {
+    channelState?: SettleResponseChannelState;
+    /** What this request charged, a uint256 decimal string; batch settlement only. */
+    chargedAmount?: string;
+  };
 }
 
 /** Batch-settlement channel state echoed to the payer; amounts are uint256 decimal strings. */

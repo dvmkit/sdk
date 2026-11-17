@@ -5,10 +5,11 @@ import type { SettleResponse, SettleResponseChannelState } from "./spec";
  * The part of a facilitator's settle answer a caller may see in
  * `PAYMENT-RESPONSE`: `success`, `transaction`, `network`, `payer`, a bounded
  * `errorReason` and, when `channelId` names the batch-settlement channel the
- * payment was for, that channel's validated `extra.channelState`. Anything
- * else the facilitator sent, such as an `errorMessage` or `extensions`, stays
- * server-side, and an overlong value is dropped, so a facilitator answer
- * cannot grow the response header.
+ * payment was for, that channel's validated `extra.channelState` and the
+ * request's `extra.chargedAmount`, which an x402 2.31 client advances its own
+ * cumulative by. Anything else the facilitator sent, such as an `errorMessage`
+ * or `extensions`, stays server-side, and an overlong value is dropped, so a
+ * facilitator answer cannot grow the response header.
  */
 export function callerSettleResponse(answer: unknown, options: { channelId?: string } = {}): SettleResponse {
   const body = isRecord(answer) ? answer : {};
@@ -19,13 +20,17 @@ export function callerSettleResponse(answer: unknown, options: { channelId?: str
       ? body.errorReason.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, SETTLE_ERROR_REASON_MAX)
       : "";
   const channelState = options.channelId === undefined ? undefined : loggedChannelState(body.extra, options.channelId);
+  // Echoed only beside channel state proven to be this payment's channel.
+  const chargedAmount = channelState === undefined ? undefined : uint256Decimal(isRecord(body.extra) ? body.extra.chargedAmount : undefined);
   return {
     success: body.success === true,
     transaction: boundedToken(body.transaction) ?? "",
     ...(network !== undefined && { network }),
     ...(payer !== undefined && { payer }),
     ...(errorReason !== "" && { errorReason }),
-    ...(channelState !== undefined && { extra: { channelState } }),
+    ...(channelState !== undefined && {
+      extra: { channelState, ...(chargedAmount !== undefined && { chargedAmount }) },
+    }),
   };
 }
 
@@ -55,10 +60,8 @@ export function settleChannelState(
   for (const field of CHANNEL_AMOUNT_FIELDS) {
     const value = state[field];
     if (value === undefined) continue;
-    const decimal = typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : value;
-    if (typeof decimal !== "string" || !UINT256_DECIMAL.test(decimal) || BigInt(decimal) > UINT256_MAX) {
-      return { kind: "dropped" };
-    }
+    const decimal = uint256Decimal(value);
+    if (decimal === undefined) return { kind: "dropped" };
     kept[field] = decimal;
   }
   return { kind: "kept", state: kept };
@@ -83,6 +86,14 @@ function loggedChannelState(extra: unknown, channelId: string): SettleResponseCh
     diagnosticConsole.warn({ event: "x402_settle_channel_state_dropped", rail: "x402" });
   }
   return bound.kind === "kept" ? bound.state : undefined;
+}
+
+/** A uint256 as a decimal string, from a string or a safe non-negative integer. */
+function uint256Decimal(value: unknown): string | undefined {
+  const decimal = typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : value;
+  return typeof decimal === "string" && UINT256_DECIMAL.test(decimal) && BigInt(decimal) <= UINT256_MAX
+    ? decimal
+    : undefined;
 }
 
 function boundedToken(value: unknown): string | undefined {

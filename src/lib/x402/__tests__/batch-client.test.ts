@@ -491,46 +491,143 @@ describe("x402 batch client", () => {
     await batch.processX402BatchResponseForWallet({
       wallet,
       depositMicro: 200_000,
+      paymentHeader: payment.paymentHeader,
       paymentResponse: response,
       channelId: payment.channelId,
     });
 
     await expect(storage.get(other)).resolves.toMatchObject({ balance: "9000", chargedCumulativeAmount: "100" });
+    await expect(storage.get(funded)).resolves.toMatchObject({ balance: "0", chargedCumulativeAmount: "0" });
   });
 
-  // An older caller, or plain JavaScript, can still omit the now-required channel.
+  // An older caller, or plain JavaScript, can still omit the channel; the signed
+  // payment's own channel is what binds the answer.
   it.each([
     ["names another channel", "other", "123"],
     ["carries an amount past uint256", "own", (2n ** 256n).toString()],
   ] as const)("stores nothing from an unbound acknowledgement that %s", async (_case, target, amount) => {
-    const key = `0x${"11".repeat(32)}` as `0x${string}`;
-    const account = privateKeyToAccount(key);
-    const network = "eip155:84532";
-    const own = `0x${"dd".repeat(32)}`;
-    const other = `0x${"ee".repeat(32)}`;
-    const store = await import("../channel-store");
+    const { batch, store, wallet, payment } = await signedDepositPayment();
     const storage = new store.DvmX402ChannelStorage();
-    await storage.set(own, { balance: "0", chargedCumulativeAmount: "0" });
+    const other = `0x${"ee".repeat(32)}`;
     await storage.set(other, { balance: "9000", chargedCumulativeAmount: "100" });
-    const batch = await import("../batch-client");
 
     await batch.processX402BatchResponseForWallet({
-      wallet: { privateKey: key, address: account.address, network },
+      wallet,
       depositMicro: 200_000,
+      paymentHeader: payment.paymentHeader,
       paymentResponse: encodePaymentResponseHeader({
         success: true,
         transaction: "0xsettled",
-        network,
-        payer: account.address,
+        network: wallet.network,
+        payer: wallet.address,
         extra: {
-          channelState: { channelId: target === "own" ? own : other, balance: amount, chargedCumulativeAmount: amount },
+          channelState: {
+            channelId: target === "own" ? payment.channelId : other,
+            balance: amount,
+            chargedCumulativeAmount: amount,
+          },
         },
       }),
     } as unknown as Parameters<typeof batch.processX402BatchResponseForWallet>[0]);
 
-    await expect(storage.get(own)).resolves.toMatchObject({ balance: "0", chargedCumulativeAmount: "0" });
+    await expect(storage.get(payment.channelId)).resolves.toMatchObject({ balance: "0", chargedCumulativeAmount: "0" });
     await expect(storage.get(other)).resolves.toMatchObject({ balance: "9000", chargedCumulativeAmount: "100" });
   });
+
+  it("stamps a deposit acknowledged after a restart as a local sum, not a chain reading", async () => {
+    const { batch, store, wallet, payment } = await signedDepositPayment();
+
+    await batch.processX402BatchResponseForWallet({
+      wallet,
+      depositMicro: 200_000,
+      paymentHeader: payment.paymentHeader,
+      paymentResponse: encodePaymentResponseHeader({
+        success: true,
+        transaction: "0xsettled",
+        network: wallet.network,
+        payer: wallet.address,
+        extra: {
+          chargedAmount: "200000",
+          channelState: { channelId: payment.channelId, chargedCumulativeAmount: "200000", balance: "200000" },
+        },
+      }),
+      channelId: payment.channelId,
+    });
+
+    await expect(new store.DvmX402ChannelStorage().get(payment.channelId)).resolves.toMatchObject({
+      balance: "200000",
+      chargedCumulativeAmount: "200000",
+    });
+    expect(store.x402ChannelBalanceUnreconciledAt(payment.channelId)).toBeGreaterThan(0);
+  });
+
+  // A voucher answer observes nothing about the funded balance, so it neither
+  // certifies a local sum nor casts doubt on a chain reading.
+  it.each([
+    ["a local sum", true],
+    ["a chain reading", false],
+  ] as const)("leaves a voucher's balance provenance as %s", async (_case, unreconciled) => {
+    const { batch, store, wallet, payment } = await signedDepositPayment({ fundedMicro: "1000000" });
+    expect(decodePaymentSignatureHeader(payment.paymentHeader).payload).toMatchObject({ type: "voucher" });
+    const channels = new store.DvmX402ChannelStorage();
+    const funded = { balance: "1000000", totalClaimed: "0", chargedCumulativeAmount: "0" };
+    if (unreconciled) await channels.setLocallyAppliedDeposit(payment.channelId, funded);
+    else await channels.reconcileChainState(payment.channelId, funded);
+    const stampBefore = store.x402ChannelBalanceUnreconciledAt(payment.channelId);
+    expect(stampBefore !== undefined).toBe(unreconciled);
+
+    await batch.processX402BatchResponse(
+      payment.scheme,
+      encodePaymentResponseHeader({
+        success: true,
+        transaction: "",
+        network: wallet.network,
+        payer: wallet.address,
+        extra: {
+          chargedAmount: "200000",
+          channelState: { channelId: payment.channelId, chargedCumulativeAmount: "200000", balance: "1000000" },
+        },
+      })
+    );
+
+    await expect(new store.DvmX402ChannelStorage().get(payment.channelId)).resolves.toMatchObject({
+      balance: "1000000",
+      chargedCumulativeAmount: "200000",
+    });
+    expect(store.x402ChannelBalanceUnreconciledAt(payment.channelId)).toBe(stampBefore);
+  });
+
+  // A DVM whose SDK predates echoing `chargedAmount` reports only the cumulative.
+  it.each([
+    ["the cumulative this voucher signed", "200000", "200000"],
+    ["a cumulative this voucher did not sign", "150000", "0"],
+    ["no cumulative at all", undefined, "0"],
+  ] as const)(
+    "takes the request amount as charged only from %s",
+    async (_case, cumulative, expectedCharged) => {
+      const { batch, store, payment, wallet } = await signedDepositPayment();
+
+      await batch.processX402BatchResponse(
+        payment.scheme,
+        encodePaymentResponseHeader({
+          success: true,
+          transaction: "0xsettled",
+          network: wallet.network,
+          payer: wallet.address,
+          extra: {
+            channelState: {
+              channelId: payment.channelId,
+              balance: "200000",
+              ...(cumulative !== undefined ? { chargedCumulativeAmount: cumulative } : {}),
+            },
+          },
+        })
+      );
+
+      const stored = await new store.DvmX402ChannelStorage().get(payment.channelId);
+      expect(stored?.chargedCumulativeAmount).toBe(expectedCharged);
+    }
+  );
 
   it("blocks even the credit that owns a refused voucher, until its deposit expires", async () => {
     const key = `0x${"11".repeat(32)}` as `0x${string}`;
@@ -2261,4 +2358,68 @@ async function refundFixture(network: `${string}:${string}` = "eip155:84532") {
       });
     },
   };
+}
+
+/**
+ * A payment `createX402BatchPayment` signed for a 200000 request on a channel
+ * this machine already knows, holding `fundedMicro` (a deposit when it cannot
+ * cover the request, a voucher when it can).
+ */
+async function signedDepositPayment(opts: { fundedMicro?: string } = {}) {
+  const key = `0x${"11".repeat(32)}` as `0x${string}`;
+  const account = privateKeyToAccount(key);
+  const network = "eip155:84532" as const;
+  const receiver = `0x${"22".repeat(20)}` as `0x${string}`;
+  const receiverAuthorizer = `0x${"33".repeat(20)}` as `0x${string}`;
+  const token = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const;
+  const channelId = computeChannelId(
+    {
+      payer: account.address,
+      payerAuthorizer: account.address,
+      receiver,
+      receiverAuthorizer,
+      token,
+      withdrawDelay: 86_400,
+      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+    },
+    network
+  );
+  const store = await import("../channel-store");
+  // A known channel keeps upstream from reading the chain before it signs.
+  await new store.DvmX402ChannelStorage().set(channelId, {
+    balance: opts.fundedMicro ?? "0",
+    totalClaimed: "0",
+    chargedCumulativeAmount: "0",
+  });
+  const batch = await import("../batch-client");
+  const wallet = { privateKey: key, address: account.address, network };
+  const payment = await batch.createX402BatchPayment({
+    wallet,
+    paymentRequired: {
+      x402Version: 2,
+      resource: { url: "https://dvm.example/v1/credit" },
+      accepts: [
+        {
+          scheme: "batch-settlement",
+          network,
+          asset: token,
+          amount: "200000",
+          payTo: receiver,
+          maxTimeoutSeconds: 60,
+          extra: {
+            receiverAuthorizer,
+            withdrawDelay: 86_400,
+            name: "x402 Batch Settlement",
+            version: "1",
+            assetTransferMethod: "eip3009",
+          },
+        },
+      ],
+    },
+    endpoint: "https://dvm.example",
+    callerPubkey: "aa".repeat(32),
+    creditId: "credit-1",
+    depositMicro: 200_000,
+  });
+  return { batch, store, wallet, payment };
 }

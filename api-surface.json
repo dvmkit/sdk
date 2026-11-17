@@ -1086,11 +1086,11 @@
         },
         "createX402BatchSettlementServer": {
           "stability": "experimental",
-          "signature": "ff99524d2a9e86b7ff78038401c77bb1d2f3c6c27f08c8b1aaba360e00886ecf"
+          "signature": "bd304e3eb58e216e9e1cb632fd6ace8d5d1fb33eb03c0fab579bfb2924802529"
         },
         "CreateX402BatchSettlementServerOpts": {
           "stability": "experimental",
-          "signature": "12981900217787e931003c9dbd3d2b67f794348168d9ff065426a1c7d2dc1c1f"
+          "signature": "2feeefa4b15bc6f982f357958fba0d531c6165e381b890bf01351fa793e52a96"
         },
         "CREDIT_ENVELOPE_KEYS": {
           "stability": "experimental",
@@ -1178,7 +1178,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "9df3ef24a38782a92071d53fb0c87acbec631bb5537d3504e0a66fed29708bcc"
+          "signature": "8d745e44c06a263d0533bc9daeae6fb7722224b8e5fad7688749b027e6ca643f"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1270,7 +1270,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "09f40809a1afec766d6923cab5cf8bee1a600b6d284285f1a2603e963ccf6e9e"
+          "signature": "3ef62f3f1749dd4981ff40a5ab0dac2a30bd231c19672e9f6fc32150c6f4d459"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1478,7 +1478,7 @@
         },
         "PostgresX402ChannelStorage": {
           "stability": "experimental",
-          "signature": "c2be8f4ca59638024ca97c9bd3620b97398f6b198136e035351a9f337247aecb"
+          "signature": "de479d95096aee810a0b99ad9e6003216b34775397d334c5f51a9713023e1d67"
         },
         "PostgresX402ExactSettlementStore": {
           "stability": "experimental",

@@ -20,6 +20,7 @@ import {
   type AutoSettlementConfig,
   BatchSettlementEvmScheme,
   type Channel,
+  type ChannelLockStorage,
   type ChannelStorage,
   type ClaimChannelSelector,
   InMemoryChannelStorage,
@@ -564,6 +565,19 @@ export async function createX402BatchSettlementServer(
     storage = new InMemoryChannelStorage();
   }
   storage = withX402ShutdownClaimBudget(storage);
+  // Handed to the scheme explicitly: with no lock-capable store upstream falls
+  // back to a per-process lock, which a fleet sharing this database would not
+  // share. A builder's own `storage` keeps upstream's choice.
+  const lockStorage = postgres ? (storage as ChannelStorage & ChannelLockStorage) : undefined;
+  if (opts.config.storage && !opts.allowInMemory && !isChannelLockCapable(opts.config.storage)) {
+    diagnosticConsole.warn({
+      level: "warn",
+      event: "x402_channel_lock_in_process",
+      network: opts.network,
+      detail:
+        "the configured x402 channel storage has no acquire, release and isHeld; each process admits requests to a channel on its own, not fleet-wide",
+    });
+  }
   if (postgres && opts.hostedObligations) {
     opts.hostedObligations.attachX402SettlementStore(postgres);
   }
@@ -648,8 +662,11 @@ export async function createX402BatchSettlementServer(
       network: opts.network,
       ...(rpcUrl ? { rpcUrl } : {}),
     }));
+  // `enforceMinDeposit` stays off: callers size their own deposits, and
+  // `buildRequirements` drops the hint it would enforce.
   const scheme = new BatchSettlementEvmScheme(opts.payTo as `0x${string}`, {
     storage,
+    ...(lockStorage ? { lockStorage } : {}),
     ...(opts.config.receiverAuthorizerSigner
       ? { receiverAuthorizerSigner: opts.config.receiverAuthorizerSigner }
       : {}),
@@ -758,7 +775,11 @@ export async function createX402BatchSettlementServer(
       ],
       undefined
     );
-    return requirements as PaymentRequirementsV2[];
+    // A payment must carry every `extra` field the server requires, and a
+    // caller's journalled header signed against an x402 2.21 402 has no
+    // `minDeposit`. The SDK never enforces a minimum deposit, so the hint is
+    // not announced and those headers still match.
+    return (requirements as PaymentRequirementsV2[]).map(withoutMinDepositHint);
   };
 
   let stopPromise: Promise<void> | undefined;
@@ -940,6 +961,7 @@ export async function createX402BatchSettlementServer(
             const value = await recoverSettledPayment({
               postgres,
               storage,
+              lockStorage: postgres,
               intent: prior,
               funding,
               payload,
@@ -951,7 +973,7 @@ export async function createX402BatchSettlementServer(
             return { ok: true as const, value };
           }
           if (prior.status === "submitting") {
-            await clearPending(storage, funding.channelId, prior.pendingId);
+            await releaseIntentAdmission(postgres, funding.channelId, prior.pendingId);
             const reconciliation = await reconcileSubmittingSettlement(
               facilitator,
               settlementEvidence,
@@ -989,6 +1011,7 @@ export async function createX402BatchSettlementServer(
             const value = await recoverSettledPayment({
               postgres,
               storage,
+              lockStorage: postgres,
               intent: { ...prior, status: "settled", response: reconciled },
               funding,
               payload,
@@ -999,7 +1022,7 @@ export async function createX402BatchSettlementServer(
             });
             return { ok: true as const, value };
           }
-          await clearPending(storage, funding.channelId, prior.pendingId);
+          await releaseIntentAdmission(postgres, funding.channelId, prior.pendingId);
         }
 
         channelBeforeVerify = await storage.get(funding.channelId);
@@ -1027,11 +1050,11 @@ export async function createX402BatchSettlementServer(
               postgres ? (base, apply) => postgres.withSanctionedRefundBase(base, apply) : undefined
             );
           } catch {
-            await restoreRevokedVoucher(storage, funding.channelId, undefined, channelBeforeVerify);
+            await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
             return correctiveRefusal(resource, requirements, payload, "verify_failed");
           }
           if ("refundBoundFailure" in live) {
-            await restoreRevokedVoucher(storage, funding.channelId, undefined, channelBeforeVerify);
+            await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
             return {
               ok: false as const,
               reason: live.refundBoundFailure,
@@ -1040,7 +1063,7 @@ export async function createX402BatchSettlementServer(
             };
           }
           if (!live.isValid) {
-            await restoreRevokedVoucher(storage, funding.channelId, undefined, channelBeforeVerify);
+            await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
             return correctiveRefusal(
               resource,
               requirements,
@@ -1054,11 +1077,11 @@ export async function createX402BatchSettlementServer(
         try {
           verify = await resource.verifyPayment(payload, matched);
         } catch {
-          await restoreRevokedVoucher(storage, funding.channelId, undefined, channelBeforeVerify);
+          await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
           return correctiveRefusal(resource, requirements, payload, "verify_failed");
         }
         if (!verify.isValid) {
-          await restoreRevokedVoucher(storage, funding.channelId, undefined, channelBeforeVerify);
+          await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
           return correctiveRefusal(
             resource,
             requirements,
@@ -1067,19 +1090,25 @@ export async function createX402BatchSettlementServer(
           );
         }
 
-        const reserved = await storage.get(funding.channelId);
-        pendingId = reserved?.pendingRequest?.pendingId;
-        if (reserved?.withdrawRequestedAt) {
-          // Release the synthetic refund base and reservation before the
+        // Verification writes nothing to the row: the admitted request's view of
+        // the channel, with the voucher it just checked, lives in the scheme's
+        // request context until settle commits it.
+        const admitted = scheme.readRequestContext(payload);
+        pendingId = admitted?.pendingId;
+        const reserved = admitted?.channelSnapshot;
+        if (!reserved) throw new Error("x402 settlement verification left no channel snapshot");
+        if (reserved.withdrawRequestedAt) {
+          // Undo the synthetic refund base and release the admission before the
           // channel transaction commits. The fleet claim runs outside this
-          // lock to preserve the global-lock → channel-lock ordering.
-          await restoreReservation(storage, funding.channelId, pendingId, channelBeforeVerify);
+          // lock to preserve the global-lock → channel-lock ordering. The
+          // request context stays, so the refusal below still reports the snapshot.
+          await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
+          await scheme.releasePendingRequest(payload);
           return { withdrawalPending: true as const };
         }
 
         let intent: X402SettlementIntent | undefined;
         if (external && postgres) {
-          if (!reserved) throw new Error("x402 settlement verification created no channel state");
           intent = await postgres.prepareSettlement({
             settlementId,
             channelId: funding.channelId,
@@ -1095,6 +1124,7 @@ export async function createX402BatchSettlementServer(
             const value = await recoverSettledPayment({
               postgres,
               storage,
+              lockStorage: postgres,
               intent,
               funding,
               payload,
@@ -1109,7 +1139,7 @@ export async function createX402BatchSettlementServer(
 
         cancel = resource.createPaymentCancellationDispatcher(payload, matched);
         // The handler-equivalent ledger work deliberately runs before settle.
-        // If it throws, upstream cancellation clears `pendingRequest`. A
+        // If it throws, upstream cancellation releases the admission. A
         // successful external settle is durably recorded before this
         // transaction completes so a later retry can finish the ledger.
         let committed = await args.commit(funding, tx);
@@ -1159,16 +1189,34 @@ export async function createX402BatchSettlementServer(
         return { ok: true as const, value: { funding, settlement, committed } };
       };
 
+      // Upstream releases on most paths, not all of them (a withdrawal refusal
+      // after a successful verify is one it leaves held), so every outcome ends
+      // here. The lock is the scheme's: the Postgres store, or upstream's own.
+      const releaseAdmission = async (): Promise<void> => {
+        const owner = pendingId ?? scheme.readRequestContext(payload)?.pendingId;
+        if (!owner) return;
+        try {
+          await scheme.getLockStorage()?.release(funding.channelId, owner);
+        } catch (error) {
+          // Its TTL bounds a lock that fails to release; failing the request
+          // here would discard a settlement that already happened.
+          loggers.x402.warn("x402_channel_lock_release_failed", {
+            "channel.id": funding.channelId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      };
       const guarded = async (tx?: CreditLedgerQuerier) => {
         try {
           return await runLocked(tx);
         } catch (error) {
           if (!settlementState.succeeded) {
-            await restoreRevokedVoucher(storage, funding.channelId, pendingId, channelBeforeVerify);
+            await restoreRevokedVoucher(storage, funding.channelId, channelBeforeVerify);
           }
           await cancel?.cancel({ reason: "handler_threw", error }).catch(() => undefined);
-          await clearPending(storage, funding.channelId, pendingId);
           throw error;
+        } finally {
+          await releaseAdmission();
         }
       };
       const result = postgres
@@ -1200,11 +1248,8 @@ export async function createX402BatchSettlementServer(
         } catch (error) {
           // The payment is refused either way. A facilitator that rejected the
           // rush claim is a provider fault the caller cannot act on, so it must
-          // not turn a corrective 402 into a 500 — and the voucher this branch
-          // just verified stays on the row for the next claim to carry.
+          // not turn a corrective 402 into a 500.
           diagnosticConsole.error("x402 batch-settlement withdrawal claim failed", error);
-        } finally {
-          await restoreReservation(storage, funding.channelId, pendingId, channelBeforeVerify);
         }
         return correctiveRefusal(resource, requirements, payload, "withdrawal_pending");
       }
@@ -1448,6 +1493,10 @@ async function reconcileSubmittingSettlement(
     };
   }
 
+  // Recovery commits a deposit's charge as `channelBefore` plus the request,
+  // and the caller advances its record by `chargedAmount`. A refund charges
+  // nothing.
+  const deposit = isBatchSettlementDepositPayload(raw);
   return {
     reconciled: true,
     response: {
@@ -1464,7 +1513,14 @@ async function reconcileSubmittingSettlement(
           totalClaimed: live.totalClaimed,
           withdrawRequestedAt: live.withdrawRequestedAt,
           refundNonce: String(live.refundNonce),
+          ...(deposit && {
+            chargedCumulativeAmount: (
+              BigInt(intent.channelBefore.chargedCumulativeAmount) +
+              BigInt(intent.requirements.amount)
+            ).toString(),
+          }),
         },
+        ...(deposit && { chargedAmount: intent.requirements.amount }),
       },
     },
   };
@@ -1584,7 +1640,7 @@ function createSettlementRepair(
 
       const runLedgerLeg = async () =>
         postgres.withChannelTransaction(intent.channelId, async (tx) => {
-          await clearPending(storage, intent.channelId, intent.pendingId);
+          await releaseIntentAdmission(postgres, intent.channelId, intent.pendingId);
           let value = await args.commit(intent, tx);
           value = await args.complete(
             { transaction: evidence.transaction, amount: evidence.amount },
@@ -1604,6 +1660,7 @@ function createSettlementRepair(
           try {
             await applyRecoveredChannelSettlement(
               storage,
+              postgres,
               intent.payload,
               intent.requirements,
               response,
@@ -2046,6 +2103,7 @@ function deriveRefundBase(
 async function recoverSettledPayment<T>(args: {
   postgres: PostgresX402ChannelStorage;
   storage: ChannelStorage;
+  lockStorage: ChannelLockStorage;
   intent: X402SettlementIntent;
   funding: X402BatchFunding;
   payload: PaymentPayload;
@@ -2062,6 +2120,7 @@ async function recoverSettledPayment<T>(args: {
     let committed = await args.commit(args.funding, tx);
     await applyRecoveredChannelSettlement(
       args.storage,
+      args.lockStorage,
       args.payload,
       args.matched,
       settlement,
@@ -2100,6 +2159,7 @@ async function withLocalChannelLock<T>(
 
 async function applyRecoveredChannelSettlement(
   storage: ChannelStorage,
+  lockStorage: ChannelLockStorage,
   payload: PaymentPayload,
   requirements: PaymentRequirements,
   settlement: SettleResponse,
@@ -2113,6 +2173,11 @@ async function applyRecoveredChannelSettlement(
   const channelState = isRecord(settlement.extra?.channelState)
     ? settlement.extra.channelState
     : {};
+  // Read before the update: its callback must stay synchronous. The caller
+  // holds the channel lock, so the hold cannot change in between.
+  const hold = pendingId
+    ? await admissionHold(lockStorage, raw.voucher.channelId, pendingId)
+    : "none";
   const result = await storage.updateChannel(raw.voucher.channelId, (current) => {
     const currentMatchesOriginalAuthority =
       current?.chargedCumulativeAmount === channelBefore.chargedCumulativeAmount &&
@@ -2123,10 +2188,8 @@ async function applyRecoveredChannelSettlement(
       current === undefined && isBatchSettlementDepositPayload(raw);
     if (
       pendingId &&
-      ((current?.pendingRequest && current.pendingRequest.pendingId !== pendingId) ||
-        (!current?.pendingRequest &&
-          !currentMatchesOriginalAuthority &&
-          !intentCreatedMissingChannel))
+      (hold === "other" ||
+        (hold === "none" && !currentMatchesOriginalAuthority && !intentCreatedMissingChannel))
     ) {
       return current;
     }
@@ -2147,7 +2210,6 @@ async function applyRecoveredChannelSettlement(
         refundNonce: readUintNumber(channelState, "refundNonce", base.refundNonce),
         onchainSyncedAt: now,
         lastRequestTimestamp: now,
-        pendingRequest: undefined,
       };
     }
     return {
@@ -2313,70 +2375,67 @@ function batchVoucher(payload: Record<string, unknown>): {
   return payload.voucher;
 }
 
-async function clearPending(
-  storage: ChannelStorage,
+/**
+ * Release the admission an earlier attempt at this settlement held. An older
+ * SDK's reservation, kept on the channel row under the same id, goes with it.
+ */
+async function releaseIntentAdmission(
+  lockStorage: ChannelLockStorage,
   channelId: string,
   pendingId: string | undefined
 ): Promise<void> {
-  if (!pendingId) return;
-  await storage.updateChannel(channelId, (current) => {
-    if (!current || current.pendingRequest?.pendingId !== pendingId) return current;
-    return { ...current, pendingRequest: undefined };
-  });
+  if (pendingId) await lockStorage.release(channelId, pendingId);
+}
+
+/** Upstream's view of who holds a channel, for code outside its hooks. */
+async function admissionHold(
+  lockStorage: ChannelLockStorage,
+  channelId: string,
+  pendingId: string
+): Promise<"self" | "other" | "none"> {
+  if (await lockStorage.isHeld(channelId, pendingId)) return "self";
+  return (await lockStorage.isHeld(channelId)) ? "other" : "none";
 }
 
 /**
- * Release a reservation the refused request took, without ever deleting the row.
- *
- * A pre-verify snapshot is restored when one exists. When it does not — a cold
- * or rebuilt fleet meeting a channel whose row upstream's verify synthesised
- * from the facilitator's `extra` — the voucher on the row is the only payer
- * signature this fleet holds, good for `chargedCumulativeAmount` against a
- * running withdrawal window, so it stays. Deleting is wrong on the success path
- * too: `updateClaimedSessions` leaves `pendingRequest` set, so the guard below
- * still matches on a row that just recorded `totalClaimed`.
+ * Undo a refund's revocation of unclaimed charges when the refund does not
+ * settle. Only the charge moves: verification no longer writes a voucher, so
+ * one that differs from `before` was committed since and stays.
  */
-async function restoreReservation(
-  storage: ChannelStorage,
-  channelId: string,
-  pendingId: string | undefined,
-  before: Channel | undefined
-): Promise<void> {
-  if (!pendingId) return;
-  await storage.updateChannel(channelId, (current) => {
-    if (!current || current.pendingRequest?.pendingId !== pendingId) return current;
-    if (!before) return { ...current, pendingRequest: undefined };
-    return {
-      ...current,
-      chargedCumulativeAmount: before.chargedCumulativeAmount,
-      signedMaxClaimable: before.signedMaxClaimable,
-      signature: before.signature,
-      pendingRequest: undefined,
-    };
-  });
-}
-
 async function restoreRevokedVoucher(
   storage: ChannelStorage,
   channelId: string,
-  pendingId: string | undefined,
   before: Channel | undefined
 ): Promise<void> {
   if (!before) return;
   await storage.updateChannel(channelId, (current) => {
-    if (!current || (current.pendingRequest && current.pendingRequest.pendingId !== pendingId)) {
+    if (
+      !current ||
+      current.chargedCumulativeAmount === before.chargedCumulativeAmount ||
+      current.signedMaxClaimable !== before.signedMaxClaimable ||
+      current.signature !== before.signature
+    ) {
       return current;
     }
-    return {
-      ...current,
-      chargedCumulativeAmount: before.chargedCumulativeAmount,
-      signedMaxClaimable: before.signedMaxClaimable,
-      signature: before.signature,
-      pendingRequest: undefined,
-    };
+    return { ...current, chargedCumulativeAmount: before.chargedCumulativeAmount };
   });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function withoutMinDepositHint(requirement: PaymentRequirementsV2): PaymentRequirementsV2 {
+  if (!requirement.extra || !("minDeposit" in requirement.extra)) return requirement;
+  const { minDeposit: _hint, ...extra } = requirement.extra;
+  return { ...requirement, extra };
+}
+
+function isChannelLockCapable(storage: ChannelStorage): boolean {
+  const candidate = storage as Partial<ChannelLockStorage>;
+  return (
+    typeof candidate.acquire === "function" &&
+    typeof candidate.release === "function" &&
+    typeof candidate.isHeld === "function"
+  );
 }

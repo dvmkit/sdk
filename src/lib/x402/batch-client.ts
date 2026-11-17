@@ -10,6 +10,7 @@ import { BATCH_SETTLEMENT_ADDRESS, type ClientEvmSigner, toClientEvmSigner } fro
 import {
   BatchSettlementEvmScheme,
   computeChannelId,
+  processPaymentResponse,
   readChannelBalanceAndTotalClaimed,
 } from "@x402/evm/batch-settlement/client";
 import { createPublicClient, encodeAbiParameters, http, keccak256, toBytes } from "viem";
@@ -97,10 +98,12 @@ export async function createX402BatchPayment(args: {
       "This is an upstream payload-shape change; do not retry until the CLI is updated."
     );
   }
+  const paymentHeader = encodePaymentSignatureHeader(payload);
   schemeChannel.set(scheme, channelId);
+  schemePayment.set(scheme, paymentHeader);
   return {
     ...facts,
-    paymentHeader: encodePaymentSignatureHeader(payload),
+    paymentHeader,
     channelId,
     scheme,
   };
@@ -139,44 +142,37 @@ function formatX402VoucherPendingRefusal(
 }
 
 /**
- * Advance durable cumulative state from a successful PAYMENT-RESPONSE. The
- * answer's channel state is persisted only for the channel this payment was
- * for: `channelId`, or the one `createX402BatchPayment` signed with `scheme`.
- * With neither, the channel state is dropped rather than stored unchecked.
+ * Advance durable cumulative state from a successful PAYMENT-RESPONSE to the
+ * payment `createX402BatchPayment` signed with `scheme`. The answer may update
+ * only that payment's channel; `channelId`, when given, must name it.
  */
 export async function processX402BatchResponse(
   scheme: BatchSettlementEvmScheme,
   paymentResponse: string | undefined,
   channelId: string | undefined = schemeChannel.get(scheme)
 ): Promise<void> {
-  if (!paymentResponse) {
-    throw new DvmError(
-      "x402_payment_response_missing",
-      "The DVM accepted prepaid-credit funding through x402 without a PAYMENT-RESPONSE header.",
-      "Retry the same funding. Its signed voucher remains journalled verbatim and will not advance locally until the DVM acknowledges it."
-    );
-  }
-  const response = boundToChannel(decodePaymentResponseHeader(paymentResponse), channelId);
-  const clearProvenance = storageForScheme(scheme).stageNextUnobservedBalanceProvenance(
-    dvmBalanceProvenance(response)
-  );
-  try {
-    await scheme.processSettleResponse(response);
-  } finally {
-    clearProvenance();
-  }
+  const paymentHeader = schemePayment.get(scheme);
+  if (!paymentHeader) throw new Error("x402 batch scheme signed no payment to acknowledge");
+  await applyX402BatchResponse(storageForScheme(scheme), paymentHeader, paymentResponse, channelId);
 }
 
-/** Recreate the durable scheme and process an acknowledgement after a restart. */
+/** Process an acknowledgement after a restart, against the journalled payment it answers. */
 export async function processX402BatchResponseForWallet(args: {
   wallet: X402Wallet;
   depositMicro: number;
+  /** The journalled PAYMENT-SIGNATURE this answer acknowledges. */
+  paymentHeader: string;
   paymentResponse: string | undefined;
   /** The pending funding's channel, the only one the answer may update. */
   channelId: string;
 }): Promise<void> {
   const { scheme } = createScheme(args.wallet, args.depositMicro);
-  await processX402BatchResponse(scheme, args.paymentResponse, args.channelId);
+  await applyX402BatchResponse(
+    storageForScheme(scheme),
+    args.paymentHeader,
+    args.paymentResponse,
+    args.channelId
+  );
 }
 
 /**
@@ -564,7 +560,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       responseHeader = boundHeaderToChannel(result.x402PaymentResponse, channelId);
       clearResponseProvenance?.();
       clearResponseProvenance = responseHeader
-        ? responseStorage.stageNextUnobservedBalanceProvenance("unreconciled")
+        ? stageRefundAnswer(responseStorage, channelId, responseHeader)
         : undefined;
       return new Response(JSON.stringify(result), {
         status: 200,
@@ -670,6 +666,102 @@ export function assertX402RequirementDescribesChannel(args: {
 
 const schemeStorage = new WeakMap<BatchSettlementEvmScheme, DvmX402ChannelStorage>();
 const schemeChannel = new WeakMap<BatchSettlementEvmScheme, string>();
+/** The PAYMENT-SIGNATURE `createX402BatchPayment` signed with each scheme. */
+const schemePayment = new WeakMap<BatchSettlementEvmScheme, string>();
+
+/** What a signed batch payment authorised, the inputs upstream applies an answer against. */
+interface X402SignedSettle {
+  channelId: `0x${string}`;
+  /** The request's price, `accepted.amount`: the most one answer may charge. */
+  requestAmount: string;
+  /** The ERC-3009 value, on a deposit only. */
+  depositAmount?: string;
+  /** The cumulative the voucher signed: the charge before it plus `requestAmount`. */
+  maxClaimableAmount: string;
+}
+
+async function applyX402BatchResponse(
+  storage: DvmX402ChannelStorage,
+  paymentHeader: string,
+  paymentResponse: string | undefined,
+  channelId: string | undefined
+): Promise<void> {
+  if (!paymentResponse) {
+    throw new DvmError(
+      "x402_payment_response_missing",
+      "The DVM accepted prepaid-credit funding through x402 without a PAYMENT-RESPONSE header.",
+      "Retry the same funding. Its signed voucher remains journalled verbatim and will not advance locally until the DVM acknowledges it."
+    );
+  }
+  const signed = signedSettle(paymentHeader);
+  if (channelId !== undefined && channelId.toLowerCase() !== signed.channelId.toLowerCase()) {
+    throw new Error(`x402 answer for ${channelId} cannot acknowledge a payment on ${signed.channelId}`);
+  }
+  const decoded = decodePaymentResponseHeader(paymentResponse);
+  // An answer whose channel state is for another channel, or out of bounds,
+  // acknowledges nothing this payment can stand on: upstream would still add
+  // the deposit, so it is not handed over at all.
+  if (settleChannelState(decoded.extra, signed.channelId).kind === "dropped") return;
+  const response = withSignedCharge(boundToChannel(decoded, signed.channelId), signed);
+  // Upstream adds a deposit to the stored balance on its own arithmetic and
+  // leaves a voucher's balance alone; neither is a chain observation.
+  const clearProvenance = storage.stageNextUnobservedBalanceProvenance(
+    signed.depositAmount === undefined ? "unchanged" : "unreconciled"
+  );
+  try {
+    const header = encodePaymentResponseHeader(response);
+    await processPaymentResponse(
+      storage,
+      (name) => (name.toUpperCase() === "PAYMENT-RESPONSE" ? header : undefined),
+      {
+        channelId: signed.channelId,
+        requestAmount: signed.requestAmount,
+        ...(signed.depositAmount !== undefined ? { depositAmount: signed.depositAmount } : {}),
+      }
+    );
+  } finally {
+    clearProvenance();
+  }
+}
+
+function signedSettle(paymentHeader: string): X402SignedSettle {
+  const payment = decodePaymentSignatureHeader(paymentHeader);
+  const channelId = (payment.payload as { voucher?: { channelId?: unknown } }).voucher?.channelId;
+  const facts = x402VoucherFactsFromPayload(payment.payload);
+  const requestAmount = payment.accepted?.amount;
+  if (
+    typeof channelId !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(channelId) ||
+    !facts ||
+    typeof requestAmount !== "string"
+  ) {
+    throw new Error("x402 batch payment has no cumulative voucher to acknowledge");
+  }
+  return {
+    channelId: channelId as `0x${string}`,
+    requestAmount,
+    ...(facts.depositMicro !== undefined ? { depositAmount: facts.depositMicro } : {}),
+    maxClaimableAmount: facts.maxClaimableMicro,
+  };
+}
+
+/**
+ * Supply the charge a DVM's answer leaves out. Upstream advances the local
+ * cumulative by `extra.chargedAmount` alone, and a DVM whose SDK predates
+ * sending it reports only the resulting `chargedCumulativeAmount`. That figure is taken as
+ * the whole request amount only when it is exactly the cumulative this
+ * payment's own voucher signed; anything else leaves the answer as it came.
+ */
+function withSignedCharge<T extends { extra?: Record<string, unknown> }>(
+  response: T,
+  signed: X402SignedSettle
+): T {
+  const extra = response.extra;
+  if (!extra || extra.chargedAmount !== undefined) return response;
+  const state = isRecord(extra.channelState) ? extra.channelState : undefined;
+  if (state?.chargedCumulativeAmount !== signed.maxClaimableAmount) return response;
+  return { ...response, extra: { ...extra, chargedAmount: signed.requestAmount } };
+}
 
 /**
  * Keep an answer's channel state only when it is for `channelId` and within
@@ -687,7 +779,13 @@ function boundToChannel<T extends { extra?: Record<string, unknown> }>(response:
       : settleChannelState(response.extra, channelId);
   if (bound.kind === "absent") return response;
   const { extra: _dropped, ...rest } = response;
-  return (bound.kind === "kept" ? { ...rest, extra: { channelState: bound.state } } : rest) as T;
+  if (bound.kind === "dropped") return rest as T;
+  // Upstream validates the charge against the request amount itself.
+  const charged = response.extra?.chargedAmount;
+  return {
+    ...rest,
+    extra: { channelState: bound.state, ...(charged !== undefined ? { chargedAmount: charged } : {}) },
+  } as unknown as T;
 }
 
 function boundHeaderToChannel(header: string | undefined, channelId: string): string | undefined {
@@ -702,16 +800,37 @@ function boundHeaderToChannel(header: string | undefined, channelId: string): st
   return encodePaymentResponseHeader(boundToChannel(response, channelId));
 }
 
-function dvmBalanceProvenance(response: {
-  extra?: Record<string, unknown>;
-}): "unreconciled" | "unchanged" {
-  const channelState = response.extra?.channelState;
-  return typeof channelState === "object" &&
-    channelState !== null &&
-    "balance" in channelState &&
-    channelState.balance !== undefined
-    ? "unreconciled"
-    : "unchanged";
+/**
+ * What a refund answer leaves on record: the DVM's figures, as an older x402
+ * client applied them. A positive remaining balance keeps the record; none, or
+ * no channel state, lets upstream delete it.
+ */
+function stageRefundAnswer(
+  storage: DvmX402ChannelStorage,
+  channelId: string,
+  responseHeader: string
+): () => void {
+  const clearProvenance = storage.stageNextUnobservedBalanceProvenance("unreconciled");
+  let state: Record<string, unknown> | undefined;
+  try {
+    const extra = decodePaymentResponseHeader(responseHeader).extra;
+    state = isRecord(extra?.channelState) ? extra.channelState : undefined;
+  } catch {
+    // Upstream refuses an undecodable header itself, with its own error.
+  }
+  const balance = typeof state?.balance === "string" ? state.balance : undefined;
+  if (!state || balance === undefined || BigInt(balance) <= 0n) return clearProvenance;
+  const clearResidual = storage.stageRefundResidual(channelId, {
+    balance,
+    ...(typeof state.chargedCumulativeAmount === "string"
+      ? { chargedCumulativeAmount: state.chargedCumulativeAmount }
+      : {}),
+    ...(typeof state.totalClaimed === "string" ? { totalClaimed: state.totalClaimed } : {}),
+  });
+  return () => {
+    clearProvenance();
+    clearResidual();
+  };
 }
 
 function storageForScheme(scheme: BatchSettlementEvmScheme): DvmX402ChannelStorage {

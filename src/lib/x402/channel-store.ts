@@ -275,6 +275,7 @@ export async function withX402ChannelLock<T>(operation: () => Promise<T>): Promi
 /** File-backed implementation of upstream's `ClientChannelStorage` contract. */
 export class DvmX402ChannelStorage implements ClientChannelStorage {
   private nextBalanceProvenance: { provenance: X402UnobservedBalanceProvenance } | undefined;
+  private refundResidual: { id: string; residual: BatchSettlementClientContext } | undefined;
 
   get(key: string): Promise<BatchSettlementClientContext | undefined> {
     return fromSynchronousStore(() => loadFile().channels[canonicalChannelId(key)]?.context);
@@ -381,10 +382,33 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
     });
   }
 
+  /**
+   * Turn upstream's next delete of `key` into a write of the escrow the DVM
+   * reported left after a cooperative refund. Upstream treats every refund it
+   * did not size itself as full and deletes the record, but a drain bounded by
+   * an outstanding voucher leaves money in the channel, and the record is what
+   * reports it. The figure is the DVM's, so the write is stamped unreconciled.
+   * Returns a cleanup for answers upstream rejects instead.
+   */
+  stageRefundResidual(key: string, residual: BatchSettlementClientContext): () => void {
+    const staged = { id: canonicalChannelId(key), residual };
+    this.refundResidual = staged;
+    return () => {
+      if (this.refundResidual === staged) this.refundResidual = undefined;
+    };
+  }
+
   delete(key: string): Promise<void> {
     return fromSynchronousStore(() => {
       const file = loadFile();
       const id = canonicalChannelId(key);
+      const residual = this.refundResidual?.id === id ? this.refundResidual.residual : undefined;
+      this.refundResidual = undefined;
+      if (residual) {
+        const context = { ...(file.channels[id]?.context ?? {}), ...residual };
+        writeContext(key, context, "unreconciled", "advance");
+        return;
+      }
       const record = file.channels[id];
       if (!record) return;
       if (record.metadata) file.channels[id] = { metadata: record.metadata };

@@ -489,6 +489,8 @@
     "x402.verify_payment.result",
     "x402.verify_with_facilitator",
     "x402.verify_with_facilitator.result",
+    "x402_channel_lock_in_process",
+    "x402_channel_lock_release_failed",
     "x402_claim_ceiling_unbound",
     "x402_claim_ceiling_unresolved",
     "x402_credential_rejected",

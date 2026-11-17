@@ -10,6 +10,8 @@ import type {
 import {
   computeChannelId,
   createBatchSettlementEIP3009DepositPayload,
+  InMemoryClientChannelStorage,
+  processPaymentResponse,
   signVoucher,
 } from "@x402/evm/batch-settlement/client";
 import type { Channel } from "@x402/evm/batch-settlement/server";
@@ -19,6 +21,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { formatPostgresApplicationName } from "../../../lib/pg-retry";
+import { encodeSettleResponseHeader } from "../../../lib/x402/spec";
 import { loggers } from "../../../observability/loggers";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
@@ -921,7 +924,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     });
   });
 
-  it("reconciles a mined deposit without submitting it twice when response persistence crashes", async () => {
+  it("reconciles a mined deposit without submitting it twice when response persistence crashes, and answers with the charge a stock client records", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
     const receiver = privateKeyToAccount(generatePrivateKey());
     const minedTransaction = `0x${"66".repeat(32)}`;
@@ -1059,6 +1062,20 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       });
       expect(await storage.getSettlement("fund", "recovery-credit:fund-1")).toMatchObject({
         status: "complete",
+      });
+      if (!recovered.ok) throw new Error("recovery refused");
+      const client = new InMemoryClientChannelStorage();
+      await processPaymentResponse(
+        client,
+        (name) =>
+          name === "PAYMENT-RESPONSE"
+            ? encodeSettleResponseHeader(recovered.value.settlement, { channelId })
+            : null,
+        { channelId, requestAmount: "100", depositAmount: "1000" }
+      );
+      expect(await client.get(channelId.toLowerCase())).toMatchObject({
+        chargedCumulativeAmount: "100",
+        balance: "1000",
       });
     } finally {
       persist.mockRestore();
@@ -1788,7 +1805,8 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
         chargedCumulativeAmount: "100",
         signedMaxClaimable: "100",
       });
-      expect(restoredChannel?.pendingRequest).toBeUndefined();
+      // The failed attempt's admission went with its transaction.
+      expect(await storage.isHeld(channelId)).toBe(false);
 
       const persist = vi
         .spyOn(PostgresX402ChannelStorage.prototype, "recordSettlementResponse")
