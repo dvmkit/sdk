@@ -1,21 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Mandated credit jobs accept a durable decline between asks, expose the pending stop on job status, and decline the next ask without paying it. A stop is also recorded when a paid ask resumes during the decline’s payment-intent check, and the built-in memory job store preserves pending stops. Existing open-ask declines and jobs without mandates keep their behavior.
-
-### Breaking protocol reservation
-
-- `data.mandate` is now reserved protocol metadata on job submission, including when a capability schema declares that key. Builders using `mandate` for application data must rename it. It is always removed from handler input and requires the signed credit envelope; this avoids passing payment authorization to application code.
-
-- Accept signed standing credit limits on job submission and persist them immutably with the job. The additive nullable `jobs.mandate` JSONB column is initialized automatically. `/v1/info` advertises `credit.standing_mandate: true` alongside durable balance-payment support; callers must check this field because older providers silently strip unknown data fields. Invalid mandates return HTTP 400 `invalid_mandate`. See `protocol-fixtures/standing-mandate-v1.json` and the protocol notes. Stored mandates then pay later asks: see the next entry.
-
-- Pay a mandated job's later asks from the caller's credit without a caller message. After each `payment-request`, the provider writes a `payment` from `requester` whose `content.credit` carries `mandate: true`, `request_seq`, `amount_micro`, `currency`, `credit_id`, `draw_id`, and a deterministic `payment_id`, with the same draw growth, piece, and `credit_balance_payments` record as a signed balance payment. A mandate that expires while waiting for its credit lock or during settlement rolls back all payment writes before commit. An expired mandate, an ask above `max_ask_micro`, a job total above `max_total_micro`, a short balance, a currency mismatch, or an intended draw that belongs to another job leaves the ask open for a signed payment and emits `mandate_payment_skipped` with the reason. `PaymentContent.credit` is now a union of the signed authorization and this unsigned mandate shape. The stale-job sweep settles and resumes a mandated job still suspended on its ask after a 10-second grace period, so a provider worker that stops between the ask and its payment, or before the handler wakes, does not strand the job. The sweep also resumes a mandated job whose signed balance payment committed before its worker stopped, without charging twice.
-
-### Fixes
-
-- A job replayed on another worker after a restart now wakes when a signed balance payment for its open ask arrives on that worker. Previously the replayed handler refused the claim for an ask written by an earlier process and stayed suspended although the payment was accepted.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -33,9 +17,31 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ## [0.41.0](https://github.com/dvmkit/sdk/compare/v0.40.0...v0.41.0) (2026-11-17)
 
 
+A caller paying a metered job from prepaid credit can sign spending limits once at submit (a standing mandate), and the provider then pays each later ask from that credit with no caller message. This keeps metered jobs paid while a caller's agent is not running.
+
+### Breaking API changes
+
+Against `0.40.0`:
+
+- `PaymentContent.credit` is now a union: the signed balance authorization, or an unsigned mandate payment `{ mandate: true, credit_id, draw_id, payment_id, request_seq, amount_micro, currency }`. Code that reads `content.credit.signature` must narrow on `mandate` first.
+- `JobRecord` gains optional `mandate` (`StandingMandate`, newly exported from `@dvmkit/sdk/server`) and `stopRequested`. A custom `JobStore` must persist `mandate` insert-only and preserve `stopRequested` across snapshot saves; `DeclineOutcome` gains `"stop_requested"` for `declineJob`.
+- `CREDIT_ENVELOPE_KEYS` and `CreditEnvelope` include `mandate`; the credit menu advertises `standing_mandate`.
+- The other changed signatures (`createDVMHost`, `JobManager`, the x402 settlement servers and the testing helpers among them) change only through these reachable types.
+
+### Breaking protocol reservation
+
+- `data.mandate` is now reserved protocol metadata on job submission, including when a capability schema declares that key. Builders using `mandate` for application data must rename it. It is always removed from handler input and requires the signed credit envelope, so payment authorization never reaches application code.
+
 ### Features
 
-* **server:** standing mandate for credit-paid metered jobs ([#188](https://github.com/dvmkit/sdk/issues/188)) ([b4ef0b7](https://github.com/dvmkit/sdk/commit/b4ef0b7253e80d549b5590582d1ce51973e4548d))
+- **server:** standing mandate for credit-paid metered jobs ([#188](https://github.com/dvmkit/sdk/issues/188)) ([b4ef0b7](https://github.com/dvmkit/sdk/commit/b4ef0b7253e80d549b5590582d1ce51973e4548d))
+- Accept signed standing credit limits on job submission and persist them immutably with the job. The additive nullable `jobs.mandate` JSONB column is initialized automatically. `/v1/info` advertises `credit.standing_mandate: true` alongside durable balance-payment support; callers must check this field because older providers silently strip unknown data fields. Invalid mandates return HTTP 400 `invalid_mandate`. See `protocol-fixtures/standing-mandate-v1.json` and the protocol notes.
+- Pay a mandated job's later asks from the caller's credit without a caller message. After each `payment-request`, the provider writes a `payment` from `requester` whose `content.credit` carries `mandate: true`, `request_seq`, `amount_micro`, `currency`, `credit_id`, `draw_id`, and a deterministic `payment_id`, with the same draw growth, piece, and `credit_balance_payments` record as a signed balance payment. A mandate that expires while waiting for its credit lock or during settlement rolls back all payment writes before commit. An expired mandate, an ask above `max_ask_micro`, a job total above `max_total_micro`, a short balance, a currency mismatch, or an intended draw that belongs to another job leaves the ask open for a signed payment and emits `mandate_payment_skipped` with the reason. The stale-job sweep settles and resumes a mandated job still suspended on its ask after a 10-second grace period, including one whose signed balance payment committed before its worker stopped, without charging twice.
+- Mandated credit jobs accept a durable decline between asks, expose the pending stop on job status (`stop_requested` with a `display` line), and decline the next ask without paying it, charging only finished pieces. Existing open-ask declines and jobs without mandates keep their behavior. The built-in memory job store preserves pending stops.
+
+### Fixes
+
+- A job replayed on another worker after a restart now wakes when a signed balance payment for its open ask arrives on that worker. Previously the replayed handler refused the claim for an ask written by an earlier process and stayed suspended although the payment was accepted.
 
 ## [0.40.0](https://github.com/dvmkit/sdk/compare/v0.40.0-rc.1...v0.40.0) (2026-11-17)
 
