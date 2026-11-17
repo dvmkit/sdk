@@ -1,3 +1,4 @@
+import type { StandingMandate } from "./credit-envelope";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
 import type { ProofLike } from "@cashu/cashu-ts";
 
@@ -138,6 +139,10 @@ export interface JobRecord {
   creditId?: string;
   /** The draw placed for this job on `creditId`. */
   drawId?: string;
+  /** Signed authorization, including future draw ids. Custom stores must persist it insert-only. */
+  mandate?: StandingMandate;
+  /** Store-owned stop, consumed at the next ask without charging the running piece early. */
+  stopRequested?: boolean;
   /** Funding-time evidence returned on explicit fund-and-draw submissions. */
   fundingReceipt?: FundingReceipt;
   fundingCredit?: CreditSnapshot;
@@ -340,8 +345,8 @@ export class JobEndedError extends Error {
   }
 }
 
-/** What a store did with a caller's decline: ended the job, or why it refused. */
-export type DeclineOutcome = "declined" | "not_active" | "no_open_ask";
+/** What a store did with a caller's decline: ended it, recorded a standing stop, or refused it. */
+export type DeclineOutcome = "declined" | "stop_requested" | "not_active" | "no_open_ask";
 
 /**
  * Why a job's cumulative ask total can't bound its draw growth.
@@ -771,7 +776,8 @@ export interface StreamableJobStore extends JobStore {
   /**
    * End a job at the caller's decline of its open ask or prompt: `cancelled`, ended by the
    * caller, with the piece in progress released. Same transaction shape as {@link cancelJob};
-   * refuses with `no_open_ask` when nothing is open for the caller to decline.
+   * a mandated job with no open ask records `stop_requested` durably for its next ask.
+   * Otherwise refuses with `no_open_ask` when nothing is open for the caller to decline.
    */
   declineJob?(jobId: string, reason: string): Promise<DeclineOutcome>;
 

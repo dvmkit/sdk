@@ -112,7 +112,7 @@ import {
   type ConsumedCredentialStore,
   MemoryConsumedCredentialStore,
 } from "./consumed-credential-store";
-import { type CreditEnvelope, CreditEnvelopeError, extractCreditEnvelope } from "./credit-envelope";
+import { type CreditEnvelope, CreditEnvelopeError, InvalidMandateError, extractCreditEnvelope } from "./credit-envelope";
 import type { CreditExpirySweepOpts } from "./credit-expiry-sweep";
 import { startCardRefundSweep } from "./card-refund-sweep";
 import { startCreditExpirySweep } from "./credit-expiry-sweep";
@@ -134,6 +134,7 @@ import {
   deferredX402IntentId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
+  isDerivedCreditId,
   priceFiatMicro,
   resolvePriceFiat,
 } from "./funding";
@@ -1305,6 +1306,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       onJobRetentionSweepFailed: opts.onJobRetentionSweepFailed,
       onJobRetentionSweepRecovered: opts.onJobRetentionSweepRecovered,
       reactivationClaimGraceMs: opts.reactivationClaimGraceMs,
+      resumePaidAsk: (jobId) => this.resumePaidAsk(this.jobManager, jobId),
     });
     this.app = new Hono<AppEnv>();
     try {
@@ -2343,7 +2345,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       devMode: this.opts.devMode,
       callerPubkey,
     });
-    if (menu && this.balancePaymentSupported()) menu.balance_payment = true;
+    if (menu && this.balancePaymentSupported()) {
+      menu.balance_payment = true;
+      // Balance payments need a Postgres job store, and the app leaves the stale timeouts at
+      // their positive defaults, so the sweep that resumes stranded mandated asks always runs here.
+      menu.standing_mandate = true;
+    }
     if (menu && this.adminCreditRoutesMounted()) menu.jit_refund_park = true;
     return menu;
   }
@@ -3517,6 +3524,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // envelope is stripped like a well-formed one, so it lands here as
     // `invalid_credit_fields` rather than as a schema error blaming the input.
     // Prepaid credit is owned by a verified pubkey; an unsigned body has none.
+    if (!route && unsignedPaid && body.data && typeof body.data === "object" && "mandate" in body.data) {
+      return c.json({ error: "invalid_mandate", message: "mandate requires a signed credit request." }, 400);
+    }
     if (!route && unsignedPaid && carriesCreditFields(signedRequestInput(body))) {
       return c.json(
         {
@@ -3531,6 +3541,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     try {
       creditEnvelope = route ? undefined : extractCreditEnvelope(body.data);
     } catch (err) {
+      if (err instanceof InvalidMandateError) {
+        return c.json({ error: "invalid_mandate", message: err.message }, 400);
+      }
       if (err instanceof CreditEnvelopeError) {
         return c.json(
           {
@@ -3771,6 +3784,29 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             priceMsats,
             dynamicUpfront,
           });
+
+      if (creditEnvelope?.mandate && priceFiat &&
+          creditEnvelope.mandate.max_total_micro < priceFiat.amountMicro) {
+        return c.json({ error: "invalid_mandate", message: "mandate.max_total_micro must cover the upfront price in the credit currency." }, 400);
+      }
+
+      if (creditEnvelope?.mandate && !resumeOnly && !priceMsats) {
+        const credit = await this.creditLedger.get(creditEnvelope.creditId);
+        if ((isDerivedCreditId(creditEnvelope.creditId) && credit?.callerPubkey !== authPubkey) ||
+            (credit && credit.callerPubkey !== authPubkey) || (!priceMsats && !credit)) {
+          return c.json({ error: "invalid_mandate", message: "The mandate must name credit available to the signed caller; reserved credit ids cannot be opened by callers." }, 400);
+        }
+        if (credit && credit.currency !== (priceFiat?.currency ?? this.creditCurrency())) {
+          return c.json({ error: "invalid_mandate", message: "The mandate credit currency must match the job currency." }, 400);
+        }
+        const existingDraw = await this.creditLedger.getDraw({ creditId: creditEnvelope.creditId, drawId: creditEnvelope.drawId });
+        if (existingDraw) {
+          const recovered = await this.recoverDrawnJob(c, { creditId: creditEnvelope.creditId,
+            drawId: creditEnvelope.drawId, jobId: existingDraw.jobId, fingerprint, callerPubkey: authPubkey });
+          if (recovered) return recovered;
+          return c.json({ error: "invalid_mandate", message: "The mandate draw_id already belongs to an existing draw. Choose a fresh draw_id." }, 400);
+        }
+      }
 
       // Unsigned admission is for per-call payment only: a request that needs
       // no payment (free, or a development host that skips verification) gets
@@ -4090,6 +4126,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         capabilityName,
         requesterTokenHash,
         {
+          mandate: creditEnvelope?.mandate,
           requesterToken: jobToken,
           requestFingerprint: fingerprint,
           requesterPubkey: authPubkey,
@@ -4711,6 +4748,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Terminal outcomes always come from the durable snapshot.
     if ("listeners" in job && !isTerminal(snapshot.status) && !isTerminal(job.status)) snapshot.status = job.status;
     const content = await this.contentFields(snapshot);
+    if (snapshot.stopRequested && !isTerminal(snapshot.status)) {
+      content.stop_requested = true;
+      content.display = this.standingDeclineDisplay();
+    }
     const status = withheldStatus(snapshot.status, content);
     const res: Record<string, unknown> = { job_id: snapshot.id, status };
     Object.assign(res, terminalResponseFields({ ...snapshot, status }), content);
@@ -4909,6 +4950,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
   }
 
+  private standingDeclineDisplay(): string {
+    return this.balancePaymentSupported()
+      ? "The job will stop at its next payment ask. Only finished pieces will be charged."
+      : "Stop recorded. Decline the next open payment ask to stop the job.";
+  }
+
   private noOpenAskResponse(c: Context<AppEnv>): Response {
     return c.json(
       {
@@ -4921,8 +4968,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * End a job its handler is not running here at the caller's decline. Same shape as the
-   * DELETE route's store-only cancel; the store refuses unless an ask or prompt is open.
+   * Durably decline a stored open ask, or record a mandated stop when nothing is open.
+   * Also handles a live worker's between-asks decline; an ordinary job without an ask is refused.
    */
   private async declineStoredJob(c: Context<AppEnv>, id: string, reason: string): Promise<Response> {
     const jm = this.jobManager;
@@ -4940,6 +4987,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
     if (outcome === "not_active") return this.jobNotActiveResponse(c);
     if (outcome === "no_open_ask") return this.noOpenAskResponse(c);
+    if (outcome === "stop_requested") {
+      const pending = await store.get(id);
+      return c.json({ seq: pending?.seq ?? 0, stop_requested: true,
+        display: this.standingDeclineDisplay() }, 201);
+    }
     await jm.finalizeStoredTerminal(id);
     const ended = await store.get(id);
     return c.json({ seq: ended?.seq ?? 0 }, 201);
@@ -4984,21 +5036,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           // Wake the existing claim/resume owner. A COMMIT acknowledgement may
           // arrive after NOTIFY has already advanced the handler to another ask.
           await this.opts.db.query("SELECT pg_notify('job_messages', $1)", [id]);
-          if (!activeJob) {
-            const fresh = await jm.store.get(id);
-            if (fresh?.status === "awaiting-input" && isStreamableJobStore(jm.store)) {
-              fresh.messages = await jm.store.getMessages(id, 0);
-              fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
-              const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
-              const authorized = wire.content.credit as { request_seq: number };
-              if (ask?.seq === authorized.request_seq && !jm.activeJobs.has(id)) {
-                const { job } = jm.reactivateJob(fresh);
-                const lock = await jm.store.tryReactivationLock(id, () =>
-                  this.runReactivation(jm, job, { type: "payment", content: wire.content! }, fresh.status));
-                if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
-              }
-            }
-          }
+          if (!activeJob) await this.resumePaidAsk(jm, id, (wire.content.credit as { request_seq: number }).request_seq);
         } catch {
           // The accepted outcome is durable. A progress failure must never ask
           // the caller to spend again; a non-payment resume can recover it.
@@ -5036,6 +5074,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
       const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
       if (railRefusal) return railRefusal;
+      if (body.type === "decline" && activeJob.mandate &&
+          !activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob) &&
+          isStreamableJobStore(jm.store) && jm.store.declineJob) {
+        const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
+        return this.declineStoredJob(c, id, reason);
+      }
       if (body.type === "decline") {
         // A payment being verified commits first: it may pay the ask being declined.
         try {
@@ -5046,6 +5090,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
         if (isTerminal(activeJob.status)) return this.jobNotActiveResponse(c);
         if (!activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob)) {
+          if (activeJob.mandate && isStreamableJobStore(jm.store) && jm.store.declineJob) {
+            const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
+            return this.declineStoredJob(c, id, reason);
+          }
           return this.noOpenAskResponse(c);
         }
       }
@@ -5322,6 +5370,28 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       ...(unappliedCredit && { credit: unappliedCredit }),
       ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
     }, 503);
+  }
+
+  /**
+   * Replay an `awaiting-input` job no worker here is running, once its open ask has been paid from
+   * balance. `requestSeq` names the ask the payment answered; a later ask means the job has moved
+   * on. The reactivation claim keeps a live worker elsewhere, or a concurrent resumer, from
+   * running it twice.
+   */
+  private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
+    if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
+    const fresh = await jm.store.get(id);
+    if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
+    fresh.messages = await jm.store.getMessages(id, 0);
+    fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
+    const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
+    const payment = ask && fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
+      message.seq > ask.seq);
+    if (!ask || !payment || (requestSeq !== undefined && ask.seq !== requestSeq) || jm.activeJobs.has(id)) return;
+    const { job } = jm.reactivateJob(fresh);
+    const lock = await jm.store.tryReactivationLock(id, () =>
+      this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status));
+    if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
   }
 
   /**

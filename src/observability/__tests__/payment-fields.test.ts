@@ -1,9 +1,10 @@
+import { readFileSync } from "node:fs";
 import type { Pool } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createStdoutLogger } from "../../sdk/logger";
 import { diagnosticConsole } from "../diagnostic-console";
-import { projectDiagnosticFields, projectSpanRow } from "../projection";
+import { projectDiagnosticFields, projectEventName, projectSpanRow } from "../projection";
 import { DbTransport, HttpTransport, SpanWriter } from "../span-writer";
 import { formatSpanLine } from "../stdout-sink";
 import type { SpanRow } from "../types";
@@ -52,6 +53,16 @@ describe("payment diagnostic catalogue", () => {
     ["phase", ["upfront", "mid-job"]],
   ] as const)("retains the independently documented %s values", (field, values) => {
     for (const value of values) expect(projectDiagnosticFields({ [field]: value })).toEqual({ [field]: value });
+  });
+
+  it("retains the protocol's standing-mandate fallback reasons", () => {
+    const fixture = JSON.parse(readFileSync(new URL("../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8")) as {
+      mandate_payment: { fallback_reasons: string[] };
+    };
+    expect(projectEventName("mandate_payment_skipped")).toBe("mandate_payment_skipped");
+    for (const reason of fixture.mandate_payment.fallback_reasons) {
+      expect(projectDiagnosticFields({ reason })).toEqual({ reason });
+    }
   });
 
   it.each(["SENTINEL", {}, ["rate_unavailable"], new String("rate_unavailable"), new Error("SENTINEL"), null, 42])("omits unrecognized or nonprimitive payment fields (%j)", (value) => {

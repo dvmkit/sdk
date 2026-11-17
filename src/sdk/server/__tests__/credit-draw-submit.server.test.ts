@@ -1,4 +1,5 @@
 /* Signed credit draws use pure-signature replay protection, without a funding artifact. */
+import { readFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -10,6 +11,7 @@ import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import { MemoryKVStore } from "../../store";
 import { createDVMServer } from "../app";
+import { getStandingMandate } from "../credit-envelope";
 import { CreditLedgerError } from "../credit-ledger";
 import { derivedFundCreditId, fundingCommitment } from "../funding";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
@@ -67,16 +69,24 @@ const servers = servedApps();
 
 async function startServer(
   ledger = new MemoryCreditLedger(),
-  opts?: { onDelayedJob?: () => Promise<void> }
+  opts?: { onDelayedJob?: () => Promise<void>; jobStore?: MemoryJobStore; onInput?: (input: unknown) => void; freeOutcome?: "complete" | "fail"; allowUnsigned?: boolean }
 ): Promise<{ url: string; ledger: MemoryCreditLedger }> {
   const dvm = configureDVM({
     name: "credit-draw-test",
     capabilities: {
       do: {
-        input: signedSchema,
+        input: signedSchema.extend({ mandate: z.unknown().optional() }).passthrough(),
         price: "$0.10",
         onJob(ctx) {
+          opts?.onInput?.(ctx.input);
           ctx.complete("done");
+        },
+      },
+      free: {
+        input: signedSchema,
+        onJob(ctx) {
+          if (opts?.freeOutcome === "fail") ctx.fail("work failed");
+          else ctx.complete("free result");
         },
       },
       boom: {
@@ -103,12 +113,12 @@ async function startServer(
         },
       },
     },
-    auth: secp256k1Auth(),
+    auth: secp256k1Auth({ allowUnsignedPaid: opts?.allowUnsigned }),
   });
   const { app } = await createDVMServer(dvm, {
     env: {},
     store: new MemoryKVStore(),
-    jobStore: new MemoryJobStore(),
+    jobStore: opts?.jobStore ?? new MemoryJobStore(),
     fxFetcher: stubFx,
     receiptKey: RECEIPT_KEY,
     creditLedger: ledger,
@@ -630,5 +640,203 @@ describe("a strict capability schema draws credit", () => {
     });
     expect(res.status).toBe(401);
     expect(await ledger.getDraw({ creditId: "c1", drawId: "d-swapped" })).toBeUndefined();
+  });
+});
+
+
+const mandateFixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8"));
+const mandate = () => ({ ...mandateFixture.data_fields.mandate, expires_at_ms: Date.now() + 86_400_000 });
+
+describe("standing mandate admission", () => {
+  it("stores signed limits outside handler input and refuses signature tampering", async () => {
+    const jobStore = new MemoryJobStore();
+    const inputs: unknown[] = [];
+    const { url, ledger } = await startServer(undefined, { jobStore, onInput: (input) => inputs.push(input) });
+    await fundCredit(ledger, { creditId: "example-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 2_000_000, expiryMs: FUTURE_MS });
+    const limits = mandate();
+    const body = { capability: "do", data: signer.signRequest(PRIVKEY, {
+      action: "go", ...mandateFixture.data_fields, mandate: limits }) };
+    const tampered = structuredClone(body);
+    Object.assign(tampered.data, { mandate: { ...limits, max_total_micro: limits.max_total_micro + 1 } });
+    const rejected = await submit(url, tampered);
+    expect(rejected.status).toBe(401);
+    expect((await ledger.get("example-credit"))?.availableMicro).toBe(2_000_000);
+    const accepted = await submit(url, body);
+    expect(accepted.status).toBe(200);
+    const { job_id } = await accepted.json();
+    const retry = await submit(url, drawBody("do", { ...mandateFixture.data_fields, mandate: limits }));
+    expect(retry.status).toBe(200);
+    expect((await retry.json()).job_id).toBe(job_id);
+    const record = await jobStore.get(job_id);
+    expect(getStandingMandate(record!)).toEqual({ ...limits, credit_id: "example-credit", draw_id: "example-draw" });
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).not.toHaveProperty("mandate");
+    await jobStore.save({ ...record!, mandate: { ...record!.mandate!, max_total_micro: 9_000_000 } });
+    expect(getStandingMandate((await jobStore.get(job_id))!)).toEqual({ ...limits, credit_id: "example-credit", draw_id: "example-draw" });
+  });
+
+  it("records a memory-store standing decline and preserves it across a stale snapshot", async () => {
+    const jobStore = new MemoryJobStore();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const parked = new Promise<void>((resolve) => { entered = resolve; });
+    const { url, ledger } = await startServer(undefined, { jobStore, onDelayedJob: () => { entered(); return hold; } });
+    await fundCredit(ledger, { creditId: "example-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 2_000_000, expiryMs: FUTURE_MS });
+    try {
+      const created = await submit(url, drawBody("delayed", { ...mandateFixture.data_fields, mandate: mandate() }));
+      expect(created.status).toBe(202);
+      const job = await created.json() as { job_id: string; job_token: string };
+      await parked;
+      const stale = (await jobStore.get(job.job_id))!;
+      const response = await fetch(`${url}/v1/job/${job.job_id}/messages`, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Job-Token": job.job_token },
+        body: JSON.stringify({ type: "decline", content: {} }) });
+      expect(response.status).toBe(201);
+      expect(await response.json()).toEqual({ seq: expect.any(Number), stop_requested: true,
+        display: mandateFixture.standing_decline.unsupported_display });
+      const first = (await jobStore.get(job.job_id))!;
+      expect(first).toMatchObject({ status: "processing", stopRequested: true });
+      expect(await jobStore.declineJob(job.job_id, "again")).toBe("stop_requested");
+      await jobStore.save({ ...stale, stopRequested: false });
+      expect(await jobStore.get(job.job_id)).toMatchObject({ status: "processing", stopRequested: true });
+      const status = await fetch(`${url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
+      expect(await status.json()).toMatchObject({ stop_requested: true, display: mandateFixture.standing_decline.unsupported_display });
+    } finally { release(); }
+  }, 30_000);
+
+  it.each([
+    ["missing credit fields", () => ({ mandate: mandate() })],
+    ["missing draw", () => ({ credit_id: "c", mandate: mandate() })],
+    ["ask above total", () => ({ mandate: { ...mandate(), max_ask_micro: 2_000_000 } })],
+    ["total below upfront", () => ({ mandate: { ...mandate(), max_total_micro: 99_999, max_ask_micro: 1 } })],
+    ["expired", () => ({ mandate: { ...mandate(), expires_at_ms: Date.now() - 1 } })],
+    ["more than seven days", () => ({ mandate: { ...mandate(), expires_at_ms: Date.now() + 8 * 86_400_000 } })],
+    ["extra key", () => ({ mandate: { ...mandate(), other: true } })],
+    ["fractional total", () => ({ mandate: { ...mandate(), max_total_micro: 100_000.1 } })],
+    ["fractional ask", () => ({ mandate: { ...mandate(), max_ask_micro: 1.1 } })],
+    ["unsafe total", () => ({ mandate: { ...mandate(), max_total_micro: Number.MAX_SAFE_INTEGER + 1 } })],
+    ["zero ask", () => ({ mandate: { ...mandate(), max_ask_micro: 0 } })],
+    ["null", () => ({ mandate: null })],
+    ["array", () => ({ mandate: [] })],
+    ["missing limit", () => ({ mandate: { expires_at_ms: Date.now() + 1000 } })],
+  ])("rejects %s before money or handler work", async (name, fields) => {
+    const input = fields();
+    if (name === "missing credit fields") Object.assign(input, { credit_id: undefined, draw_id: undefined });
+    if (name === "missing draw") Object.assign(input, { draw_id: undefined });
+    const onInput = vi.fn();
+    const { url, ledger } = await startServer(undefined, { onInput });
+    await fundCredit(ledger, { creditId: "c", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    const res = await submit(url, drawBody("do", { credit_id: "c", draw_id: "d", ...input }));
+    expect(res.status).toBe(mandateFixture.invalid.status);
+    expect(await res.json()).toMatchObject({ error: mandateFixture.invalid.error, message: expect.any(String) });
+    expect((await ledger.get("c"))?.availableMicro).toBe(1_000_000);
+    expect(onInput).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("zero-upfront mandate accounting", () => {
+  it.each(["complete", "fail"] as const)("cannot release another job's hold when the free handler would %s", async (freeOutcome) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { url, ledger } = await startServer(undefined, { freeOutcome, onDelayedJob: () => held });
+    await fundCredit(ledger, { creditId: "held-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    try {
+      const paid = await submit(url, drawBody("delayed", { credit_id: "held-credit", draw_id: "held-draw" }));
+      expect(paid.status).toBe(202);
+      expect((await ledger.getDraw({ creditId: "held-credit", drawId: "held-draw" }))?.status).toBe("pending");
+      const free = await submit(url, drawBody("free", { credit_id: "held-credit", draw_id: "held-draw", mandate: mandate() }));
+      expect(free.status).toBe(400);
+      expect(await free.json()).toMatchObject({ error: "invalid_mandate" });
+      expect((await ledger.getDraw({ creditId: "held-credit", drawId: "held-draw" }))?.status).toBe("pending");
+      expect((await ledger.get("held-credit"))?.availableMicro).toBe(900_000);
+    } finally { release(); }
+  });
+
+  it("issues a signed receipt without inventing an upfront draw", async () => {
+    const jobStore = new MemoryJobStore();
+    const { url, ledger } = await startServer(undefined, { jobStore });
+    await fundCredit(ledger, { creditId: "free-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    const limits = mandate();
+    const res = await submit(url, drawBody("free", { credit_id: "free-credit", draw_id: "future-draw", mandate: limits }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.receipt).toBeDefined();
+    expect(verifyReceipt(body.receipt)).toBe(true);
+    expect(body.receipt.credit).toBeUndefined();
+    const record = await jobStore.get(body.job_id);
+    expect(record?.creditId).toBeUndefined();
+    expect(record?.drawId).toBeUndefined();
+    expect(record?.mandate).toEqual({ ...limits, credit_id: "free-credit", draw_id: "future-draw" });
+    expect(await ledger.getDraw({ creditId: "free-credit", drawId: "future-draw" })).toBeUndefined();
+    expect((await ledger.get("free-credit"))?.availableMicro).toBe(1_000_000);
+  });
+
+  it.each([
+    ["reserved credit id", "imp:missing", "usd", false],
+    ["another owner", "other-owner", "usd", true],
+    ["wrong currency", "euro-credit", "eur", false],
+  ] as const)("refuses %s before accepting future draw authority", async (_name, creditId, currency, otherOwner) => {
+    const { url, ledger } = await startServer();
+    if (creditId !== "imp:missing") await fundCredit(ledger, { creditId,
+      callerPubkey: otherOwner ? hex(schnorr.getPublicKey(OTHER_PRIVKEY)) : CALLER_PUBKEY,
+      currency, amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    const res = await submit(url, drawBody("free", { credit_id: creditId, draw_id: "future-draw", mandate: mandate() }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_mandate" });
+    expect(await ledger.getDraw({ creditId, drawId: "future-draw" })).toBeUndefined();
+  });
+
+  it("refuses unsigned mandate authority without spending credit", async () => {
+    const onInput = vi.fn();
+    const { url, ledger } = await startServer(undefined, { allowUnsigned: true, onInput });
+    await fundCredit(ledger, { creditId: "unsigned-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    const res = await submit(url, { capability: "do", data: { action: "go", credit_id: "unsigned-credit",
+      draw_id: "unsigned-draw", mandate: mandate() } });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_mandate" });
+    expect((await ledger.get("unsigned-credit"))?.availableMicro).toBe(1_000_000);
+    expect(onInput).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("mandated paid admission recovery", () => {
+  it.each([false, true])("recovers a committed draw after the job save fails (mandate=%s)", async (withMandate) => {
+    const jobStore = new MemoryJobStore();
+    const onInput = vi.fn();
+    const { url, ledger } = await startServer(undefined, { jobStore, onInput });
+    await fundCredit(ledger, { creditId: "recovery-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 1_000_000, expiryMs: FUTURE_MS });
+    const fields = { request_id: "recover-after-save-failure", credit_id: "recovery-credit", draw_id: "recovery-draw",
+      ...(withMandate && { mandate: mandate() }) };
+    const save = vi.spyOn(jobStore, "save").mockRejectedValueOnce(new Error("job storage unavailable"));
+    const first = await submit(url, drawBody("do", fields));
+    expect(first.status).toBe(500);
+    save.mockRestore();
+    const held = await ledger.getDraw({ creditId: "recovery-credit", drawId: "recovery-draw" });
+    expect(held).toMatchObject({ status: "pending", amountMicro: 100_000 });
+    expect(held?.jobId).toBeDefined();
+    expect(await jobStore.get(held!.jobId!)).toBeUndefined();
+    expect(onInput).not.toHaveBeenCalled();
+    const retry = await submit(url, drawBody("do", fields));
+    expect(retry.status, await retry.clone().text()).toBe(200);
+    const recovered = await retry.json();
+    expect(recovered.job_id).toBe(held!.jobId);
+    expect(verifyReceipt(recovered.receipt)).toBe(true);
+    expect((await ledger.getDraw({ creditId: "recovery-credit", drawId: "recovery-draw" }))?.status).toBe("settled");
+    expect((await ledger.get("recovery-credit"))?.balanceMicro).toBe(900_000);
+    expect(onInput).toHaveBeenCalledTimes(1);
+    if (withMandate) {
+      expect((await jobStore.get(held!.jobId!))?.mandate).toEqual({
+        ...fields.mandate, credit_id: "recovery-credit", draw_id: "recovery-draw" });
+    }
   });
 });

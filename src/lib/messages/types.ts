@@ -134,7 +134,11 @@ export interface PaymentRequestContent {
 
 /** Requester sends a rail proof or signed balance authorization; provider sends change/refund. */
 export interface PaymentContent {
-  /** Signed authorization to spend existing credit on one outstanding ask. Cannot accompany rail credentials. */
+  /**
+   * Existing credit spent on one outstanding ask: the caller's signed authorization, or a
+   * provider-written settlement under the job's standing mandate (`mandate: true`, unsigned).
+   * Cannot accompany rail credentials.
+   */
   credit?: {
     credit_id: string;
     draw_id: string;
@@ -147,6 +151,14 @@ export interface PaymentContent {
     timestamp: number;
     nonce: string;
     auth_statement: import("../signed-request-statement").SignedRequestStatementHeader;
+  } | {
+    mandate: true;
+    credit_id: string;
+    draw_id: string;
+    payment_id: string;
+    request_seq: number;
+    amount_micro: number;
+    currency: string;
   };
   cashu_token?: string;
   mint?: string;

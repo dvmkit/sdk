@@ -165,6 +165,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     delete snapshot.pieceEnding;
     if (existing) {
       snapshot.createdAt = existing.createdAt;
+      snapshot.mandate = structuredClone(existing.mandate);
+      snapshot.stopRequested = existing.stopRequested;
       snapshot.upfrontPayment = structuredClone(existing.upfrontPayment);
       // Store-owned after insert, like the Postgres columns.
       snapshot.pieces = structuredClone(existing.pieces);
@@ -655,7 +657,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     expectedActivityBefore: number | null,
     ending: PieceEnding,
     requireOpenAsk = false
-  ): Promise<"ended" | "not_active" | "no_open_ask"> {
+  ): Promise<"ended" | "stop_requested" | "not_active" | "no_open_ask"> {
     const record = this.data.get(jobId);
     if (!record) return Promise.resolve("not_active");
     const eligible =
@@ -673,7 +675,11 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
       const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
       if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve("not_active");
     }
-    if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) return Promise.resolve("no_open_ask");
+    if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
+      if (!record.mandate) return Promise.resolve("no_open_ask");
+      record.stopRequested = true;
+      return Promise.resolve("stop_requested");
+    }
     const seq = this.allocateSeq(jobId);
     const cancelMsg: Message = {
       seq,

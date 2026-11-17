@@ -1,0 +1,78 @@
+{
+  "data_fields": {
+    "credit_id": "example-credit",
+    "draw_id": "example-draw",
+    "mandate": {
+      "max_total_micro": 1100000,
+      "max_ask_micro": 550000,
+      "expires_at_ms": 1795000000000
+    }
+  },
+  "info_credit_fields": {
+    "standing_mandate": true
+  },
+  "invalid": {
+    "status": 400,
+    "error": "invalid_mandate"
+  },
+  "mandate_payment": {
+    "message": {
+      "from": "requester",
+      "type": "payment",
+      "content": {
+        "credit": {
+          "mandate": true,
+          "credit_id": "example-credit",
+          "draw_id": "example-draw",
+          "payment_id": "mandate:b760d987033f4635e36af50da52021993b89d7f2c85f2b0a09fe1236d43f09c0",
+          "request_seq": 3,
+          "amount_micro": 550000,
+          "currency": "usd"
+        }
+      }
+    },
+    "payment_id": {
+      "prefix": "mandate:",
+      "sha256_of_json": [
+        "mandate",
+        "<job_id>",
+        "<request_seq>"
+      ],
+      "vector": {
+        "job_id": "example-job",
+        "request_seq": 3,
+        "preimage": "[\"mandate\",\"example-job\",3]",
+        "payment_id": "mandate:b760d987033f4635e36af50da52021993b89d7f2c85f2b0a09fe1236d43f09c0"
+      }
+    },
+    "fallback_reasons": [
+      "mandate_expired",
+      "mandate_ask_cap",
+      "mandate_total_cap",
+      "mandate_balance",
+      "mandate_currency",
+      "mandate_draw_owned_elsewhere",
+      "mandate_ask_unpriced",
+      "mandate_credit_unavailable"
+    ]
+  },
+  "standing_decline": {
+    "request": {
+      "type": "decline",
+      "content": {
+        "reason": "stop after this piece"
+      }
+    },
+    "status": 201,
+    "response": {
+      "seq": 3,
+      "stop_requested": true,
+      "display": "The job will stop at its next payment ask. Only finished pieces will be charged."
+    },
+    "status_fields": {
+      "stop_requested": true,
+      "display": "The job will stop at its next payment ask. Only finished pieces will be charged."
+    },
+    "unsupported_display": "Stop recorded. Decline the next open payment ask to stop the job."
+  }
+}

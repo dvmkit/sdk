@@ -207,7 +207,7 @@ For example, a job takes $0.10 upfront, then asks $0.20, then $0.50:
 
 Every ask is new money: the upfront payment is never spent on an ask, however large it was. A job has one open `payment-request` at a time; a payment that arrives with no ask open lands as balance and buys no piece ([Payments that arrive as a job ends](#payments-that-arrive-as-a-job-ends)). Amounts are integer micro-units of the job credit's currency, and the figure the draw settles is computed once, in the transaction that makes the job terminal, and frozen on the job row; every later resolution of the draw settles exactly that figure.
 
-A `payment-request` carries `charged_if_declined_micro`: the pieces finished so far at their charge, a lowered `finishedChargeMicro` where the DVM gave one, which is exactly what declining that ask settles. A caller ends a job at its open ask or prompt with `{ type: "decline", content: { reason? } }` on `POST /v1/job/:id/messages`. The job ends `cancelled`, ended by the caller, with the piece in progress released; at an open ask nothing is running, since the ask finished it. The answer is HTTP 201 `{ seq }`. With no ask or prompt open the decline is refused with HTTP 409 `no_open_ask` and changes nothing; a payment still being verified holds it as it holds a cancel (HTTP 409 `payment_in_progress`).
+A `payment-request` carries `charged_if_declined_micro`: the pieces finished so far at their charge, a lowered `finishedChargeMicro` where the DVM gave one, which is exactly what declining that ask settles. A caller ends a job at its open ask or prompt with `{ type: "decline", content: { reason? } }` on `POST /v1/job/:id/messages`. The job ends `cancelled`, ended by the caller, with the piece in progress released; at an open ask nothing is running, since the ask finished it. The answer is HTTP 201 `{ seq }`. Without a standing mandate, with no ask or prompt open the decline is refused with HTTP 409 `no_open_ask` and changes nothing; a payment still being verified holds it as it holds a cancel (HTTP 409 `payment_in_progress`).
 
 A terminal job's signed receipt keeps `v: 1` and, when the job held a credit draw, gains an optional `settlement` block: `{ held, charged, released, pieces: [{ amount, charged, paid_seq, state }] }`. `paid_seq` is the sequence of the payment message that bought the piece, `0` for the upfront payment; `state` is `finished`, `stopped` (a cancel charged it) or `released`. `credit.amount` is now the amount charged, `0` on a draw released whole; receipts issued before this change named the hold there on a released draw. `paid` keeps meaning what the caller's payments credited. `pieces` is empty on a job accepted before piece charging, which settles as one piece. It is also empty when the job's piece totals disagree with the ledger's recorded hold or charge, for example after another finalizer resolved the draw differently. The signed `credit.amount` and `settlement` totals attest the recorded draw; an empty breakdown does not mean the charge is zero. Existing receipts remain unchanged and continue to verify. The terminal report to the platform gains `chargedMicro`, its `currency` (`null` without a draw) and `stoppedPiece`, true when a cancel stopped a running piece and charged it. Reports also carry `heldMicro`, the original hold including all paid mid-job pieces, and `finishedPieceCount`, the number of finished paid pieces excluding a stopped piece. The hold is `0` without a resolved draw; an unpaid unsigned x402 job reports a zero hold and count, and a successfully settled one reports one finished piece. Historical jobs without a piece list omit the count. Both additions are optional: consumers must accept older reports without them and ignore unrecognized fields. A caller reconciling its credit (`applyReceiptCredit`) checks a receipt whose `settlement.charged` is positive on every ending, comparing the charge and the reported balance with its own payments: its prior balance plus the verified funding of the draw.
 
@@ -486,3 +486,82 @@ Card drains add `refund_blocked` for permanent refusal and `written_off` for an 
 Postgres initialization adds nullable `credit_drains.card_recovery` without rewriting old plans. Missing entry revisions mean revision zero and retain their original idempotency keys. A replan persists its revision and retained successes before planning or sending replacements, so a crash resumes the same revision without treating a partial retained plan as complete. Money amounts remain integer micro-units/cents. A write-off stores separate refunded gross and unpaid amounts; it emits no `sent` receipt or successful-refund report. Full successful refunds retain the transactional drain/outbox contract.
 
 Custom card ledgers must supply `withCardRefundLock`, `saveCardDrainState`, and `saveCardRefund`; a missing capability fails closed before refunds. The lock must serialize all refund and recovery work per credit across machines, re-read under that lock, and release on failure. The callback's optional query connection is session-scoped: plan and progress writes autocommit; booking and the outbox share a short transaction. Implementations must honor `tx` on drain reads, plan/state writes, funding-lot reads, terminal transitions, and receipt appends to avoid pool exhaustion. State writes compare expected status/revision, and progress writes refuse obsolete revisions. Other rails need no recovery methods.
+
+
+## Standing credit mandate
+
+A provider advertising `credit.standing_mandate: true` on `/v1/info` accepts an optional
+`mandate` in the signed `POST /v1/job` `data`, beside `credit_id` and `draw_id`:
+
+```json
+{"credit_id":"example-credit","draw_id":"example-draw","mandate":{"max_total_micro":1100000,"max_ask_micro":550000,"expires_at_ms":1795000000000}}
+```
+
+The signature covers the original wire data, including all mandate fields. The mandate is
+protocol metadata and never enters the capability handler's input, even if its schema declares
+that key. The provider stores the accepted limits immutably with the job. Both amounts are
+positive safe integers in millionths of the credit currency. `max_total_micro` includes the
+upfront price and must cover it; `max_ask_micro` must not exceed the total. `expires_at_ms`
+is an integer timestamp in milliseconds, strictly in the future and at most seven days from
+acceptance. Only these three mandate keys are allowed, and both credit identifiers are required.
+
+HTTP 400 `invalid_mandate` with a caller-facing `message` refuses malformed limits, extra or
+missing keys, missing credit identifiers, an unsigned mandate, an expired or excessively distant
+expiry, or a total below the upfront. A zero-upfront mandate also gets this refusal for an
+unavailable reserved credit id, a currency mismatch, or a draw id already used by another job.
+These refusals create no job or credit draw. Zero-upfront mandates require existing credit owned
+by the signed caller in the job currency. Paid mandates use the existing upfront payment checks
+and recovery: a conflicting body reusing a paid draw gets 409 `draw_conflict`, while an exact
+retry can recover even when the draw committed before the original job row was saved.
+
+The stored mandate includes `credit_id` and `draw_id`, but a zero-upfront job's accounting
+fields remain unset until an ask actually creates a draw. This admission does not reserve the
+intended draw id: two zero-upfront admissions may name the same unused pair. Once a draw exists,
+another job must never pay from it: the first mandate-paid ask creates the job's own draw, and an
+ask whose intended draw already exists for another job stays open for ordinary payment. Custom job stores must persist
+`JobRecord.mandate` unchanged after creation; its public type is `StandingMandate` from
+`@dvmkit/sdk/server`. Existing credit ownership, currency, and signature checks still apply. The portable admission contract is
+`protocol-fixtures/standing-mandate-v1.json`; its timestamp is illustrative and callers must
+choose a fresh expiry. Older providers may strip unknown keys silently: callers must check the
+advertisement before relying on acceptance. Discovery uses the same durable-storage and rollout
+gate as `credit.balance_payment`.
+
+
+`data.mandate` is a reserved key even when a capability schema declares it. This is a breaking
+reservation for builders who previously used that name for application data: rename that field.
+The SDK always strips it before handler input parsing. Admission currently checks the expiry
+window on each submit, including an idempotent retry or `request_id` resume. After expiry,
+a retry returns 400 `invalid_mandate`; use the existing job id and token to read the job instead.
+Do not modify the mandate on a retry, because that changes the signed request's identity.
+Callers must not rely on an unadvertised provider paying later asks, even if it accepted the mandate.
+
+### Mandate-paid asks
+
+When a mandated job's handler calls `ctx.requestPayment`, the provider writes the usual `payment-request` and then, if every limit holds, pays it at once from the mandate's credit. Builder code is unchanged: `requestPayment` resolves as if the caller had paid. The payment is the next message in the job's history, written by the provider on the caller's behalf and carrying no signature; the stored mandate is the authorization:
+
+```json
+{"from":"requester","type":"payment","content":{"credit":{"mandate":true,"credit_id":"example-credit","draw_id":"example-draw","payment_id":"mandate:b760d987033f4635e36af50da52021993b89d7f2c85f2b0a09fe1236d43f09c0","request_seq":3,"amount_micro":550000,"currency":"usd"}}}
+```
+
+`request_seq` is the seq of the `payment-request` it pays and `amount_micro`/`currency` repeat that ask's `content.credit`. `payment_id` gives each ask exactly one mandate payment identity. It is `mandate:` followed by the lowercase hex SHA-256 of the UTF-8 bytes of a compact JSON array: the string `"mandate"`, the job id as a JSON string, and `request_seq` as a JSON integer, with no whitespace between tokens. For job `example-job` and `request_seq` 3 the hashed bytes are `["mandate","example-job",3]` and the result is the `payment_id` above; the fixture carries the same vector. The ledger move is the signed balance payment's: the job's draw grows by the ask, the ask buys the next piece, and the payment is recorded in the same transaction. A zero-upfront job's first mandate-paid ask creates its draw with the mandate's `credit_id` and `draw_id` and binds the job to it. A caller cannot send a `mandate: true` payment; an inbound credit payment must be signed.
+
+The provider evaluates the limits when the ask is written, not at admission, and again by its stale-job sweep while the ask stays open. Mandate expiry is rechecked against current server time after the ledger has acquired its credit lock and staged the payment, immediately before commit. Expiry during a lock wait or settlement rolls the whole payment back and leaves the ask open. The ask stays open, exactly as without a mandate, when any of these holds:
+
+- `mandate_expired`: the current time is at or after `expires_at_ms`.
+- `mandate_ask_cap`: the ask's `amount_micro` exceeds `max_ask_micro`.
+- `mandate_total_cap`: the job's draw, upfront and earlier asks included, plus this ask would exceed `max_total_micro`.
+- `mandate_balance`: the credit's available balance does not cover the ask.
+- `mandate_currency`: the ask's currency is not the credit's.
+- `mandate_draw_owned_elsewhere`: the intended draw exists for another job, or the job is bound to a different draw.
+- `mandate_ask_unpriced`: the ask carries no credit price the job's ask total covers.
+- `mandate_credit_unavailable`: the credit is missing, not the caller's, expired, closed, or otherwise refuses the spend.
+
+The provider emits the `mandate_payment_skipped` diagnostic with the reason. The caller can still pay the open ask with a signed balance payment or any other offered rail; for a zero-upfront job whose intended draw is taken, the signed payment must name a fresh `draw_id`. A signed payment and a mandate payment for the same ask are serialized on the job: exactly one is charged, and the other is refused or does nothing. Replaying a job after a restart treats a mandate payment in its history as paid and never charges it again. The mandate payment commits in its own transaction after the ask, so a provider worker can stop between the two, or after paying but before the handler resumes. The provider's stale-job sweep covers both: a mandated job still suspended on its ask after a short grace period has the ask settled (a no-op if it already was) and the job resumed, with no caller message, and exactly one worker runs it. This recovery also resumes a job whose signed balance payment committed before the receiving worker stopped, without charging again. The sweep leaves alone a job with an unanswered prompt, which the caller's answer resumes, unless a standing decline must end its unpaid ask. Until then it is an ordinary open ask that the caller may pay. The portable message and reason list are in `protocol-fixtures/standing-mandate-v1.json`.
+
+### Standing decline
+
+On a job with a stored mandate, `POST /v1/job/:id/messages` with `{ "type": "decline", "content": { "reason": "stop after this piece" } }` between asks records a durable stop. HTTP 201 returns `{ "seq": <current seq>, "stop_requested": true, "display": "The job will stop at its next payment ask. Only finished pieces will be charged." }`. `GET /v1/job/:id` includes the same `stop_requested` and `display` fields while the stop is pending. Repeating the decline while it is pending succeeds with the same stop; it does not append another message or end the running piece. The stop survives a provider restart and cannot be overwritten by a worker's older snapshot. If automatic mandate settlement is disabled or unavailable on this host, the response and status instead say `Stop recorded. Decline the next open payment ask to stop the job.` The stop remains recorded but does not automatically end the next ask. The caller can decline that open ask normally, or a host with mandate settlement enabled can apply the stop.
+
+When automatic credit payments are enabled, at the next payment ask, the provider checks the stop under the same job-row lock as mandate settlement, before any credit movement, in both the ask-open path and the stale-job sweep. It does not pay that ask and follows the existing decline path: `cancelled`, ended by the caller, finished pieces charged at their reported usage, and the rest released. A payment committed before the stop remains paid. This does not change cancel semantics or stop a piece immediately. An already open ask or prompt is declined immediately as before, returning HTTP 201 `{ "seq": <final seq> }`. Without a mandate, a between-asks decline still returns the unchanged HTTP 409 `no_open_ask` response. The portable pending-stop response is in `protocol-fixtures/standing-mandate-v1.json`.
+
+Compatibility: the pending `stop_requested` and `display` response fields are additive. Stores implementing `declineJob` may now return `stop_requested` for a durably recorded standing decline; a live worker whose store lacks `declineJob` keeps HTTP 409 `no_open_ask` between asks, and a nonlocal request to such a store keeps HTTP 409 `decline_unavailable`.

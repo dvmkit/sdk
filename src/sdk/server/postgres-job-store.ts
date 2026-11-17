@@ -183,6 +183,9 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       -- receipt countersigns the ReceiptCredit block from it.
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credit_id TEXT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS draw_id TEXT;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS mandate JSONB;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_requested BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_reason TEXT;
       -- the original signed funding artifact and the snapshot served
       -- with a fund-and-draw response. INSERT-only for replay stability.
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS funding_receipt JSONB;
@@ -573,8 +576,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         request_fingerprint, requester_pubkey, request_id, credit_id, draw_id,
         pending_payment_fiat_micro, pending_payment_fiat_currency, auth_request_path,
         funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment,
-        pieces, channel
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53,$54)
+        pieces, channel, mandate
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53,$54,$55)
       ON CONFLICT (id) DO UPDATE SET
         terminal_at_ms = COALESCE(jobs.terminal_at_ms, EXCLUDED.terminal_at_ms),
         ended_by = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.ended_by ELSE EXCLUDED.ended_by END,
@@ -719,6 +722,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         record.pieces ? JSON.stringify(record.pieces) : null,
         // INSERT-only: a job never changes channel.
         record.channel ?? null,
+        record.mandate ? JSON.stringify(record.mandate) : null,
       ]
     );
     let rowCount: number | null;
@@ -1766,7 +1770,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     endedBy: "caller" | "provider" | null,
     ending: PieceEnding,
     requireOpenAsk = false
-  ): Promise<"ended" | "not_active" | "no_open_ask"> {
+  ): Promise<"ended" | "stop_requested" | "not_active" | "no_open_ask"> {
     const staleOnly = expectedActivityBefore !== null;
     const client = await this.pool.connect();
     try {
@@ -1797,6 +1801,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         }
       }
       if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
+        if (record.mandate) {
+          // Snapshots never write this column: a worker holding an older job cannot undo a stop.
+          await client.query(`UPDATE jobs SET stop_requested=TRUE, stop_reason=COALESCE(stop_reason,$2)
+            WHERE id=$1`, [jobId, reason]);
+          await client.query("COMMIT");
+          return "stop_requested";
+        }
         await client.query("ROLLBACK");
         return "no_open_ask";
       }
@@ -1976,6 +1987,8 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     costRevision: row.cost_revision == null ? undefined : Number(row.cost_revision),
     creditId: (row.credit_id ?? undefined) as string | undefined,
     drawId: (row.draw_id ?? undefined) as string | undefined,
+    stopRequested: row.stop_requested === true ? true : undefined,
+    mandate: (row.mandate ?? undefined) as JobRecord["mandate"],
     fundingReceipt: (row.funding_receipt ?? undefined) as JobRecord["fundingReceipt"],
     fundingCredit: (row.funding_credit ?? undefined) as JobRecord["fundingCredit"],
     receivedProofs: row.received_proofs as JobRecord["receivedProofs"],

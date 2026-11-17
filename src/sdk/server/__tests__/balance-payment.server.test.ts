@@ -8,6 +8,8 @@ import { signDeployAttestation, attestationEnv } from "../../../test-support/dep
 import { dropSchemas, pinnedPool, recreateSchema } from "../../../test-support/schema-isolation";
 import { configureDVM } from "../../configure";
 import { commitBalancePayment } from "../balance-payment";
+import { getStandingMandate } from "../credit-envelope";
+import { PostgresJobStore } from "../postgres-job-store";
 import { CreditLedger } from "../credit-ledger";
 import { createDVMHost } from "../host";
 import { secp256k1Auth } from "../secp256k1-auth";
@@ -41,12 +43,12 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     await dropSchemas(schema);
   });
 
-  async function server(outcome: "complete" | "fail" | "wait" | "twice" = "complete", enabled = true, reporting = false) {
+  async function server(outcome: "complete" | "fail" | "wait" | "twice" = "complete", enabled = true, reporting = false, priced = false) {
     const host = createDVMHost({ pool, port: 0, env: { ...attestationEnv(attestation), ...(reporting && { DVMKIT_PLATFORM_URL: "http://127.0.0.1:1", DVMKIT_PLATFORM_TOKEN: "test-platform-token" }), ...(!enabled && { DVMKIT_BALANCE_PAYMENTS: "false" }) } });
     hosts.push(host);
     const worker = hosts.length;
     host.mount(configureDVM({ name: "balance-service", credit: {}, auth: secp256k1Auth(), capabilities: {
-      run: { input: z.object({ action: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string() }), async onJob(ctx) {
+      run: { ...(priced && { price: "$0.001" }), input: z.object({ action: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string() }), async onJob(ctx) {
         if (reporting) ctx.cost({ amount: 0.000002, currency: "usd" });
         await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "one step");
         if (outcome === "twice") await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "second step");
@@ -81,6 +83,49 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
       amount_micro: 1_000, currency: "usd" }, undefined,
     { audience, method: "POST", path: `/v1/job/${job.job_id}/messages`, capability: null }) } };
   }
+
+  it.each([false, true])("persists a standing mandate across a provider restart (upfront=%s)", async (priced) => {
+    const url = await server("complete", true, false, priced);
+    expect((await (await fetch(`${url}/v1/info`)).json()).credit.standing_mandate).toBe(true);
+    const creditId = `mandate-credit-${priced}`;
+    await fund(creditId);
+    // Below the handler's ask, so the mandate leaves it open and the job stays unbound.
+    const mandate = { max_total_micro: 5000, max_ask_micro: 999, expires_at_ms: Date.now() + 86_400_000 };
+    const data = signer.signRequest(key, { action: "run", credit_id: creditId, draw_id: "mandate-draw", mandate },
+      undefined, { audience, method: "POST", path: "/v1/job", capability: "run" });
+    const created = await post(`${url}/v1/job`, { capability: "run", data });
+    expect(created.status).toBe(202);
+    const { job_id } = await created.json();
+    await hosts.at(-1)!.shutdown();
+    await server();
+    const reloaded = await new PostgresJobStore(pool).get(job_id);
+    expect(getStandingMandate(reloaded!)).toEqual({ ...mandate, credit_id: creditId, draw_id: "mandate-draw" });
+    expect(reloaded?.creditId).toBe(priced ? creditId : undefined);
+    expect(reloaded?.drawId).toBe(priced ? "mandate-draw" : undefined);
+    await new PostgresJobStore(pool).save({ ...reloaded!, mandate: { ...reloaded!.mandate!, max_total_micro: 9000 } });
+    expect(getStandingMandate((await new PostgresJobStore(pool).get(job_id))!)).toEqual({ ...mandate, credit_id: creditId, draw_id: "mandate-draw" });
+  }, 20_000);
+
+  it("accepts an ordinary signed per-ask payment on a zero-upfront mandated job", async () => {
+    const url = await server();
+    const creditId = "mandate-fallback-credit";
+    const drawId = `draw-${creditId}`;
+    await fund(creditId);
+    const data = signer.signRequest(key, { action: "run", credit_id: creditId, draw_id: drawId,
+      // Below the ask, so the mandate leaves it for the caller's signed payment.
+      mandate: { max_total_micro: 5000, max_ask_micro: 999, expires_at_ms: Date.now() + 86_400_000 } },
+      undefined, { audience, method: "POST", path: "/v1/job", capability: "run" });
+    const created = await post(`${url}/v1/job`, { capability: "run", data });
+    expect(created.status).toBe(202);
+    const job = await created.json();
+    await expect.poll(async () => (await pool.query("SELECT pending_payment_fiat_micro FROM jobs WHERE id=$1", [job.job_id])).rows[0]?.pending_payment_fiat_micro).toBe("1000");
+    const ask = (await pool.query("SELECT data FROM job_messages WHERE job_id=$1 AND data->>'type'='payment-request'", [job.job_id])).rows[0].data;
+    const paid = await post(`${url}/v1/job/${job.job_id}/messages`, payment({ ...job, ask }, creditId, drawId), job.job_token);
+    expect(paid.status, await paid.clone().text()).toBe(201);
+    await expect.poll(async () => (await ledger.getDraw({ creditId, drawId }))?.status).toBe("settled");
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(9000);
+    expect((await new PostgresJobStore(pool).get(job.job_id))?.creditId).toBe(creditId);
+  }, 20_000);
 
   it("negotiates support and completes a zero-upfront job using owner credit, with terminal replay", async () => {
     const url = await server();
