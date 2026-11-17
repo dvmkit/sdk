@@ -2,35 +2,6 @@
 
 ## Unreleased
 
-### Bug Fixes
-
-- Run on `@x402/core`, `@x402/evm` and `@x402/extensions` 2.31.0, pinned exactly. The production dependency graph no longer carries an advisory-affected Zod.
-- Reusable-channel (`batch-settlement`) payments use x402 2.31's per-channel admission lock. On a Postgres-backed DVM the lock is a row in the new `x402_batch_channel_locks` table, so every machine sharing the database sees it, and a request on a channel another request holds is refused with `invalid_batch_settlement_evm_channel_busy`, as before. A lock lasts the payment requirements' `maxTimeoutSeconds` (60 seconds); a machine that stops while holding one blocks that channel for at most that long. A request keeps its own lock past that time until another request takes it over. When the lock store itself fails, x402 2.31 continues without a lock and its charge compare-and-set still admits one charge per voucher; the request's ledger work commits normally. A lock that cannot be released logs `x402_channel_lock_release_failed` and expires on its own.
-- `/v1/credit` reusable-channel answers carry `extra.chargedAmount` in `PAYMENT-RESPONSE` beside the kept `extra.channelState`, including a deposit the DVM recovers from chain evidence after a crash, which also carries the charged total as `extra.channelState.chargedCumulativeAmount`. An x402 2.31 client advances its channel record by that amount and cannot advance it without one. The SDK's paying client takes the charge from the voucher it signed when an older DVM sends only the cumulative and that cumulative is exactly the one the voucher signed.
-- A fleet that has lost a channel's row and meets a voucher during the payer's withdrawal now refuses it as `invalid_batch_settlement_evm_cumulative_amount_mismatch` and stores nothing: x402 2.31 checks a rowless voucher against the on-chain claimed total. Charges recorded only on the lost row and never claimed are no longer recoverable through that voucher.
-- A cooperative refund that leaves money in the channel keeps the paying client's channel record with the DVM's reported remaining balance, as before; x402 2.31 would otherwise delete it.
-
-### Breaking API changes
-
-- `PostgresX402ChannelStorage` implements x402 2.31's `ChannelLockStorage` (`acquire`, `release` and `isHeld`), and the channels it returns no longer carry `pendingRequest`. `createX402BatchSettlementServer`, `CreateX402BatchSettlementServerOpts`, `CreditRouteDeps` and `handleCreditRequest` change signature through x402 2.31's `Channel` type, which drops `pendingRequest` and gains an optional `network`, and the types that carry it.
-- A builder's own `storage` in the batch-settlement configuration must implement x402 2.31's `ChannelLockStorage` for a request on a channel to be admitted fleet-wide. Without `acquire`, `release` and `isHeld`, x402 2.31 admits per process, the server logs `x402_channel_lock_in_process` once at startup (outside dev/test in-memory mode), and charges across machines rely on the store's `updateChannel` being the atomic compare-and-set x402 2.31's storage contract requires. With the previous SDK the reservation lived in that store's channel row. A DVM that gives the SDK a database (`db` or a `PostgresX402ChannelStorage` passed as `channelStorage` or `storage`) is unaffected.
-- `processX402BatchResponseForWallet` (unstable `@dvmkit/sdk/internal` caller entry) now requires `paymentHeader`, the journalled `PAYMENT-SIGNATURE` the answer acknowledges: x402 2.31 advances a channel record from the payment's own voucher and deposit, not from the answer alone. Pass the pending funding's journalled header.
-- `processX402BatchResponse` (`@dvmkit/sdk/internal`) now throws `x402 batch scheme signed no payment to acknowledge` when `scheme` did not sign a payment through `createX402BatchPayment`, and throws when `channelId` names a channel other than the signed payment's, where it previously dropped the answer's channel state.
-- `DvmX402ChannelStorage` (`@dvmkit/sdk/internal`) gains `stageRefundResidual`, and the `SettleResponse` type's `extra` gains an optional `chargedAmount`.
-
-### Migrations
-
-- Initialization creates the `x402_batch_channel_locks` table. The `pending_request` column on `x402_batch_channels` is kept: the SDK no longer writes it but honours a live reservation an older SDK wrote there, treating the channel as held until that reservation clears or expires, and leaves it in place when it updates the row, so a rolling deploy or a rollback to the previous SDK keeps working. An unreadable `pending_request` fails the request closed.
-- Reusable-channel payment requirements stay as they were: the server drops the `extra.minDeposit` hint x402 2.31 adds, because a payment must carry every `extra` field the server requires and a caller's journalled payment signed against the previous SDK's 402 has none. The SDK does not enforce a minimum deposit.
-
-### Compatibility requirements
-
-- Node.js 22 or newer, unchanged. `@x402/core`, `@x402/evm` and `@x402/extensions` move to exactly 2.31.0.
-
-### dvmctl and platform prerequisites
-
-- A platform that projects SDK diagnostics must admit the catalogue events `x402_channel_lock_in_process` and `x402_channel_lock_release_failed`; until then they are stored as `diagnostic.unknown`.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -55,6 +26,36 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Bug Fixes
 
 * **x402:** run on x402 2.31 with a shared channel admission lock ([#184](https://github.com/dvmkit/sdk/issues/184)) ([9679760](https://github.com/dvmkit/sdk/commit/96797606d8a4badb13f7bdddb9a8a06aa3b0526a))
+
+### Breaking API changes
+
+- `PostgresX402ChannelStorage` implements x402 2.31's `ChannelLockStorage` (`acquire`, `release` and `isHeld`), and the channels it returns no longer carry `pendingRequest`. `createX402BatchSettlementServer`, `CreateX402BatchSettlementServerOpts`, `CreditRouteDeps` and `handleCreditRequest` change signature through x402 2.31's `Channel` type, which drops `pendingRequest` and gains an optional `network`, and the types that carry it.
+- A builder's own `storage` in the batch-settlement configuration must implement x402 2.31's `ChannelLockStorage` for a request on a channel to be admitted fleet-wide. Without `acquire`, `release` and `isHeld`, x402 2.31 admits per process, the server logs `x402_channel_lock_in_process` once at startup (outside dev/test in-memory mode), and charges across machines rely on the store's `updateChannel` being the atomic compare-and-set x402 2.31's storage contract requires. With the previous SDK the reservation lived in that store's channel row. A DVM that gives the SDK a database (`db` or a `PostgresX402ChannelStorage` passed as `channelStorage` or `storage`) is unaffected.
+- `processX402BatchResponseForWallet` (unstable `@dvmkit/sdk/internal` caller entry) now requires `paymentHeader`, the journalled `PAYMENT-SIGNATURE` the answer acknowledges: x402 2.31 advances a channel record from the payment's own voucher and deposit, not from the answer alone. Pass the pending funding's journalled header.
+- `processX402BatchResponse` (`@dvmkit/sdk/internal`) now throws `x402 batch scheme signed no payment to acknowledge` when `scheme` did not sign a payment through `createX402BatchPayment`, and throws when `channelId` names a channel other than the signed payment's, where it previously dropped the answer's channel state.
+- `DvmX402ChannelStorage` (`@dvmkit/sdk/internal`) gains `stageRefundResidual`, and the `SettleResponse` type's `extra` gains an optional `chargedAmount`.
+
+### Migrations
+
+- Initialization creates the `x402_batch_channel_locks` table. The `pending_request` column on `x402_batch_channels` is kept: the SDK no longer writes it but honours a live reservation an older SDK wrote there, treating the channel as held until that reservation clears or expires, and leaves it in place when it updates the row, so a rolling deploy or a rollback to the previous SDK keeps working. An unreadable `pending_request` fails the request closed.
+- Reusable-channel payment requirements stay as they were: the server drops the `extra.minDeposit` hint x402 2.31 adds, because a payment must carry every `extra` field the server requires and a caller's journalled payment signed against the previous SDK's 402 has none. The SDK does not enforce a minimum deposit.
+
+### Compatibility requirements
+
+- Node.js 22 or newer, unchanged. `@x402/core`, `@x402/evm` and `@x402/extensions` move to exactly 2.31.0.
+
+### dvmctl and platform prerequisites
+
+- A platform that projects SDK diagnostics must admit the catalogue events `x402_channel_lock_in_process` and `x402_channel_lock_release_failed`; until then they are stored as `diagnostic.unknown`.
+
+### Fix details
+
+- Run on `@x402/core`, `@x402/evm` and `@x402/extensions` 2.31.0, pinned exactly. The production dependency graph no longer carries an advisory-affected Zod.
+- Reusable-channel (`batch-settlement`) payments use x402 2.31's per-channel admission lock. On a Postgres-backed DVM the lock is a row in the new `x402_batch_channel_locks` table, so every machine sharing the database sees it, and a request on a channel another request holds is refused with `invalid_batch_settlement_evm_channel_busy`, as before. A lock lasts the payment requirements' `maxTimeoutSeconds` (60 seconds); a machine that stops while holding one blocks that channel for at most that long. A request keeps its own lock past that time until another request takes it over. When the lock store itself fails, x402 2.31 continues without a lock and its charge compare-and-set still admits one charge per voucher; the request's ledger work commits normally. A lock that cannot be released logs `x402_channel_lock_release_failed` and expires on its own.
+- `/v1/credit` reusable-channel answers carry `extra.chargedAmount` in `PAYMENT-RESPONSE` beside the kept `extra.channelState`, including a deposit the DVM recovers from chain evidence after a crash, which also carries the charged total as `extra.channelState.chargedCumulativeAmount`. An x402 2.31 client advances its channel record by that amount and cannot advance it without one. The SDK's paying client takes the charge from the voucher it signed when an older DVM sends only the cumulative and that cumulative is exactly the one the voucher signed.
+- A fleet that has lost a channel's row and meets a voucher during the payer's withdrawal now refuses it as `invalid_batch_settlement_evm_cumulative_amount_mismatch` and stores nothing: x402 2.31 checks a rowless voucher against the on-chain claimed total. Charges recorded only on the lost row and never claimed are no longer recoverable through that voucher.
+- A cooperative refund that leaves money in the channel keeps the paying client's channel record with the DVM's reported remaining balance, as before; x402 2.31 would otherwise delete it.
+
 
 ## [0.39.0](https://github.com/dvmkit/sdk/compare/v0.38.0...v0.39.0) (2026-11-16)
 
