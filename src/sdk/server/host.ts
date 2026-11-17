@@ -31,7 +31,7 @@ import { envFlag } from "../env";
 import type { FxFetcher } from "../pricing/index";
 import { MemoryKVStore } from "../store";
 import type { CashuMode, DVMDescriptor, KVStore, PaymentMethod, ZodLike } from "../types";
-import { createDVMServer, revenueReporterBannerState, unknownRouteNotFound } from "./app";
+import { type AppEnv, createDVMServer, revenueReporterBannerState, unknownRouteNotFound } from "./app";
 import type { PostgresKVStore } from "./postgres-kv-store";
 import type { ResolvedCashuOpts } from "./cashu-env";
 import { resolveCashuOptsFromEnv } from "./cashu-env";
@@ -282,6 +282,15 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
   const routeClientCompatibility =
     opts.wrapRouteClientCompatibility?.(requireClientCompatibility) ?? requireClientCompatibility;
   const mounts: MountEntry[] = [];
+  app.use("*", async (c: Context<AppEnv>, next) => {
+    // Root-mounted middleware also matches sibling DVMs. Consult the routing
+    // mount table so those requests are not counted against the root DVM.
+    c.set("prefixedDVMRequest", mounts.some((entry) => {
+      const prefix = x402MountPrefix(entry.prefix);
+      return prefix !== "" && (c.req.path === prefix || c.req.path.startsWith(`${prefix}/`));
+    }));
+    await next();
+  });
   const paymentModes: PaymentMode[] = [];
   // When the caller injects a pool, it owns the lifecycle — we never end it.
   const ownsPool = !opts.pool;

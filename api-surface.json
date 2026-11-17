@@ -1179,7 +1179,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "d693b8023121a4c88611a62d8129813f716ceba51f7a5a0393619d7bed0daa4a"
+          "signature": "97d705fee280253b1c301d462bc575bb9652ec13b97310c5d197ed707b3c0ba9"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1271,7 +1271,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "6882664583cb1ccec6d3a63d11ae73066e33f02fea888235ae9387e101b946b8"
+          "signature": "bee636904274ea2f77db114ef0c29009691a7f4f962fef032e1e7c5f84001c71"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",

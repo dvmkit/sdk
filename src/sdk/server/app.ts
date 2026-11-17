@@ -1036,6 +1036,7 @@ export interface AppEnv {
     requesterId: string;
     unknownRoute?: boolean;
     clientCompatibility?: ClientCompatibility;
+    prefixedDVMRequest?: boolean;
   };
 }
 
@@ -1397,9 +1398,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // full request lifecycle so even pre-handler failures (auth, validation,
     // payment) appear in the trace. Skips /health and internal /_* routes.
     this.app.use("*", async (c, next) => {
+      const prefix = mountPrefix(c);
+      if (prefix === "" && c.get("prefixedDVMRequest")) return next();
       // Relative to this server's mount, so a mounted DVM skips and names its
       // routes exactly as one served at the root.
-      const route = c.req.path.slice(mountPrefix(c).length) || "/";
+      const route = c.req.path.slice(prefix.length) || "/";
       if (route === "/health" || route === "/healthz" || route.startsWith("/_")) return next();
 
       let statusCode = 200;
