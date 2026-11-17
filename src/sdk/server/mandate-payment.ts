@@ -120,6 +120,9 @@ export async function settleMandateAsk(args: {
     const response = await settleAskFromBalance({ tx, ledger: args.ledger, jobId: args.jobId, dvmId: args.dvmId, job,
       creditId: mandate.credit_id, drawId: mandate.draw_id, amountMicro: priced.amount_micro, credit: content,
       paymentId, fingerprint, requestSeq: ask.seq });
+    // The ledger now holds the credit lock, whose wait may have crossed expiry. Every payment
+    // write is still uncommitted: rolling back here also discards its draw, piece, and notification.
+    if (Date.now() >= mandate.expires_at_ms) return await skip("mandate_expired");
     await tx.query("COMMIT");
     return { outcome: "paid", requestSeq: ask.seq, seq: response.seq, replayed: false };
   } catch (error) {

@@ -676,6 +676,37 @@ describe("standing mandate admission", () => {
     expect(getStandingMandate((await jobStore.get(job_id))!)).toEqual({ ...limits, credit_id: "example-credit", draw_id: "example-draw" });
   });
 
+  it("records a memory-store standing decline and preserves it across a stale snapshot", async () => {
+    const jobStore = new MemoryJobStore();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const parked = new Promise<void>((resolve) => { entered = resolve; });
+    const { url, ledger } = await startServer(undefined, { jobStore, onDelayedJob: () => { entered(); return hold; } });
+    await fundCredit(ledger, { creditId: "example-credit", callerPubkey: CALLER_PUBKEY,
+      currency: "usd", amountMicro: 2_000_000, expiryMs: FUTURE_MS });
+    try {
+      const created = await submit(url, drawBody("delayed", { ...mandateFixture.data_fields, mandate: mandate() }));
+      expect(created.status).toBe(202);
+      const job = await created.json() as { job_id: string; job_token: string };
+      await parked;
+      const stale = (await jobStore.get(job.job_id))!;
+      const response = await fetch(`${url}/v1/job/${job.job_id}/messages`, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Job-Token": job.job_token },
+        body: JSON.stringify({ type: "decline", content: {} }) });
+      expect(response.status).toBe(201);
+      expect(await response.json()).toEqual({ seq: expect.any(Number), stop_requested: true,
+        display: mandateFixture.standing_decline.unsupported_display });
+      const first = (await jobStore.get(job.job_id))!;
+      expect(first).toMatchObject({ status: "processing", stopRequested: true });
+      expect(await jobStore.declineJob(job.job_id, "again")).toBe("stop_requested");
+      await jobStore.save({ ...stale, stopRequested: false });
+      expect(await jobStore.get(job.job_id)).toMatchObject({ status: "processing", stopRequested: true });
+      const status = await fetch(`${url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
+      expect(await status.json()).toMatchObject({ stop_requested: true, display: mandateFixture.standing_decline.unsupported_display });
+    } finally { release(); }
+  }, 30_000);
+
   it.each([
     ["missing credit fields", () => ({ mandate: mandate() })],
     ["missing draw", () => ({ credit_id: "c", mandate: mandate() })],

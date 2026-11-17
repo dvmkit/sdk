@@ -12,6 +12,7 @@ import type { SDKJobContext } from "../../types";
 import { CreditLedger } from "../credit-ledger";
 import { createDVMHost } from "../host";
 import { JobManager } from "../job-manager";
+import { isStreamableJobStore } from "../job-store";
 import { mandatePaymentId, settleMandateAsk } from "../mandate-payment";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
@@ -49,13 +50,15 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   let ledger: CreditLedger;
   const completions = new Map<string, number>();
   // A `late` job asks only once the test opens its gate, so the test sets the scene without racing a clock.
-  const gates = new Map<string, { opened: Promise<void>; open: () => void }>();
+  const gates = new Map<string, { opened: Promise<void>; open: () => void; arrived: Promise<void>; arrive: () => void }>();
   const gate = (jobId: string) => {
     let entry = gates.get(jobId);
     if (!entry) {
       let open!: () => void;
       const opened = new Promise<void>((resolve) => { open = resolve; });
-      entry = { opened, open };
+      let arrive!: () => void;
+      const arrived = new Promise<void>((resolve) => { arrive = resolve; });
+      entry = { opened, open, arrived, arrive };
       gates.set(jobId, entry);
     }
     return entry;
@@ -96,13 +99,19 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     const input = z.object({ action: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string() });
     const onJob = async (ctx: SDKJobContext<Record<string, unknown>, unknown>) => {
       const script = (ctx.input as { action: Script }).action;
-      if (script === "late") await gate(ctx.jobId).opened;
+      if (script === "late") {
+        const hold = gate(ctx.jobId);
+        hold.arrive();
+        await hold.opened;
+      }
       // A prompt left open across the ask keeps the job awaiting input after the ask is paid.
       const earlier = script === "asked-mid-prompt" ? ctx.prompt("earlier", "Anything else?") : undefined;
       await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next hour");
       await earlier;
       if (script === "stop" || script === "stop-prompt") {
-        await gate(ctx.jobId).opened;
+        const hold = gate(ctx.jobId);
+        hold.arrive();
+        await hold.opened;
         if (script === "stop-prompt") void ctx.prompt("later", "Anything else?").catch(() => undefined);
         await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next hour", { finishedChargeMicro: 600 });
       }
@@ -166,15 +175,24 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     return managers.mock.contexts.at(-1) as JobManager<unknown, undefined>;
   }
   /** Runs `observe` before every query on the shared pool; a throw fails that query. */
-  function observeQueries(observe: (sql: unknown, params: unknown) => void) {
+  function observeQueries(observe: (sql: unknown, params: unknown) => void | Promise<void>) {
     const originals = new Map<PoolClient, PoolClient["query"]>();
     const inject = (client: PoolClient) => {
       if (originals.has(client)) return;
       const query = client.query.bind(client);
       originals.set(client, query);
-      client.query = (async (...args: unknown[]) => {
-        observe(args[0], args[1]);
-        return (query as (...args: unknown[]) => Promise<unknown>)(...args);
+      client.query = ((...args: unknown[]) => {
+        const invoke = async () => {
+          await observe(args[0], args[1]);
+          return (query as (...args: unknown[]) => Promise<unknown>)(...args);
+        };
+        const callback = args.at(-1);
+        // Pool.query uses callbacks internally; injecting an error must also release that client.
+        if (typeof callback === "function") {
+          void invoke().catch((error: unknown) => { callback(error); });
+          return;
+        }
+        return invoke();
       }) as typeof client.query;
     };
     pool.on("acquire", inject);
@@ -229,11 +247,12 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     const url = await server();
     await fund(creditId);
     const job = await submit(url, { creditId, priced: true, script, maxTotal: 5 * ASK });
-    await expect.poll(() => latestManager().activeJobs.get(job.job_id)?.pendingPayment ?? null).toBeNull();
-    await expect.poll(() => balancePayments(job.job_id)).toHaveLength(1);
-    await expect.poll(() => status(job.job_id)).toBe("processing");
+    await gate(job.job_id).arrived;
+    expect(latestManager().activeJobs.get(job.job_id)?.pendingPayment).toBeNull();
+    expect(await balancePayments(job.job_id)).toHaveLength(1);
+    expect(await status(job.job_id)).toBe("processing");
     const stopped = await decline(url, job);
-    expect(stopped.status).toBe(201);
+    expect(stopped.status, await stopped.clone().text()).toBe(201);
     expect(await stopped.json()).toEqual({ ...fixture.standing_decline.response, seq: expect.any(Number) });
     const read = await fetch(`${url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
     expect(await read.json()).toMatchObject({ status: "processing", ...fixture.standing_decline.status_fields });
@@ -250,6 +269,63 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     expect(completions.get(job.job_id)).toBeUndefined();
   }
 
+  it("accepts a decline while a paid ask finishes resuming into the between-asks gate", async () => {
+    let releaseResume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });
+    let resumeEntered!: () => void;
+    const resuming = new Promise<void>((resolve) => { resumeEntered = resolve; });
+    let releaseIntent!: () => void;
+    const intentGate = new Promise<void>((resolve) => { releaseIntent = resolve; });
+    let intentEntered!: () => void;
+    const checkingIntent = new Promise<void>((resolve) => { intentEntered = resolve; });
+    const url = await server();
+    const manager = latestManager();
+    const resumeOwner = manager as unknown as { adoptPaymentMetadata: (...args: unknown[]) => Promise<boolean> };
+    const adopt = resumeOwner.adoptPaymentMetadata.bind(manager);
+    const resumeSpy = vi.spyOn(resumeOwner, "adoptPaymentMetadata").mockImplementation(async (...args) => {
+      resumeEntered();
+      await resumeGate;
+      return adopt(...args);
+    });
+    const arrivalStore = manager.store as unknown as { openPaymentIntentUntil: (...args: unknown[]) => Promise<number | undefined> };
+    const checkIntent = arrivalStore.openPaymentIntentUntil.bind(manager.store);
+    let intentSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const creditId = "stop-resume-transition";
+      await fund(creditId);
+      const job = await submit(url, { creditId, priced: true, script: "stop", maxTotal: 5 * ASK });
+      await resuming;
+      expect(await status(job.job_id)).toBe("processing");
+      expect(manager.activeJobs.get(job.job_id)?.pendingPayment).not.toBeNull();
+      intentSpy = vi.spyOn(arrivalStore, "openPaymentIntentUntil").mockImplementation(async (...args) => {
+        intentEntered();
+        await intentGate;
+        return checkIntent(...args);
+      });
+      const pending = decline(url, job);
+      await checkingIntent;
+      releaseResume();
+      await gate(job.job_id).arrived;
+      const live = manager.activeJobs.get(job.job_id)!;
+      expect(live.status).toBe("processing");
+      expect(live.pendingPayment).toBeNull();
+      expect(live.pendingPrompts.size).toBe(0);
+      expect(live.pendingPaymentMsats ?? 0).toBe(0);
+      expect(await status(job.job_id)).toBe("processing");
+      releaseIntent();
+      const response = await pending;
+      expect(response.status, await response.clone().text()).toBe(201);
+      expect(await response.json()).toEqual({ ...fixture.standing_decline.response, seq: expect.any(Number) });
+      gate(job.job_id).open();
+      await expectDeclined(job);
+    } finally {
+      releaseResume();
+      releaseIntent();
+      resumeSpy.mockRestore();
+      intentSpy?.mockRestore();
+    }
+  }, 30_000);
+
   it("records an idempotent standing decline and charges only finished work at the next ask", async () => {
     const { url, job } = await stoppedJob("stop-next");
     const repeated = await decline(url, job);
@@ -263,11 +339,21 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   it("preserves a standing decline across a provider restart before the next ask", async () => {
     const { job } = await stoppedJob("stop-restart");
     await hosts[0].shutdown();
-    const resumed = await server();
-    // Resume processing through the existing inbound recovery path; no payment is sent.
-    const response = await post(`${resumed}/v1/job/${job.job_id}/messages`,
-      { type: "response", content: { prompt_id: "resume", text: "continue" } }, job.job_token);
-    expect(response.status).toBe(201);
+    // Leave the old handler parked; only the replacement worker's gate will be released.
+    gates.delete(job.job_id);
+    await server();
+    const manager = latestManager();
+    const store = manager.store;
+    if (!isStreamableJobStore(store)) throw new Error("restart requires a streamable store");
+    const saved = (await store.get(job.job_id))!;
+    expect(saved.stopRequested).toBe(true);
+    saved.messages = await store.getMessages(job.job_id, 0);
+    saved.seq = Math.max(saved.seq, ...saved.messages.map((message) => message.seq));
+    // Mid-piece processing recovery is explicit; the HTTP inbound path only replays suspended asks.
+    const replay = manager.reactivateJob(saved);
+    replay.job.replayHighSeq = saved.seq;
+    manager.runHandler(replay.job, replay.sdkCtx);
+    await gate(job.job_id).arrived;
     gate(job.job_id).open();
     await expectDeclined(job);
   }, 30_000);
@@ -392,6 +478,7 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     const creditId = "stop-custom-running";
     await fund(creditId);
     const job = await submit(url, { creditId, script: "late", maxTotal: 5 * ASK });
+    await gate(job.job_id).arrived;
     const store = latestManager().store as { declineJob?: unknown };
     const original = store.declineJob;
     store.declineJob = undefined;
@@ -404,7 +491,7 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       expect((await pool.query("SELECT status,stop_requested FROM jobs WHERE id=$1", [job.job_id])).rows[0])
         .toEqual({ status: "processing", stop_requested: false });
     } finally { store.declineJob = original; }
-  });
+  }, 30_000);
 
   it("keeps the exact between-asks refusal on a job without a mandate", async () => {
     const url = await server();
@@ -529,6 +616,130 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId })).toMatchObject({ status: "settled", amountMicro: ASK });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - ASK);
   }, 40_000);
+
+  it("resumes a signed-paid ask from the sweep after the receiving worker stops before resume", async () => {
+    const creditId = "sweep-signed-crash";
+    const { job, ask } = await strandedAsk(creditId);
+    const receiving = await server();
+    let written = false;
+    let committed = false;
+    let failed = false;
+    const restore = observeQueries((sql) => {
+      if (typeof sql !== "string") return;
+      if (sql.startsWith("INSERT INTO credit_balance_payments")) written = true;
+      if (written && sql === "COMMIT") committed = true;
+      if (!failed && committed && sql === "SELECT pg_notify('job_messages', $1)") {
+        failed = true;
+        throw new Error("worker stopped before resume");
+      }
+    });
+    try {
+      const paid = await post(`${receiving}/v1/job/${job.job_id}/messages`, signedPayment(job, ask.seq, creditId, job.drawId), job.job_token);
+      expect(paid.status, await paid.clone().text()).toBe(201);
+      expect(failed).toBe(true);
+      expect(await status(job.job_id)).toBe("awaiting-input");
+      await hosts[1].shutdown();
+    } finally { restore(); }
+    await server();
+    const first = latestManager();
+    await server();
+    await Promise.all([first.sweepMandateAsks(afterGrace()), latestManager().sweepMandateAsks(afterGrace())]);
+    await expect.poll(() => status(job.job_id), { timeout: 15_000 }).toBe("completed");
+    expect(completions.get(job.job_id)).toBe(1);
+    expect(await balancePayments(job.job_id)).toEqual([{ payment_id: `signed-${job.job_id}-${ask.seq}`, request_seq: String(ask.seq) }]);
+    expect((await messages(job.job_id)).filter((m) => m.from === "requester" && m.type === "payment")).toHaveLength(1);
+    await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId })).toMatchObject({ status: "settled", amountMicro: ASK });
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - ASK);
+  }, 40_000);
+
+  it("does not resume an expired unpaid ask with a later verified payment", async () => {
+    const url = await server();
+    const creditId = "sweep-unpaid-history";
+    await fund(creditId);
+    const job = await submit(url, { creditId, script: "one", maxTotal: 5 * ASK, maxAsk: ASK - 1 });
+    const ask = await openAsk(job.job_id);
+    await hosts[0].shutdown();
+    await server();
+    const manager = latestManager();
+    const store = manager.store;
+    if (!isStreamableJobStore(store)) throw new Error("expected a streaming job store");
+    // Real late rail payments are hidden as `balance`, not `verified`. Construct
+    // the inconsistent history through the store to exercise the resumer's independent guard.
+    const expiredAskSeq = await store.appendOutgoing(job.job_id, { from: "provider", type: "payment-request",
+      timestamp: Math.floor(Date.now() / 1000), content: { ...ask.content, expires_at_ms: Date.now() - 60_000 } });
+    const paymentSeq = await store.recordInbound(job.job_id, { from: "requester", type: "payment",
+      timestamp: Math.floor(Date.now() / 1000), content: { credit: { credit_id: creditId, request_seq: expiredAskSeq } } });
+    await store.verifyAndCredit(job.job_id, paymentSeq, null);
+    expect((await messages(job.job_id)).findLast((m) => m.from === "requester" && m.type === "payment"))
+      .toMatchObject({ seq: paymentSeq });
+    expect(paymentSeq).toBeGreaterThan(expiredAskSeq);
+    expect(await store.get(job.job_id)).toMatchObject({ status: "awaiting-input", pendingPaymentMsats: ASK });
+    expect(await settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id })).toEqual({ outcome: "none" });
+
+    const run = vi.spyOn(manager, "runHandler");
+    await manager.sweepMandateAsks(afterGrace());
+    expect(run).not.toHaveBeenCalled();
+    expect(manager.activeJobs.has(job.job_id)).toBe(false);
+    expect(await store.get(job.job_id)).toMatchObject({ status: "awaiting-input", pendingPaymentMsats: ASK });
+    expect(completions.has(job.job_id)).toBe(false);
+    expect(await balancePayments(job.job_id)).toEqual([]);
+    expect(await ledger.getDraw({ creditId, drawId: job.drawId })).toBeUndefined();
+    expect((await ledger.get(creditId))?.availableMicro).toBe(10_000);
+  }, 30_000);
+
+  it.each(["credit lock", "commit"] as const)("does not pay when the mandate expires while waiting for %s", async (boundary) => {
+    const url = await server();
+    const creditId = `expiry-${boundary.replaceAll(" ", "-")}`;
+    await fund(creditId);
+    const job = await submit(url, { creditId, script: "late", maxTotal: 5 * ASK, expiresInMs: 10_000 });
+    await gate(job.job_id).arrived;
+    const tx = await pool.connect();
+    let release!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const atCommit = new Promise<void>((resolve) => { entered = resolve; });
+    let paymentWritten = false;
+    let restore = () => {};
+    const warningStart = warnings.length;
+    try {
+      if (boundary === "credit lock") {
+        await tx.query("BEGIN");
+        await tx.query("SELECT credit_id FROM credits WHERE credit_id=$1 FOR UPDATE", [creditId]);
+      } else {
+        restore = observeQueries(async (sql, params) => {
+          if (typeof sql !== "string") return;
+          if (sql.startsWith("INSERT INTO credit_balance_payments")) paymentWritten = true;
+          if (paymentWritten && sql === "SELECT pg_notify('job_messages', $1)" && (params as unknown[])[0] === job.job_id) {
+            entered();
+            await paused;
+          }
+        });
+      }
+      gate(job.job_id).open();
+      if (boundary === "credit lock") {
+        await expect.poll(async () => (await pool.query(`SELECT COUNT(*)::int AS n FROM pg_stat_activity
+          WHERE datname=current_database() AND query LIKE 'SELECT%FROM credits%FOR UPDATE'
+          AND wait_event_type='Lock'`)).rows[0].n, { timeout: 5_000 }).toBeGreaterThan(0);
+      } else { await atCommit; }
+      expect(Date.now()).toBeLessThan(job.expiresAtMs);
+      // The lock/commit barrier is held across the real authorization expiry, not a scheduling delay.
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, job.expiresAtMs - Date.now() + 25)));
+      if (boundary === "credit lock") await tx.query("COMMIT");
+      else release();
+      await expect.poll(async () => warnings.slice(warningStart).some((w) => w.reason === "mandate_expired") ||
+        await status(job.job_id) === "completed", { timeout: 5_000 }).toBe(true);
+      expect(await balancePayments(job.job_id)).toEqual([]);
+      expect((await messages(job.job_id)).filter((m) => m.type === "payment")).toEqual([]);
+      expect(await status(job.job_id)).toBe("awaiting-input");
+      expect(await ledger.getDraw({ creditId, drawId: job.drawId })).toBeUndefined();
+      expect((await ledger.get(creditId))?.availableMicro).toBe(10_000);
+    } finally {
+      release();
+      restore();
+      await tx.query("ROLLBACK");
+      tx.release();
+    }
+  }, 30_000);
 
   it("settles a stranded ask and resumes the job from the sweep, with no caller message", async () => {
     const creditId = "sweep-unsettled";

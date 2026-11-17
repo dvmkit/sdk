@@ -5090,6 +5090,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         }
         if (isTerminal(activeJob.status)) return this.jobNotActiveResponse(c);
         if (!activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob)) {
+          if (activeJob.mandate && isStreamableJobStore(jm.store) && jm.store.declineJob) {
+            const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
+            return this.declineStoredJob(c, id, reason);
+          }
           return this.noOpenAskResponse(c);
         }
       }
@@ -5377,7 +5381,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
     if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
     const fresh = await jm.store.get(id);
-    if (fresh?.status !== "awaiting-input") return;
+    if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
     fresh.messages = await jm.store.getMessages(id, 0);
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");

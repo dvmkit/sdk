@@ -1480,7 +1480,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             if (local) {
               // A settlement whose notification was missed wakes the resolver here.
               if (settlement?.outcome !== "skipped") await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
-            } else if (settlement?.outcome === "paid") {
+            } else if (settlement?.outcome === "paid" || settlement?.outcome === "none") {
+              // A signed payment also needs recovery if its worker died after commit. The resumer
+              // rechecks durable ask satisfaction and verified history before claiming execution.
               await this.opts.resumePaidAsk?.(jobId);
             }
           } catch (err) {
