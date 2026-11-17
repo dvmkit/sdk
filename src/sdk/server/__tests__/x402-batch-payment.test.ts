@@ -1090,7 +1090,7 @@ describe("x402 batch-settlement PAYMENT-RESPONSE", () => {
       success: true,
       transaction: "0xrefund",
       network: "eip155:84532",
-      extra: { channelState: CHANNEL_STATE },
+      extra: { channelState: CHANNEL_STATE, chargedAmount: "250000" },
     });
   });
 
@@ -1101,6 +1101,23 @@ describe("x402 batch-settlement PAYMENT-RESPONSE", () => {
     const response = await drainRequest(app);
 
     expect(response.status).toBe(200);
+    expect(decoded(response)).toEqual({
+      success: true,
+      transaction: "0xrefund",
+      network: "eip155:84532",
+      extra: { channelState: CHANNEL_STATE, chargedAmount: "250000" },
+    });
+  });
+
+  it.each([
+    ["a non-numeric charge", "lots"],
+    ["a charge just past uint256", (2n ** 256n).toString()],
+  ])("drops %s and keeps the channel state", async (_case, chargedAmount) => {
+    const batch = batchServer(undefined, "250000", { extra: { channelState: CHANNEL_STATE, chargedAmount } });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await drainRequest(app);
+
     expect(decoded(response)).toEqual({
       success: true,
       transaction: "0xrefund",
@@ -1162,7 +1179,8 @@ describe("x402 batch-settlement PAYMENT-RESPONSE", () => {
     ["an amount just past uint256", { ...CHANNEL_STATE, chargedCumulativeAmount: (2n ** 256n).toString() }],
   ])("drops a channel state with %s and keeps the standard fields", async (_case, channelState) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const batch = batchServer(undefined, "250000", { extra: { channelState } });
+    // The charge is echoed only beside channel state proven to be this channel's.
+    const batch = batchServer(undefined, "250000", { extra: { channelState, chargedAmount: "250000" } });
     const { app } = await x402Credit(batch, 250_000);
 
     const response = await drainRequest(app);

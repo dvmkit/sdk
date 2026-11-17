@@ -8,12 +8,16 @@ import type {
 import {
   computeChannelId,
   createBatchSettlementEIP3009DepositPayload,
+  InMemoryClientChannelStorage,
+  processPaymentResponse,
   signVoucher,
 } from "@x402/evm/batch-settlement/client";
-import { type Channel, InMemoryChannelStorage } from "@x402/evm/batch-settlement/server";
+import { type Channel, type ChannelStorage, InMemoryChannelStorage } from "@x402/evm/batch-settlement/server";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 
+import { encodeSettleResponseHeader } from "../../../lib/x402/spec";
+import { diagnosticConsole } from "../../../observability/diagnostic-console";
 import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 import type { HostedSettlementReportObligations } from "../hosting-settlement-report-obligations";
@@ -134,6 +138,15 @@ class StatefulFacilitator implements FacilitatorClient {
  * rather than the claim.
  */
 const earnedNothing = (): Promise<number> => Promise.resolve(0);
+
+// A drain is paid against the 402 the server builds for its zero price, as the
+// credit route builds it.
+async function refundRequirements(
+  server: Awaited<ReturnType<typeof createX402BatchSettlementServer>>
+): Promise<PaymentRequirements> {
+  const [built] = await server.buildRequirements("0");
+  return built as PaymentRequirements;
+}
 
 function header(
   payload: Pick<PaymentPayload, "x402Version" | "payload">,
@@ -257,13 +270,132 @@ describe("x402 batch-settlement stateful round trip", () => {
       await expect(server.accept({
         paymentHeader: header({ x402Version: 2,
           payload: { type: "refund", channelConfig, voucher } },
-        { ...requirements, amount: "0" }),
+        await refundRequirements(server)),
         amount: "0", operation: "refund", effectId: "reserved-refund:drain",
         expectedChannelId: channelId, refundBoundNative: 100,
         commit: async () => "drained",
       })).rejects.toThrow("original refund reservation unavailable");
       expect(reserveX402).toHaveBeenCalledOnce();
       expect(facilitator.settle).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  // A caller may resume a header it journalled against a 402 from an SDK on
+  // x402 2.21, whose requirements carried no `extra.minDeposit`.
+  it("admits a deposit and a voucher signed against requirements without a minimum deposit", async () => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const facilitator = new StatefulFacilitator();
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK, payTo: receiver.address, earnedNative: earnedNothing,
+      config: { storage: new InMemoryChannelStorage(), facilitatorClient: facilitator,
+        receiverAuthorizerSigner: receiver, autoSettlement: false },
+    });
+    try {
+      const [built] = await server.buildRequirements("100");
+      const { minDeposit: _absent, ...extra } = (built as PaymentRequirements).extra;
+      const olderRequirements = { ...(built as PaymentRequirements), extra };
+      const channelConfig: Channel["channelConfig"] = {
+        payer: payer.address, payerAuthorizer: payer.address,
+        receiver: receiver.address, receiverAuthorizer: receiver.address,
+        token: TOKEN, withdrawDelay: 86_400, salt: `0x${"5b".repeat(32)}`,
+      };
+      const channelId = computeChannelId(channelConfig, NETWORK);
+      const deposit = await createBatchSettlementEIP3009DepositPayload(
+        payer, 2, olderRequirements, channelConfig, "1000", "100"
+      );
+
+      await expect(server.accept({ paymentHeader: header(deposit, olderRequirements),
+        amount: "100", operation: "fund", effectId: "older-402:fund-1",
+        commit: async () => "funded" })).resolves.toMatchObject({ ok: true });
+      const voucher = await signVoucher(payer, channelId, "200", NETWORK);
+      await expect(server.accept({
+        paymentHeader: header({ x402Version: 2, payload: { type: "voucher", channelConfig, voucher } }, olderRequirements),
+        amount: "100", operation: "fund", effectId: "older-402:fund-2",
+        commit: async () => "charged",
+      })).resolves.toMatchObject({ ok: true, value: { committed: "charged" } });
+      expect(await server.getChannel(channelId)).toMatchObject({ chargedCumulativeAmount: "200" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("warns once at startup when the builder's channel storage cannot lock a channel across processes", async () => {
+    const warn = vi.spyOn(diagnosticConsole, "warn");
+    const inProcessWarnings = () =>
+      warn.mock.calls.filter(([value]) => (value as { event?: string }).event === "x402_channel_lock_in_process");
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const start = async (storage: ChannelStorage) => {
+      const server = await createX402BatchSettlementServer({
+        network: NETWORK, payTo: receiver.address, earnedNative: earnedNothing,
+        config: { storage, facilitatorClient: new StatefulFacilitator(),
+          receiverAuthorizerSigner: receiver, autoSettlement: false },
+      });
+      await server.stop();
+    };
+    const lockCapable = new InMemoryChannelStorage();
+
+    await start(lockCapable);
+    expect(inProcessWarnings()).toHaveLength(0);
+    await start({
+      get: (channelId) => lockCapable.get(channelId),
+      list: () => lockCapable.list(),
+      updateChannel: (channelId, update) => lockCapable.updateChannel(channelId, update),
+    });
+    expect(inProcessWarnings()).toHaveLength(1);
+  });
+
+  it("answers each payment in a form a stock x402 client advances its channel record by", async () => {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const facilitator = new StatefulFacilitator();
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK, payTo: receiver.address, earnedNative: earnedNothing,
+      config: { storage: new InMemoryChannelStorage(), facilitatorClient: facilitator,
+        receiverAuthorizerSigner: receiver, autoSettlement: false },
+    });
+    try {
+      const [built] = await server.buildRequirements("100");
+      const requirements = built as PaymentRequirements;
+      const channelConfig: Channel["channelConfig"] = {
+        payer: payer.address, payerAuthorizer: payer.address,
+        receiver: receiver.address, receiverAuthorizer: receiver.address,
+        token: TOKEN, withdrawDelay: 86_400, salt: `0x${"5a".repeat(32)}`,
+      };
+      const channelId = computeChannelId(channelConfig, NETWORK);
+      const client = new InMemoryClientChannelStorage();
+      const settleOnClient = (settlement: SettleResponse, depositAmount?: string) =>
+        processPaymentResponse(
+          client,
+          (name) => (name === "PAYMENT-RESPONSE" ? encodeSettleResponseHeader(settlement, { channelId }) : null),
+          { channelId, requestAmount: "100", ...(depositAmount !== undefined && { depositAmount }) }
+        );
+
+      const deposit = await createBatchSettlementEIP3009DepositPayload(
+        payer, 2, requirements, channelConfig, "1000", "100"
+      );
+      const opened = await server.accept({ paymentHeader: header(deposit, requirements),
+        amount: "100", operation: "fund", effectId: "stock-client:fund-1",
+        commit: async () => "funded" });
+      if (!opened.ok) throw new Error(`deposit refused: ${opened.reason}`);
+      await settleOnClient(opened.value.settlement, "1000");
+      expect(await client.get(channelId.toLowerCase())).toMatchObject({
+        chargedCumulativeAmount: "100", balance: "1000",
+      });
+
+      const voucher = await signVoucher(payer, channelId, "200", NETWORK);
+      const charged = await server.accept({
+        paymentHeader: header({ x402Version: 2, payload: { type: "voucher", channelConfig, voucher } }, requirements),
+        amount: "100", operation: "fund", effectId: "stock-client:fund-2",
+        commit: async () => "charged",
+      });
+      if (!charged.ok) throw new Error(`voucher refused: ${charged.reason}`);
+      await settleOnClient(charged.value.settlement);
+      expect(await client.get(channelId.toLowerCase())).toMatchObject({
+        chargedCumulativeAmount: "200", balance: "1000",
+      });
     } finally {
       await server.stop();
     }
@@ -343,10 +475,8 @@ describe("x402 batch-settlement stateful round trip", () => {
         },
       })
     ).rejects.toThrow("ledger refused");
-    expect(await server.getChannel(channelId)).toMatchObject({
-      chargedCumulativeAmount: "100",
-      pendingRequest: undefined,
-    });
+    expect(await server.getChannel(channelId)).toMatchObject({ chargedCumulativeAmount: "100" });
+    expect(await storage.isHeld(channelId)).toBe(false);
 
     const second = await server.accept({
       paymentHeader: header(secondPayload, requirements),
@@ -436,7 +566,7 @@ describe("x402 batch-settlement stateful round trip", () => {
       },
     } as const;
     const refund = await server.accept({
-      paymentHeader: header(refundPayload, { ...requirements, amount: "0" }),
+      paymentHeader: header(refundPayload, await refundRequirements(server)),
       amount: "0",
       operation: "refund",
       expectedChannelId: channelId,
@@ -458,12 +588,12 @@ describe("x402 batch-settlement stateful round trip", () => {
 
   /**
    * A rebuilt fleet meets a channel it holds no row for, and the payer is
-   * withdrawing. Upstream's verify synthesises the row from the facilitator's
-   * `extra`, so the voucher it just banked is the only payer signature anyone
-   * has for the value already charged — the refusal must not take it away, on
-   * either outcome of the rush claim.
+   * withdrawing. Upstream checks a rowless voucher against the on-chain claimed
+   * total, so a voucher carrying charges only the lost row recorded is refused
+   * as a cumulative mismatch before any claim: those unclaimed charges are not
+   * recoverable through this voucher, and the refusal stores nothing.
    */
-  it("keeps the payer signature through a withdrawal race on a channel with no local row", async () => {
+  it("refuses a withdrawal-race voucher on a channel with no local row and stores nothing", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
     const receiver = privateKeyToAccount(generatePrivateKey());
     const storage = new InMemoryChannelStorage();
@@ -471,8 +601,8 @@ describe("x402 batch-settlement stateful round trip", () => {
     const server = await createX402BatchSettlementServer({
       network: NETWORK,
       payTo: receiver.address,
-      // The credit this channel funded has drawn everything charged to it, so
-      // the rush claim has the full 100 to protect.
+      // The credit this channel funded has drawn everything charged to it, so a
+      // rush claim would have the full 100 to take.
       earnedNative: () => Promise.resolve(100),
       config: {
         storage,
@@ -520,50 +650,30 @@ describe("x402 batch-settlement stateful round trip", () => {
 
     // The fleet lost its channel state; the payer starts a withdrawal.
     await storage.updateChannel(channelId, () => undefined);
-    expect(await server.getChannel(channelId)).toBeUndefined();
     facilitator.withdrawRequestedAt = 123;
-    facilitator.claimFails = true;
+    const settleCallsBefore = facilitator.settle.mock.calls.length;
+    const commit = vi.fn(async () => "must not run");
 
-    const claimFailed = await server.accept({
+    const refused = await server.accept({
       paymentHeader: header(voucherPayload, requirements),
       amount: "100",
       operation: "fund",
       effectId: "credit-2:fund-withdrawing-1",
-      commit: async () => "must not run",
+      commit,
     });
-    expect(claimFailed).toMatchObject({ ok: false, reason: "withdrawal_pending" });
+
+    expect(refused).toMatchObject({
+      ok: false,
+      reason: "invalid_batch_settlement_evm_cumulative_amount_mismatch",
+    });
+    expect(refused).not.toHaveProperty("corrective");
     // With no mirrored row, upstream owns the single live verification. The
     // dvmkit preflight must not spend a second facilitator round trip.
     expect(facilitator.verify).toHaveBeenCalledTimes(2);
-    expect(await server.getChannel(channelId)).toMatchObject({
-      signature: voucher.signature,
-      signedMaxClaimable: "200",
-      chargedCumulativeAmount: "100",
-      pendingRequest: undefined,
-    });
-
-    // Same shape again, this time with a claim the facilitator accepts: the
-    // row that just recorded `totalClaimed` has to survive too.
-    await storage.updateChannel(channelId, () => undefined);
-    facilitator.claimFails = false;
-    const claimLanded = await server.accept({
-      paymentHeader: header(voucherPayload, requirements),
-      amount: "100",
-      operation: "fund",
-      effectId: "credit-2:fund-withdrawing-2",
-      commit: async () => "must not run",
-    });
-    expect(claimLanded).toMatchObject({ ok: false, reason: "withdrawal_pending" });
-    expect(facilitator.verify).toHaveBeenCalledTimes(3);
-    expect(facilitator.settle).toHaveBeenLastCalledWith(
-      expect.objectContaining({ payload: expect.objectContaining({ type: "claim" }) }),
-      expect.anything()
-    );
-    expect(await server.getChannel(channelId)).toMatchObject({
-      signature: voucher.signature,
-      totalClaimed: "100",
-      pendingRequest: undefined,
-    });
+    expect(facilitator.settle).toHaveBeenCalledTimes(settleCallsBefore);
+    expect(commit).not.toHaveBeenCalled();
+    expect(await server.getChannel(channelId)).toBeUndefined();
+    expect(await storage.isHeld(channelId)).toBe(false);
     await server.stop();
   });
 
@@ -624,7 +734,7 @@ describe("x402 batch-settlement stateful round trip", () => {
         x402Version: 2,
         payload: { type: "refund", channelConfig, voucher: refundVoucher },
       },
-      { ...requirements, amount: "0" }
+      await refundRequirements(server)
     );
     await expect(
       server.accept({
@@ -659,8 +769,8 @@ describe("x402 batch-settlement stateful round trip", () => {
       totalClaimed: "0",
       chargedCumulativeAmount: "100",
       signedMaxClaimable: "100",
-      pendingRequest: undefined,
     });
+    expect(await storage.isHeld(channelId)).toBe(false);
 
     let releaseFailedCommit = (): void => undefined;
     const failedCommitGate = new Promise<void>((resolve) => {
@@ -782,7 +892,7 @@ describe("x402 batch-settlement stateful round trip", () => {
     const uncorrected = await server.accept({
       paymentHeader: header(
         { x402Version: 2, payload: { type: "refund", channelConfig, voucher: floorVoucher } },
-        { ...requirements, amount: "0" }
+        await refundRequirements(server)
       ),
       amount: "0",
       operation: "refund",
@@ -808,7 +918,7 @@ describe("x402 batch-settlement stateful round trip", () => {
     const drained = await server.accept({
       paymentHeader: header(
         { x402Version: 2, payload: { type: "refund", channelConfig, voucher: basedVoucher } },
-        { ...requirements, amount: "0" }
+        await refundRequirements(server)
       ),
       amount: "0",
       operation: "refund",
@@ -850,13 +960,14 @@ describe("x402 batch-settlement stateful round trip", () => {
   it("refuses a drain whose escrow the DVM has already claimed", async () => {
     const payer = privateKeyToAccount(generatePrivateKey());
     const receiver = privateKeyToAccount(generatePrivateKey());
+    const storage = new InMemoryChannelStorage();
     const facilitator = new StatefulFacilitator();
     const server = await createX402BatchSettlementServer({
       network: NETWORK,
       payTo: receiver.address,
       earnedNative: earnedNothing,
       config: {
-        storage: new InMemoryChannelStorage(),
+        storage,
         facilitatorClient: facilitator,
         receiverAuthorizerSigner: receiver,
         autoSettlement: false,
@@ -906,7 +1017,7 @@ describe("x402 batch-settlement stateful round trip", () => {
             voucher: await signVoucher(payer, channelId, "60", NETWORK),
           },
         },
-        { ...requirements, amount: "0" }
+        await refundRequirements(server)
       ),
       amount: "0",
       operation: "refund",
@@ -921,10 +1032,8 @@ describe("x402 batch-settlement stateful round trip", () => {
       corrective: false,
     });
     expect(facilitator.settle).toHaveBeenCalledTimes(settleCallsBeforeDrain);
-    expect(await server.getChannel(channelId)).toMatchObject({
-      chargedCumulativeAmount: "100",
-      pendingRequest: undefined,
-    });
+    expect(await server.getChannel(channelId)).toMatchObject({ chargedCumulativeAmount: "100" });
+    expect(await storage.isHeld(channelId)).toBe(false);
     await server.stop();
   });
 
@@ -986,7 +1095,7 @@ describe("x402 batch-settlement stateful round trip", () => {
     const refused = await server.accept({
       paymentHeader: header(
         { x402Version: 2, payload: { type: "refund", channelConfig, voucher: refundVoucher } },
-        { ...requirements, amount: "0" }
+        await refundRequirements(server)
       ),
       amount: "0",
       operation: "refund",

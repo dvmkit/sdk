@@ -5,6 +5,7 @@ import type { PaymentPayload, PaymentRequirements, SettleResponse } from "@x402/
 import { BATCH_SETTLEMENT_ADDRESS } from "@x402/evm";
 import type {
   Channel,
+  ChannelLockStorage,
   ChannelStorage,
   ChannelUpdateResult,
 } from "@x402/evm/batch-settlement/server";
@@ -296,7 +297,7 @@ const LOCK_NOT_AVAILABLE = "55P03";
  * {@link withFleetSettlementLock} and {@link withRelaySubmissionLock} are the
  * other two nesting sites and are bounded a different way — see their docs.
  */
-export class PostgresX402ChannelStorage implements ChannelStorage {
+export class PostgresX402ChannelStorage implements ChannelStorage, ChannelLockStorage {
   private readonly transaction = new AsyncLocalStorage<PoolClient>();
   private readonly refundBase = new AsyncLocalStorage<string>();
   private settlementPool?: Promise<Pool>;
@@ -459,6 +460,15 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
           scope          TEXT PRIMARY KEY,
           pending_settle BOOLEAN NOT NULL,
           updated_at     BIGINT NOT NULL
+        )
+      `);
+      // Upstream's per-channel admission lock. Expiry is judged by the
+      // database clock, so machines with skewed clocks agree on it.
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS x402_batch_channel_locks (
+          channel_id TEXT PRIMARY KEY,
+          pending_id TEXT NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL
         )
       `);
     });
@@ -924,6 +934,71 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
   }
 
   /**
+   * Take upstream's admission lock for one request unless another holds it.
+   *
+   * Inside {@link withChannelTransaction} the row is written on the channel
+   * transaction, so it is invisible to other machines and rolls back with the
+   * request; there the advisory channel lock is what excludes them. A request
+   * admitted by an older SDK holds a `pending_request` on the channel row
+   * instead, and it counts as held until it clears or expires.
+   */
+  async acquire(channelId: string, pendingId: string, ttlMs: number): Promise<boolean> {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+      // A RangeError is one of the failures upstream refuses to treat as "no lock".
+      throw new RangeError(`x402 channel lock ttlMs must be a positive integer; got ${ttlMs}`);
+    }
+    return this.withLockQuery(channelId, true, async (q, id) => {
+      if ((await liveLegacyReservation(q, id)) !== undefined) return false;
+      const { rowCount } = await q.query(
+        `INSERT INTO x402_batch_channel_locks (channel_id, pending_id, expires_at)
+         VALUES ($1, $2, clock_timestamp() + $3 * interval '1 millisecond')
+         ON CONFLICT (channel_id) DO UPDATE
+           SET pending_id = EXCLUDED.pending_id, expires_at = EXCLUDED.expires_at
+           WHERE x402_batch_channel_locks.expires_at <= clock_timestamp()`,
+        [id, pendingId, ttlMs]
+      );
+      return rowCount === 1;
+    });
+  }
+
+  /** Release `pendingId`'s lock, or an older SDK's reservation with that id. */
+  async release(channelId: string, pendingId: string): Promise<void> {
+    await this.withLockQuery(channelId, false, async (q, id) => {
+      await q.query(
+        `DELETE FROM x402_batch_channel_locks WHERE channel_id = $1 AND pending_id = $2`,
+        [id, pendingId]
+      );
+      await q.query(
+        `UPDATE x402_batch_channels SET pending_request = NULL
+         WHERE channel_id = $1 AND pending_request->>'pendingId' = $2`,
+        [id, pendingId]
+      );
+    });
+  }
+
+  /**
+   * With no `pendingId`: is any request admitted on this channel right now.
+   * With one: does that request still own its lock. An owner keeps a lock past
+   * its TTL until another request takes it over, so a settle that outlives the
+   * TTL still finds its own admission rather than reading as "no lock" and
+   * refusing to create the row its deposit just paid for.
+   */
+  async isHeld(channelId: string, pendingId?: string): Promise<boolean> {
+    return this.withLockQuery(channelId, false, async (q, id) => {
+      const legacy = await liveLegacyReservation(q, id);
+      if (legacy !== undefined) return pendingId === undefined || legacy === pendingId;
+      const { rows } = await q.query<{ pending_id: string; live: boolean }>(
+        `SELECT pending_id, expires_at > clock_timestamp() AS live
+         FROM x402_batch_channel_locks WHERE channel_id = $1`,
+        [id]
+      );
+      const lock = rows[0];
+      if (!lock) return false;
+      return pendingId === undefined ? lock.live : lock.pending_id === pendingId;
+    });
+  }
+
+  /**
    * Run channel state and its ledger effect under the channel lock.
    *
    * Upstream's voucher-only settle updates `chargedCumulativeAmount` through
@@ -954,7 +1029,12 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
       await client.query("BEGIN");
       await lockChannel(client, channelId);
       const result = await this.transaction.run(client, () => operation(client));
-      await client.query("COMMIT");
+      const committed = await client.query("COMMIT");
+      // Postgres answers COMMIT on an aborted transaction with a ROLLBACK
+      // instead of an error, which would report rolled-back ledger work as done.
+      if (committed.command === "ROLLBACK") {
+        throw new Error(`x402 channel transaction for ${channelId} rolled back at COMMIT`);
+      }
       return result;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -1085,6 +1165,52 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
     return this.settlementPool;
   }
 
+  /**
+   * Run one admission-lock operation on the active channel transaction, or on
+   * its own connection. `exclusive` holds the advisory channel lock around it,
+   * which is what makes acquire's read-then-write atomic across machines.
+   */
+  private async withLockQuery<T>(
+    channelId: string,
+    exclusive: boolean,
+    operation: (q: X402ChannelQuerier, channelId: string) => Promise<T>
+  ): Promise<T> {
+    if (typeof channelId !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(channelId)) {
+      throw new TypeError(`x402 channel lock needs a bytes32 channelId; got ${String(channelId)}`);
+    }
+    const id = channelId.toLowerCase();
+    const active = this.transaction.getStore();
+    if (active) {
+      // Upstream treats a lock-store error as "no lock" and carries on, so a
+      // failed statement must not leave the channel transaction aborted: its
+      // COMMIT would then discard the ledger work after money may have moved.
+      await active.query("SAVEPOINT x402_channel_lock");
+      try {
+        if (exclusive) await lockChannel(active, id);
+        const result = await operation(active, id);
+        await active.query("RELEASE SAVEPOINT x402_channel_lock");
+        return result;
+      } catch (error) {
+        await active.query("ROLLBACK TO SAVEPOINT x402_channel_lock");
+        throw error;
+      }
+    }
+    if (!exclusive) return operation(poolForX402ShutdownClaim(this.pool), id);
+    const client = await connectForX402ShutdownClaim(this.pool);
+    try {
+      await client.query("BEGIN");
+      await lockChannel(client, id);
+      const result = await operation(client, id);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   private async runUnderFleetLock(
     operation: () => Promise<unknown>,
     wait: boolean
@@ -1171,7 +1297,13 @@ export class PostgresX402ChannelStorage implements ChannelStorage {
       return { channel: undefined, status: "deleted" };
     }
 
-    assertChannelTransition(current, next, normalized, this.refundBase.getStore());
+    // Only a refund revocation lowers the charge, and it must not race an
+    // admitted request; the lookup is skipped on every other write.
+    const admitted =
+      current !== undefined &&
+      BigInt(next.chargedCumulativeAmount) < BigInt(current.chargedCumulativeAmount) &&
+      (await requestAdmitted(client, normalized));
+    assertChannelTransition(current, next, normalized, this.refundBase.getStore(), admitted);
     if (
       this.terminalizeUnbackedCredit &&
       next.onchainSyncedAt !== undefined &&
@@ -1214,8 +1346,19 @@ interface X402ChannelRow {
   refund_nonce: string;
   onchain_synced_at: string | null;
   last_request_timestamp: string;
-  pending_request: Channel["pendingRequest"] | null;
+  /**
+   * An older SDK's admission reservation. Never written here, but kept on
+   * update so a rolling deploy or a rollback still sees it.
+   */
+  pending_request: unknown;
   hosting_binding: unknown;
+}
+
+/** The reservation shape older SDKs stored in `pending_request`. */
+interface LegacyPendingRequest {
+  pendingId: string;
+  /** Epoch milliseconds on the writing machine's clock. */
+  expiresAt: number;
 }
 
 interface X402SettlementRow {
@@ -1445,8 +1588,8 @@ async function writeChannel(
     `INSERT INTO x402_batch_channels (
        channel_id, channel_config, charged_cumulative_amount, signed_max_claimable,
        signature, balance, total_claimed, withdraw_requested_at, refund_nonce,
-       onchain_synced_at, last_request_timestamp, pending_request, hosting_binding
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       onchain_synced_at, last_request_timestamp, hosting_binding
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (channel_id) DO UPDATE SET
        channel_config = EXCLUDED.channel_config,
        charged_cumulative_amount = EXCLUDED.charged_cumulative_amount,
@@ -1457,8 +1600,7 @@ async function writeChannel(
        withdraw_requested_at = EXCLUDED.withdraw_requested_at,
        refund_nonce = EXCLUDED.refund_nonce,
        onchain_synced_at = EXCLUDED.onchain_synced_at,
-       last_request_timestamp = EXCLUDED.last_request_timestamp,
-       pending_request = EXCLUDED.pending_request`,
+       last_request_timestamp = EXCLUDED.last_request_timestamp`,
     [
       channelId,
       channel.channelConfig,
@@ -1471,7 +1613,6 @@ async function writeChannel(
       channel.refundNonce,
       channel.onchainSyncedAt ?? null,
       channel.lastRequestTimestamp,
-      channel.pendingRequest ?? null,
       binding,
     ]
   );
@@ -1492,15 +1633,53 @@ function toChannel(row: X402ChannelRow): Channel {
       ? { onchainSyncedAt: safeInteger(row.onchain_synced_at, "onchain_synced_at") }
       : {}),
     lastRequestTimestamp: safeInteger(row.last_request_timestamp, "last_request_timestamp"),
-    ...(row.pending_request ? { pendingRequest: row.pending_request } : {}),
   };
+}
+
+/** Whether any request holds the channel: a live lock, or an older SDK's live reservation. */
+async function requestAdmitted(q: X402ChannelQuerier, channelId: string): Promise<boolean> {
+  if ((await liveLegacyReservation(q, channelId)) !== undefined) return true;
+  const { rows } = await q.query(
+    `SELECT 1 FROM x402_batch_channel_locks
+     WHERE channel_id = $1 AND expires_at > clock_timestamp()`,
+    [channelId]
+  );
+  return rows.length > 0;
+}
+
+/** The pending id of an older SDK's unexpired reservation on the channel row, if any. */
+async function liveLegacyReservation(
+  q: X402ChannelQuerier,
+  channelId: string
+): Promise<string | undefined> {
+  const { rows } = await q.query<{ pending_request: unknown }>(
+    `SELECT pending_request FROM x402_batch_channels WHERE channel_id = $1`,
+    [channelId]
+  );
+  const value = rows[0]?.pending_request;
+  if (value === null || value === undefined) return undefined;
+  if (!isLegacyPendingRequest(value)) {
+    // A TypeError fails closed upstream: an unreadable reservation is not "no lock".
+    throw new TypeError(`x402 channel ${channelId} has an unreadable pending_request`);
+  }
+  return value.expiresAt > Date.now() ? value.pendingId : undefined;
+}
+
+function isLegacyPendingRequest(value: unknown): value is LegacyPendingRequest {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    typeof (value as Record<string, unknown>).pendingId === "string" &&
+    typeof (value as Record<string, unknown>).expiresAt === "number"
+  );
 }
 
 function assertChannelTransition(
   current: Channel | undefined,
   next: Channel,
   expectedId: string,
-  sanctionedRefundBase: string | undefined
+  sanctionedRefundBase: string | undefined,
+  requestAdmitted: boolean
 ): void {
   if (normalizeChannelId(next.channelId) !== expectedId) {
     throw new Error(`x402 channel update changed channelId ${expectedId}`);
@@ -1515,7 +1694,7 @@ function assertChannelTransition(
   // `withSanctionedRefundBase` for the one update that applies it, and only
   // that exact figure is accepted; every other path keeps the flat "never
   // decrease" rule. The floor (`totalClaimed`), the untouched payer voucher and
-  // the absence of a live reservation are checked on top.
+  // the absence of an admitted request are checked on top.
   const revokesUnclaimedAuthority =
     sanctionedRefundBase !== undefined &&
     BigInt(next.chargedCumulativeAmount) < BigInt(current.chargedCumulativeAmount) &&
@@ -1523,8 +1702,7 @@ function assertChannelTransition(
     BigInt(next.chargedCumulativeAmount) >= BigInt(next.totalClaimed) &&
     next.signedMaxClaimable === current.signedMaxClaimable &&
     next.signature === current.signature &&
-    current.pendingRequest === undefined &&
-    next.pendingRequest === undefined;
+    !requestAdmitted;
   if (
     BigInt(next.chargedCumulativeAmount) < BigInt(current.chargedCumulativeAmount) &&
     !revokesUnclaimedAuthority
@@ -1534,22 +1712,10 @@ function assertChannelTransition(
   if (BigInt(next.totalClaimed) < BigInt(current.totalClaimed)) {
     throw new Error(`x402 channel ${expectedId} attempted to decrease totalClaimed`);
   }
-  // The refund's own reservation re-signs the voucher at exactly the revoked
-  // base, so `signedMaxClaimable` drops to `chargedCumulativeAmount` and no
-  // lower — never to an arbitrary figure.
-  const reservesRevokedVoucher =
-    BigInt(next.signedMaxClaimable) < BigInt(current.signedMaxClaimable) &&
-    next.chargedCumulativeAmount === current.chargedCumulativeAmount &&
-    next.signedMaxClaimable === next.chargedCumulativeAmount &&
-    current.pendingRequest === undefined &&
-    next.pendingRequest !== undefined;
-  if (
-    BigInt(next.signedMaxClaimable) < BigInt(current.signedMaxClaimable) &&
-    !reservesRevokedVoucher &&
-    (!current.pendingRequest ||
-      next.pendingRequest ||
-      BigInt(next.signedMaxClaimable) < BigInt(next.chargedCumulativeAmount))
-  ) {
+  // Verification no longer writes the voucher it checks, so every voucher that
+  // reaches the row is one a charge was committed against: a lower one would
+  // replace payer claim authority with less.
+  if (BigInt(next.signedMaxClaimable) < BigInt(current.signedMaxClaimable)) {
     throw new Error(`x402 channel ${expectedId} attempted to decrease signedMaxClaimable`);
   }
   if (next.refundNonce < current.refundNonce) {
