@@ -47,7 +47,7 @@ export type {
 /** @stability experimental */
 export { MemoryConsumedCredentialStore } from "./consumed-credential-store";
 /** @stability experimental */
-export type { CreditEnvelope, CreditFundCommitment } from "./credit-envelope";
+export type { CreditEnvelope, CreditFundCommitment, StandingMandate } from "./credit-envelope";
 /** @stability experimental */
 export {
   CREDIT_ENVELOPE_KEYS,

@@ -1,3 +1,4 @@
+import type { StandingMandate } from "./credit-envelope";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
 import type { ProofLike } from "@cashu/cashu-ts";
 
@@ -139,6 +140,8 @@ export interface ServerJob {
   creditId?: string;
   /** The draw placed for this job on `creditId`. */
   drawId?: string;
+  /** Signed submission limits; immutable after job creation. Amounts use the credit currency. */
+  mandate?: StandingMandate;
   /** Original funding artifact returned by an explicit fund-and-draw. */
   fundingReceipt?: FundingReceipt;
   fundingCredit?: CreditSnapshot;
@@ -307,6 +310,7 @@ export function toJobRecord(job: ServerJob): JobRecord {
     costRevision: job.costRevision,
     creditId: job.creditId,
     drawId: job.drawId,
+    mandate: job.mandate,
     fundingReceipt: job.fundingReceipt,
     fundingCredit: job.fundingCredit,
     receivedProofs: job.receivedProofs,
@@ -365,6 +369,7 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     costRevision: record.costRevision,
     creditId: record.creditId,
     drawId: record.drawId,
+    mandate: record.mandate,
     fundingReceipt: record.fundingReceipt,
     fundingCredit: record.fundingCredit,
     receivedProofs: [...record.receivedProofs],

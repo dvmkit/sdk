@@ -1170,6 +1170,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     capability: string,
     requesterTokenHash?: string,
     provenance?: {
+      mandate?: JobRecord["mandate"];
       requesterToken?: string;
       requestFingerprint?: string;
       requesterPubkey?: string;
@@ -1217,6 +1218,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       cashuFlow: payment.cashuFlow,
       creditId: payment.creditId,
       drawId: payment.drawId,
+      mandate: provenance?.mandate,
       fundingReceipt: payment.fundingReceipt,
       fundingCredit: payment.fundingCredit,
       receivedProofs: payment.receivedProofs,
@@ -1416,6 +1418,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.pendingPaymentMsats = record.pendingPaymentMsats;
     job.creditId = record.creditId;
     job.drawId = record.drawId;
+    job.mandate = record.mandate;
     job.paymentRail = record.paymentRail;
     job.paymentMint = record.paymentMint;
     job.paymentTxHash = record.paymentTxHash;

@@ -165,6 +165,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     delete snapshot.pieceEnding;
     if (existing) {
       snapshot.createdAt = existing.createdAt;
+      snapshot.mandate = structuredClone(existing.mandate);
       snapshot.upfrontPayment = structuredClone(existing.upfrontPayment);
       // Store-owned after insert, like the Postgres columns.
       snapshot.pieces = structuredClone(existing.pieces);

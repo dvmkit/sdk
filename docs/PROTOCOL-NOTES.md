@@ -486,3 +486,53 @@ Card drains add `refund_blocked` for permanent refusal and `written_off` for an 
 Postgres initialization adds nullable `credit_drains.card_recovery` without rewriting old plans. Missing entry revisions mean revision zero and retain their original idempotency keys. A replan persists its revision and retained successes before planning or sending replacements, so a crash resumes the same revision without treating a partial retained plan as complete. Money amounts remain integer micro-units/cents. A write-off stores separate refunded gross and unpaid amounts; it emits no `sent` receipt or successful-refund report. Full successful refunds retain the transactional drain/outbox contract.
 
 Custom card ledgers must supply `withCardRefundLock`, `saveCardDrainState`, and `saveCardRefund`; a missing capability fails closed before refunds. The lock must serialize all refund and recovery work per credit across machines, re-read under that lock, and release on failure. The callback's optional query connection is session-scoped: plan and progress writes autocommit; booking and the outbox share a short transaction. Implementations must honor `tx` on drain reads, plan/state writes, funding-lot reads, terminal transitions, and receipt appends to avoid pool exhaustion. State writes compare expected status/revision, and progress writes refuse obsolete revisions. Other rails need no recovery methods.
+
+
+## Standing credit mandate
+
+A provider advertising `credit.standing_mandate: true` on `/v1/info` accepts an optional
+`mandate` in the signed `POST /v1/job` `data`, beside `credit_id` and `draw_id`:
+
+```json
+{"credit_id":"example-credit","draw_id":"example-draw","mandate":{"max_total_micro":1100000,"max_ask_micro":550000,"expires_at_ms":1795000000000}}
+```
+
+The signature covers the original wire data, including all mandate fields. The mandate is
+protocol metadata and never enters the capability handler's input, even if its schema declares
+that key. The provider stores the accepted limits immutably with the job. Both amounts are
+positive safe integers in millionths of the credit currency. `max_total_micro` includes the
+upfront price and must cover it; `max_ask_micro` must not exceed the total. `expires_at_ms`
+is an integer timestamp in milliseconds, strictly in the future and at most seven days from
+acceptance. Only these three mandate keys are allowed, and both credit identifiers are required.
+
+HTTP 400 `invalid_mandate` with a caller-facing `message` refuses malformed limits, extra or
+missing keys, missing credit identifiers, an unsigned mandate, an expired or excessively distant
+expiry, or a total below the upfront. A zero-upfront mandate also gets this refusal for an
+unavailable reserved credit id, a currency mismatch, or a draw id already used by another job.
+These refusals create no job or credit draw. Zero-upfront mandates require existing credit owned
+by the signed caller in the job currency. Paid mandates use the existing upfront payment checks
+and recovery: a conflicting body reusing a paid draw gets 409 `draw_conflict`, while an exact
+retry can recover even when the draw committed before the original job row was saved.
+
+The stored mandate includes `credit_id` and `draw_id`, but a zero-upfront job's accounting
+fields remain unset until an ask actually creates a draw. This admission does not reserve the
+intended draw id: two zero-upfront admissions may name the same unused pair. Once a draw exists,
+another job must never pay from it. The ask-payment implementation must create or verify the
+job's own draw and leave an ask open for ordinary payment if the intended draw already belongs
+to another job. Custom job stores must persist
+`JobRecord.mandate` unchanged after creation; its public type is `StandingMandate` from
+`@dvmkit/sdk/server`. Existing credit ownership, currency, and signature checks still apply. The portable admission contract is
+`protocol-fixtures/standing-mandate-v1.json`; its timestamp is illustrative and callers must
+choose a fresh expiry. Older providers may strip unknown keys silently: callers must check the
+advertisement before relying on acceptance. Discovery uses the same durable-storage and rollout
+gate as `credit.balance_payment`.
+
+
+`data.mandate` is a reserved key even when a capability schema declares it. This is a breaking
+reservation for builders who previously used that name for application data: rename that field.
+The SDK always strips it before handler input parsing. Admission currently checks the expiry
+window on each submit, including an idempotent retry or `request_id` resume. After expiry,
+a retry returns 400 `invalid_mandate`; use the existing job id and token to read the job instead.
+Do not modify the mandate on a retry, because that changes the signed request's identity.
+Mandate acceptance and the complete mandate-payment implementation must be deployed together;
+acceptance alone does not mean an unadvertised provider will automatically pay later asks.

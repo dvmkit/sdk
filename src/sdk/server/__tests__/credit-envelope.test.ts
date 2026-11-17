@@ -67,7 +67,7 @@ describe("stripCreditEnvelope", () => {
     .strict();
 
   it("removes the reserved keys a capability schema doesn't declare", () => {
-    expect(creditEnvelopeIgnoreFields(capabilitySchema)).toEqual(["credit_id", "draw_id", "fund"]);
+    expect(creditEnvelopeIgnoreFields(capabilitySchema)).toEqual(["credit_id", "draw_id", "fund", "mandate"]);
     const wire = {
       action: "go",
       credit_id: "c1",
@@ -90,9 +90,15 @@ describe("stripCreditEnvelope", () => {
       credit_id: z.string().optional(),
       fund: z.object({ amount_micro: z.number(), fund_id: z.string() }).optional(),
     });
-    expect(creditEnvelopeIgnoreFields(creditRequest)).toEqual(["draw_id"]);
+    expect(creditEnvelopeIgnoreFields(creditRequest)).toEqual(["draw_id", "mandate"]);
     const body = { op: "fund", credit_id: "c1", fund: { amount_micro: 1, fund_id: "f1" } };
     expect(stripCreditEnvelope(creditRequest, body)).toBe(body);
+  });
+
+  it("keeps mandate out of a schema that declares it", () => {
+    const schema = z.object({ action: z.string(), mandate: z.unknown().optional() }).passthrough();
+    expect(schema.parse(stripCreditEnvelope(schema, { action: "go", mandate: { max_total_micro: 1 } })))
+      .toEqual({ action: "go" });
   });
 
   it("is identity on data with no reserved keys, and on non-objects", () => {
@@ -104,11 +110,12 @@ describe("stripCreditEnvelope", () => {
   });
 
   it("treats a schema with no readable shape as declaring nothing", () => {
-    expect(creditEnvelopeIgnoreFields(z.string())).toEqual(["credit_id", "draw_id", "fund"]);
-    expect(creditEnvelopeIgnoreFields(undefined)).toEqual(["credit_id", "draw_id", "fund"]);
+    expect(creditEnvelopeIgnoreFields(z.string())).toEqual(["credit_id", "draw_id", "fund", "mandate"]);
+    expect(creditEnvelopeIgnoreFields(undefined)).toEqual(["credit_id", "draw_id", "fund", "mandate"]);
     expect(creditEnvelopeIgnoreFields(z.object({ fund: z.string() }).refine(() => true))).toEqual([
       "credit_id",
       "draw_id",
+      "mandate",
     ]);
   });
 });

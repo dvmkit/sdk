@@ -1,0 +1,13 @@
+{
+  "data_fields": {
+    "credit_id": "example-credit",
+    "draw_id": "example-draw",
+    "mandate": {
+      "max_total_micro": 1100000,
+      "max_ask_micro": 550000,
+      "expires_at_ms": 1795000000000
+    }
+  },
+  "info_credit_fields": { "standing_mandate": true },
+  "invalid": { "status": 400, "error": "invalid_mandate" }
+}

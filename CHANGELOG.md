@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Breaking protocol reservation
+
+- `data.mandate` is now reserved protocol metadata on job submission, including when a capability schema declares that key. Builders using `mandate` for application data must rename it. It is always removed from handler input and requires the signed credit envelope; this avoids passing payment authorization to application code.
+
+- Accept signed standing credit limits on job submission and persist them immutably with the job. The additive nullable `jobs.mandate` JSONB column is initialized automatically. `/v1/info` advertises `credit.standing_mandate: true` alongside durable balance-payment support; callers must check this field because older providers silently strip unknown data fields. Invalid mandates return HTTP 400 `invalid_mandate`. See `protocol-fixtures/standing-mandate-v1.json` and the protocol notes. This adds admission and storage; later ask authorization uses the persisted limits.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.

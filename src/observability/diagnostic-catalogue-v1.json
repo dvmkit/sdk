@@ -905,6 +905,7 @@
     "insecure_scheme",
     "internal_error",
     "invalid_input",
+    "invalid_mandate",
     "invalid_menu",
     "invalid_payment",
     "invalid_quote_data",

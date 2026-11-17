@@ -112,7 +112,7 @@ import {
   type ConsumedCredentialStore,
   MemoryConsumedCredentialStore,
 } from "./consumed-credential-store";
-import { type CreditEnvelope, CreditEnvelopeError, extractCreditEnvelope } from "./credit-envelope";
+import { type CreditEnvelope, CreditEnvelopeError, InvalidMandateError, extractCreditEnvelope } from "./credit-envelope";
 import type { CreditExpirySweepOpts } from "./credit-expiry-sweep";
 import { startCardRefundSweep } from "./card-refund-sweep";
 import { startCreditExpirySweep } from "./credit-expiry-sweep";
@@ -134,6 +134,7 @@ import {
   deferredX402IntentId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
+  isDerivedCreditId,
   priceFiatMicro,
   resolvePriceFiat,
 } from "./funding";
@@ -2343,7 +2344,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       devMode: this.opts.devMode,
       callerPubkey,
     });
-    if (menu && this.balancePaymentSupported()) menu.balance_payment = true;
+    if (menu && this.balancePaymentSupported()) {
+      menu.balance_payment = true;
+      menu.standing_mandate = true;
+    }
     if (menu && this.adminCreditRoutesMounted()) menu.jit_refund_park = true;
     return menu;
   }
@@ -3517,6 +3521,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // envelope is stripped like a well-formed one, so it lands here as
     // `invalid_credit_fields` rather than as a schema error blaming the input.
     // Prepaid credit is owned by a verified pubkey; an unsigned body has none.
+    if (!route && unsignedPaid && body.data && typeof body.data === "object" && "mandate" in body.data) {
+      return c.json({ error: "invalid_mandate", message: "mandate requires a signed credit request." }, 400);
+    }
     if (!route && unsignedPaid && carriesCreditFields(signedRequestInput(body))) {
       return c.json(
         {
@@ -3531,6 +3538,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     try {
       creditEnvelope = route ? undefined : extractCreditEnvelope(body.data);
     } catch (err) {
+      if (err instanceof InvalidMandateError) {
+        return c.json({ error: "invalid_mandate", message: err.message }, 400);
+      }
       if (err instanceof CreditEnvelopeError) {
         return c.json(
           {
@@ -3771,6 +3781,29 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             priceMsats,
             dynamicUpfront,
           });
+
+      if (creditEnvelope?.mandate && priceFiat &&
+          creditEnvelope.mandate.max_total_micro < priceFiat.amountMicro) {
+        return c.json({ error: "invalid_mandate", message: "mandate.max_total_micro must cover the upfront price in the credit currency." }, 400);
+      }
+
+      if (creditEnvelope?.mandate && !resumeOnly && !priceMsats) {
+        const credit = await this.creditLedger.get(creditEnvelope.creditId);
+        if ((isDerivedCreditId(creditEnvelope.creditId) && credit?.callerPubkey !== authPubkey) ||
+            (credit && credit.callerPubkey !== authPubkey) || (!priceMsats && !credit)) {
+          return c.json({ error: "invalid_mandate", message: "The mandate must name credit available to the signed caller; reserved credit ids cannot be opened by callers." }, 400);
+        }
+        if (credit && credit.currency !== (priceFiat?.currency ?? this.creditCurrency())) {
+          return c.json({ error: "invalid_mandate", message: "The mandate credit currency must match the job currency." }, 400);
+        }
+        const existingDraw = await this.creditLedger.getDraw({ creditId: creditEnvelope.creditId, drawId: creditEnvelope.drawId });
+        if (existingDraw) {
+          const recovered = await this.recoverDrawnJob(c, { creditId: creditEnvelope.creditId,
+            drawId: creditEnvelope.drawId, jobId: existingDraw.jobId, fingerprint, callerPubkey: authPubkey });
+          if (recovered) return recovered;
+          return c.json({ error: "invalid_mandate", message: "The mandate draw_id already belongs to an existing draw. Choose a fresh draw_id." }, 400);
+        }
+      }
 
       // Unsigned admission is for per-call payment only: a request that needs
       // no payment (free, or a development host that skips verification) gets
@@ -4090,6 +4123,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         capabilityName,
         requesterTokenHash,
         {
+          mandate: creditEnvelope?.mandate,
           requesterToken: jobToken,
           requestFingerprint: fingerprint,
           requesterPubkey: authPubkey,

@@ -1,3 +1,4 @@
+import type { StandingMandate } from "./credit-envelope";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
 import type { ProofLike } from "@cashu/cashu-ts";
 
@@ -138,6 +139,8 @@ export interface JobRecord {
   creditId?: string;
   /** The draw placed for this job on `creditId`. */
   drawId?: string;
+  /** Signed authorization, including future draw ids. Custom stores must persist it insert-only. */
+  mandate?: StandingMandate;
   /** Funding-time evidence returned on explicit fund-and-draw submissions. */
   fundingReceipt?: FundingReceipt;
   fundingCredit?: CreditSnapshot;
