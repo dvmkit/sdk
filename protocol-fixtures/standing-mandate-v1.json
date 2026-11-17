@@ -55,5 +55,24 @@
       "mandate_ask_unpriced",
       "mandate_credit_unavailable"
     ]
+  },
+  "standing_decline": {
+    "request": {
+      "type": "decline",
+      "content": {
+        "reason": "stop after this piece"
+      }
+    },
+    "status": 201,
+    "response": {
+      "seq": 3,
+      "stop_requested": true,
+      "display": "The job will stop at its next payment ask. Only finished pieces will be charged."
+    },
+    "status_fields": {
+      "stop_requested": true,
+      "display": "The job will stop at its next payment ask. Only finished pieces will be charged."
+    },
+    "unsupported_display": "Stop recorded. Decline the next open payment ask to stop the job."
   }
 }

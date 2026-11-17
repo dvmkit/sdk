@@ -4748,6 +4748,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     // Terminal outcomes always come from the durable snapshot.
     if ("listeners" in job && !isTerminal(snapshot.status) && !isTerminal(job.status)) snapshot.status = job.status;
     const content = await this.contentFields(snapshot);
+    if (snapshot.stopRequested && !isTerminal(snapshot.status)) {
+      content.stop_requested = true;
+      content.display = this.standingDeclineDisplay();
+    }
     const status = withheldStatus(snapshot.status, content);
     const res: Record<string, unknown> = { job_id: snapshot.id, status };
     Object.assign(res, terminalResponseFields({ ...snapshot, status }), content);
@@ -4946,6 +4950,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
   }
 
+  private standingDeclineDisplay(): string {
+    return this.balancePaymentSupported()
+      ? "The job will stop at its next payment ask. Only finished pieces will be charged."
+      : "Stop recorded. Decline the next open payment ask to stop the job.";
+  }
+
   private noOpenAskResponse(c: Context<AppEnv>): Response {
     return c.json(
       {
@@ -4958,8 +4968,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * End a job its handler is not running here at the caller's decline. Same shape as the
-   * DELETE route's store-only cancel; the store refuses unless an ask or prompt is open.
+   * Durably decline a stored open ask, or record a mandated stop when nothing is open.
+   * Also handles a live worker's between-asks decline; an ordinary job without an ask is refused.
    */
   private async declineStoredJob(c: Context<AppEnv>, id: string, reason: string): Promise<Response> {
     const jm = this.jobManager;
@@ -4977,6 +4987,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
     if (outcome === "not_active") return this.jobNotActiveResponse(c);
     if (outcome === "no_open_ask") return this.noOpenAskResponse(c);
+    if (outcome === "stop_requested") {
+      const pending = await store.get(id);
+      return c.json({ seq: pending?.seq ?? 0, stop_requested: true,
+        display: this.standingDeclineDisplay() }, 201);
+    }
     await jm.finalizeStoredTerminal(id);
     const ended = await store.get(id);
     return c.json({ seq: ended?.seq ?? 0 }, 201);
@@ -5059,6 +5074,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
       const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
       if (railRefusal) return railRefusal;
+      if (body.type === "decline" && activeJob.mandate &&
+          !activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob) &&
+          isStreamableJobStore(jm.store) && jm.store.declineJob) {
+        const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
+        return this.declineStoredJob(c, id, reason);
+      }
       if (body.type === "decline") {
         // A payment being verified commits first: it may pay the ask being declined.
         try {

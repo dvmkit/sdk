@@ -183,7 +183,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `CreditSnapshot` | interface | type-only | experimental | Read model with funded balance and pending holds. |
 | `CreditStatus` | type | type-only | experimental | `unbacked`: Tempo backing finalized before the DVM was protected. |
 | `CreditTerms` | interface | type-only | experimental | Public, cacheable prepaid terms exclude caller IDs and balances. |
-| `DeclineOutcome` | type | type-only | experimental | What a store did with a caller's decline: ended the job, or why it refused. |
+| `DeclineOutcome` | type | type-only | experimental | What a store did with a caller's decline: ended it, recorded a standing stop, or refused it. |
 | `DEFAULT_INVOICE_TTL_SECONDS` | value | runtime | experimental | Default bolt11 lifetime — long enough to pay by hand, short enough to retire. |
 | `DRAIN_DELIVERY_RESERVE_SATS` | value | runtime | experimental | Refund delivery uses a fixed eight-sat reserve so owed_sats cannot shrink after it is promised. |
 | `DrainConflictReason` | type | type-only | experimental | Structured drain_conflict reasons select caller instructions without matching prose. |

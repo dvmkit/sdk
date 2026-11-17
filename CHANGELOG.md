@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mandated credit jobs accept a durable decline between asks, expose the pending stop on job status, and decline the next ask without paying it. Existing open-ask declines and jobs without mandates keep their behavior.
+
 ### Breaking protocol reservation
 
 - `data.mandate` is now reserved protocol metadata on job submission, including when a capability schema declares that key. Builders using `mandate` for application data must rename it. It is always removed from handler input and requires the signed credit envelope; this avoids passing payment authorization to application code.

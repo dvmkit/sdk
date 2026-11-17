@@ -20,6 +20,7 @@ export type MandateSkipReason =
 
 export type MandateSettlement =
   | { outcome: "paid"; requestSeq: number; seq: number; replayed: boolean }
+  | { outcome: "declined"; requestSeq: number; reason: string }
   | { outcome: "skipped"; requestSeq: number; reason: MandateSkipReason }
   /** No open ask to pay: none was written, it is already paid, or the job ended. */
   | { outcome: "none" };
@@ -50,6 +51,7 @@ export async function settleMandateAsk(args: {
       status: string; dvm_id: string | null; requester_pubkey: string | null; credit_id: string | null;
       draw_id: string | null; pending_payment_fiat_micro: string | null;
       pending_payment_fiat_currency: string | null; pending_payment_msats: string | null;
+      stop_requested: boolean; stop_reason: string | null;
       asked_topup_micro: string | null; next_seq: number; mandate: StandingMandate | null;
     }>("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [args.jobId]);
     const job = jobs.rows[0];
@@ -75,6 +77,10 @@ export async function settleMandateAsk(args: {
     }
     // Cleared by whichever payment settled this ask first, on any rail.
     if (job.pending_payment_msats === null || Number(job.pending_payment_msats) <= 0) return await none(tx);
+    if (job.stop_requested) {
+      await tx.query("ROLLBACK");
+      return { outcome: "declined", requestSeq: ask.seq, reason: job.stop_reason ?? "Job declined" };
+    }
     const now = args.nowMs ?? Date.now();
     if (askExpired(ask.content.expires_at_ms, now)) return await none(tx);
     const skip = async (reason: MandateSkipReason): Promise<MandateSettlement> => {
@@ -139,7 +145,8 @@ export async function settleMandateAsk(args: {
 /**
  * Mandated jobs suspended on an ask that has gone quiet since `beforeMs`: the newest provider
  * message is still the ask, so either its settlement never ran (the asking worker died) or it
- * settled and no worker claimed the resume. A job with an unanswered prompt is left out: once
+ * settled and no worker claimed the resume. A job with an unanswered prompt is left out unless
+ * a standing decline must end its unpaid ask: once
  * its paid ask is claimed it still awaits input, and the caller's answer resumes it anyway.
  * A provider prompt carries its id as `content.id`; the caller's answer names it as `prompt_id`.
  * Oldest first; pass the last row back as `after` for the next page.
@@ -155,11 +162,11 @@ export async function findQuietMandatedAsks(pool: Pool, args: {
        AND ($5::bigint IS NULL OR (j.last_activity_at, j.id) > ($5::bigint, $6::text))
        AND (SELECT m.data->>'type' FROM job_messages m WHERE m.job_id=j.id AND m.status='verified'
             AND m.data->>'from'='provider' ORDER BY m.seq DESC LIMIT 1)='payment-request'
-       AND NOT EXISTS (SELECT 1 FROM job_messages p WHERE p.job_id=j.id AND p.status='verified'
+       AND ((j.stop_requested AND j.pending_payment_msats > 0) OR NOT EXISTS (SELECT 1 FROM job_messages p WHERE p.job_id=j.id AND p.status='verified'
             AND p.data->>'from'='provider' AND p.data->>'type'='prompt'
             AND NOT EXISTS (SELECT 1 FROM job_messages r WHERE r.job_id=j.id AND r.status='verified'
               AND r.data->>'from'='requester' AND r.data->>'type'='response'
-              AND r.data->'content'->>'prompt_id' = p.data->'content'->>'id'))
+              AND r.data->'content'->>'prompt_id' = p.data->'content'->>'id')))
      ORDER BY j.last_activity_at, j.id LIMIT $4`,
     [args.beforeMs, args.dvmId, args.capabilities, args.limit, args.after?.lastActivityAt ?? null, args.after?.id ?? null]);
   return rows.map((row) => ({ id: row.id, lastActivityAt: Number(row.last_activity_at) }));

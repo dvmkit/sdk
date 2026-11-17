@@ -26,6 +26,7 @@ const attestation = signDeployAttestation({ builderSecret: "23".repeat(32),
 const audience = { dvm_id: attestation.payload.dvm_id, builder_pubkey: attestation.identityPubkey };
 const ASK = 1_000;
 const fixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8")) as {
+  standing_decline: { unsupported_display: string; response: { seq: number; stop_requested: boolean; display: string }; status_fields: { stop_requested: boolean; display: string } };
   mandate_payment: { message: { from: string; type: string; content: { credit: Record<string, unknown> } };
     payment_id: { prefix: string; vector: { job_id: string; request_seq: number; preimage: string; payment_id: string } } };
 };
@@ -33,7 +34,7 @@ const fixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/s
 const documentedPaymentId = (jobId: string, requestSeq: number) =>
   fixture.mandate_payment.payment_id.prefix + createHash("sha256").update(JSON.stringify(["mandate", jobId, requestSeq])).digest("hex");
 
-type Script = "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt";
+type Script = "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt" | "stop" | "stop-prompt";
 
 it("derives the published payment_id vector byte for byte", () => {
   const { prefix, vector } = fixture.mandate_payment.payment_id;
@@ -87,8 +88,10 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     await dropSchemas(schema);
   });
 
-  async function server() {
-    const host = createDVMHost({ pool, port: 0, env: attestationEnv(attestation) });
+  async function server(opts: { onCancel?: () => Promise<void>; balancePayments?: boolean } = {}) {
+    const host = createDVMHost({ pool, port: 0, env: {
+      ...attestationEnv(attestation), ...(opts.balancePayments === false ? { DVMKIT_BALANCE_PAYMENTS: "false" } : {}),
+    } });
     hosts.push(host);
     const input = z.object({ action: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string() });
     const onJob = async (ctx: SDKJobContext<Record<string, unknown>, unknown>) => {
@@ -98,14 +101,19 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       const earlier = script === "asked-mid-prompt" ? ctx.prompt("earlier", "Anything else?") : undefined;
       await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next hour");
       await earlier;
+      if (script === "stop" || script === "stop-prompt") {
+        await gate(ctx.jobId).opened;
+        if (script === "stop-prompt") void ctx.prompt("later", "Anything else?").catch(() => undefined);
+        await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next hour", { finishedChargeMicro: 600 });
+      }
       if (script === "prompt" || script === "hold") await ctx.prompt("continue", "Continue?");
       if (script === "two" || script === "prompt") await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next hour");
       completions.set(ctx.jobId, (completions.get(ctx.jobId) ?? 0) + 1);
       ctx.complete("done");
     };
     host.mount(configureDVM({ name: "mandate-service", credit: {}, auth: secp256k1Auth(), capabilities: {
-      run: { input, onJob },
-      paid: { price: "$0.001", input, onJob },
+      run: { input, onJob, onCancel: opts.onCancel },
+      paid: { price: "$0.001", input, onJob, onCancel: opts.onCancel },
     } }));
     return (await host.serve()).url;
   }
@@ -213,6 +221,212 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   }
   // Past the sweep's grace window without waiting it out.
   const afterGrace = () => Date.now() + 60_000;
+
+  async function decline(url: string, job: { job_id: string; job_token: string }) {
+    return post(`${url}/v1/job/${job.job_id}/messages`, { type: "decline", content: { reason: "stop after this piece" } }, job.job_token);
+  }
+  async function stoppedJob(creditId: string, script: Script = "stop") {
+    const url = await server();
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script, maxTotal: 5 * ASK });
+    await expect.poll(() => latestManager().activeJobs.get(job.job_id)?.pendingPayment ?? null).toBeNull();
+    await expect.poll(() => balancePayments(job.job_id)).toHaveLength(1);
+    await expect.poll(() => status(job.job_id)).toBe("processing");
+    const stopped = await decline(url, job);
+    expect(stopped.status).toBe(201);
+    expect(await stopped.json()).toEqual({ ...fixture.standing_decline.response, seq: expect.any(Number) });
+    const read = await fetch(`${url}/v1/job/${job.job_id}`, { headers: { "X-Job-Token": job.job_token } });
+    expect(await read.json()).toMatchObject({ status: "processing", ...fixture.standing_decline.status_fields });
+    return { url, job };
+  }
+  async function expectDeclined(job: { job_id: string; creditId: string; drawId: string }) {
+    await expect.poll(() => status(job.job_id), { timeout: 15_000 }).toBe("cancelled");
+    // The upfront piece finished at ask 1; the next piece used 600 of its 1,000 micro cap.
+    await expect.poll(() => ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }))
+      .toMatchObject({ status: "settled", amountMicro: 1_600 });
+    expect((await ledger.get(job.creditId))?.balanceMicro).toBe(8_400);
+    expect((await ledger.get(job.creditId))?.availableMicro).toBe(8_400);
+    expect(await balancePayments(job.job_id)).toHaveLength(1);
+    expect(completions.get(job.job_id)).toBeUndefined();
+  }
+
+  it("records an idempotent standing decline and charges only finished work at the next ask", async () => {
+    const { url, job } = await stoppedJob("stop-next");
+    const repeated = await decline(url, job);
+    expect(repeated.status).toBe(201);
+    expect(await repeated.json()).toEqual({ ...fixture.standing_decline.response, seq: expect.any(Number) });
+    expect(await status(job.job_id)).toBe("processing");
+    gate(job.job_id).open();
+    await expectDeclined(job);
+  }, 30_000);
+
+  it("preserves a standing decline across a provider restart before the next ask", async () => {
+    const { job } = await stoppedJob("stop-restart");
+    await hosts[0].shutdown();
+    const resumed = await server();
+    // Resume processing through the existing inbound recovery path; no payment is sent.
+    const response = await post(`${resumed}/v1/job/${job.job_id}/messages`,
+      { type: "response", content: { prompt_id: "resume", text: "continue" } }, job.job_token);
+    expect(response.status).toBe(201);
+    gate(job.job_id).open();
+    await expectDeclined(job);
+  }, 30_000);
+
+  it.each([false, true])("never pays a stopped job's stranded ask from the sweep (prompt=%s)", async (prompt) => {
+    const { job } = await stoppedJob(`stop-sweep-${prompt}`, prompt ? "stop-prompt" : "stop");
+    const settle = vi.spyOn(JobManager.prototype as unknown as { payAskFromMandate: () => Promise<void> }, "payAskFromMandate")
+      .mockResolvedValue(undefined);
+    try {
+      gate(job.job_id).open();
+      await expect.poll(async () => (await messages(job.job_id)).filter((m) => m.type === "payment-request")).toHaveLength(2);
+      await hosts[0].shutdown();
+    } finally { settle.mockRestore(); }
+    await server();
+    await latestManager().sweepMandateAsks(afterGrace());
+    await expectDeclined(job);
+  }, 30_000);
+
+  it("reads a committed stop after waiting for the settlement row lock", async () => {
+    const { job } = await stoppedJob("stop-lock");
+    const suppress = vi.spyOn(JobManager.prototype as unknown as { payAskFromMandate: () => Promise<void> }, "payAskFromMandate")
+      .mockResolvedValue(undefined);
+    try {
+      gate(job.job_id).open();
+      await expect.poll(async () => (await messages(job.job_id)).filter((m) => m.type === "payment-request")).toHaveLength(2);
+    } finally { suppress.mockRestore(); }
+    await pool.query("UPDATE jobs SET stop_requested=FALSE WHERE id=$1", [job.job_id]);
+    const tx = await pool.connect();
+    try {
+      await tx.query("BEGIN");
+      await tx.query("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", [job.job_id]);
+      // A stop is committing while settlement waits: a lock-free read sees the old false flag.
+      await tx.query("UPDATE jobs SET stop_requested=TRUE WHERE id=$1", [job.job_id]);
+      let lockAttempt!: () => void;
+      const attempted = new Promise<void>((resolve) => { lockAttempt = resolve; });
+      const restore = observeQueries((sql) => {
+        if (sql === "SELECT * FROM jobs WHERE id=$1 FOR UPDATE") lockAttempt();
+      });
+      const pending = settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id });
+      try {
+        await attempted;
+        await expect.poll(async () => (await pool.query(`SELECT COUNT(*)::int AS n FROM pg_stat_activity
+          WHERE datname=current_database() AND query='SELECT * FROM jobs WHERE id=$1 FOR UPDATE'
+          AND wait_event_type='Lock'`)).rows[0].n).toBeGreaterThan(0);
+        await tx.query("COMMIT");
+        expect(await pending).toMatchObject({ outcome: "declined" });
+      } finally { restore(); }
+    } finally { await tx.query("ROLLBACK"); tx.release(); }
+    await latestManager().sweepMandateAsks(afterGrace());
+    await expectDeclined(job);
+  }, 30_000);
+
+  it.each(["payment ask", "prompt"] as const)("preserves the live decline transcript and summary at an open %s", async (kind) => {
+    const url = await server();
+    const creditId = `stop-open-${kind.replaceAll(" ", "-")}`;
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: kind === "prompt" ? "hold" : "one",
+      maxTotal: 5 * ASK, maxAsk: kind === "prompt" ? ASK : ASK - 1 });
+    if (kind === "prompt") {
+      await expect.poll(async () => (await messages(job.job_id)).some((m) => m.type === "prompt")).toBe(true);
+    } else {
+      await openAsk(job.job_id);
+    }
+    const response = await decline(url, job);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ seq: expect.any(Number) });
+    await expect.poll(() => status(job.job_id)).toBe("cancelled");
+    const history = await messages(job.job_id);
+    expect.soft(history.filter((m) => m.type === "decline" || m.type === "cancel"))
+      .toEqual([expect.objectContaining({ from: "requester", type: "decline", content: { reason: "stop after this piece" } })]);
+    expect.soft((await pool.query("SELECT summary FROM jobs WHERE id=$1", [job.job_id])).rows[0].summary).toBeNull();
+    await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId }))
+      .toMatchObject({ status: "settled", amountMicro: ASK });
+    expect(await balancePayments(job.job_id)).toHaveLength(kind === "prompt" ? 1 : 0);
+  });
+
+  it("awaits live decline cleanup without requiring the optional store-only decline method", async () => {
+    let entered = false;
+    let finished = false;
+    let finish!: () => void;
+    const cleanup = new Promise<void>((resolve) => { finish = resolve; });
+    const url = await server({ onCancel: async () => { entered = true; await cleanup; finished = true; } });
+    const creditId = "stop-custom-open";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "one", maxTotal: 5 * ASK, maxAsk: ASK - 1 });
+    await openAsk(job.job_id);
+    const store = latestManager().store as { declineJob?: unknown };
+    const original = store.declineJob;
+    store.declineJob = undefined;
+    let responded = false;
+    const pending = decline(url, job).then((response) => { responded = true; return response; });
+    try {
+      await expect.poll(() => entered).toBe(true);
+      expect(responded).toBe(false);
+      finish();
+      const response = await pending;
+      expect(response.status).toBe(201);
+      expect(finished).toBe(true);
+    } finally {
+      finish();
+      await pending;
+      store.declineJob = original;
+    }
+  });
+
+  it("adapts the pending stop response and status to the reading host's payment support", async () => {
+    const { url, job } = await stoppedJob("stop-disabled-display");
+    const disabled = await server({ balancePayments: false });
+    const response = await decline(disabled, job);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ ...fixture.standing_decline.response,
+      display: fixture.standing_decline.unsupported_display, seq: expect.any(Number) });
+    const read = async (base: string) => (await fetch(`${base}/v1/job/${job.job_id}`,
+      { headers: { "X-Job-Token": job.job_token } })).json();
+    expect(await read(disabled)).toMatchObject({ ...fixture.standing_decline.status_fields,
+      display: fixture.standing_decline.unsupported_display });
+    expect(await read(url)).toMatchObject(fixture.standing_decline.status_fields);
+  });
+
+  it("refuses a live standing decline with the old error when its store lacks declineJob", async () => {
+    const url = await server();
+    const creditId = "stop-custom-running";
+    await fund(creditId);
+    const job = await submit(url, { creditId, script: "late", maxTotal: 5 * ASK });
+    const store = latestManager().store as { declineJob?: unknown };
+    const original = store.declineJob;
+    store.declineJob = undefined;
+    try {
+      const response = await decline(url, job);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: "no_open_ask",
+        message: "The job has no open payment request or prompt to decline.",
+        hint: "Decline answers an open ask. To stop a running job, cancel it with DELETE /v1/job/:id." });
+      expect((await pool.query("SELECT status,stop_requested FROM jobs WHERE id=$1", [job.job_id])).rows[0])
+        .toEqual({ status: "processing", stop_requested: false });
+    } finally { store.declineJob = original; }
+  });
+
+  it("keeps the exact between-asks refusal on a job without a mandate", async () => {
+    const url = await server();
+    const data = signer.signRequest(key, { action: "late" }, undefined,
+      { audience, method: "POST", path: "/v1/job", capability: "run" });
+    const created = await post(`${url}/v1/job`, { capability: "run", data });
+    const job = await created.json() as { job_id: string; job_token: string };
+    const response = await decline(url, job);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "no_open_ask",
+      message: "The job has no open payment request or prompt to decline.",
+      hint: "Decline answers an open ask. To stop a running job, cancel it with DELETE /v1/job/:id." });
+    expect(await status(job.job_id)).toBe("processing");
+    await hosts[0].shutdown();
+    const other = await server();
+    const remote = await decline(other, job);
+    expect(remote.status).toBe(409);
+    expect(await remote.json()).toEqual({ error: "no_open_ask",
+      message: "The job has no open payment request or prompt to decline.",
+      hint: "Decline answers an open ask. To stop a running job, cancel it with DELETE /v1/job/:id." });
+    expect(await status(job.job_id)).toBe("processing");
+  });
 
   it.each([false, true])("pays each later ask from credit with no caller message (upfront=%s)", async (priced) => {
     const url = await server();

@@ -1437,6 +1437,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     await job.messageAppenderTail;
     if (!job.pendingPayment || isTerminal(job.status)) return;
     const settlement = await settleMandateAsk({ pool: this.opts.db, ledger, jobId: job.id, dvmId: this.opts.dvmId ?? "" });
+    if (settlement.outcome === "declined") {
+      if (isStreamableJobStore(this.jobStore)) await this.jobStore.declineJob?.(job.id, settlement.reason);
+      await this.finalizeStoredTerminal(job.id);
+      await this.adoptDurableTerminal(job);
+    }
     if (reportSkip) reportMandateSkip(settlement);
     return settlement;
   }
@@ -1468,6 +1473,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             const settlement = local
               ? await this.payAskFromMandate(local, false)
               : await settleMandateAsk({ pool: db, ledger, jobId, dvmId });
+            if (!local && settlement?.outcome === "declined") {
+              await this.jobStore.declineJob?.(jobId, settlement.reason);
+              await this.finalizeStoredTerminal(jobId);
+            }
             if (local) {
               // A settlement whose notification was missed wakes the resolver here.
               if (settlement?.outcome !== "skipped") await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);

@@ -184,6 +184,8 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credit_id TEXT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS draw_id TEXT;
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS mandate JSONB;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_requested BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_reason TEXT;
       -- the original signed funding artifact and the snapshot served
       -- with a fund-and-draw response. INSERT-only for replay stability.
       ALTER TABLE jobs ADD COLUMN IF NOT EXISTS funding_receipt JSONB;
@@ -1768,7 +1770,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     endedBy: "caller" | "provider" | null,
     ending: PieceEnding,
     requireOpenAsk = false
-  ): Promise<"ended" | "not_active" | "no_open_ask"> {
+  ): Promise<"ended" | "stop_requested" | "not_active" | "no_open_ask"> {
     const staleOnly = expectedActivityBefore !== null;
     const client = await this.pool.connect();
     try {
@@ -1799,6 +1801,13 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         }
       }
       if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
+        if (record.mandate) {
+          // Snapshots never write this column: a worker holding an older job cannot undo a stop.
+          await client.query(`UPDATE jobs SET stop_requested=TRUE, stop_reason=COALESCE(stop_reason,$2)
+            WHERE id=$1`, [jobId, reason]);
+          await client.query("COMMIT");
+          return "stop_requested";
+        }
         await client.query("ROLLBACK");
         return "no_open_ask";
       }
@@ -1978,6 +1987,7 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     costRevision: row.cost_revision == null ? undefined : Number(row.cost_revision),
     creditId: (row.credit_id ?? undefined) as string | undefined,
     drawId: (row.draw_id ?? undefined) as string | undefined,
+    stopRequested: row.stop_requested === true ? true : undefined,
     mandate: (row.mandate ?? undefined) as JobRecord["mandate"],
     fundingReceipt: (row.funding_receipt ?? undefined) as JobRecord["fundingReceipt"],
     fundingCredit: (row.funding_credit ?? undefined) as JobRecord["fundingCredit"],
