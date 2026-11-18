@@ -70,6 +70,27 @@ describe("assessCashuLock", () => {
     expect(at(floorSec - 1)).toMatchObject({ code: "lock_not_exclusive", locktimeBelowFloor: true });
   });
 
+  it.each(["9007199254740992", "18446744073709551616", "100000000000000000000"])(
+    "refuses unsafe locktime %s as lock_not_exclusive",
+    (locktime) => {
+      const locked = secret(DVM_KEY, [["locktime", locktime], ["refund", PAYER_KEY]]);
+      expect(assessCashuLock(locked, ACTIVE, NOW)).toMatchObject({ kind: "rejected", code: "lock_not_exclusive" });
+    }
+  );
+
+  it("accepts the largest safe locktime only when it meets the floor", () => {
+    const locked = secret(DVM_KEY, [["locktime", "9007199254740991"], ["refund", PAYER_KEY]]);
+    expect(assessCashuLock(locked, ACTIVE, NOW, Number.MAX_SAFE_INTEGER)).toEqual({
+      kind: "exclusive",
+      lockPubkey: DVM_KEY,
+    });
+    expect(assessCashuLock(locked, ACTIVE, NOW, Number.MAX_SAFE_INTEGER + 1)).toMatchObject({
+      kind: "rejected",
+      code: "lock_not_exclusive",
+      locktimeBelowFloor: true,
+    });
+  });
+
   it.each(acceptedLockShapes({ current: DVM_KEY, retired: RETIRED_KEY, payer: PAYER_KEY, nowSec: NOW }))(
     "accepts $label",
     ({ data, tags, matches }) => {
