@@ -2,6 +2,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 
+import fundRetry from "../../../../protocol-fixtures/x402-credit-fund-retry-v1.json";
 import { type DrainReceipt, verifyDrainReceipt } from "../../../lib/receipt";
 import { decodePaymentRequiredHeader, type PaymentRequirementsV2 } from "../../../lib/x402/spec";
 import type { FxFetcher } from "../../pricing/fx";
@@ -155,8 +156,10 @@ function creditRoute(
       fxFetcher: fx(),
       railOpts: (c) =>
         Promise.resolve({
+          x402Config: { network: REQUIREMENT.network, payTo: REQUIREMENT.payTo },
           x402Payment: c.req.header("PAYMENT-SIGNATURE"),
           x402BatchSettlement: batch,
+          creditLedger: ledger,
         }),
       onDeposit: vi.fn(),
       drainReport: {},
@@ -408,6 +411,23 @@ describe("x402 batch-settlement credit funding", () => {
     expect(wire).not.toContain("x402-self-relay:");
   });
 
+  it("answers confirmed deposit absence with retry guidance and no payment challenge", async () => {
+    const batch = batchServer();
+    vi.mocked(batch.accept).mockResolvedValueOnce({
+      ok: false,
+      reason: "settlement_not_on_chain",
+      requirements: [REQUIREMENT],
+      corrective: false,
+    });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await fundRequest(app, CHANNEL_HEADER);
+
+    expect(response.status).toBe(fundRetry.status);
+    expect(await response.json()).toEqual(fundRetry.body);
+    for (const header of fundRetry.omittedHeaders) expect(response.headers.has(header)).toBe(false);
+  });
+
   it("terminally refuses a channel already bound to another credit before acceptance", async () => {
     const batch = batchServer();
     const ledger = new MemoryCreditLedger();
@@ -588,6 +608,26 @@ describe("x402 batch-settlement credit funding", () => {
 });
 
 describe("x402 batch-settlement credit drain refusals", () => {
+  it("keeps refund guidance when reconciliation finds no drain on chain", async () => {
+    const batch = batchServer();
+    vi.mocked(batch.accept).mockResolvedValueOnce({
+      ok: false,
+      reason: "settlement_not_on_chain",
+      requirements: [REQUIREMENT],
+    });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await drainRequest(app);
+
+    expect(response.status).toBe(402);
+    expect(await response.json()).toMatchObject({
+      error: "settlement_not_on_chain",
+      display: expect.stringContaining("this refund did not move"),
+      hint: expect.stringContaining("same drain_id"),
+      retryable: true,
+    });
+  });
+
   it("returns a complete signed receipt chain and does not countersign a replay", async () => {
     const batch = batchServer();
     const { app, ledger } = await x402Credit(batch, 250_000, RECEIPT_ISSUER);

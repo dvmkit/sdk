@@ -1,0 +1,11 @@
+{
+  "status": 503,
+  "body": {
+    "error": "settlement_not_on_chain",
+    "message": "x402 channel deposit was not found on chain",
+    "display": "The service checked the chain and confirmed that the deposit did not land. No credit was added.",
+    "hint": "Retry the same signed funding request with the same PAYMENT-SIGNATURE header.",
+    "retryable": true
+  },
+  "omittedHeaders": ["PAYMENT-REQUIRED"]
+}

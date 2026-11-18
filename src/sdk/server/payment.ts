@@ -1303,6 +1303,21 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         },
       });
       if (!accepted.ok) {
+        if (accepted.reason === "settlement_not_on_chain") {
+          return {
+            paidMsats: 0,
+            receivedProofs: [],
+            error: {
+              body: paymentErrorBody(accepted.reason, {
+                message: "x402 channel deposit was not found on chain",
+                display:
+                  "The service checked the chain and confirmed that the deposit did not land. No credit was added.",
+                hint: "Retry the same signed funding request with the same PAYMENT-SIGNATURE header.",
+              }),
+              status: 503,
+            },
+          };
+        }
         return {
           paidMsats: 0,
           receivedProofs: [],

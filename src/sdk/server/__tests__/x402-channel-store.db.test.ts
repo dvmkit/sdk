@@ -15,6 +15,7 @@ import {
   signVoucher,
 } from "@x402/evm/batch-settlement/client";
 import type { Channel } from "@x402/evm/batch-settlement/server";
+import { Hono } from "hono";
 import pg from "pg";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -26,9 +27,14 @@ import { loggers } from "../../../observability/loggers";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import { MemoryKVStore } from "../../store";
-import { createDVMServer } from "../app";
+import { createDVMServer, type AppEnv } from "../app";
 import { CreditLedger } from "../credit-ledger";
+import { CREDIT_REQUEST_SCHEMA, handleCreditRequest } from "../credit-routes";
+import { fundingCommitment } from "../funding";
 import { MemoryJobStore } from "../memory-job-store";
+import { PostgresProcessedPaymentStore } from "../processed-payment-store";
+import { secp256k1Auth } from "../secp256k1-auth";
+import { createSignedRequestVerifier } from "../signed-request";
 import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "../x402-channel-store";
@@ -1534,6 +1540,155 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       expect(facilitator.settle).toHaveBeenCalledOnce();
       expect(balances.get(deposit.channelId.toLowerCase())).toBe(1000n);
       expect(await storage.getSettlement("fund", effectId)).toMatchObject({ status: "complete" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("reconciles a failed deposit before an identical funding request can submit it again", async () => {
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const balances = new Map<string, bigint>();
+    const facilitator = recordingFacilitator(balances);
+    vi.mocked(facilitator.settle).mockResolvedValueOnce({
+      success: false,
+      transaction: "",
+      network: NETWORK,
+      errorReason: "invalid_batch_settlement_evm_deposit_transaction_failed",
+    });
+    const findAppliedSettlement = vi.fn(async () => undefined);
+    let chainHead = 100n;
+    const processedPayments = new PostgresProcessedPaymentStore(pool);
+    await processedPayments.init();
+    const config = {
+      facilitatorClient: facilitator,
+      receiverAuthorizerSigner: receiver,
+      autoSettlement: false as const,
+    };
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK,
+      payTo: receiver.address,
+      db: pool,
+      earnedNative: earnedNothing,
+      config,
+      settlementEvidenceReader: { getBlockNumber: async () => chainHead, findAppliedSettlement },
+    });
+
+    try {
+      const creditId = "failed-deposit-retry-credit";
+      const fundId = "fund-1";
+      const effectId = `${creditId}:${fundId}`;
+      const amountMicro = 100;
+      const [requirements] = await server.buildRequirements(String(amountMicro));
+      const { paymentHeader, channelId } = await depositPayment(
+        receiver.address,
+        requirements as PaymentRequirements
+      );
+      const fxFetcher: FxFetcher = {
+        fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
+        lastKnown: () => null,
+        supportedCurrencies: () => ["usd"],
+      };
+      const app = new Hono<AppEnv>();
+      const auth = secp256k1Auth();
+      app.post("/v1/credit", (c) =>
+        handleCreditRequest(c, {
+          auth,
+          ledger,
+          fxFetcher,
+          menu: async () => ({
+            currency: "usd",
+            funding: ["x402"],
+            min_micro: amountMicro,
+            max_micro: 1_000_000,
+            ttl_ms: 86_400_000,
+          }),
+          creditConfig: {
+            min: "$0.0001",
+            max: "$1.00",
+            ttlSeconds: 86_400,
+            allowOneShotStablecoin: true,
+          },
+          railOpts: async (request) => ({
+            x402Config: { network: NETWORK, payTo: receiver.address, batchSettlement: config },
+            x402Payment: request.req.header("PAYMENT-SIGNATURE"),
+            x402BatchSettlement: server,
+            creditLedger: ledger,
+            processedPayments,
+            dvmId: "deposit-retry-test",
+          }),
+          onDeposit: () => undefined,
+          drainReport: {},
+          receiptIssuer: undefined,
+          lightning: undefined,
+          settleLightning: async () => undefined,
+        })
+      );
+      const signer = createSignedRequestVerifier(CREDIT_REQUEST_SCHEMA);
+      const signedBody = JSON.stringify(
+        signer.signRequest(new Uint8Array(32).fill(7), {
+          op: "fund",
+          credit_id: creditId,
+          fund: {
+            fund_id: fundId,
+            amount_micro: amountMicro,
+            commitment: fundingCommitment(paymentHeader),
+          },
+        })
+      );
+      const fund = () =>
+        app.request("/v1/credit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "PAYMENT-SIGNATURE": paymentHeader },
+          body: signedBody,
+        });
+
+      const failed = await fund();
+      expect(failed.status).toBe(503);
+      expect(await failed.json()).toMatchObject({
+        error: "x402_settlement_submission_failed",
+        retryable: true,
+      });
+      expect(await storage.getSettlement("fund", effectId)).toMatchObject({
+        status: "submitting",
+        submissionBlock: "100",
+      });
+      expect(await ledger.get(creditId)).toBeUndefined();
+      expect(facilitator.settle).toHaveBeenCalledTimes(1);
+
+      const reconciled = await fund();
+      expect(reconciled.status).toBe(503);
+      expect(await reconciled.json()).toMatchObject({
+        error: "settlement_not_on_chain",
+        retryable: true,
+      });
+      expect(findAppliedSettlement).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ effectId, submissionBlock: "100" })
+      );
+      const prepared = await storage.getSettlement("fund", effectId);
+      expect(prepared?.status).toBe("prepared");
+      expect(prepared?.submissionBlock).toBeUndefined();
+      expect(facilitator.settle).toHaveBeenCalledTimes(1);
+      expect(balances.has(channelId.toLowerCase())).toBe(false);
+      expect(await ledger.getFunding({ creditId, fundId })).toBeUndefined();
+
+      chainHead = 101n;
+      const funded = await fund();
+      expect(funded.status).toBe(200);
+      expect(await funded.json()).toMatchObject({ funded_micro: amountMicro, replayed: false });
+      expect(facilitator.settle).toHaveBeenCalledTimes(2);
+      expect(balances.get(channelId.toLowerCase())).toBe(1000n);
+      expect(await ledger.get(creditId)).toMatchObject({
+        balanceMicro: amountMicro,
+        x402ChannelId: channelId.toLowerCase(),
+      });
+      expect(await ledger.getFunding({ creditId, fundId })).toMatchObject({
+        amountMicro,
+        rail: "x402",
+      });
+      expect(await storage.getSettlement("fund", effectId)).toMatchObject({
+        status: "complete",
+        submissionBlock: "101",
+      });
     } finally {
       await server.stop();
     }
