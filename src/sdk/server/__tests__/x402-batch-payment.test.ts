@@ -428,6 +428,27 @@ describe("x402 batch-settlement credit funding", () => {
     for (const header of fundRetry.omittedHeaders) expect(response.headers.has(header)).toBe(false);
   });
 
+  it("keeps a corrective verification refusal when its reason matches the deposit retry code", async () => {
+    const batch = batchServer();
+    vi.mocked(batch.accept).mockResolvedValueOnce({
+      ok: false,
+      reason: "settlement_not_on_chain",
+      requirements: [REQUIREMENT],
+    });
+    const { app } = await x402Credit(batch, 250_000);
+
+    const response = await fundRequest(app, CHANNEL_HEADER);
+
+    expect(response.status).toBe(402);
+    expect(await response.json()).toMatchObject({ error: "payment_invalid", retryable: false });
+    const challenge = response.headers.get("PAYMENT-REQUIRED");
+    if (!challenge) throw new Error("expected PAYMENT-REQUIRED header");
+    expect(decodePaymentRequiredHeader(challenge)).toMatchObject({
+      error: "settlement_not_on_chain",
+      accepts: [REQUIREMENT],
+    });
+  });
+
   it("terminally refuses a channel already bound to another credit before acceptance", async () => {
     const batch = batchServer();
     const ledger = new MemoryCreditLedger();

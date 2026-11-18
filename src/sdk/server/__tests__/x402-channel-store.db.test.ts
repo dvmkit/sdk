@@ -1700,10 +1700,15 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     });
     try {
       await resetWedgeToSubmitting(pool, absent.effectId);
-      await expect(retryWedgedRefund(absent)).resolves.toMatchObject({
+      const refusal = await retryWedgedRefund(absent);
+      expect(refusal).toMatchObject({
         ok: false,
         reason: "settlement_not_on_chain",
+        requirements: expect.arrayContaining([
+          expect.objectContaining({ scheme: "batch-settlement", amount: "0" }),
+        ]),
       });
+      expect(refusal).not.toHaveProperty("corrective", false);
       const absentSettlement = await storage.getSettlement("refund", absent.effectId);
       expect(absentSettlement).toMatchObject({
         status: "prepared",

@@ -1303,7 +1303,8 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
         },
       });
       if (!accepted.ok) {
-        if (accepted.reason === "settlement_not_on_chain") {
+        // Facilitator verification can use the same reason without a chain scan.
+        if (accepted.reason === "settlement_not_on_chain" && accepted.corrective === false) {
           return {
             paidMsats: 0,
             receivedProofs: [],
