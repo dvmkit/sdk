@@ -329,7 +329,7 @@ Node server hosting, persistence, authentication, compatibility, and payment inf
 | `X402_BATCH_SETTLEMENT_NETWORK` | value | runtime | experimental | Hosted-facilitator channel network retained for the existing testnet path. |
 | `X402BatchAcceptance` | interface | type-only | experimental | Successful batch-settlement result plus the caller-owned ledger result. |
 | `X402BatchFunding` | interface | type-only | experimental | Natural identity and incremental value carried by an accepted channel voucher. |
-| `X402BatchRefusal` | interface | type-only | experimental | Structured refusal that can be turned back into a corrective 402. |
+| `X402BatchRefusal` | interface | type-only | experimental | Structured batch-settlement refusal with optional voucher correction. |
 | `X402BatchSettlementServer` | interface | type-only | experimental | Runtime server handle used only by `/v1/credit`. |
 | `X402ChannelStorageOpts` | interface | type-only | experimental | Exported declaration from the built public entry point. |
 | `X402ExactAcceptance` | type | type-only | experimental | Result of accepting or recovering one exact x402 authorization. |

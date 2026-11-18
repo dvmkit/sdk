@@ -159,16 +159,14 @@ export class X402SettlementSubmissionError extends Error {
   }
 }
 
-/** Structured refusal that can be turned back into a corrective 402. */
+/** Structured batch-settlement refusal with optional voucher correction. */
 export interface X402BatchRefusal {
   ok: false;
   reason: string;
   requirements: PaymentRequirementsV2[];
   /**
-   * `false` when re-signing cannot fix this: the caller must be answered with a
-   * terminal error rather than a 402 carrying fresh requirements, because an
-   * agent reads a corrective 402 as "sign this and resubmit" and lands straight
-   * back on the same refusal. Omitted means corrective.
+   * `false` when the response should omit a fresh payment challenge. Follow the
+   * refusal reason for retry guidance. Omitted means corrective.
    */
   corrective?: boolean;
 }
@@ -981,11 +979,18 @@ export async function createX402BatchSettlementServer(
             );
             if (!reconciliation.reconciled) {
               if (reconciliation.reason === "settlement_not_on_chain") {
-                // This is the one definitive non-settlement answer. Return the
-                // intent to the ordinary submission phase, but leave the retry
-                // to the caller: automatically resubmitting at this ambiguous
-                // boundary would recreate the crash-safety bug this row guards.
+                // Proof from the submission bookmark permits a durable reset.
+                // End this request after reconciliation so the next attempt
+                // goes through verification and records its own bookmark.
                 await postgres.markSettlementRetryable(prior.settlementId);
+                if (args.operation === "fund") {
+                  return {
+                    ok: false as const,
+                    reason: reconciliation.reason,
+                    requirements: requirements as PaymentRequirementsV2[],
+                    corrective: false as const,
+                  };
+                }
               } else if (reconciliation.reason === "chain_unreachable") {
                 // One warning per caller retry makes a persistently broken RPC
                 // visible without a background loop. The row deliberately

@@ -30,6 +30,12 @@ An explicit `paymentMethods` list bounds `payment.methods` on `/v1/info` and `/v
 
 Omitting the override preserves derived defaults, including independent x402 batch credit funding when hosted exact payment is unavailable. Availability, currency support, and stablecoin-credit opt-in still filter the allowed methods. This corrects discovery on older servers that could expose excluded rails; it adds no wire fields or storage migration.
 
+## Retrying a reusable x402 channel deposit
+
+After `POST /v1/credit` reports `x402_settlement_submission_failed`, resend the same signed funding request with the original `PAYMENT-SIGNATURE` header. If the server checks from the saved submission block and confirms that the deposit did not land, it prepares the deposit for another attempt and returns HTTP 503 with `error: "settlement_not_on_chain"` and `retryable: true`. The [portable response](../protocol-fixtures/x402-credit-fund-retry-v1.json) omits `PAYMENT-REQUIRED` and `accepts`. Resend the same request again to submit the deposit. If the server finds the deposit on chain, it can recover the original payment without submitting it again.
+
+Clients can distinguish this funding response from an older server's HTTP 402 `payment_invalid` using the status and error code. A cooperative drain still uses refund-specific guidance for `settlement_not_on_chain`.
+
 ## Card-funded credit
 
 A DVM with card credit lists `stripe` in `credit.funding` and adds `credit.stripe: { network_id, min_micro, currency: "usd" }`. It never appears in `payment.methods`, and `/v1/job` never issues or accepts a `method="stripe"` challenge.
