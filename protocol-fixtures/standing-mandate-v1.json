@@ -9,7 +9,8 @@
     }
   },
   "info_credit_fields": {
-    "standing_mandate": true
+    "standing_mandate": true,
+    "mandate_skipped": true
   },
   "invalid": {
     "status": 400,
@@ -55,6 +56,20 @@
       "mandate_ask_unpriced",
       "mandate_credit_unavailable"
     ]
+  },
+  "mandate_skipped": {
+    "ask_content": {
+      "expires_at_ms": 1795000000000,
+      "credit": {
+        "amount_micro": 550001,
+        "currency": "usd"
+      },
+      "amount_msats": 1000,
+      "reason": "Next piece",
+      "mandate_skipped": {
+        "reason": "mandate_ask_cap"
+      }
+    }
   },
   "standing_decline": {
     "request": {

@@ -25,6 +25,11 @@ export interface CreditTerms {
   /** Signed standing credit mandates on job submission are supported. */
   standing_mandate?: true;
   /**
+   * A mandated ask the provider will not pay carries `content.mandate_skipped` with the reason.
+   * Absent means unsupported; never infer it from a version.
+   */
+  mandate_skipped?: true;
+  /**
    * The authenticated builder park-drain route accepts a validated just-in-time mint refund
    * even when Cashu receiving is off. Absent or false means unsupported; never infer it.
    */
@@ -363,6 +368,7 @@ export function toCreditTerms(menu: CreditMenu): CreditTerms {
   return {
     ...(menu.balance_payment && { balance_payment: true }),
     ...(menu.standing_mandate && { standing_mandate: true }),
+    ...(menu.mandate_skipped && { mandate_skipped: true }),
     ...(menu.jit_refund_park && { jit_refund_park: true }),
     min_micro: menu.min_micro,
     max_micro: menu.max_micro,

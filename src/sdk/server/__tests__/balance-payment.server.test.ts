@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import type { Pool, PoolClient } from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +15,10 @@ import { CreditLedger } from "../credit-ledger";
 import { createDVMHost, type DVMHostOpts } from "../host";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
+
+const mandateFixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8")) as {
+  info_credit_fields: Record<string, true>;
+};
 
 const schema = `sdk_balance_http_${randomUUID().replaceAll("-", "")}`;
 const key = Buffer.from("12".repeat(32), "hex");
@@ -95,7 +100,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
 
   it.each([false, true])("persists a standing mandate across a provider restart (upfront=%s)", async (priced) => {
     const url = await server("complete", true, false, { priced });
-    expect((await (await fetch(`${url}/v1/info`)).json()).credit.standing_mandate).toBe(true);
+    const { credit } = await (await fetch(`${url}/v1/info`)).json();
+    expect(credit).toMatchObject(mandateFixture.info_credit_fields);
     const creditId = `mandate-credit-${priced}`;
     await fund(creditId);
     // Below the handler's ask, so the mandate leaves it open and the job stays unbound.

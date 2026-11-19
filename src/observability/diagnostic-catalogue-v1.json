@@ -254,6 +254,7 @@
     "mandate_ask_resume_failed",
     "mandate_ask_sweep_failed",
     "mandate_payment_skipped",
+    "mandate_skip_record_failed",
     "melter_previous_run_read_failed",
     "melter_report_unconfigured",
     "melter_run_report",

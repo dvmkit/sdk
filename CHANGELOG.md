@@ -14,6 +14,10 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## Unreleased
+
+- A standing-mandate ask the provider will not pay now carries `content.mandate_skipped.reason` on its `payment-request`, so a caller can pay the open ask at once instead of waiting out settlement timing. Providers advertise it as `credit.mandate_skipped: true` on `/v1/info`. The portable shape is in `protocol-fixtures/standing-mandate-v1.json`.
+
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
 
 - JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.

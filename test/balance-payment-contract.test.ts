@@ -24,4 +24,11 @@ describe("portable balance payment contract", () => {
     expect(parseCreditTerms({ ...terms, balance_payment: "true" })?.balance_payment).toBeUndefined();
     expect(parseCreditTerms({ ...terms, balance_payment: false })?.balance_payment).toBeUndefined();
   });
+
+  it("preserves the skipped-mandate notice only when it is advertised as true", () => {
+    const terms = { min_micro: 100, max_micro: 5_000_000, ttl_ms: 86_400_000, currency: "usd", funding: ["cashu"] };
+    expect(parseCreditTerms({ ...terms, mandate_skipped: true })?.mandate_skipped).toBe(true);
+    expect(parseCreditTerms({ ...terms, mandate_skipped: "true" })?.mandate_skipped).toBeUndefined();
+    expect(parseCreditTerms(terms)?.mandate_skipped).toBeUndefined();
+  });
 });

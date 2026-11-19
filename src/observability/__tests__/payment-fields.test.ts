@@ -58,11 +58,13 @@ describe("payment diagnostic catalogue", () => {
   it("retains the protocol's standing-mandate fallback reasons", () => {
     const fixture = JSON.parse(readFileSync(new URL("../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8")) as {
       mandate_payment: { fallback_reasons: string[] };
+      mandate_skipped: { ask_content: { mandate_skipped: { reason: string } } };
     };
     expect(projectEventName("mandate_payment_skipped")).toBe("mandate_payment_skipped");
     for (const reason of fixture.mandate_payment.fallback_reasons) {
       expect(projectDiagnosticFields({ reason })).toEqual({ reason });
     }
+    expect(fixture.mandate_payment.fallback_reasons).toContain(fixture.mandate_skipped.ask_content.mandate_skipped.reason);
   });
 
   it.each(["SENTINEL", {}, ["rate_unavailable"], new String("rate_unavailable"), new Error("SENTINEL"), null, 42])("omits unrecognized or nonprimitive payment fields (%j)", (value) => {
