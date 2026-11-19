@@ -2353,6 +2353,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // Balance payments need a Postgres job store, and the app leaves the stale timeouts at
       // their positive defaults, so the sweep that resumes stranded mandated asks always runs here.
       menu.standing_mandate = true;
+      menu.mandate_skipped = true;
     }
     if (menu && this.adminCreditRoutesMounted()) menu.jit_refund_park = true;
     return menu;

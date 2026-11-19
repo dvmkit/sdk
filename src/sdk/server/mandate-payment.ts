@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { askExpired } from "./ask-expiry";
@@ -85,6 +85,7 @@ export async function settleMandateAsk(args: {
     if (askExpired(ask.content.expires_at_ms, now)) return await none(tx);
     const skip = async (reason: MandateSkipReason): Promise<MandateSettlement> => {
       await tx.query("ROLLBACK");
+      await recordMandateSkip(tx, args.jobId, ask.seq, reason);
       return { outcome: "skipped", requestSeq: ask.seq, reason };
     };
     const priced = ask.content.credit;
@@ -123,6 +124,10 @@ export async function settleMandateAsk(args: {
     // The ledger now holds the credit lock, whose wait may have crossed expiry. Every payment
     // write is still uncommitted: rolling back here also discards its draw, piece, and notification.
     if (Date.now() >= mandate.expires_at_ms) return await skip("mandate_expired");
+    // An earlier skip of this ask no longer holds.
+    await tx.query(
+      "UPDATE job_messages SET data = data #- '{content,mandate_skipped}' WHERE job_id=$1 AND seq=$2 AND data->'content' ? 'mandate_skipped'",
+      [args.jobId, ask.seq]);
     await tx.query("COMMIT");
     return { outcome: "paid", requestSeq: ask.seq, seq: response.seq, replayed: false };
   } catch (error) {
@@ -131,13 +136,16 @@ export async function settleMandateAsk(args: {
       // A draw id another job recorded first surfaces from the ledger rather than the job row.
       const reason: MandateSkipReason = error.code === "insufficient_credit" ? "mandate_balance"
         : error.code === "draw_conflict" ? "mandate_draw_owned_elsewhere" : "mandate_credit_unavailable";
+      await recordMandateSkip(tx, args.jobId, requestSeq, reason);
       return { outcome: "skipped", requestSeq, reason };
     }
     // A conflict is a draw that appeared for another job; a clipped growth means the job's ask
     // total no longer covers this ask.
     if (requestSeq !== undefined && error instanceof BalancePaymentError) {
-      return { outcome: "skipped", requestSeq,
-        reason: error.body.error === "credit_payment_conflict" ? "mandate_draw_owned_elsewhere" : "mandate_ask_unpriced" };
+      const reason: MandateSkipReason = error.body.error === "credit_payment_conflict"
+        ? "mandate_draw_owned_elsewhere" : "mandate_ask_unpriced";
+      await recordMandateSkip(tx, args.jobId, requestSeq, reason);
+      return { outcome: "skipped", requestSeq, reason };
     }
     throw error;
   } finally {
@@ -189,6 +197,37 @@ export async function findQuietCreditAsks(pool: Pool, args: {
      ORDER BY j.last_activity_at, j.id LIMIT $4`,
     [args.beforeMs, args.dvmId, args.capabilities, args.limit, args.after?.lastActivityAt ?? null, args.after?.id ?? null]);
   return rows.map((row) => ({ id: row.id, lastActivityAt: Number(row.last_activity_at), hasMandate: row.has_mandate }));
+}
+
+/**
+ * Show the caller why the mandate will not pay this ask, as `content.mandate_skipped` on the ask
+ * itself. Runs after the settlement transaction rolled back, in its own transaction: the skip's
+ * rollback must not be undone by the annotation, and a paid ask must never be annotated, so the
+ * job row lock is retaken and the ask rechecked. Best effort, since the ask stays payable
+ * either way and a sweep tick tries again.
+ */
+async function recordMandateSkip(tx: PoolClient, jobId: string, requestSeq: number, reason: MandateSkipReason): Promise<void> {
+  try {
+    await tx.query("BEGIN");
+    const { rows: [job] } = await tx.query<{ pending_payment_msats: string | null; status: string }>(
+      "SELECT pending_payment_msats, status FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
+    const open = job && !["completed", "failed", "cancelled"].includes(job.status) &&
+      job.pending_payment_msats !== null && Number(job.pending_payment_msats) > 0;
+    if (open) {
+      const { rows: paid } = await tx.query("SELECT 1 FROM credit_balance_payments WHERE job_id=$1 AND request_seq=$2", [jobId, requestSeq]);
+      if (!paid.length) {
+        await tx.query(
+          `UPDATE job_messages SET data = jsonb_set(data, '{content,mandate_skipped}', $3::jsonb)
+           WHERE job_id=$1 AND seq=$2 AND data->>'type'='payment-request' AND data->>'from'='provider'
+             AND data->'content'->'mandate_skipped' IS DISTINCT FROM $3::jsonb`,
+          [jobId, requestSeq, JSON.stringify({ reason })]);
+      }
+    }
+    await tx.query("COMMIT");
+  } catch (error) {
+    await tx.query("ROLLBACK").catch(() => undefined);
+    diagnosticConsole.error({ level: "mandate_skip_record_failed", jobId, error_code: typeof (error as { code?: unknown } | null)?.code === "string" ? (error as { code: string }).code : "unknown_error" });
+  }
 }
 
 /** Emit the limit that left a mandated ask open. */

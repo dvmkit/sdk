@@ -164,6 +164,13 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     if (live.length) return live;
     return (await pool.query<{ messages: Stored[] }>("SELECT messages FROM jobs WHERE id=$1", [jobId])).rows[0]?.messages ?? [];
   }
+  /** The latest ask exactly as a caller reads it from the job's messages endpoint. */
+  async function servedAsk(url: string, job: { job_id: string; job_token: string }) {
+    const response = await fetch(`${url}/v1/job/${job.job_id}/messages`, { headers: { "X-Job-Token": job.job_token } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { messages: { type: string; from: string; content: { mandate_skipped?: unknown } }[] };
+    return body.messages.findLast((m) => m.from === "provider" && m.type === "payment-request")!;
+  }
   async function status(jobId: string) {
     return (await pool.query("SELECT status FROM jobs WHERE id=$1", [jobId])).rows[0]?.status as string | undefined;
   }
@@ -581,6 +588,8 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     expect(await settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id }))
       .toEqual({ outcome: "none" });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - upfront - 2 * ASK);
+    // A mandate that pays every ask never marks one as skipped.
+    expect(asks.filter((m) => "mandate_skipped" in m.content)).toEqual([]);
   }, 30_000);
 
   it.each([
@@ -604,6 +613,8 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     const ask = await openAsk(job.job_id);
     await expect.poll(() => warnings.slice(before).filter((w) => w.event === "mandate_payment_skipped").map((w) => w.reason))
       .toEqual([row.reason]);
+    // The caller sees the skip with its reason on the open ask itself.
+    await expect.poll(async () => (await servedAsk(url, job)).content.mandate_skipped).toEqual({ reason: row.reason });
     expect((await messages(job.job_id)).filter((m) => m.from === "requester" && m.type === "payment")).toEqual([]);
     expect(await balancePayments(job.job_id)).toEqual([]);
     expect((await ledger.get(creditId))?.availableMicro).toBe(available);
@@ -965,9 +976,14 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     await openAsk(job.job_id);
     await manager.sweepMandateAsks(afterGrace());
     expect(await balancePayments(job.job_id)).toEqual([]);
+    expect((await servedAsk(url, job)).content.mandate_skipped).toEqual({ reason: "mandate_balance" });
     await fund(creditId, 10_000);
     await manager.sweepMandateAsks(afterGrace());
     await expect.poll(() => status(job.job_id), { timeout: 15_000 }).toBe("completed");
+    // The ask is paid now, so it no longer claims the mandate will not pay it.
+    const asks = (await messages(job.job_id)).filter((m) => m.type === "payment-request");
+    expect(asks).toHaveLength(1);
+    expect(asks.filter((m) => "mandate_skipped" in m.content)).toEqual([]);
     expect(completions.get(job.job_id)).toBe(1);
     expect(await balancePayments(job.job_id)).toHaveLength(1);
   }, 40_000);

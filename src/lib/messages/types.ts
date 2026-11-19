@@ -73,6 +73,12 @@ export interface ArtifactContent {
 
 /** Provider requests payment to continue. */
 export interface PaymentRequestContent {
+  /**
+   * Set while a standing mandate has decided not to pay this ask, so the caller can pay it
+   * now. The reason is one of the `mandate_*` codes in the protocol notes. It follows the
+   * latest decision and is removed if the mandate later pays the ask.
+   */
+  mandate_skipped?: { reason: string };
   /** Caller response deadline in integer Unix milliseconds; absent on older servers. */
   expires_at_ms?: number;
   /** Exact outstanding balance charge, in integer micro-units. Use this message’s seq as request_seq. */
