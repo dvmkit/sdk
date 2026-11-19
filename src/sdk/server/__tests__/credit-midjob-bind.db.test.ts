@@ -255,7 +255,6 @@ describe.skipIf(!RUN)("the mid-job Tx C seam", () => {
       pendingPaymentMsats: ASK_MSATS,
       pendingPaymentFiatMicro: ASK_MICRO,
       pendingPaymentFiatCurrency: "usd",
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

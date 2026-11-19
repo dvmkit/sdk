@@ -478,7 +478,7 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
           creditLedger: h.ledger, processedPayments: h.processedPayments,
           cashuMode: "p2pk-accumulator", db: {} as never, mints: ["https://mint.example"],
         });
-        const record = { ...toJobRecord({ ...boundJob(), paymentRail: "cashu", seq: 0, receivedProofs: [],
+        const record = { ...toJobRecord({ ...boundJob(), paymentRail: "cashu", seq: 0,
           stepCache: new StepCache(), state: {}, tags: [], capability: "test", input: "", params: {},
           createdAt: Date.now(), lastActivityAt: Date.now() } as ServerJob) };
         await store.save(record);

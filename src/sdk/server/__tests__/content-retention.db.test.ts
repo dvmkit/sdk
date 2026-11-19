@@ -88,6 +88,56 @@ describe.skipIf(!RUN)("durable content holds and financial export", () => {
     }
   });
 
+  it("preserves legacy job proofs during a hold and erases them when the job is redacted", async () => {
+    const schema = `content_legacy_${randomUUID().replaceAll("-", "")}`;
+    await recreateSchema(schema);
+    const legacy = await pinnedPool(schema);
+    const job = contentJob();
+    const proofs = [{ amount: 1, id: "proof", secret: "bearer-proof-secret", C: "point" }];
+    const storedProofs = async () => (await legacy.query<{ received_proofs: unknown }>(
+      "SELECT received_proofs FROM jobs WHERE id=$1", [job.id]
+    )).rows[0]?.received_proofs;
+    try {
+      const jobs = new PostgresJobStore(legacy);
+      await jobs.init();
+      await legacy.query("ALTER TABLE jobs ADD COLUMN received_proofs JSONB NOT NULL DEFAULT '[]'");
+      await jobs.save(job);
+      expect(await storedProofs()).toEqual([]);
+      await legacy.query("UPDATE jobs SET received_proofs=$2 WHERE id=$1", [job.id, JSON.stringify(proofs)]);
+      await jobs.init();
+      await jobs.save({ ...job, summary: "updated result" });
+      const saved = await jobs.get(job.id);
+      expect(saved).toMatchObject({ id: job.id, summary: "updated result", paidMsats: 21_000 });
+      expect(saved).not.toHaveProperty("receivedProofs");
+
+      const client = await legacy.connect();
+      try {
+        const begin = recipe.indexOf("BEGIN TRANSACTION");
+        await client.query(recipe.slice(0, begin));
+        const results = await client.query(recipe.slice(begin)) as unknown as pg.QueryResult[];
+        const exported = results.find((result) => result.command === "SELECT")!.rows[0].jsonb_build_object;
+        expect(exported.jobs).toMatchObject([{ id: job.id, paid_msats: 21_000 }]);
+        expect(JSON.stringify(exported)).not.toContain(proofs[0].secret);
+      } finally {
+        client.release(true);
+      }
+
+      const { holds: [hold] } = await jobs.mutateContentHold(job.id, place);
+      const sweep = { jobId: job.id, expectedLastActivityAt: ACTIVITY, redactedAt: ACTIVITY + 200 };
+      expect(await jobs.redactJob(sweep)).toBe(false);
+      expect(await storedProofs()).toEqual(proofs);
+      await jobs.mutateContentHold(job.id, {
+        action: "cleared", hold_id: hold.id, reason: "resolved", actor: ADMIN_KEY, at: ACTIVITY + 100,
+      });
+      expect(await jobs.redactJob(sweep)).toBe(true);
+      expect(await storedProofs()).toEqual([]);
+      expect(await jobs.get(job.id)).toMatchObject({ redactedAt: sweep.redactedAt, paidMsats: 21_000 });
+    } finally {
+      await legacy.end();
+      await dropSchemas(schema);
+    }
+  });
+
   it("refuses a stale retention scan clock before erasing terminal content", async () => {
     await store.save(contentJob());
     expect(await store.redactJob({ jobId: "example-job", expectedLastActivityAt: ACTIVITY - 1, redactedAt: Date.now() })).toBe(false);
@@ -235,7 +285,7 @@ describe.skipIf(!RUN)("durable content holds and financial export", () => {
     } finally { await client.query("ROLLBACK; DISCARD TEMP; RESET search_path"); client.release(); }
   });
 
-  it("exports signed financial tuples and recovery links without raw data, bearer proofs or payout secrets", async () => {
+  it("exports signed financial tuples and recovery links without raw data or payout secrets", async () => {
     await store.save(contentJob());
     const issuer = new ReceiptIssuer({ secret: "22".repeat(32), dvm: "example", dvmId: "example-dvm" });
     const receipt = issuer.issue(contentJob(), await store.claimReceiptSeq("example-job"));
@@ -260,7 +310,7 @@ describe.skipIf(!RUN)("durable content holds and financial export", () => {
       expect(verifyReceipt(exported.jobs[0].receipt as JobReceipt)).toBe(true);
       expect(verifyFundingReceipt(exported.fundings[0].receipt as FundingReceipt)).toBe(true);
       expect(verifyDrainReceipt(exported.drains[0].receipts[0] as DrainReceipt)).toBe(true);
-      for (const secret of ["raw-input-secret", "raw-param-secret", "raw-output-secret", "bearer-proof-secret", "bearer-token-secret", "payout-secret", "operational-secret", "invoice-secret", "private-note-secret", "extension-secret"]) expect(JSON.stringify(exported)).not.toContain(secret);
+      for (const secret of ["raw-input-secret", "raw-param-secret", "raw-output-secret", "bearer-token-secret", "payout-secret", "operational-secret", "invoice-secret", "private-note-secret", "extension-secret"]) expect(JSON.stringify(exported)).not.toContain(secret);
       for (const unsupported of [
         { ...receipt, v: 2 },
         { ...receipt, kind: "future_kind" },

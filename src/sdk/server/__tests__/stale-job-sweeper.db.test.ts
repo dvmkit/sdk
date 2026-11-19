@@ -51,7 +51,6 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
       messages: [],
       seq: 0,
       paidMsats: 1000,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: lastActivityAt,

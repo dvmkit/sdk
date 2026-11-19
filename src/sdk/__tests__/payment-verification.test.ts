@@ -31,7 +31,6 @@ function makeJob(overrides?: Partial<ServerJob>): ServerJob {
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     pendingPaymentMsats: 1000,
     listeners: new Set(),
     abort: new AbortController(),

@@ -25,7 +25,6 @@ function record(status: JobRecord["status"] = "processing"): JobRecord {
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     stepCache: [],
     state: {},
     createdAt: 1000,
@@ -223,7 +222,7 @@ describe("SDK terminal attribution and timing", () => {
         executions++;
         ctx.complete("paid");
       }, () => { fallbackPayments++; });
-      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
       await jm.persistJob(job);
       jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
       await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
@@ -276,7 +275,7 @@ describe("SDK terminal attribution and timing", () => {
       resumed = true;
       ctx.complete("duplicate");
     });
-    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
     await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
@@ -300,7 +299,7 @@ describe("SDK terminal attribution and timing", () => {
         await Promise.all([ctx.prompt("a", "A?"), ctx.prompt("b", "B?")]);
         ctx.complete("both answered");
       });
-      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
       await jm.persistJob(job);
       jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
       await jm.persistJob(job);
@@ -349,7 +348,7 @@ describe("SDK terminal attribution and timing", () => {
       executions++;
       ctx.complete("answered and paid");
     });
-    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
     await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
@@ -434,7 +433,7 @@ describe("SDK terminal attribution and timing", () => {
       executions++;
       ctx.complete("answered and paid");
     });
-    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
     await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
@@ -500,7 +499,7 @@ describe("SDK terminal attribution and timing", () => {
       executions++;
       ctx.complete("answered and paid");
     });
-    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
     await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());
@@ -576,7 +575,7 @@ describe("SDK terminal attribution and timing", () => {
       resumed = true;
       ctx.complete("duplicate");
     });
-    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
     await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());

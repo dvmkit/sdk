@@ -201,7 +201,7 @@ async function failJob(
     const job = jm.createJob(
       { input: "hi" },
       "requester-1",
-      { ...payment, receivedProofs: [], ...draw },
+      { ...payment, ...draw },
       100_000,
       "do"
     );

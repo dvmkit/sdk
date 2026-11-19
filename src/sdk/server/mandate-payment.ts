@@ -53,7 +53,11 @@ export async function settleMandateAsk(args: {
       pending_payment_fiat_currency: string | null; pending_payment_msats: string | null;
       stop_requested: boolean; stop_reason: string | null;
       asked_topup_micro: string | null; next_seq: number; mandate: StandingMandate | null;
-    }>("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [args.jobId]);
+    }>(
+      `SELECT status, dvm_id, requester_pubkey, credit_id, draw_id, pending_payment_fiat_micro,
+              pending_payment_fiat_currency, pending_payment_msats, stop_requested, stop_reason,
+              asked_topup_micro, next_seq, mandate
+       FROM jobs WHERE id=$1 FOR UPDATE`, [args.jobId]);
     const job = jobs.rows[0];
     const mandate = job?.mandate;
     if (!job || !mandate || (job.dvm_id !== null && job.dvm_id !== args.dvmId) || !job.requester_pubkey ||

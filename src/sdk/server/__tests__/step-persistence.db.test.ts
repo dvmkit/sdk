@@ -48,7 +48,7 @@ describe.skipIf(!RUN)("durable step records", () => {
   function record(): JobRecord {
     return {
       id: randomUUID(), tags: [], capability: "test", input: "", params: {}, requesterId: "requester",
-      status: "processing", messages: [], seq: 0, paidMsats: 0, receivedProofs: [],
+      status: "processing", messages: [], seq: 0, paidMsats: 0,
       stepCache: [], state: {}, createdAt: Date.now(), lastActivityAt: Date.now(),
     };
   }
@@ -64,7 +64,7 @@ describe.skipIf(!RUN)("durable step records", () => {
       stepped.resolve();
       await hang.promise;
     });
-    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
     await jm.persistJob(job);
     jm.runHandler(job, jm.buildAndAttachContext(job, ""));
     try {
@@ -92,7 +92,7 @@ describe.skipIf(!RUN)("durable step records", () => {
       answered.resolve(answer);
     };
     const first = manager(handler);
-    const job = first.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const job = first.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
     await first.persistJob(job);
     const failed = Promise.withResolvers<void>();
     const save = vi.spyOn(store, "save").mockImplementation(async () => {

@@ -24,7 +24,6 @@ function seedRecord(overrides: Partial<JobRecord> = {}): JobRecord {
     messages: [],
     seq: 0,
     paidMsats: 19_000,
-    receivedProofs: [],
     stepCache: [],
     state: {},
     createdAt: Date.now() - STALE_AGE_MS,
@@ -228,7 +227,7 @@ describe("JobManager stale-job sweeper", () => {
       const job = owner.createJob(
         { input: "hello" },
         "requester-1",
-        { paidMsats: 0, receivedProofs: [] },
+        { paidMsats: 0 },
         undefined,
         "test"
       );
@@ -319,7 +318,7 @@ describe("status-aware watchdog + worker heartbeat", () => {
       });
 
       try {
-        const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+        const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "test");
         const ctx = jm.buildAndAttachContext(job, "");
         await jm.persistJob(job);
         jm.runHandler(job, ctx);
@@ -359,7 +358,7 @@ describe("status-aware watchdog + worker heartbeat", () => {
     });
 
     try {
-      const job = owner.createJob({ input: "" }, "test", { paidMsats: 19_000, receivedProofs: [] }, undefined, "test");
+      const job = owner.createJob({ input: "" }, "test", { paidMsats: 19_000 }, undefined, "test");
       const ctx = owner.buildAndAttachContext(job, "");
       await owner.persistJob(job);
       owner.runHandler(job, ctx);
@@ -388,7 +387,7 @@ describe("status-aware watchdog + worker heartbeat", () => {
     });
 
     try {
-      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "test");
       const ctx = jm.buildAndAttachContext(job, "");
       await jm.persistJob(job);
       jm.runHandler(job, ctx);

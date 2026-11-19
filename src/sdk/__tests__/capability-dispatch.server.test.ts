@@ -337,7 +337,6 @@ describe("capability dispatch", () => {
       messages: [],
       seq: 0,
       paidMsats: 0,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

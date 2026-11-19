@@ -99,7 +99,6 @@ async function cancelStored(opts: {
     {
       paidMsats: opts.paidMsats ?? 100_000,
       ...(opts.paymentRail === null ? {} : { paymentRail: "cashu" as const }),
-      receivedProofs: [],
       ...opts.credit,
     },
     100_000,

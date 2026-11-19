@@ -328,7 +328,7 @@ describe("unsigned x402 settled after the job", () => {
     });
     try {
       const payment: PaymentInfo = {
-        paidMsats: PRICE_MSATS, receivedProofs: [], paymentRail: rail,
+        paidMsats: PRICE_MSATS, paymentRail: rail,
         ...(rail === "x402" && { creditId: implicitCreditId("x402", TX) }),
       };
       const job = jobs.createJob(

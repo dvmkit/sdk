@@ -67,7 +67,6 @@ describe.skipIf(!RUN)("signed receipts (Postgres)", () => {
       seq: 0,
       paidMsats: 19_000,
       paymentRail: "cashu",
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: now,

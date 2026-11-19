@@ -211,7 +211,9 @@ When you pass `env` to `serve()` or `createDVMHost()`, that object is the comple
 
 ## Job content retention and case holds
 
-`configureDVM` defaults `jobRetentionDays` to 730. Set a shorter or longer whole-day window explicitly, or `0` to disable automatic age expiry. Only completed, failed, and cancelled jobs are eligible. The terminal `lastActivityAt` is frozen: reads, receipt delivery, late messages, and re-saving an outcome do not renew it. The sweep removes input, params, summary, messages, state, caches, and bearer proofs; it preserves durable status, signed receipts, payment amounts, and recovery linkage.
+`configureDVM` defaults `jobRetentionDays` to 730. Set a shorter or longer whole-day window explicitly, or `0` to disable automatic age expiry. Only completed, failed, and cancelled jobs are eligible. The terminal `lastActivityAt` is frozen: reads, receipt delivery, late messages, and re-saving an outcome do not renew it. The sweep removes input, params, summary, messages, state, and caches. It preserves durable status, signed receipts, payment amounts, and recovery linkage.
+
+The Cashu wallet accumulator stores inbound proofs. New Postgres job tables omit `received_proofs`, and existing tables can retain the column with its original default. If the column exists, the sweep erases its historical values with other eligible job content.
 
 Authenticated job submit, request-result, status and JSON message responses expose `content_expires_at` (epoch milliseconds or `null`) and `content_available` (boolean). A null deadline means the job is active, expiry is disabled, or an active hold suppresses it. A past deadline can still have available content until the sweep runs. Missing fields on an older service or unsupported custom store mean unknown. SSE messages retain their existing event format; read job status for expiry.
 

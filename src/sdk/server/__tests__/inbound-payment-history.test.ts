@@ -180,7 +180,7 @@ describe("inbound payment history", () => {
       env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, fxFetcher: createFxFetcher(),
     });
     try {
-      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
       await jm.persistJob(job);
       providerMessage(job, "text", { text: "Before payment" });
       await jm.persistJob(job);
@@ -208,7 +208,7 @@ describe("inbound payment history", () => {
       fxFetcher: createFxFetcher(),
     });
     try {
-      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
       await jm.persistJob(job);
       const local: string[] = [];
       const durable: string[] = [];
@@ -244,7 +244,7 @@ describe("inbound payment history", () => {
       fxFetcher: createFxFetcher(),
     });
     try {
-      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
       await jm.persistJob(job);
       const seen: string[] = [];
       const unsubscribe = await store.subscribeMessages(job.id, 0, message => seen.push(message.type));
@@ -284,7 +284,7 @@ describe("inbound payment history", () => {
         supportedCurrencies: () => ["usd"],
       },
     });
-    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
     job.pendingPaymentMsats = 1000;
     try {
       await jm.persistJob(job);

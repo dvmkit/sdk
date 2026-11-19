@@ -5,8 +5,6 @@ import { paymentFailureFields } from "./payment-diagnostics";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-
-import type { ProofLike } from "@cashu/cashu-ts";
 import { Challenge } from "mppx";
 
 import type { LockPubkey } from "../../lib/cashu/lock-pubkey";
@@ -138,7 +136,6 @@ export interface PaymentInfo {
    * ledger book it instead of silently dropping the row.
    */
   paymentRail?: FundingMethod;
-  receivedProofs: ProofLike[];
   /**
    * Settlement reference for the credit. x402 carries the EVM tx hash from
    * the facilitator; mpp carries the credential's `challenge.id`,
@@ -771,7 +768,6 @@ async function verifyCardFundingInScope(
   if (!credential) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: {
           error: "payment_required",
@@ -843,7 +839,6 @@ async function verifyCardFundingInScope(
     });
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("payment_invalid", {
           message: "The card was charged but the credit could not be recorded.",
@@ -860,7 +855,6 @@ async function verifyCardFundingInScope(
     {
       paidMsats: 0,
       paymentRail: "stripe",
-      receivedProofs: [],
       paymentTxHash: charged.paymentIntentId,
       nativeAmount: cents,
       nativeAsset: "usd-cents",
@@ -943,7 +937,6 @@ function cardChargeRefusal(outcome: CardChargeFailure, challenges: Challenge.Cha
   }[outcome.reason];
   return {
     paidMsats: 0,
-    receivedProofs: [],
     error: {
       body: paymentErrorBody("payment_invalid", {
         message: `Card funding refused (${outcome.reason}): ${outcome.message}.`,
@@ -1189,7 +1182,6 @@ async function verifyUpfrontPaymentInScope(
     if (existingDraw) {
       return {
         paidMsats: 0,
-        receivedProofs: [],
         replayedDraw: {
           creditId: creditEnv.creditId,
           drawId: creditEnv.drawId,
@@ -1228,7 +1220,6 @@ async function verifyUpfrontPaymentInScope(
     if (!mints?.length) {
       return {
         paidMsats: 0,
-        receivedProofs: [],
         error: {
           body: paymentErrorBody("cashu_unavailable", {
             message: "This DVM is not configured to accept Cashu payments.",
@@ -1255,7 +1246,6 @@ async function verifyUpfrontPaymentInScope(
     // proofs via the agent-wallet accumulator path are valid.
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("cashu_not_p2pk_locked", {
           message: "This DVM requires P2PK-locked Cashu proofs. Initialize an agent wallet first.",
@@ -1323,7 +1313,6 @@ async function verifyUpfrontPaymentInScope(
         if (accepted.reason === "settlement_not_on_chain" && accepted.corrective === false) {
           return {
             paidMsats: 0,
-            receivedProofs: [],
             error: {
               body: paymentErrorBody(accepted.reason, {
                 message: "x402 channel deposit was not found on chain",
@@ -1337,7 +1326,6 @@ async function verifyUpfrontPaymentInScope(
         }
         return {
           paidMsats: 0,
-          receivedProofs: [],
           error: {
             body: paymentErrorBody("payment_invalid", {
               message: `x402 channel payment refused: ${accepted.reason}`,
@@ -1356,7 +1344,6 @@ async function verifyUpfrontPaymentInScope(
         {
           paidMsats: requiredMsats,
           paymentRail: "x402",
-          receivedProofs: [],
           paymentTxHash: accepted.value.funding.paymentId,
           nativeAmount: requiredUsdcMicro,
           nativeAsset: "usdc",
@@ -1376,7 +1363,6 @@ async function verifyUpfrontPaymentInScope(
       logCredentialRejected("x402", "upfront", err);
       return {
         paidMsats: 0,
-        receivedProofs: [],
         error: {
           body: paymentErrorBody("payment_invalid", {
             message: "x402 channel payment verification failed",
@@ -1569,7 +1555,6 @@ async function verifyUpfrontPaymentInScope(
           {
             paidMsats,
             paymentRail: "x402",
-            receivedProofs: [],
             paymentTxHash: receipt.txHash,
             paymentTransactionHash: receipt.txHash,
             nativeAmount: receipt.amountUsdcMicro,
@@ -1582,7 +1567,6 @@ async function verifyUpfrontPaymentInScope(
       }
       return {
         paidMsats: 0,
-        receivedProofs: [],
         error: {
           body: paymentErrorBody("payment_invalid", {
             message: "x402 payment verification failed",
@@ -1596,7 +1580,6 @@ async function verifyUpfrontPaymentInScope(
       logCredentialRejected("x402", "upfront", err);
       return {
         paidMsats: 0,
-        receivedProofs: [],
         error: {
           body: paymentErrorBody("payment_invalid", { message: "x402 verification error" }),
           status: 402,
@@ -1662,7 +1645,6 @@ async function verifyUpfrontPaymentInScope(
           );
           return {
             paidMsats: 0,
-            receivedProofs: [],
             error: {
               body: paymentErrorBody("payment_invalid", {
                 message: sessionUnavailable.message,
@@ -1736,7 +1718,6 @@ async function verifyUpfrontPaymentInScope(
         );
         return {
           paidMsats: 0,
-          receivedProofs: [],
           error: {
             body: paymentErrorBody("payment_invalid", {
               message: "MPP credential already used",
@@ -1855,7 +1836,6 @@ async function verifyUpfrontPaymentInScope(
         );
         return {
           paidMsats: 0,
-          receivedProofs: [],
           error: {
             body: paymentErrorBody("payment_invalid", {
               message: TEMPO_SESSION_UPDATED_REASON,
@@ -1938,7 +1918,6 @@ async function verifyUpfrontPaymentInScope(
         {
           paidMsats: requiredMsats,
           paymentRail: "tempo",
-          receivedProofs: [],
           paymentTxHash: cred.challenge.id,
           paymentTransactionHash: tempoReceiptTransactionHash(tempoReceipt),
           nativeAmount: methodNativeAmountFromDecimal(expectedAmount, cred.challenge.method),
@@ -1965,7 +1944,6 @@ async function verifyUpfrontPaymentInScope(
       );
       return {
         paidMsats: 0,
-        receivedProofs: [],
         error: {
           body: paymentErrorBody("payment_invalid", {
             message: "MPP credential verification failed",
@@ -2000,7 +1978,6 @@ async function verifyUpfrontPaymentInScope(
         });
         return {
           paidMsats: 0,
-          receivedProofs: [],
           replayedDraw: { creditId: draw.creditId, drawId: draw.drawId, jobId: rec?.jobId ?? null },
         };
       }
@@ -2011,7 +1988,6 @@ async function verifyUpfrontPaymentInScope(
       const rv = draw.railValue;
       return {
         paidMsats: rv.drawMsats > 0 ? rv.drawMsats : requiredMsats,
-        receivedProofs: [],
         paymentRail: railAsFundingMethod(rv.rail),
         paymentMint: rv.mint ?? undefined,
         paymentTxHash: drawSettlementRef(ledgerCtx.dvmId, draw.creditId, draw.drawId),
@@ -2064,7 +2040,6 @@ async function verifyUpfrontPaymentInScope(
         : undefined;
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: {
           error: "payment_required",
@@ -2080,7 +2055,7 @@ async function verifyUpfrontPaymentInScope(
     };
   }
 
-  return { paidMsats: 0, receivedProofs: [] };
+  return { paidMsats: 0 };
 }
 
 function tempoReceiptTransactionHash(
@@ -3266,7 +3241,6 @@ async function verifyIncomingPaymentInScope(
           // an already-settled job suspended.
           paidMsats: snapshot.pendingPaymentMsats ?? receipt.amountMsats,
           paymentRail: "x402",
-          receivedProofs: [],
           paymentTxHash: receipt.txHash,
           nativeAmount: receipt.amountUsdcMicro,
           nativeAsset: "usdc",
@@ -3402,7 +3376,6 @@ async function verifyIncomingPaymentInScope(
         {
           paidMsats: expectedMsats,
           paymentRail: "tempo",
-          receivedProofs: [],
           paymentTxHash: credential.challenge.id,
           nativeAmount: creditNative,
           nativeAsset,
@@ -3594,7 +3567,6 @@ async function acceptDurableExactIncoming(args: {
       ...(replayedDrawFunding && { drawFunding: replayedDrawFunding }),
       paidMsats: args.snapshot.pendingPaymentMsats ?? accepted.receipt.amountMsats,
       paymentRail: "x402",
-      receivedProofs: [],
       paymentTxHash:
         replayedDrawFound && replayedCreditId && replayedDrawId
           ? drawSettlementRef(ledgerCtx.dvmId, replayedCreditId, replayedDrawId)
@@ -3830,7 +3802,6 @@ async function verifyAccumulatorReceipt(
   if (!cashuToken || (!accumulatorDb && !opts.disposableCashu) || !dvmId || !lockPubkeys || lockPubkeys.length === 0) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("cashu_unavailable", {
           message: "Accumulator path is not fully configured.",
@@ -3850,7 +3821,6 @@ async function verifyAccumulatorReceipt(
   if (mintHealthTracker && !mintHealthTracker.initialProbeComplete()) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("mint_health_pending", {
           message: "Mint health check is still in progress — retry in a moment.",
@@ -3880,7 +3850,6 @@ async function verifyAccumulatorReceipt(
     const healthy = mintHealthTracker.healthyMints();
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("cashu_mint_sick", {
           message: `Mint ${tokenMint} is currently unhealthy. Retry with a token minted at a healthy mint.`,
@@ -4004,7 +3973,6 @@ async function verifyAccumulatorReceipt(
     const requestId = result.requestId;
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody(result.code, {
           message: result.message,
@@ -4099,7 +4067,6 @@ async function verifyAccumulatorReceipt(
     const held = ledgerCtx?.midJob ? credited : undefined;
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("payment_insufficient", {
           message: `Payment of ${result.paidMsats} msats is short of the ${requiredMsats} msats required.`,
@@ -4139,7 +4106,6 @@ async function verifyAccumulatorReceipt(
       paidMsats: result.paidMsats,
       paymentMint: result.mintUrl,
       paymentRail: "cashu",
-      receivedProofs: [],
       // The request id the proofs were banked under, supplied or derived, is
       // the per-call settlement reference for revenue_events.tx_hash. Unique
       // per (dvm_id, request_id) by the wallet_accumulator UNIQUE constraint,
@@ -5455,7 +5421,6 @@ async function acceptDurableExactUpfront(args: {
   if (accepted.outcome === "ambiguous") {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("x402_settlement_ambiguous", {
           message: `Exact x402 settlement ${accepted.intentId} has an economically ambiguous outcome.`,
@@ -5471,7 +5436,6 @@ async function acceptDurableExactUpfront(args: {
   if (accepted.outcome === "rejected") {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("payment_invalid", {
           message: "x402 payment verification failed",
@@ -5489,7 +5453,6 @@ async function acceptDurableExactUpfront(args: {
         true
       ) ?? {
         paidMsats: 0,
-        receivedProofs: [],
       }
     );
   }
@@ -5501,7 +5464,6 @@ async function acceptDurableExactUpfront(args: {
     {
       paidMsats,
       paymentRail: "x402",
-      receivedProofs: [],
       paymentTxHash: accepted.receipt.txHash,
       paymentTransactionHash: accepted.receipt.txHash,
       nativeAmount: authorizedUsdcMicro,
@@ -5544,7 +5506,6 @@ async function acceptDeferredExactUpfront(args: {
 }): Promise<PaymentResult> {
   const refuse = (error: NonNullable<PaymentResult["error"]>["body"], status = 402): PaymentResult => ({
     paidMsats: 0,
-    receivedProofs: [],
     error: {
       body: error,
       status,
@@ -5615,7 +5576,7 @@ async function acceptDeferredExactUpfront(args: {
         new ProcessedPaymentReplayError("x402", prepared.intentId),
         args.x402Requirements,
         true
-      ) ?? { paidMsats: 0, receivedProofs: [] }
+      ) ?? { paidMsats: 0 }
     );
   }
   args.deferred.settler.hold(prepared.intentId, {
@@ -5629,7 +5590,6 @@ async function acceptDeferredExactUpfront(args: {
   return {
     paidMsats,
     paymentRail: "x402",
-    receivedProofs: [],
     nativeAmount: authorizedUsdcMicro,
     nativeAsset: "usdc",
     creditId,
@@ -5775,7 +5735,6 @@ function mapLedgerCommitError(
   if (err instanceof ProcessedPaymentReplayError) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         body: paymentErrorBody("replay_rejected", {
           message: `Payment ${err.paymentId} on rail ${err.rail} was already processed at this DVM.`,
@@ -5789,7 +5748,6 @@ function mapLedgerCommitError(
   if (err instanceof ReplayedDrawError) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       replayedDraw: { creditId: err.draw.creditId, drawId: err.draw.drawId, jobId: null },
     };
   }
@@ -5804,7 +5762,6 @@ function mapLedgerCommitError(
   if (err instanceof X402SettlementSubmissionError) {
     return {
       paidMsats: 0,
-      receivedProofs: [],
       error: {
         // A fixed message plus the reason enum, never `err.message`: that string
         // is upstream's and may include the relay lock holder's
@@ -5877,7 +5834,6 @@ function creditLedgerErrorResult(
   const bindingMismatch = err.code === "rail_mismatch";
   return {
     paidMsats: 0,
-    receivedProofs: [],
     error: {
       body: paymentErrorBody(code, {
         message: err.message,
@@ -6209,7 +6165,6 @@ function creditRefusal(
 ): PaymentResult {
   return {
     paidMsats: 0,
-    receivedProofs: [],
     error: {
       body: paymentErrorBody(code, { message, extra: opts?.extra, hint: opts?.hint }),
       status: opts?.status ?? 402,
@@ -6282,7 +6237,7 @@ async function resolveRateOrNull(fetcher?: FxFetcher): Promise<number | null> {
 
 /** `verifyUpfrontPayment`'s no-rate refusal, in its `PaymentResult` shape. */
 function rateUnavailableResult(): PaymentResult {
-  return { paidMsats: 0, receivedProofs: [], error: rateUnavailablePaymentError() };
+  return { paidMsats: 0, error: rateUnavailablePaymentError() };
 }
 
 /** Typed refusal shared by upfront and mid-job x402 acceptance gates. */
@@ -6299,7 +6254,6 @@ function x402NotOfferedPaymentError(currency?: string): PaymentErrorDetail {
 function x402NotOfferedResult(currency?: string): PaymentResult {
   return {
     paidMsats: 0,
-    receivedProofs: [],
     error: x402NotOfferedPaymentError(currency),
   };
 }

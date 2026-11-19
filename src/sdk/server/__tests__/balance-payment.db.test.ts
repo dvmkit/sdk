@@ -51,7 +51,7 @@ describe.skipIf(!RUN)("balance payment atomic persistence", () => {
       expiryMs: Date.now() + 86_400_000, basis: { rail: "cashu", paidMsats: 100_000 } });
     await store.save({ id: "job", tags: [], capability: "run", input: "", params: {},
       requesterId: "caller", requesterPubkey: caller, requesterTokenHash: tokenHash,
-      status: "awaiting-input", messages: [], seq: 0, paidMsats: 0, receivedProofs: [],
+      status: "awaiting-input", messages: [], seq: 0, paidMsats: 0,
       stepCache: [], state: {}, createdAt: Date.now(), lastActivityAt: Date.now() });
     await store.appendOutgoing("job", { from: "provider", type: "payment-request", timestamp: now,
       content: { amount_msats: 10_000, reason: "work", credit: { amount_micro: 1_000, currency: "usd" } } },

@@ -48,7 +48,6 @@ describe.skipIf(!RUN)("cross-machine NOTIFY-driven resolver wake", () => {
       seq: 0,
       paidMsats,
       pendingPaymentMsats: pending || undefined,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

@@ -17,7 +17,7 @@ describe("paid completion observer", () => {
       receiptIssuer: new ReceiptIssuer({ secret: "11".repeat(32), dvm: "observer", dvmId: "observer" }),
     });
     const record = { id: "paid", tags: [], capability: "test", input: "", params: {}, requesterId: "caller", status: "completed", messages: [], seq: 0, paidMsats: 999999,
-      paymentRail: "cashu", creditId: "credit", drawId: "draw", receivedProofs: [], stepCache: [], state: {}, createdAt: Date.now(), lastActivityAt: Date.now() } as JobRecord;
+      paymentRail: "cashu", creditId: "credit", drawId: "draw", stepCache: [], state: {}, createdAt: Date.now(), lastActivityAt: Date.now() } as JobRecord;
     await ledger.fund({ creditId: "credit", callerPubkey: "caller", currency: "eur", amountMicro: 12345, expiryMs: Date.now() + 60000,
       basis: { rail: "cashu", paidMsats: 1000, mint: "http://localhost:3338", fundingRef: "verified" } });
     await ledger.draw({ creditId: "credit", drawId: "draw", amountMicro: 12345, jobId: "paid" });

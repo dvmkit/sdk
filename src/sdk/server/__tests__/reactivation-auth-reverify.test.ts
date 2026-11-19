@@ -71,7 +71,6 @@ function seedRecord(input: string, overrides: Partial<JobRecord> = {}): JobRecor
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     stepCache: [],
     state: {},
     createdAt: Date.now() - 60_000,

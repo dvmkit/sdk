@@ -374,7 +374,7 @@ describe("draws are the revenue events", () => {
       const job = jm.createJob(
         { input: "hi" },
         "requester-1",
-        { paidMsats: 21_000, receivedProofs: [], creditId: "c1", drawId: "d1" },
+        { paidMsats: 21_000, creditId: "c1", drawId: "d1" },
         21_000,
         "do"
       );
@@ -516,7 +516,6 @@ describe("a multi-rate credit books what the deposit was worth", () => {
         {
           paidMsats,
           paymentRail: "cashu",
-          receivedProofs: [],
           creditId: "c1",
           drawId: "d1"
         },

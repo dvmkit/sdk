@@ -47,7 +47,7 @@ describe("verifyUpfrontPayment — accumulator path threads revenue fields", () 
     expect(result.paymentMint).toBe(MINT);
     expect(result.paymentTxHash).toBe("req-accum-uuid");
     expect(result.cashuFlow).toBe("p2pk_accumulator");
-    expect(result.receivedProofs).toEqual([]);
+    expect(result).not.toHaveProperty("receivedProofs");
   });
 
   it("does not populate paymentTxHash on rejection", async () => {

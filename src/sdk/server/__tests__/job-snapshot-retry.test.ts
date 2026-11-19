@@ -7,7 +7,7 @@ import { PostgresJobStore } from "../postgres-job-store";
 const job: JobRecord = {
   id: "snapshot-retry", tags: [], capability: "test", input: "hello", params: {}, requesterId: "requester",
   requesterPubkey: "11".repeat(32), requestId: "request-retry", status: "processing",
-  messages: [], seq: 0, paidMsats: 0, receivedProofs: [], stepCache: [], state: {},
+  messages: [], seq: 0, paidMsats: 0, stepCache: [], state: {},
   createdAt: 1, lastActivityAt: 1,
 };
 const duplicate = () => Object.assign(new Error("duplicate caller/request"), {

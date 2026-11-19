@@ -19,7 +19,7 @@ function context(saveStep?: (jobId: string, record: StepRecord) => Promise<void>
     env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, staleJobTimeoutMs: 0, fxFetcher: createFxFetcher(),
   });
   managers.push(manager);
-  const job = manager.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+  const job = manager.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
   return { job, ctx: manager.buildAndAttachContext(job, "") };
 }
 

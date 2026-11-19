@@ -37,7 +37,7 @@ describe.skipIf(!RUN)("concurrent job snapshots", () => {
     return {
       id, tags: [], capability: "test", input: "hello", params: {}, requesterId: "requester",
       requesterPubkey: "11".repeat(32), requestId: id, status: "processing",
-      messages: [], seq: 0, paidMsats: 0, receivedProofs: [], stepCache: [], state: {},
+      messages: [], seq: 0, paidMsats: 0, stepCache: [], state: {},
       createdAt: Date.now(), lastActivityAt: Date.now(),
     };
   }

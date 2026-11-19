@@ -47,7 +47,6 @@ function record(id: string, status: JobStatus = "completed"): JobRecord {
     paymentTxHash: `tx-${id}`,
     nativeAmount: 21,
     nativeAsset: "sats",
-    receivedProofs: [{ amount: 1, id: "proof", secret: "secret", C: "C" }],
     pendingPaymentMsats: 10,
     pendingMppChallengeIds: ["challenge"],
     pendingX402Nonce: `0x${"01".repeat(32)}`,
@@ -121,7 +120,6 @@ describe("JobManager job-record retention", () => {
         input: "",
         params: {},
         messages: [],
-        receivedProofs: [],
         stepCache: [],
         state: {},
       });

@@ -70,7 +70,7 @@ describe("a streamable custom job store that keeps no pieces of its own", () => 
       await ledger.fund({ creditId: "c1", callerPubkey: "aa".repeat(32), currency: "usd", amountMicro: 100_000,
         expiryMs: Date.now() + 86_400_000, basis: { rail: "x402", paidMsats: 100_000, fundingRef: "upfront" } });
       const job = jm.createJob({ input: "go" }, "test", {
-        paidMsats: 100_000, receivedProofs: [], paymentRail: "x402", creditId: "c1", drawId: "d1", drawAmountMicro: 100_000,
+        paidMsats: 100_000, paymentRail: "x402", creditId: "c1", drawId: "d1", drawAmountMicro: 100_000,
       }, undefined, "work");
       await ledger.draw({ creditId: "c1", drawId: "d1", jobId: job.id, amountMicro: 100_000 });
       await jm.persistJob(job);

@@ -54,7 +54,6 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
       messages: [],
       seq: 0,
       paidMsats: 0,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),
@@ -277,7 +276,7 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     const jm = new JobManager(configureDVM({ name: "terminal-history", capability: "test", onJob: async () => undefined }), {
       env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true, fxFetcher: stubFx,
     });
-    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
     const received: string[] = [];
     let unsubscribe: (() => void) | undefined;
     try {
@@ -388,7 +387,6 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
       messages: [],
       seq: 1,
       paidMsats: 0,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

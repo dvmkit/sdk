@@ -88,7 +88,7 @@ describe.skipIf(!RUN)("jobs on two channels sharing a capability name (Postgres)
     channel?: "x402"
   ) {
     const input = JSON.stringify(data);
-    const job = jm.createJob({ input }, "anonymous", { paidMsats: 0, receivedProofs: [] }, undefined, "fetch", undefined, {
+    const job = jm.createJob({ input }, "anonymous", { paidMsats: 0 }, undefined, "fetch", undefined, {
       ...(channel ? { channel } : {}),
     });
     await jm.persistJob(job);

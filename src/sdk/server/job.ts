@@ -1,6 +1,5 @@
 import type { StandingMandate } from "./credit-envelope";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
-import type { ProofLike } from "@cashu/cashu-ts";
 
 import type {
   Message,
@@ -145,7 +144,6 @@ export interface ServerJob {
   /** Original funding artifact returned by an explicit fund-and-draw. */
   fundingReceipt?: FundingReceipt;
   fundingCredit?: CreditSnapshot;
-  receivedProofs: ProofLike[];
   pendingPaymentMsats?: number;
   /**
    * Per-job binding for MPP credentials. Contains the `challenge.id` of every
@@ -313,7 +311,6 @@ export function toJobRecord(job: ServerJob): JobRecord {
     mandate: job.mandate,
     fundingReceipt: job.fundingReceipt,
     fundingCredit: job.fundingCredit,
-    receivedProofs: job.receivedProofs,
     pendingPaymentMsats: job.pendingPaymentMsats,
     pendingMppChallengeIds: job.pendingMppChallengeIds,
     pendingX402Nonce: job.pendingX402Nonce,
@@ -372,7 +369,6 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     mandate: record.mandate,
     fundingReceipt: record.fundingReceipt,
     fundingCredit: record.fundingCredit,
-    receivedProofs: [...record.receivedProofs],
     pendingPaymentMsats: record.pendingPaymentMsats,
     pendingMppChallengeIds: record.pendingMppChallengeIds
       ? [...record.pendingMppChallengeIds]

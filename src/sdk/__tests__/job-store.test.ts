@@ -5,8 +5,8 @@ import type { ServerJob } from "../server/job";
 import { fromJobRecord, providerMessage, toJobRecord } from "../server/job";
 import type { JobRecord } from "../server/job-store";
 import { isStreamableJobStore } from "../server/job-store";
-import { MemoryJobStore } from "../server/memory-job-store";
 import { StepCache } from "../step-cache";
+import { MemoryJobStore } from "../testing";
 
 function makeJob(overrides?: Partial<ServerJob>): ServerJob {
   return {
@@ -20,7 +20,6 @@ function makeJob(overrides?: Partial<ServerJob>): ServerJob {
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     listeners: new Set(),
     abort: new AbortController(),
     stepCache: new StepCache(),
@@ -48,7 +47,6 @@ function makeRecord(overrides?: Partial<JobRecord>): JobRecord {
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     stepCache: [],
     state: { count: 0 },
     createdAt: 1000,
@@ -205,6 +203,29 @@ describe("MemoryJobStore", () => {
     expect(retrieved?.id).toBe("job-abc-1");
     expect(retrieved?.tags).toEqual(["test"]);
     expect(retrieved?.params).toEqual({ lang: "en" });
+  });
+
+  it("discards legacy proof data before saving a job", async () => {
+    const store = new MemoryJobStore();
+    const legacyRecord = {
+      ...makeRecord({ status: "completed", paidMsats: 21_000 }),
+      receivedProofs: [{ amount: 21, id: "test-keyset", secret: "test-proof", C: "test-point" }],
+    };
+    await store.save(legacyRecord);
+
+    const saved = await store.get(legacyRecord.id);
+    expect(saved).toMatchObject({ id: legacyRecord.id, paidMsats: 21_000 });
+    expect(saved).not.toHaveProperty("receivedProofs");
+
+    const redactedAt = legacyRecord.lastActivityAt + 1_000;
+    expect(await store.redactJob({
+      jobId: legacyRecord.id,
+      expectedLastActivityAt: legacyRecord.lastActivityAt,
+      redactedAt,
+    })).toBe(true);
+    const snapshot = await store.getContentSnapshot(legacyRecord.id);
+    expect(snapshot?.job).toMatchObject({ paidMsats: 21_000, redactedAt });
+    expect(snapshot?.job).not.toHaveProperty("receivedProofs");
   });
 
   it("returns clones (not references)", async () => {

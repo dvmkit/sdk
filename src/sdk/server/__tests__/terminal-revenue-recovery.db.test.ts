@@ -105,7 +105,6 @@ describe.skipIf(!RUN)("terminal revenue recovery (Postgres stores)", () => {
         paymentMint: "https://mint.example.com",
         paymentTxHash: "req-recovery-job",
         cashuFlow: "p2pk_accumulator",
-        receivedProofs: [],
         ...credit,
       },
       300_000,

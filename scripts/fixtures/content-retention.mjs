@@ -14,7 +14,7 @@ const secret = Buffer.from("11".repeat(32), "hex");
 const actor = /** @type {Awaited<ReturnType<import("@dvmkit/sdk/server").InstallAdminContentRoutesOpts["getLockPubkeyState"]>>["current"]} */ (`02${Buffer.from(schnorr.getPublicKey(secret)).toString("hex")}`);
 const now = 1760000000000;
 /** @type {import("@dvmkit/sdk/server").JobRecord} */
-const job = { id: "packed-job", tags: [], capability: "work", input: "private input", params: {}, requesterId: "caller", status: "completed", summary: "private output", messages: [], seq: 0, paidMsats: 0, receivedProofs: [], stepCache: [], state: {}, createdAt: fixture.last_activity_at, lastActivityAt: fixture.last_activity_at };
+const job = { id: "packed-job", tags: [], capability: "work", input: "private input", params: {}, requesterId: "caller", status: "completed", summary: "private output", messages: [], seq: 0, paidMsats: 0, stepCache: [], state: {}, createdAt: fixture.last_activity_at, lastActivityAt: fixture.last_activity_at };
 assert.equal(configureDVM({ name: "example", capability: "work", onJob() {} }).jobRetentionDays, 730);
 assert.deepEqual(contentMetadata(job, 730), fixture.metadata[0].expected);
 const store = new MemoryJobStore();

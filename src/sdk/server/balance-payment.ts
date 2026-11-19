@@ -71,7 +71,10 @@ export async function commitBalancePayment(args: {
       draw_id: string | null; pending_payment_fiat_micro: string | null;
       pending_payment_fiat_currency: string | null; pending_payment_msats: string | null;
       asked_topup_micro: string | null; next_seq: number;
-    }>("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [args.jobId]);
+    }>(
+      `SELECT status, dvm_id, requester_pubkey, credit_id, draw_id, pending_payment_fiat_micro,
+              pending_payment_fiat_currency, pending_payment_msats, asked_topup_micro, next_seq
+       FROM jobs WHERE id=$1 FOR UPDATE`, [args.jobId]);
     const job = jobs.rows[0];
     if (!job || (job.dvm_id !== null && job.dvm_id !== args.dvmId) || job.requester_pubkey !== pubkey) conflict("credit_payment_owner_mismatch");
     if (["completed", "failed", "cancelled"].includes(job.status)) conflict("job_not_active");
