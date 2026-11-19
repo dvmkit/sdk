@@ -4,6 +4,7 @@
 
 - A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
 - When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
+- When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
 
 ## Upgrade details
 

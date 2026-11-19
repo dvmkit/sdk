@@ -2611,17 +2611,11 @@ const PAYMENT_ERROR_COPY: Record<PaymentErrorCode, PaymentErrorCopy> = {
     hint: "Run 'dvm wallet tempo-exit <dvm>' to inspect the channel, request its on-chain exit if needed, and withdraw after the 15-minute grace period.",
     retryable: false,
   },
-  // The voucher verified and the ledger leg rolled back with the
-  // failed submission, so nothing was charged and nothing about the payment is
-  // wrong — which is exactly what the `payment_invalid` this replaced got
-  // backwards, telling an agent to discard a credential that is still good. The
-  // copy must not send them to a fresh quote (the channel voucher is reusable
-  // and re-signing changes nothing) and must not read as their fault: the one
-  // action that helps is the same request again, shortly.
+  // A facilitator can lose its result after the deposit lands. The same signed
+  // request lets the service reconcile the deposit from its saved submission block.
   x402_settlement_submission_failed: {
-    display:
-      "The service couldn't put this payment through to the chain just now, so the request didn't run. Nothing was charged, and the payment is still good.",
-    hint: "Retry the same request shortly — it's a service-side chain problem, not a problem with the payment. Don't request a fresh quote or re-sign; if it persists, contact the service operator.",
+    display: "The service couldn't confirm whether your deposit went through.",
+    hint: "Retry the same request shortly with the original signed body and PAYMENT-SIGNATURE header. If the problem persists, contact the service operator.",
     retryable: true,
   },
   settlement_not_on_chain: {

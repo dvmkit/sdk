@@ -36,7 +36,11 @@ import { PostgresProcessedPaymentStore } from "../processed-payment-store";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
 import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
-import { createX402BatchSettlementServer } from "../x402-batch-settlement";
+import {
+  createX402BatchSettlementServer,
+  type CreateX402BatchSettlementServerOpts,
+  type X402BatchSettlementServer,
+} from "../x402-batch-settlement";
 import { PostgresX402ChannelStorage } from "../x402-channel-store";
 import type { X402FacilitatorHealthLike } from "../x402-facilitator-support";
 import { createX402SelfRelaySigner } from "../x402-self-relay";
@@ -151,6 +155,85 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     await admin.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
     await admin.end();
   });
+
+  async function signedDepositRequest(args: {
+    server: X402BatchSettlementServer;
+    config: CreateX402BatchSettlementServerOpts["config"];
+    receiver: `0x${string}`;
+    creditId: string;
+    fundId: string;
+    amountMicro: number;
+  }) {
+    const { server, config, receiver, creditId, fundId, amountMicro } = args;
+    const processedPayments = new PostgresProcessedPaymentStore(pool);
+    await processedPayments.init();
+    const [requirements] = await server.buildRequirements(String(amountMicro));
+    const { paymentHeader, channelId } = await depositPayment(
+      receiver,
+      requirements as PaymentRequirements
+    );
+    const fxFetcher: FxFetcher = {
+      fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
+      lastKnown: () => null,
+      supportedCurrencies: () => ["usd"],
+    };
+    const app = new Hono<AppEnv>();
+    const auth = secp256k1Auth();
+    app.post("/v1/credit", (c) =>
+      handleCreditRequest(c, {
+        auth,
+        ledger,
+        fxFetcher,
+        menu: async () => ({
+          currency: "usd",
+          funding: ["x402"],
+          min_micro: amountMicro,
+          max_micro: 1_000_000,
+          ttl_ms: 86_400_000,
+        }),
+        creditConfig: {
+          min: "$0.0001",
+          max: "$1.00",
+          ttlSeconds: 86_400,
+          allowOneShotStablecoin: true,
+        },
+        railOpts: async (request) => ({
+          x402Config: { network: NETWORK, payTo: receiver, batchSettlement: config },
+          x402Payment: request.req.header("PAYMENT-SIGNATURE"),
+          x402BatchSettlement: server,
+          creditLedger: ledger,
+          processedPayments,
+          dvmId: "deposit-retry-test",
+        }),
+        onDeposit: () => undefined,
+        drainReport: {},
+        receiptIssuer: undefined,
+        lightning: undefined,
+        settleLightning: async () => undefined,
+      })
+    );
+    const signer = createSignedRequestVerifier(CREDIT_REQUEST_SCHEMA);
+    const signedBody = JSON.stringify(
+      signer.signRequest(new Uint8Array(32).fill(7), {
+        op: "fund",
+        credit_id: creditId,
+        fund: {
+          fund_id: fundId,
+          amount_micro: amountMicro,
+          commitment: fundingCommitment(paymentHeader),
+        },
+      })
+    );
+    return {
+      channelId,
+      fund: () =>
+        app.request("/v1/credit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "PAYMENT-SIGNATURE": paymentHeader },
+          body: signedBody,
+        }),
+    };
+  }
 
   it("stores the complete upstream channel shape and serializes concurrent updates", async () => {
     await storage.updateChannel(CHANNEL_ID, () => channel());
@@ -1458,7 +1541,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     }
   );
 
-  it("reconciles a mined deposit when the facilitator reports a post-submit failure", async () => {
+  it("reports an unknown deposit outcome and recovers the mined deposit on the identical funding request", async () => {
     const receiver = privateKeyToAccount(generatePrivateKey());
     const minedTransaction = `0x${"67".repeat(32)}`;
     const balances = new Map<string, bigint>();
@@ -1481,65 +1564,87 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
         }
       ),
     };
-    const evidence = vi.fn(async () => {
+    const findAppliedSettlement = vi.fn(async () => {
       const balance = [...balances.values()][0] ?? 0n;
       return balance === 1000n ? { transaction: minedTransaction, amount: "1000" } : undefined;
     });
+    const config = {
+      facilitatorClient: facilitator,
+      receiverAuthorizerSigner: receiver,
+      autoSettlement: false as const,
+    };
     const server = await createX402BatchSettlementServer({
       network: NETWORK,
       payTo: receiver.address,
       db: pool,
       earnedNative: earnedNothing,
-      config: {
-        facilitatorClient: facilitator,
-        receiverAuthorizerSigner: receiver,
-        autoSettlement: false,
-      },
+      config,
       settlementEvidenceReader: {
         getBlockNumber: async () => 100n,
-        findAppliedSettlement: evidence,
+        findAppliedSettlement,
       },
     });
-    const [built] = await server.buildRequirements("100");
-    const requirements = built as PaymentRequirements;
-    const deposit = await depositPayment(receiver.address, requirements);
-    const effectId = "reported-failure-recovery-credit:fund-1";
 
     try {
-      await expect(
-        server.accept({
-          paymentHeader: deposit.paymentHeader,
-          amount: "100",
-          operation: "fund",
-          effectId,
-          commit: async () => "first-attempt",
-        })
-      ).rejects.toMatchObject({ code: "x402_settlement_submission_failed" });
+      const creditId = "reported-failure-recovery-credit";
+      const fundId = "fund-1";
+      const effectId = `${creditId}:${fundId}`;
+      const amountMicro = 100;
+      const { fund, channelId } = await signedDepositRequest({
+        server,
+        config,
+        receiver: receiver.address,
+        creditId,
+        fundId,
+        amountMicro,
+      });
+
+      const failed = await fund();
       expect(facilitator.settle).toHaveBeenCalledOnce();
-      expect(balances.get(deposit.channelId.toLowerCase())).toBe(1000n);
+      expect(balances.get(channelId.toLowerCase())).toBe(1000n);
+      expect(failed.status).toBe(503);
+      const failure = await failed.json();
+      expect(failure).toMatchObject({
+        error: "x402_settlement_submission_failed",
+        retryable: true,
+        display: expect.stringMatching(/couldn't confirm whether .*deposit went through/i),
+        hint: expect.stringMatching(/retry the same request .*original signed body.*PAYMENT-SIGNATURE/i),
+      });
+      expect(failure.display).not.toMatch(/nothing was charged|no charge occurred/i);
+      expect(failure).not.toHaveProperty("accepts");
+      expect(failed.headers.has("PAYMENT-REQUIRED")).toBe(false);
+      expect(await ledger.getFunding({ creditId, fundId })).toBeUndefined();
       expect(await storage.getSettlement("fund", effectId)).toMatchObject({
         status: "submitting",
         submissionBlock: "100",
       });
 
-      const recovered = await server.accept({
-        paymentHeader: deposit.paymentHeader,
-        amount: "100",
-        operation: "fund",
-        effectId,
-        commit: async () => "recovered",
+      const recovered = await fund();
+      expect(recovered.status).toBe(200);
+      expect(await recovered.json()).toMatchObject({ funded_micro: amountMicro, replayed: false });
+      const settlementHeader = recovered.headers.get("PAYMENT-RESPONSE");
+      if (!settlementHeader) throw new Error("Missing recovered PAYMENT-RESPONSE header");
+      expect(JSON.parse(Buffer.from(settlementHeader, "base64").toString("utf8"))).toMatchObject({
+        success: true,
+        transaction: minedTransaction,
       });
-      expect(recovered).toMatchObject({
-        ok: true,
-        value: {
-          committed: "recovered",
-          settlement: { success: true, transaction: minedTransaction, amount: "1000" },
-        },
-      });
-      expect(evidence).toHaveBeenCalledOnce();
+      expect(findAppliedSettlement).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ effectId, submissionBlock: "100" })
+      );
       expect(facilitator.settle).toHaveBeenCalledOnce();
-      expect(balances.get(deposit.channelId.toLowerCase())).toBe(1000n);
-      expect(await storage.getSettlement("fund", effectId)).toMatchObject({ status: "complete" });
+      expect(balances.get(channelId.toLowerCase())).toBe(1000n);
+      expect(await ledger.get(creditId)).toMatchObject({
+        balanceMicro: amountMicro,
+        x402ChannelId: channelId.toLowerCase(),
+      });
+      expect(await ledger.getFunding({ creditId, fundId })).toMatchObject({
+        amountMicro,
+        rail: "x402",
+      });
+      expect(await storage.getSettlement("fund", effectId)).toMatchObject({
+        status: "complete",
+        response: { success: true, transaction: minedTransaction, amount: "1000" },
+      });
     } finally {
       await server.stop();
     }
@@ -1557,8 +1662,6 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     });
     const findAppliedSettlement = vi.fn(async () => undefined);
     let chainHead = 100n;
-    const processedPayments = new PostgresProcessedPaymentStore(pool);
-    await processedPayments.init();
     const config = {
       facilitatorClient: facilitator,
       receiverAuthorizerSigner: receiver,
@@ -1578,69 +1681,14 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       const fundId = "fund-1";
       const effectId = `${creditId}:${fundId}`;
       const amountMicro = 100;
-      const [requirements] = await server.buildRequirements(String(amountMicro));
-      const { paymentHeader, channelId } = await depositPayment(
-        receiver.address,
-        requirements as PaymentRequirements
-      );
-      const fxFetcher: FxFetcher = {
-        fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
-        lastKnown: () => null,
-        supportedCurrencies: () => ["usd"],
-      };
-      const app = new Hono<AppEnv>();
-      const auth = secp256k1Auth();
-      app.post("/v1/credit", (c) =>
-        handleCreditRequest(c, {
-          auth,
-          ledger,
-          fxFetcher,
-          menu: async () => ({
-            currency: "usd",
-            funding: ["x402"],
-            min_micro: amountMicro,
-            max_micro: 1_000_000,
-            ttl_ms: 86_400_000,
-          }),
-          creditConfig: {
-            min: "$0.0001",
-            max: "$1.00",
-            ttlSeconds: 86_400,
-            allowOneShotStablecoin: true,
-          },
-          railOpts: async (request) => ({
-            x402Config: { network: NETWORK, payTo: receiver.address, batchSettlement: config },
-            x402Payment: request.req.header("PAYMENT-SIGNATURE"),
-            x402BatchSettlement: server,
-            creditLedger: ledger,
-            processedPayments,
-            dvmId: "deposit-retry-test",
-          }),
-          onDeposit: () => undefined,
-          drainReport: {},
-          receiptIssuer: undefined,
-          lightning: undefined,
-          settleLightning: async () => undefined,
-        })
-      );
-      const signer = createSignedRequestVerifier(CREDIT_REQUEST_SCHEMA);
-      const signedBody = JSON.stringify(
-        signer.signRequest(new Uint8Array(32).fill(7), {
-          op: "fund",
-          credit_id: creditId,
-          fund: {
-            fund_id: fundId,
-            amount_micro: amountMicro,
-            commitment: fundingCommitment(paymentHeader),
-          },
-        })
-      );
-      const fund = () =>
-        app.request("/v1/credit", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "PAYMENT-SIGNATURE": paymentHeader },
-          body: signedBody,
-        });
+      const { fund, channelId } = await signedDepositRequest({
+        server,
+        config,
+        receiver: receiver.address,
+        creditId,
+        fundId,
+        amountMicro,
+      });
 
       const failed = await fund();
       expect(failed.status).toBe(503);
