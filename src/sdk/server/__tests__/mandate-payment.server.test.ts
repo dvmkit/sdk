@@ -421,17 +421,18 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       await tx.query("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", [job.job_id]);
       // A stop is committing while settlement waits: a lock-free read sees the old false flag.
       await tx.query("UPDATE jobs SET stop_requested=TRUE WHERE id=$1", [job.job_id]);
-      let lockAttempt!: () => void;
-      const attempted = new Promise<void>((resolve) => { lockAttempt = resolve; });
-      const restore = observeQueries((sql) => {
-        if (sql === "SELECT * FROM jobs WHERE id=$1 FOR UPDATE") lockAttempt();
+      const attempted = Promise.withResolvers<string>();
+      const restore = observeQueries((sql, params) => {
+        if (typeof sql === "string" && /\bmandate\s+FROM jobs WHERE id=\$1 FOR UPDATE$/.test(sql) &&
+            (params as unknown[])[0] === job.job_id) {
+          attempted.resolve(sql);
+        }
       });
       const pending = settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id });
       try {
-        await attempted;
+        const lockQuery = await attempted.promise;
         await expect.poll(async () => (await pool.query(`SELECT COUNT(*)::int AS n FROM pg_stat_activity
-          WHERE datname=current_database() AND query='SELECT * FROM jobs WHERE id=$1 FOR UPDATE'
-          AND wait_event_type='Lock'`)).rows[0].n).toBeGreaterThan(0);
+          WHERE datname=current_database() AND query=$1 AND wait_event_type='Lock'`, [lockQuery])).rows[0].n).toBeGreaterThan(0);
         await tx.query("COMMIT");
         expect(await pending).toMatchObject({ outcome: "declined" });
       } finally { restore(); }

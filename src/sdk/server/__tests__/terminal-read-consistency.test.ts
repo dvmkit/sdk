@@ -131,7 +131,7 @@ describe("terminal read recovery", () => {
       },
     });
     hosts.push(manager);
-    const job = manager.createJob({ input: "hello" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+    const job = manager.createJob({ input: "hello" }, "test", { paidMsats: 0 }, undefined, "work");
     await manager.persistJob(job);
     manager.runHandler(job, manager.buildAndAttachContext(job, "hello"));
     stale = await store.get(job.id);

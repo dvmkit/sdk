@@ -885,19 +885,8 @@ describe.skipIf(!RUN)("public request-id reservation (Postgres)", () => {
       (await poolA.query("SELECT COUNT(*)::int AS count FROM credit_draws")).rows[0].count
     ).toBe(1);
     expect((await poolA.query("SELECT COUNT(*)::int AS count FROM jobs")).rows[0].count).toBe(1);
-    const persistedJob = await poolA.query<{
-      received_proofs: unknown;
-      request_fingerprint: string;
-      requester_pubkey: string;
-      request_id: string;
-    }>(
-      `SELECT received_proofs, request_fingerprint, requester_pubkey, request_id
-         FROM jobs
-        WHERE id = $1`,
-      [originalJobId]
-    );
+    const persistedJob = await poolA.query("SELECT * FROM jobs WHERE id = $1", [originalJobId]);
     expect(persistedJob.rows[0]).toMatchObject({
-      received_proofs: [],
       requester_pubkey: CALLER_PUBKEY,
       request_id: requestId,
     });

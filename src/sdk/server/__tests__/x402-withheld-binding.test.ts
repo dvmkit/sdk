@@ -37,7 +37,7 @@ describe("an ask that withholds x402 from a job bound to a Cashu credit", () => 
       await ledger.fund({ creditId: "c1", callerPubkey: CALLER, currency: "usd", amountMicro: 100_000,
         expiryMs: Date.now() + 86_400_000, basis: { rail: "cashu", paidMsats: 100_000 } });
       const job = jm.createJob({ input: "go" }, "test", {
-        paidMsats: 100_000, receivedProofs: [], paymentRail: "cashu", creditId: "c1", drawId: "d1", drawAmountMicro: 100_000,
+        paidMsats: 100_000, paymentRail: "cashu", creditId: "c1", drawId: "d1", drawAmountMicro: 100_000,
       }, undefined, "work");
       await ledger.draw({ creditId: "c1", drawId: "d1", jobId: job.id, amountMicro: 100_000 });
       await jm.persistJob(job);

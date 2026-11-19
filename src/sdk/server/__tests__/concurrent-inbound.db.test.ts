@@ -44,7 +44,6 @@ describe.skipIf(!RUN)("concurrent inbound + advisory lock", () => {
       seq: 0,
       paidMsats,
       pendingPaymentMsats: pending || undefined,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

@@ -70,7 +70,6 @@ describe.skipIf(!RUN)("per-job cost persistence", () => {
         costCurrency: cost.currency,
         costRevision: cost.revision,
       }),
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

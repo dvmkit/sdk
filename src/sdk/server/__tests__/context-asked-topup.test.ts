@@ -31,7 +31,6 @@ function blankJob(paidMsats = 0): ServerJob {
     messages: [],
     seq: 0,
     paidMsats,
-    receivedProofs: [],
     listeners: new Set(),
     abort: new AbortController(),
     stepCache: new StepCache(),

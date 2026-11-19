@@ -12,7 +12,6 @@ export function contentJob(id = "example-job"): JobRecord {
     id, tags: [], capability: "work", input: "raw-input-secret", params: { prompt: "raw-param-secret" },
     requesterId: "anonymous", requesterTokenHash: createHash("sha256").update(TOKEN).digest("hex"),
     status: "completed", summary: "raw-output-secret", messages: [], seq: 0, paidMsats: 21000,
-    receivedProofs: [{ amount: 1, secret: "bearer-proof-secret", id: "proof", C: "point" }],
     stepCache: [], state: {}, createdAt: ACTIVITY, lastActivityAt: ACTIVITY,
   };
 }

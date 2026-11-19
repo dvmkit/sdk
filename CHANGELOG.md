@@ -18,6 +18,14 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - A standing-mandate ask the provider will not pay now carries `content.mandate_skipped.reason` on its `payment-request`, so a caller can pay the open ask at once instead of waiting out settlement timing. Providers advertise it as `credit.mandate_skipped: true` on `/v1/info`. The portable shape is in `protocol-fixtures/standing-mandate-v1.json`.
 
+### Breaking API changes
+
+- `JobRecord`, exported from `@dvmkit/sdk` and `@dvmkit/sdk/server`, drops `receivedProofs`. Payment results and `JobManager` job objects also drop the field. Remove it from custom job-store readers, writers, and record builders. The Cashu wallet accumulator owns inbound proofs, and caller change tokens follow the existing path.
+
+### Migrations
+
+- New Postgres job tables omit `received_proofs`. Existing columns can stay in place with their original empty-array default. Regular job reads and writes ignore the column, and the content sweep still erases historical values where the column exists.
+
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
 
 - JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.

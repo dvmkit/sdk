@@ -27,7 +27,6 @@ function record(overrides: Partial<JobRecord> = {}): JobRecord {
     messages: [],
     seq: 0,
     paidMsats: 0,
-    receivedProofs: [],
     stepCache: [],
     state: {},
     createdAt: 1000,
@@ -98,7 +97,7 @@ describe.skipIf(!run)("durable terminal evidence", () => {
       ctx.complete("answered");
     });
     try {
-      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+      const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
       await jm.persistJob(job);
       jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
       await jm.persistJob(job);
@@ -140,7 +139,7 @@ describe.skipIf(!run)("durable terminal evidence", () => {
         ctx.complete("answered and paid");
       });
       try {
-        const job = jm.createJob({ input: "" }, "test", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+        const job = jm.createJob({ input: "" }, "test", { paidMsats: 0 }, undefined, "work");
         await jm.persistJob(job);
         jm.runHandler(job, jm.buildAndAttachContext(job, { text: "" }));
         await vi.waitFor(() => expect(job.pendingPayment).not.toBeNull());

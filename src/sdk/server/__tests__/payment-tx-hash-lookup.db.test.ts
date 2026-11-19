@@ -53,7 +53,6 @@ describe.skipIf(!RUN)("findJobByPaymentTxHash", () => {
       paymentRail: "cashu",
       paymentTxHash: requestId,
       cashuFlow: "p2pk_accumulator",
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

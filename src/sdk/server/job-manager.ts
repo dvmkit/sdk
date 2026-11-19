@@ -1247,7 +1247,6 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       mandate: provenance?.mandate,
       fundingReceipt: payment.fundingReceipt,
       fundingCredit: payment.fundingCredit,
-      receivedProofs: payment.receivedProofs,
       requiredMsats,
       // The upfront payment buys the first piece; a free job starts with none, and so does an
       // unsigned x402 job, which is one piece settled only on completion whatever its list

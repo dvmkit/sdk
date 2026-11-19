@@ -111,7 +111,7 @@ describe("a terminal write that falls back to failing the job", () => {
       staleJobSweepIntervalMs: 86_400_000,
     });
     try {
-      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+      const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
       const ctx = jm.buildAndAttachContext(job, "");
       await jm.persistJob(job);
       const arrival = await store.recordPaymentArrival(job.id, { from: "requester", type: "payment", timestamp: 0,

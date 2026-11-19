@@ -24,7 +24,7 @@ describe.skipIf(!run)("immutable upfront payment persistence", () => {
     return {
       id: "upfront-persistence", tags: [], capability: "test", input: "", params: {},
       requesterId: "caller", status: "processing", messages: [], seq: 0,
-      paidMsats: 321, upfrontPayment, receivedProofs: [], stepCache: [], state: {},
+      paidMsats: 321, upfrontPayment, stepCache: [], state: {},
       createdAt: Date.now(), lastActivityAt: Date.now(),
     };
   }

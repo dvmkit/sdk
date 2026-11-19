@@ -120,7 +120,7 @@ describe.each([
         id: "removed-job", tags: [], capability: "removed", input: "{}", params: {},
         requesterId: "dev-anonymous",
         requesterTokenHash: createHash("sha256").update("example-job-token").digest("hex"),
-        status: "processing", messages: [], seq: 0, paidMsats: 0, receivedProofs: [],
+        status: "processing", messages: [], seq: 0, paidMsats: 0,
         stepCache: [], state: {}, createdAt: Date.now(), lastActivityAt: Date.now(),
       });
       const response = await post("/v1/job/removed-job/messages", {

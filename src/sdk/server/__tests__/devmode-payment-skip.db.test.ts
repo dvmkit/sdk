@@ -65,7 +65,7 @@ describe.skipIf(!RUN)("development payment skips preserve durable input claims",
       },
       staleJobTimeoutMs: 0, processingWatchdogMs: 0, heartbeatIntervalMs: 0,
     });
-    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+    const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
     const payment = { type: "payment" as const, content: explicit ? { dev_auto: true } : {} };
     async function pay(outcome: object = {}) {
       const seq = await jm.recordInboundPending(job, payment.type, payment.content);

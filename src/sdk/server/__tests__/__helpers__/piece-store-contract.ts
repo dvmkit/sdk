@@ -15,7 +15,7 @@ export function pieceStoreContract(name: string, open: () => Promise<StreamableJ
       const id = `pieces-${name.replaceAll(" ", "-")}-${++counter}-${Math.random().toString(16).slice(2)}`;
       const record: JobRecord = {
         id, tags: [], capability: "test", input: "", params: {}, requesterId: "requester",
-        status: "processing", messages: [], seq: 0, paidMsats: 0, receivedProofs: [], stepCache: [], state: {},
+        status: "processing", messages: [], seq: 0, paidMsats: 0, stepCache: [], state: {},
         createdAt: NOW, lastActivityAt: NOW, creditId: "c1", drawId: "d1",
         pieces: [{ amountMicro: 100_000, paidSeq: 0, state: "running" }],
       };

@@ -56,7 +56,7 @@ describe.skipIf(!run)("terminal result durability (Postgres)", () => {
     await ledger.fund({ creditId: "credit", callerPubkey: "22".repeat(32), currency: "usd", amountMicro: 1_000_000,
       expiryMs: Date.now() + 3600_000, basis: { rail: "cashu", paidMsats: 1_000_000 } });
     const job = jm.createJob({ input: "hello" }, "test", {
-      paidMsats: 100_000, receivedProofs: [], paymentRail: "cashu", creditId: "credit", drawId: "draw",
+      paidMsats: 100_000, paymentRail: "cashu", creditId: "credit", drawId: "draw",
     }, undefined, "work", createHash("sha256").update(token).digest("hex"));
     await ledger.draw({ creditId: "credit", drawId: "draw", jobId: job.id, amountMicro: 100_000 });
     await jm.persistJob(job);

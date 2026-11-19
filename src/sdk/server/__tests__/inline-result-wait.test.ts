@@ -16,7 +16,7 @@ class ObservedStore extends MemoryJobStore {
 
 const record: JobRecord = {
   id: "job-example", status: "processing", input: "", params: {}, requesterId: "anonymous",
-  tags: [], capability: "work", receivedProofs: [], stepCache: [], state: {},
+  tags: [], capability: "work", stepCache: [], state: {},
   messages: [], seq: 0, createdAt: 1, lastActivityAt: 1, paidMsats: 0,
 };
 

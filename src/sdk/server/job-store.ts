@@ -1,6 +1,5 @@
 import type { StandingMandate } from "./credit-envelope";
 import type { UpfrontPayment } from "../../lib/upfront-payment";
-import type { ProofLike } from "@cashu/cashu-ts";
 
 import type { Message, MessageType } from "../../lib/messages/types";
 import type { FundingReceipt, JobReceipt } from "../../lib/receipt";
@@ -146,7 +145,6 @@ export interface JobRecord {
   /** Funding-time evidence returned on explicit fund-and-draw submissions. */
   fundingReceipt?: FundingReceipt;
   fundingCredit?: CreditSnapshot;
-  receivedProofs: ProofLike[];
   pendingPaymentMsats?: number;
   /**
    * Per-job MPP credential binding. Challenge ids issued in the

@@ -1,7 +1,13 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.41.0",
+  "version": "0.42.0",
   "storeContracts": {
+    "PostgresJobStore.getMessageReadState": {
+      "behavior": "reads job ownership and content retention metadata, with active holds, without loading the transcript"
+    },
+    "PostgresJobStore.getMessages": {
+      "cancellationOnly": "optional boolean; return only cancel messages after deduplication and before applying the limit"
+    },
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean, limit?: number }",
       "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff",
@@ -42,6 +48,10 @@
     }
   },
   "wireContracts": {
+    "jobMessagePages": {
+      "fixture": "protocol-fixtures/job-messages-page-v1.json",
+      "behavior": "JSON limit 1 through 50 returns messages in ascending sequence order, next_after and has_more for currently releasable history; the legacy JSON and SSE contracts remain available"
+    },
     "signatureRequired": {
       "fixture": "protocol-fixtures/signature-required-v1.json",
       "status": 401,
@@ -1179,7 +1189,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "d693b8023121a4c88611a62d8129813f716ceba51f7a5a0393619d7bed0daa4a"
+          "signature": "97d705fee280253b1c301d462bc575bb9652ec13b97310c5d197ed707b3c0ba9"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1271,7 +1281,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "6882664583cb1ccec6d3a63d11ae73066e33f02fea888235ae9387e101b946b8"
+          "signature": "bee636904274ea2f77db114ef0c29009691a7f4f962fef032e1e7c5f84001c71"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
@@ -1455,7 +1465,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "b8090f5378a9031e56db9a1a3584b909449ccec0e6e59e9de62ae0b39fbc4d6f"
+          "signature": "ec8a1e854a6761f26b6914b0d1c89f70b433635948d13a1f694e6a23713f561c"
         },
         "PostgresKVStore": {
           "stability": "experimental",

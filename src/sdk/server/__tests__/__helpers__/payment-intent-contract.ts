@@ -28,7 +28,7 @@ export function paymentIntentContract(name: string, open: () => Promise<IntentSt
       const id = `intent-${name}-${++counter}-${Math.random().toString(16).slice(2)}`;
       const record: JobRecord = {
         id, tags: [], capability: "test", input: "", params: {}, requesterId: "requester",
-        status: "processing", messages: [], seq: 0, paidMsats: 0, receivedProofs: [],
+        status: "processing", messages: [], seq: 0, paidMsats: 0,
         stepCache: [], state: {}, createdAt: NOW, lastActivityAt: NOW,
       };
       await store.save(record);

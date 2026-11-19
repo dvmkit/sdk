@@ -54,7 +54,7 @@ describe("ctx.auth on the x402 channel", () => {
   it("is never taken from a parsed x402 input, at admission or on reactivation", () => {
     const jm = manager();
     try {
-      const job = jm.createJob({ input }, "anonymous", { paidMsats: 0, receivedProofs: [] }, undefined, "fetch", undefined, {
+      const job = jm.createJob({ input }, "anonymous", { paidMsats: 0 }, undefined, "fetch", undefined, {
         channel: "x402",
       });
       const parsed = jm.parseInput({ input }, "fetch", true, "x402");
@@ -73,7 +73,6 @@ describe("ctx.auth on the x402 channel", () => {
         messages: [],
         seq: 0,
         paidMsats: 0,
-        receivedProofs: [],
         stepCache: [],
         state: {},
         createdAt: Date.now(),
@@ -88,7 +87,7 @@ describe("ctx.auth on the x402 channel", () => {
   it("is still taken from a dvmkit-protocol input on the same DVM", () => {
     const jm = manager();
     try {
-      const job = jm.createJob({ input }, "anonymous", { paidMsats: 0, receivedProofs: [] }, undefined, "fetch");
+      const job = jm.createJob({ input }, "anonymous", { paidMsats: 0 }, undefined, "fetch");
       const ctx = jm.buildAndAttachContext(job, jm.parseInput({ input }, "fetch"));
       expect(ctx.auth?.pubkey).toBe(CALLER_CHOSEN);
     } finally {

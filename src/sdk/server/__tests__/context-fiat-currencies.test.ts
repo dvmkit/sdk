@@ -25,7 +25,6 @@ function fundedJob(): ServerJob {
     messages: [],
     seq: 0,
     paidMsats: 100_000_000_000,
-    receivedProofs: [],
     listeners: new Set(),
     abort: new AbortController(),
     stepCache: new StepCache(),

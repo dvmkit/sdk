@@ -48,6 +48,19 @@ const JOB_MESSAGES_CHANNEL = "job_messages";
 const JOB_DVM_ID = Symbol("jobDvmId");
 type DvmScopedJobRecord = JobRecord & { [JOB_DVM_ID]?: string };
 
+// Read only the columns rowToRecord consumes. Older tables can still hold legacy proof data.
+const JOB_RECORD_COLUMNS = `
+  id, tags, capability, channel, input, params, requester_id, requester_token_hash, requester_token,
+  request_fingerprint, requester_pubkey, request_id, auth_request_path, status, timing_known,
+  ended_by, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, summary, messages, seq,
+  upfront_payment, paid_msats, payment_mint, payment_rail, payment_tx_hash, payment_transaction_hash,
+  native_amount, native_asset, cashu_flow, cost_amount_micro, cost_currency, cost_revision, credit_id,
+  draw_id, stop_requested, mandate, funding_receipt, funding_credit, pending_payment_msats,
+  pending_mpp_challenge_ids, pending_x402_nonce, pending_x402_amount_usdc_micro,
+  pending_payment_fiat_micro, pending_payment_fiat_currency, asked_topup_micro, asked_topup_currency,
+  topup_cap_unenforced_reason, required_msats, pieces, settlement, receipt, step_cache, state,
+  created_at, last_activity_at, redacted_at`;
+
 interface MessageSubscriber {
   afterSeq: number;
   cb: (msg: Message) => void;
@@ -104,7 +117,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         seq                         INTEGER NOT NULL DEFAULT 0,
         paid_msats                  BIGINT NOT NULL DEFAULT 0,
         payment_mint                TEXT,
-        received_proofs             JSONB NOT NULL DEFAULT '[]',
         pending_payment_msats       BIGINT,
         -- Keeps its mpp spelling past rail rename: it
         -- holds mppx challenge ids — objects of the MPP envelope the Tempo rail
@@ -358,7 +370,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   }
 
   async get(id: string): Promise<JobRecord | undefined> {
-    const { rows } = await this.pool.query("SELECT * FROM jobs WHERE id = $1", [id]);
+    const { rows } = await this.pool.query(`SELECT ${JOB_RECORD_COLUMNS} FROM jobs WHERE id = $1`, [id]);
     if (rows.length === 0) return undefined;
     return rowToRecord(rows[0] as Record<string, unknown>);
   }
@@ -372,7 +384,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
    */
   async findJobByPaymentTxHash(txHash: string): Promise<JobRecord | undefined> {
     const { rows } = await this.pool.query(
-      "SELECT * FROM jobs WHERE payment_tx_hash = $1 ORDER BY created_at ASC LIMIT 1",
+      `SELECT ${JOB_RECORD_COLUMNS} FROM jobs WHERE payment_tx_hash = $1 ORDER BY created_at ASC LIMIT 1`,
       [txHash]
     );
     if (rows.length === 0) return undefined;
@@ -384,7 +396,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     requesterPubkey: string
   ): Promise<JobRecord | undefined> {
     const { rows } = await this.pool.query(
-      `SELECT * FROM jobs
+      `SELECT ${JOB_RECORD_COLUMNS} FROM jobs
         WHERE requester_pubkey = $1 AND request_id = $2
         ORDER BY created_at ASC
         LIMIT 1`,
@@ -576,22 +588,22 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         messages, seq, paid_msats, payment_mint, payment_rail,
         payment_tx_hash, payment_transaction_hash, native_amount, native_asset, cashu_flow,
         cost_amount_micro, cost_currency, cost_revision,
-        received_proofs, pending_payment_msats, pending_mpp_challenge_ids,
+        pending_payment_msats, pending_mpp_challenge_ids,
         pending_x402_nonce, pending_x402_amount_usdc_micro, required_msats, step_cache, state, created_at,
         last_activity_at, next_seq, requester_token_hash, requester_token,
         request_fingerprint, requester_pubkey, request_id, credit_id, draw_id,
         pending_payment_fiat_micro, pending_payment_fiat_currency, auth_request_path,
         funding_receipt, funding_credit, dvm_id, terminal_at_ms, caller_wait_ms, awaiting_input_at_ms, ended_by, timing_known, upfront_payment,
         pieces, channel, mandate
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$51,$52,$53,$54,$55)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$50,$51,$52,$53,$54)
       ON CONFLICT (id) DO UPDATE SET
         terminal_at_ms = COALESCE(jobs.terminal_at_ms, EXCLUDED.terminal_at_ms),
         ended_by = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.ended_by ELSE EXCLUDED.ended_by END,
         caller_wait_ms = CASE WHEN jobs.status IN ('completed', 'failed', 'cancelled') THEN jobs.caller_wait_ms
           ELSE jobs.caller_wait_ms + CASE WHEN jobs.status = 'awaiting-input' AND EXCLUDED.status <> 'awaiting-input'
-            THEN GREATEST(0, $50 - COALESCE(jobs.awaiting_input_at_ms, jobs.last_activity_at)) ELSE 0 END END,
+            THEN GREATEST(0, $49 - COALESCE(jobs.awaiting_input_at_ms, jobs.last_activity_at)) ELSE 0 END END,
         awaiting_input_at_ms = CASE WHEN EXCLUDED.status = 'awaiting-input'
-          THEN COALESCE(jobs.awaiting_input_at_ms, $50) ELSE NULL END,
+          THEN COALESCE(jobs.awaiting_input_at_ms, $49) ELSE NULL END,
         status = EXCLUDED.status,
         summary = EXCLUDED.summary,
         messages = EXCLUDED.messages,
@@ -629,7 +641,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
           ELSE jobs.cost_revision
         END,
         dvm_id = COALESCE(jobs.dvm_id, EXCLUDED.dvm_id),
-        received_proofs = EXCLUDED.received_proofs,
         pending_mpp_challenge_ids = EXCLUDED.pending_mpp_challenge_ids,
         pending_x402_nonce = EXCLUDED.pending_x402_nonce,
         pending_x402_amount_usdc_micro = EXCLUDED.pending_x402_amount_usdc_micro,
@@ -680,7 +691,6 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
         record.costAmountMicro ?? null,
         record.costCurrency ?? null,
         record.costRevision ?? null,
-        JSON.stringify(record.receivedProofs),
         record.pendingPaymentMsats ?? null,
         record.pendingMppChallengeIds ? JSON.stringify(record.pendingMppChallengeIds) : null,
         record.pendingX402Nonce ?? null,
@@ -799,7 +809,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
   /** Bounded crash recovery for terminal events not yet queued. */
   async listUnreportedTerminalReports(dvmId: string, capabilities: string[] | null, afterJobId?: string): Promise<JobRecord[]> {
     const { rows } = await this.pool.query(
-      `SELECT * FROM jobs WHERE dvm_id = $1 AND terminal_report_enqueued = false AND terminal_at_ms IS NOT NULL AND timing_known = true
+      `SELECT ${JOB_RECORD_COLUMNS} FROM jobs WHERE dvm_id = $1 AND terminal_report_enqueued = false AND terminal_at_ms IS NOT NULL AND timing_known = true
        AND status IN ('completed', 'failed', 'cancelled')
        AND ($2::text[] IS NULL OR capability = ANY($2))
        AND ($3::text IS NULL OR id > $3) ORDER BY id LIMIT 100`,
@@ -820,7 +830,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     afterJobId?: string;
   }): Promise<JobRecord[]> {
     const { rows } = await this.pool.query(
-      `SELECT * FROM jobs
+      `SELECT ${JOB_RECORD_COLUMNS} FROM jobs
        WHERE dvm_id = $1 AND revenue_report_enqueued = false
          AND credit_id IS NOT NULL AND draw_id IS NOT NULL
          AND status IN ('completed', 'failed', 'cancelled')
@@ -861,7 +871,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     afterJobId?: string;
   }): Promise<JobRecord[]> {
     const { rows } = await this.pool.query(
-      `SELECT *
+      `SELECT ${JOB_RECORD_COLUMNS}
        FROM jobs
        WHERE dvm_id = $1
          AND cost_revision IS NOT NULL
@@ -914,7 +924,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     ];
     if (args.capabilities !== null) params.push(args.capabilities);
     const { rows } = await this.pool.query(
-      `SELECT * FROM jobs
+      `SELECT ${JOB_RECORD_COLUMNS} FROM jobs
         WHERE redacted_at IS NULL
           AND status IN ('completed', 'failed', 'cancelled')
           AND last_activity_at < $1
@@ -937,13 +947,20 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       await client.query("BEGIN");
       // Acquire the same fence as hold placement before taking the UPDATE snapshot.
       await client.query("SELECT id FROM jobs WHERE id = $1 FOR UPDATE", [args.jobId]);
+      // Deployed schemas may still hold proof data that must expire with the job.
+      const { rows: [schema] } = await client.query<{ has_legacy_proofs: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_attribute
+           WHERE attrelid = 'jobs'::regclass AND attname = 'received_proofs' AND NOT attisdropped
+         ) AS has_legacy_proofs`
+      );
       const { rowCount } = await client.query(
         `UPDATE jobs SET
          input = '',
          params = '{}'::jsonb,
          summary = NULL,
          messages = '[]'::jsonb,
-         received_proofs = '[]'::jsonb,
+         ${schema.has_legacy_proofs ? "received_proofs = '[]'::jsonb," : ""}
          pending_payment_msats = NULL,
          pending_mpp_challenge_ids = NULL,
          pending_x402_nonce = NULL,
@@ -1009,7 +1026,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
 
   async getContentSnapshot(jobId: string, dvmId?: string): Promise<{ job: JobRecord; history: ContentHoldHistory } | undefined> {
     const { rows } = await this.pool.query(
-      `SELECT j.*, COALESCE((SELECT jsonb_agg(h.data ORDER BY h.data->>'created_at', h.id) FROM job_content_holds h WHERE h.job_id=j.id), '[]'::jsonb) AS content_holds,
+      `SELECT ${JOB_RECORD_COLUMNS}, COALESCE((SELECT jsonb_agg(h.data ORDER BY h.data->>'created_at', h.id) FROM job_content_holds h WHERE h.job_id=j.id), '[]'::jsonb) AS content_holds,
        COALESCE((SELECT jsonb_agg(e.data ORDER BY e.event_position) FROM job_content_hold_events e WHERE e.job_id=j.id), '[]'::jsonb) AS content_hold_events
        FROM jobs j WHERE j.id=$1 AND ($2::text IS NULL OR j.dvm_id IS NULL OR j.dvm_id=$2)`, [jobId, dvmId ?? null]
     );
@@ -1021,7 +1038,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const { rows } = await client.query("SELECT * FROM jobs WHERE id=$1 AND ($2::text IS NULL OR dvm_id IS NULL OR dvm_id=$2) FOR UPDATE", [jobId, dvmId ?? null]);
+      const { rows } = await client.query(`SELECT ${JOB_RECORD_COLUMNS} FROM jobs WHERE id=$1 AND ($2::text IS NULL OR dvm_id IS NULL OR dvm_id=$2) FOR UPDATE`, [jobId, dvmId ?? null]);
       if (!rows[0]) throw new ContentHoldError("job_not_found");
       const holds = await client.query("SELECT data FROM job_content_holds WHERE job_id=$1 ORDER BY data->>'created_at', id", [jobId]);
       const events = await client.query("SELECT data FROM job_content_hold_events WHERE job_id=$1 ORDER BY event_position", [jobId]);
@@ -1540,11 +1557,11 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
       )`;
     const sql =
       capabilities === null
-        ? `SELECT * FROM jobs
+        ? `SELECT ${JOB_RECORD_COLUMNS} FROM jobs
            WHERE ${staleClause}
            ORDER BY last_activity_at ASC
            LIMIT $3`
-        : `SELECT * FROM jobs
+        : `SELECT ${JOB_RECORD_COLUMNS} FROM jobs
            WHERE ${staleClause}
              AND capability = ANY($4::text[])
            ORDER BY last_activity_at ASC
@@ -1817,7 +1834,7 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     try {
       await client.query("BEGIN");
       const { rows } = await client.query<Record<string, unknown> & { next_seq: number }>(
-        `SELECT * FROM jobs
+        `SELECT ${JOB_RECORD_COLUMNS}, next_seq FROM jobs
          WHERE id = $1
            AND status IN ('processing', 'working', 'awaiting-input')
            ${staleOnly ? "AND last_activity_at <= $2" : ""}
@@ -2032,7 +2049,6 @@ function rowToRecord(row: Record<string, unknown>): JobRecord {
     mandate: (row.mandate ?? undefined) as JobRecord["mandate"],
     fundingReceipt: (row.funding_receipt ?? undefined) as JobRecord["fundingReceipt"],
     fundingCredit: (row.funding_credit ?? undefined) as JobRecord["fundingCredit"],
-    receivedProofs: row.received_proofs as JobRecord["receivedProofs"],
     pendingPaymentMsats:
       row.pending_payment_msats == null ? undefined : Number(row.pending_payment_msats),
     pendingMppChallengeIds: (row.pending_mpp_challenge_ids ?? undefined) as string[] | undefined,

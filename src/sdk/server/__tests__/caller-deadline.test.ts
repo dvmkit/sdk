@@ -23,7 +23,7 @@ function manager(onJob: (ctx: SDKJobContext<unknown, unknown>) => Promise<void>,
   return { jm, store };
 }
 async function start(jm: ReturnType<typeof manager>["jm"]) {
-  const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0, receivedProofs: [] }, undefined, "test");
+  const job = jm.createJob({ input: "" }, "requester", { paidMsats: 0 }, undefined, "test");
   const ctx = jm.buildAndAttachContext(job, "");
   await jm.persistJob(job);
   jm.runHandler(job, ctx);

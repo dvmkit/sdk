@@ -46,8 +46,8 @@ function startJob(jm: ReturnType<typeof buildManager>, paid = false) {
     { input: "hello" },
     "requester-1",
     paid
-      ? { paidMsats: 5_000, receivedProofs: [], paymentRail: "cashu" as const }
-      : { paidMsats: 0, receivedProofs: [] },
+      ? { paidMsats: 5_000, paymentRail: "cashu" as const }
+      : { paidMsats: 0 },
     paid ? 5_000 : undefined,
     "test"
   );

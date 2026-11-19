@@ -246,7 +246,6 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     record.params = {};
     record.summary = undefined;
     record.messages = [];
-    record.receivedProofs = [];
     record.pendingPaymentMsats = undefined;
     record.pendingMppChallengeIds = undefined;
     record.pendingX402Nonce = undefined;

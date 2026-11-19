@@ -3737,7 +3737,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // time so the upfront-payment gate has a real `requiredMsats` to enforce —
       // without this, dynamic-priced capabilities let unpaid jobs through
       let jobId = publicRequestClaimResult?.jobId ?? this.jobManager.allocateJobId();
-      let payment: PaymentInfo = { paidMsats: 0, receivedProofs: [] };
+      let payment: PaymentInfo = { paidMsats: 0 };
       let resumedAcceptedPayment = false;
       if (resumeOnly) {
         const durableDraw = await this.creditLedger.getDrawByJobId(jobId);
@@ -5734,7 +5734,6 @@ function recordedDrawPayment(
   return {
     paidMsats: draw.railValue.drawMsats > 0 ? draw.railValue.drawMsats : (opts.requiredMsats ?? 0),
     paymentRail: rail,
-    receivedProofs: [],
     paymentTxHash,
     ...(rail === "x402" && /^0x[0-9a-f]{64}$/i.test(paymentTxHash)
       ? { paymentTransactionHash: paymentTxHash }

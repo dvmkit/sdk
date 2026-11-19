@@ -53,7 +53,7 @@ function manager(
 
 async function start(instance: JobManager<unknown, undefined>) {
   const scope = fixture;
-  const job = instance.createJob({ input: "" }, "caller", { paidMsats: 0, receivedProofs: [] }, undefined, "work");
+  const job = instance.createJob({ input: "" }, "caller", { paidMsats: 0 }, undefined, "work");
   scope.jobs.push(job);
   await instance.persistJob(job);
   if (!scope.active) throw new Error("Keepalive fixture was disposed before handler start");

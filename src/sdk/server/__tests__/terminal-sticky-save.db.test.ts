@@ -43,7 +43,6 @@ describe.skipIf(!RUN)("terminal-sticky save", () => {
       messages: [],
       seq: 0,
       paidMsats: 5_000,
-      receivedProofs: [],
       stepCache: [],
       state: {},
       createdAt: Date.now(),

@@ -140,7 +140,6 @@ function jobRecord(
         costCurrency: paid.cost.currency
       })
     }),
-    receivedProofs: [],
     stepCache: [],
     state: {},
     createdAt: Date.now(),

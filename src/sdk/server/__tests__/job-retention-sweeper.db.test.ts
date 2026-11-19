@@ -1,6 +1,8 @@
-import pg from "pg";
+import { randomUUID } from "node:crypto";
+import type pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { dropSchemas, pinnedPool, recreateSchema } from "../../../test-support/schema-isolation";
 import type { JobRecord, JobStatus } from "../job-store";
 import { PostgresJobStore } from "../postgres-job-store";
 
@@ -42,7 +44,6 @@ function record(id: string, status: JobStatus = "completed"): JobRecord {
     nativeAsset: "sats",
     creditId: `credit-${id}`,
     drawId: `draw-${id}`,
-    receivedProofs: [{ amount: 1, id: "proof", secret: "secret", C: "C" }],
     pendingPaymentMsats: 10,
     pendingMppChallengeIds: ["challenge"],
     pendingX402Nonce: `0x${"01".repeat(32)}`,
@@ -57,11 +58,13 @@ function record(id: string, status: JobStatus = "completed"): JobRecord {
 }
 
 describe.skipIf(!RUN)("job-record retention (Postgres)", () => {
+  const schema = `job_retention_${randomUUID().replaceAll("-", "")}`;
   let pool: pg.Pool;
   let store: PostgresJobStore;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: DATABASE_URL });
+    await recreateSchema(schema);
+    pool = await pinnedPool(schema);
     store = new PostgresJobStore(pool);
     await store.init();
   });
@@ -73,7 +76,8 @@ describe.skipIf(!RUN)("job-record retention (Postgres)", () => {
   });
 
   afterAll(async () => {
-    await pool.end();
+    await pool?.end();
+    await dropSchemas(schema);
   });
 
   it("keyset-paginates only expired, terminal, matching-capability rows", async () => {
@@ -97,7 +101,12 @@ describe.skipIf(!RUN)("job-record retention (Postgres)", () => {
     expect(second.map((job) => job.id)).toEqual(["c"]);
   });
 
-  it("redacts content, preserves accounting evidence, and cannot be rehydrated", async () => {
+  it("redacts a fresh job schema while preserving accounting evidence and preventing rehydration", async () => {
+    const columns = await pool.query(
+      `SELECT attname FROM pg_catalog.pg_attribute
+       WHERE attrelid = 'jobs'::regclass AND attname = 'received_proofs' AND NOT attisdropped`
+    );
+    expect(columns.rows).toEqual([]);
     const original = record("expired");
     await store.save(original);
     const receipt = {
@@ -152,7 +161,6 @@ describe.skipIf(!RUN)("job-record retention (Postgres)", () => {
       params: {},
       summary: null,
       messages: [],
-      received_proofs: [],
       step_cache: [],
       state: {},
       requester_id: "caller-1",

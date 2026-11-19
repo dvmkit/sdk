@@ -16,7 +16,7 @@ const fx: FxFetcher = {
 function blankJob(): ServerJob {
   return {
     id: "job-1", tags: [], capability: "test", input: "", params: {}, requesterId: "test", status: "processing",
-    messages: [], seq: 0, paidMsats: 0, receivedProofs: [], listeners: new Set(), abort: new AbortController(),
+    messages: [], seq: 0, paidMsats: 0, listeners: new Set(), abort: new AbortController(),
     stepCache: new StepCache(), state: {}, pendingPrompts: new Map(), pendingPayment: null, replayHighSeq: null,
     replayProviderSkip: 0, replayPaymentIndex: 0, createdAt: 0, lastActivityAt: 0,
   };

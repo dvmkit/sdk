@@ -152,7 +152,7 @@ describe.skipIf(!RUN)("cross-machine cancel aborts the handler", () => {
       const job = jm.createJob(
         { input: "hello" },
         "requester-1",
-        { paidMsats: 5_000, receivedProofs: [], paymentRail: "cashu" },
+        { paidMsats: 5_000, paymentRail: "cashu" },
         5_000,
         "test"
       );
@@ -246,7 +246,7 @@ describe.skipIf(!RUN)("cross-machine cancel aborts the handler", () => {
       const job = jm.createJob(
         { input: "hello" },
         "requester-1",
-        { paidMsats: 0, receivedProofs: [] },
+        { paidMsats: 0 },
         undefined,
         "test"
       );

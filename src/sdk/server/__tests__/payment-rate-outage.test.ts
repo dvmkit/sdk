@@ -46,7 +46,6 @@ function fakeJob(): ServerJob {
     status: "awaiting-input",
     paidMsats: 0,
     pendingPaymentMsats: REQUIRED_MSATS,
-    receivedProofs: [],
     messages: [],
     listeners: new Set(),
     pendingPrompts: new Map(),
