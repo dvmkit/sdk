@@ -68,8 +68,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     } }));
     return (await host.serve()).url;
   }
-  function post(url: string, body: unknown, token?: string) {
-    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Job-Token": token } : {}) }, body: JSON.stringify(body) });
+  function post(url: string, body: unknown, token?: string, signal?: AbortSignal) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Job-Token": token } : {}) }, body: JSON.stringify(body), signal });
   }
   async function pending(url: string) {
     expect((await (await fetch(`${url}/v1/info`)).json()).auth_audience).toEqual(audience);
@@ -179,16 +179,24 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
       jobId: job.job_id, dvmId: audience.dvm_id, raw: body.content.credit });
     expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "pending", amountMicro: 1_000 });
 
-    // Durable settlement can finish after the replay response.
     const settled = Promise.withResolvers<void>();
     const recovered = await server("complete", true, false, {
       onPaidJobCompleted: ({ jobId }) => {
         if (jobId === job.job_id) settled.resolve();
       },
     });
-    const replay = await post(`${recovered}/v1/job/${job.job_id}/messages`, body, job.job_token);
-    expect(replay.status).toBe(201);
-    expect(await replay.json()).toEqual(accepted.response);
+    const creditLock = await pool.connect();
+    try {
+      // The replay can acknowledge acceptance while another transaction blocks settlement.
+      await creditLock.query("BEGIN");
+      await creditLock.query("SELECT credit_id FROM credits WHERE credit_id=$1 FOR UPDATE", [creditId]);
+      const replay = await post(`${recovered}/v1/job/${job.job_id}/messages`, body, job.job_token, AbortSignal.timeout(10_000));
+      expect(replay.status).toBe(201);
+      expect(await replay.json()).toEqual(accepted.response);
+      expect((await ledger.getDraw({ creditId, drawId }))?.status).toBe("pending");
+    } finally {
+      await creditLock.query("ROLLBACK").finally(() => creditLock.release());
+    }
     await settled.promise;
     expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "settled", amountMicro: 1_000 });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(9_000);
