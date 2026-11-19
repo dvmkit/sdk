@@ -116,7 +116,13 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
   }, 20_000);
 
   it("accepts an ordinary signed per-ask payment on a zero-upfront mandated job", async () => {
-    const url = await server();
+    let submittedJobId: string | undefined;
+    const settled = Promise.withResolvers<void>();
+    const url = await server("complete", true, false, {
+      onPaidJobCompleted: ({ jobId }) => {
+        if (jobId === submittedJobId) settled.resolve();
+      },
+    });
     const creditId = "mandate-fallback-credit";
     const drawId = `draw-${creditId}`;
     await fund(creditId);
@@ -127,11 +133,13 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     const created = await post(`${url}/v1/job`, { capability: "run", data });
     expect(created.status).toBe(202);
     const job = await created.json();
+    submittedJobId = job.job_id;
     await expect.poll(async () => (await pool.query("SELECT pending_payment_fiat_micro FROM jobs WHERE id=$1", [job.job_id])).rows[0]?.pending_payment_fiat_micro).toBe("1000");
     const ask = (await pool.query("SELECT data FROM job_messages WHERE job_id=$1 AND data->>'type'='payment-request'", [job.job_id])).rows[0].data;
     const paid = await post(`${url}/v1/job/${job.job_id}/messages`, payment({ ...job, ask }, creditId, drawId), job.job_token);
     expect(paid.status, await paid.clone().text()).toBe(201);
-    await expect.poll(async () => (await ledger.getDraw({ creditId, drawId }))?.status).toBe("settled");
+    await settled.promise;
+    expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "settled", amountMicro: 1_000 });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(9000);
     expect((await new PostgresJobStore(pool).get(job.job_id))?.creditId).toBe(creditId);
   }, 20_000);
