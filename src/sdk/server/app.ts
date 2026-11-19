@@ -5392,18 +5392,23 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
     if (!ask || (requestSeq !== undefined && ask.seq !== requestSeq)) return;
-    if (requestSeq === undefined && fresh.messages.some((message) => message.seq > ask.seq && message.from === "provider" &&
-        (message.type === "prompt" || message.type === "complete" || message.type === "cancel"))) return;
-    const recoveringSignedPayment = requestSeq === undefined && !fresh.mandate;
     let paymentSeq: number | undefined;
-    if (recoveringSignedPayment) {
-      if (!this.opts.db || (fresh.pendingPaymentFiatMicro ?? 0) !== 0) return;
-      // The sweep's candidate can go stale while the live worker advances. Match the verified
-      // history to the committed payment for the ask we are about to replay.
+    if (requestSeq === undefined) {
+      if (!this.opts.db) return;
       const { rows: [accepted] } = await this.opts.db.query<{ response: { seq: number } }>(
         "SELECT response FROM credit_balance_payments WHERE job_id=$1 AND request_seq=$2", [id, ask.seq]);
-      if (!accepted || !Number.isSafeInteger(accepted.response.seq)) return;
-      paymentSeq = accepted.response.seq;
+      if (accepted) {
+        if ((fresh.pendingPaymentFiatMicro ?? 0) !== 0 || !Number.isSafeInteger(accepted.response.seq)) return;
+        paymentSeq = accepted.response.seq;
+      } else if (!fresh.mandate) {
+        return;
+      }
+      // The caller may have answered a concurrent prompt before paying. A prompt posted
+      // after the committed payment belongs to a later wait.
+      if (fresh.messages.some((message) => message.from === "provider" && (
+        (message.type === "prompt" && message.seq > (paymentSeq ?? ask.seq)) ||
+        ((message.type === "complete" || message.type === "cancel") && message.seq > ask.seq)
+      ))) return;
     }
     const payment = fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
       message.seq > ask.seq && (paymentSeq === undefined || message.seq === paymentSeq));

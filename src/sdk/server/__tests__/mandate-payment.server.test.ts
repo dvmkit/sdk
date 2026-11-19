@@ -35,7 +35,7 @@ const fixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/s
 const documentedPaymentId = (jobId: string, requestSeq: number) =>
   fixture.mandate_payment.payment_id.prefix + createHash("sha256").update(JSON.stringify(["mandate", jobId, requestSeq])).digest("hex");
 
-type Script = "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt" | "stop" | "stop-prompt" | "progress";
+type Script = "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt" | "stop" | "stop-prompt" | "progress" | "concurrent-prompt";
 
 it("derives the published payment_id vector byte for byte", () => {
   const { prefix, vector } = fixture.mandate_payment.payment_id;
@@ -110,6 +110,10 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       if (script === "progress") {
         await gate(ctx.jobId).opened;
         ctx.progress(50);
+      }
+      if (script === "concurrent-prompt") {
+        await gate(ctx.jobId).opened;
+        await ctx.prompt("concurrent", "Continue?");
       }
       await payment;
       await earlier;
@@ -219,18 +223,30 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     return { failed: () => failed, restore };
   }
   /** An unpaid ask whose worker stopped before settling it. */
-  async function strandedAsk(creditId: string, { mandate = true, progress = false } = {}) {
+  async function strandedAsk(creditId: string, { mandate = true, script = "one" }: {
+    mandate?: boolean;
+    script?: "one" | "progress" | "concurrent-prompt";
+  } = {}) {
     const url = await server();
     await fund(creditId);
     const failure = mandate ? failSettlements() : undefined;
     try {
-      const job = await submit(url, { creditId, script: progress ? "progress" : "one", maxTotal: mandate ? 5 * ASK : undefined });
+      const job = await submit(url, { creditId, script, maxTotal: mandate ? 5 * ASK : undefined });
       const ask = await openAsk(job.job_id);
       if (failure) await expect.poll(failure.failed).toBeGreaterThan(0);
-      if (progress) {
-        gate(job.job_id).open();
+      if (script !== "one") gate(job.job_id).open();
+      if (script === "progress") {
         await expect.poll(async () => (await messages(job.job_id)).findLast((message) => message.from === "provider"))
           .toMatchObject({ type: "progress" });
+      }
+      if (script === "concurrent-prompt") {
+        await expect.poll(async () => (await messages(job.job_id)).find((message) =>
+          message.seq > ask.seq && message.type === "prompt" && message.content.id === "concurrent"),
+        { timeout: 5_000 }).toBeDefined();
+        const answer = await post(`${url}/v1/job/${job.job_id}/messages`,
+          { type: "response", content: { prompt_id: "concurrent", text: "yes" } }, job.job_token);
+        expect(answer.status, await answer.clone().text()).toBe(201);
+        await openAsk(job.job_id);
       }
       await hosts[0].shutdown();
       return { job, ask };
@@ -629,18 +645,21 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   }, 40_000);
 
   it.each([
-    { mandate: true, sweepers: 2, history: "ask" },
-    { mandate: false, sweepers: 1, history: "ask" },
-    { mandate: false, sweepers: 2, history: "ask" },
-    { mandate: false, sweepers: 1, history: "progress" },
-    { mandate: false, sweepers: 1, history: "pending verification" },
-  ])("resumes a committed signed payment after worker loss (mandate=$mandate, sweepers=$sweepers, history=$history)", async ({ mandate, sweepers, history }) => {
-    const creditId = `sweep-signed-crash-${mandate}-${sweepers}-${history.replaceAll(" ", "-")}`;
-    const { job, ask } = await strandedAsk(creditId, { mandate, progress: history === "progress" });
+    { mandate: true, sweepers: 2, script: "one", pendingVerification: false },
+    { mandate: false, sweepers: 1, script: "one", pendingVerification: false },
+    { mandate: false, sweepers: 2, script: "one", pendingVerification: false },
+    { mandate: false, sweepers: 1, script: "progress", pendingVerification: false },
+    { mandate: false, sweepers: 1, script: "one", pendingVerification: true },
+    { mandate: false, sweepers: 1, script: "concurrent-prompt", pendingVerification: false },
+    { mandate: true, sweepers: 1, script: "concurrent-prompt", pendingVerification: false },
+  ] as const)("resumes a committed signed payment after worker loss (mandate=$mandate, sweepers=$sweepers, script=$script, held=$pendingVerification)",
+  async ({ mandate, sweepers, script, pendingVerification }) => {
+    const creditId = `sweep-signed-crash-${mandate}-${sweepers}-${script}-${pendingVerification}`;
+    const { job, ask } = await strandedAsk(creditId, { mandate, script });
     const receiving = await server();
     const store = latestManager().store;
     if (!isStreamableJobStore(store)) throw new Error("expected a streaming job store");
-    if (history === "pending verification") {
+    if (pendingVerification) {
       await store.recordInbound(job.job_id, { from: "requester", type: "payment",
         timestamp: Math.floor(Date.now() / 1000), content: { cashu_token: "pending" } });
     }
@@ -663,7 +682,7 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       expect(await store.get(job.job_id)).toMatchObject({
         status: "awaiting-input", drawId: job.drawId, pendingPaymentMsats: undefined,
       });
-      if (history === "pending verification") {
+      if (pendingVerification) {
         expect(await store.getMessages(job.job_id, ask.seq)).toEqual([]);
       }
       await hosts[1].shutdown();
@@ -699,8 +718,9 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     await expect.poll(() => status(job.job_id), { timeout: 15_000 }).toBe("completed");
     expect(completions.get(job.job_id)).toBe(1);
     expect(await balancePayments(job.job_id)).toEqual([{ payment_id: `signed-${job.job_id}-${ask.seq}`, request_seq: String(ask.seq) }]);
-    expect((await messages(job.job_id)).filter((m) => m.from === "requester" && m.type !== "request"))
-      .toEqual([expect.objectContaining({ type: "payment", content: { credit: expect.objectContaining({ request_seq: ask.seq }) } })]);
+    const inbound = (await messages(job.job_id)).filter((m) => m.from === "requester" && m.type !== "request");
+    expect(inbound.map((message) => message.type)).toEqual(script === "concurrent-prompt" ? ["response", "payment"] : ["payment"]);
+    expect(inbound.at(-1)?.content.credit).toMatchObject({ request_seq: ask.seq });
     await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId })).toMatchObject({ status: "settled", amountMicro: ASK });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - ASK);
   }, 40_000);
