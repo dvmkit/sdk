@@ -348,6 +348,26 @@ export interface X402BatchSettlementServer {
   stop(): Promise<void>;
 }
 
+const recoverFunding = Symbol("recoverFunding");
+
+type X402BatchRecoveryArgs<T> = {
+  paymentHeader: string;
+  amount: string;
+  effectId: string;
+  commit: (funding: X402BatchFunding, tx?: CreditLedgerQuerier) => Promise<T>;
+};
+
+export function recoverX402BatchFunding<T>(
+  server: X402BatchSettlementServer,
+  args: X402BatchRecoveryArgs<T>
+): Promise<{ ok: true; value: X402BatchAcceptance<T> } | X402BatchRefusal> | undefined {
+  // An acceptor that only implements the public contract may submit a fresh deposit.
+  const recoverable: X402BatchSettlementServer & {
+    [recoverFunding]?: (args: X402BatchRecoveryArgs<T>) => Promise<{ ok: true; value: X402BatchAcceptance<T> } | X402BatchRefusal>;
+  } = server;
+  return recoverable[recoverFunding]?.(args);
+}
+
 export interface CreateX402BatchSettlementServerOpts {
   network: string;
   payTo: string;
@@ -782,7 +802,10 @@ export async function createX402BatchSettlementServer(
 
   let stopPromise: Promise<void> | undefined;
   selfRelay?.start();
-  return {
+  const unavailableFunding: X402BatchRefusal = {
+    ok: false, reason: "batch_funding_unavailable", requirements: [], corrective: false,
+  };
+  const server = {
     buildRequirements,
     async accept<T>(args: {
       paymentHeader: string;
@@ -793,7 +816,7 @@ export async function createX402BatchSettlementServer(
       refundBoundNative?: number;
       commit: (funding: X402BatchFunding, tx?: CreditLedgerQuerier) => Promise<T>;
       complete?: (settlement: SettleResponse, committed: T, tx?: CreditLedgerQuerier) => Promise<T>;
-    }) {
+    }, recoveryOnly = false) {
       let payload: PaymentPayload;
       try {
         // The facilitator, and through it a catalog, reads the payload's
@@ -801,11 +824,15 @@ export async function createX402BatchSettlementServer(
         // stored intent and every recovery resend carry the server's own.
         payload = withBatchSettlementResource(decodeBatchPayment(args.paymentHeader));
       } catch {
+        if (recoveryOnly) return unavailableFunding;
         return {
           ok: false as const,
           reason: "decode_failed",
           requirements: await buildRequirements(args.amount),
         };
+      }
+      if (recoveryOnly && (!postgres || !isBatchSettlementDepositPayload(payload.payload))) {
+        return unavailableFunding;
       }
       const requirements = (await buildRequirements(args.amount)) as PaymentRequirements[];
       const matched = resource.findMatchingRequirements(requirements, payload);
@@ -906,11 +933,16 @@ export async function createX402BatchSettlementServer(
       // intent to mark; the read is wasted only when that prepare comes back
       // already `settled` and the recovery path returns early.
       const submissionBlock =
-        external && postgres ? (await settlementEvidence.getBlockNumber()).toString() : undefined;
+        external && postgres && !recoveryOnly
+          ? (await settlementEvidence.getBlockNumber()).toString()
+          : undefined;
       const runLocked = async (tx?: CreditLedgerQuerier) => {
         let prior = external
           ? await postgres?.getSettlement(args.operation, args.effectId)
           : undefined;
+        if (recoveryOnly && prior?.status !== "submitting" && !(prior?.status === "settled" && prior.response)) {
+          return unavailableFunding;
+        }
         if (prior && postgres) {
           const retryIdentity = assertSettlementRetry(
             prior,
@@ -983,6 +1015,7 @@ export async function createX402BatchSettlementServer(
                 // End this request after reconciliation so the next attempt
                 // goes through verification and records its own bookmark.
                 await postgres.markSettlementRetryable(prior.settlementId);
+                if (recoveryOnly) return unavailableFunding;
                 if (args.operation === "fund") {
                   return {
                     ok: false as const,
@@ -1391,6 +1424,11 @@ export async function createX402BatchSettlementServer(
       })());
     },
   };
+  return Object.assign(server, {
+    [recoverFunding]<T>(args: X402BatchRecoveryArgs<T>) {
+      return server.accept({ ...args, operation: "fund" }, true);
+    },
+  });
 }
 
 /**

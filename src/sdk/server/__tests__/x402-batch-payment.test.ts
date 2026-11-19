@@ -131,7 +131,8 @@ function batchServer(
 function creditRoute(
   batch: X402BatchSettlementServer,
   ledger: CreditLedgerLike,
-  receiptIssuer?: ReceiptIssuer
+  receiptIssuer?: ReceiptIssuer,
+  x402Offered = true
 ): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
   const auth = secp256k1Auth();
@@ -143,7 +144,7 @@ function creditRoute(
           max_micro: 5_000_000,
           ttl_ms: 86_400_000,
           currency: "usd",
-          funding: ["x402"],
+          funding: x402Offered ? ["x402"] : [],
         }),
       creditConfig: {
         min: "$0.10",
@@ -248,6 +249,19 @@ function balanceRequest(app: Hono<AppEnv>): Response | Promise<Response> {
 }
 
 describe("x402 batch-settlement credit funding", () => {
+  it("refuses an excluded payment before invoking a custom batch acceptor", async () => {
+    const batch = batchServer();
+    const ledger = durableLedger();
+    const app = creditRoute(batch, ledger, undefined, false);
+
+    const refused = await fundRequest(app, CHANNEL_HEADER);
+
+    expect(refused.status).toBe(402);
+    expect(refused.headers.get("PAYMENT-REQUIRED")).toBeNull();
+    expect(batch.accept).not.toHaveBeenCalled();
+    expect(await ledger.get("credit-1")).toBeUndefined();
+  });
+
   it("refreshes a channel-backed credit before returning its signed balance", async () => {
     const batch = batchServer();
     const { app } = await x402Credit(batch, 250_000);

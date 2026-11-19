@@ -95,6 +95,8 @@ import {
 } from "./wallet-accumulator-receive";
 import type { AccumulatorPool, AccumulatorQuerier } from "./wallet-accumulator-store";
 import {
+  recoverX402BatchFunding,
+  type X402BatchFunding,
   type X402BatchSettlementServer,
   X402SettlementSubmissionError,
 } from "./x402-batch-settlement";
@@ -692,8 +694,11 @@ export async function issueUpfrontChallenges(
   );
 }
 
-export async function verifyUpfrontPayment(opts: UpfrontPaymentOpts): Promise<PaymentResult> {
-  const result = await withPaymentDiagnostics(() => verifyUpfrontPaymentInScope(opts));
+export async function verifyUpfrontPayment(
+  opts: UpfrontPaymentOpts,
+  batchFundingOffered = true
+): Promise<PaymentResult> {
+  const result = await withPaymentDiagnostics(() => verifyUpfrontPaymentInScope(opts, batchFundingOffered));
   if (!result.error && !result.replayedDraw && !result.upfrontPayment && !opts.fundOnly) {
     // Credit-backed results carry the committed draw separately. Legacy rail
     // payments use verified rail facts; a successful unpaid gate knows zero.
@@ -974,7 +979,10 @@ function cardReplayRefusal(mapped: PaymentResult): PaymentResult {
   };
 }
 
-async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<PaymentResult> {
+async function verifyUpfrontPaymentInScope(
+  opts: UpfrontPaymentOpts,
+  batchFundingOffered: boolean
+): Promise<PaymentResult> {
   const {
     cashuToken,
     requiredMsats,
@@ -1049,6 +1057,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
   // A batch server can settle through its own relay without hosted exact support.
   const x402BatchRequirements =
     opts.fundOnly &&
+    batchFundingOffered &&
     opts.x402BatchSettlement &&
     x402ChallengesEnabled &&
     x402PriceFiat &&
@@ -1259,7 +1268,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
 
   if (
     x402Payment &&
-    x402Config &&
+    (x402Config || (!batchFundingOffered && opts.x402BatchSettlement)) &&
     requiredMsats &&
     paymentScheme(x402Payment) === X402_BATCH_SETTLEMENT_SCHEME
   ) {
@@ -1279,12 +1288,11 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     }
     const requiredUsdcMicro = x402RequiredUsdcMicro(x402PriceFiat);
     try {
-      const accepted = await opts.x402BatchSettlement.accept({
+      const payment = {
         paymentHeader: x402Payment,
         amount: String(requiredUsdcMicro),
-        operation: "fund",
         effectId: `${ledgerCtx.fundOnly.creditId}:${ledgerCtx.fundOnly.fundId}`,
-        commit: async (funding, tx) => {
+        commit: async (funding: X402BatchFunding, tx?: CreditLedgerQuerier) => {
           return commitMarkedFunding(
             ledgerCtx,
             {
@@ -1302,7 +1310,13 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
             tx
           );
         },
-      });
+      };
+      const accepted = batchFundingOffered
+        ? await opts.x402BatchSettlement.accept({ ...payment, operation: "fund" })
+        : await recoverX402BatchFunding(opts.x402BatchSettlement, payment);
+      if (!accepted || (!accepted.ok && accepted.reason === "batch_funding_unavailable")) {
+        return creditRefusal("payment_invalid", "This DVM does not offer reusable x402 channel funding.");
+      }
       if (!accepted.ok) {
         // Facilitator verification can use the same reason without a chain scan.
         if (accepted.reason === "settlement_not_on_chain" && accepted.corrective === false) {
@@ -1329,8 +1343,10 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
             }),
             status: 402,
             ...(x402Requirements && { x402Requirements }),
-            x402V2Requirements: accepted.requirements,
-            x402ErrorCode: accepted.reason,
+            ...(batchFundingOffered && {
+              x402V2Requirements: accepted.requirements,
+              x402ErrorCode: accepted.reason,
+            }),
           },
         };
       }
@@ -5711,7 +5727,7 @@ async function commitExactTempoVoucherFunding(
   return commitMarkedFunding(ctx, funding, tx);
 }
 
-function paymentScheme(header: string): string | undefined {
+export function paymentScheme(header: string): string | undefined {
   try {
     const parsed = JSON.parse(Buffer.from(header, "base64").toString("utf8")) as {
       accepted?: { scheme?: unknown };

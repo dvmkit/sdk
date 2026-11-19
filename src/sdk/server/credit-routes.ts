@@ -2074,19 +2074,21 @@ async function handleFund(
               callerPubkey: args.callerPubkey,
               fundOnly: { creditId, fundId: fund.fund_id, commitment },
             })
-          : verifyUpfrontPayment({
-              ...railOpts,
-              x402BatchSettlement: batchFundingOffered ? railOpts.x402BatchSettlement : undefined,
-              requiredMsats,
-              priceFiat: { currency: menu.currency, amountMicro: fund.amount_micro },
-              callerPubkey: args.callerPubkey,
-              fundOnly: {
-                creditId,
-                fundId: fund.fund_id,
-                commitment,
-                allowOneShotStablecoin: deps.creditConfig?.allowOneShotStablecoin,
+          : verifyUpfrontPayment(
+              {
+                ...railOpts,
+                requiredMsats,
+                priceFiat: { currency: menu.currency, amountMicro: fund.amount_micro },
+                callerPubkey: args.callerPubkey,
+                fundOnly: {
+                  creditId,
+                  fundId: fund.fund_id,
+                  commitment,
+                  allowOneShotStablecoin: deps.creditConfig?.allowOneShotStablecoin,
+                },
               },
-            }),
+              batchFundingOffered
+            ),
       { onError: () => ({ "error.code": "credit_fund_failed" }) }
     );
     error = result.error;
