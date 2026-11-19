@@ -24,6 +24,14 @@ Credit rows and draws still account for each payment. A null owner cannot claim 
 
 The failure says nothing about whether the job charged, completed, or released a hold. Do not resubmit the job or repeat a payment to recover its output. A failure before an SSE stream opens returns the same JSON 503; after the stream opens, retain the existing reconnect behavior and resume from the last received cursor. No storage migration or public export changes are required.
 
+## Job message pages
+
+To page through a job's JSON history, send `GET /v1/job/:id/messages?limit=50` with the usual job credential. The limit is a decimal integer from 1 through 50 and bounds the number of messages per response. Large individual artifacts can still make a page large. `after` is an exclusive sequence cursor, defaults to zero, and must be a non-negative decimal safe integer when paging. Invalid paging parameters return HTTP 400 with `error: "invalid_query"`.
+
+The response includes `messages` in ascending sequence order, `next_after` and `has_more`, along with the usual content metadata. Pass `next_after` as the next request's `after`. This is the last sequence delivered, or the input cursor on an empty page. `has_more` reports whether another releasable message was available during the read. A running job can publish more after it returns `false`, so save the cursor to resume polling. Pending-payment, settlement and retention gates still apply. [Portable page examples](../protocol-fixtures/job-messages-page-v1.json)
+
+JSON requests without `limit` keep the full history response after `after`, with no paging fields. SSE uses its existing stream contract and ignores `limit`. Custom streamable stores should honor the existing `getMessages` limit to bound each store read. No storage migration is required.
+
 ## Payment method discovery
 
 An explicit `paymentMethods` list bounds `payment.methods` on `/v1/info` and `/v1/quote`, the top-level `x402` and `tempo` info blocks, and credit funding rails and terms on info, quotes, and unpaid job responses. Excluded x402 and Tempo blocks are omitted rather than emitted empty. Lightning remains an independent receive-only credit funding leg. The [portable example](../protocol-fixtures/payment-method-discovery-v1.json) describes an x402/Tempo-wired DVM restricted to Cashu.
