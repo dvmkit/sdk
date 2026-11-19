@@ -38,6 +38,31 @@ Every other signature change against `0.42.0` is additive, and needs no code cha
 
 - New Postgres job tables omit `received_proofs`. Existing columns can stay in place with their original empty-array default. Regular job reads and writes ignore the column, and the content sweep still erases historical values where the column exists.
 
+## [0.43.0](https://github.com/dvmkit/sdk/compare/v0.42.0...v0.43.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** JobRecord drops receivedProofs. Custom job stores should remove the property from readers and writers. Existing Postgres job tables retain their legacy proof column and the content sweep still clears it.
+
+### Features
+
+* **server:** report the verified Tempo charge payer on per-call deposits ([#207](https://github.com/dvmkit/sdk/issues/207)) ([31a4965](https://github.com/dvmkit/sdk/commit/31a496506cad43ca9631456ea3614a6012016ef7))
+* **server:** report the verified x402 payer on per-call deposits ([#206](https://github.com/dvmkit/sdk/issues/206)) ([464d9e3](https://github.com/dvmkit/sdk/commit/464d9e37000c989b081473c0ff014619474b912c))
+* **server:** show callers when a standing mandate will not pay an ask ([9851911](https://github.com/dvmkit/sdk/commit/9851911753776919940566a6185958761dd1c27d))
+
+
+### Bug Fixes
+
+* **server:** answer a changed-terms deposit resend from its stored attempt ([a98e93d](https://github.com/dvmkit/sdk/commit/a98e93d6d18fb5fc85ea0f947a24b8a8a78ebb3c))
+* **server:** fund x402 credit without hosted exact support ([80d7992](https://github.com/dvmkit/sdk/commit/80d799210c985bb8fa8e69dc8a40fb33d2b4fe04))
+* **server:** retire duplicate job proof storage ([b064bc4](https://github.com/dvmkit/sdk/commit/b064bc407f00a45e77ba4dd7fe8cd48fec8d5e04))
+
+
+### Documentation
+
+* disclose the additive signature changes since 0.42.0 ([#210](https://github.com/dvmkit/sdk/issues/210)) ([21a8ada](https://github.com/dvmkit/sdk/commit/21a8adae3f5aa78b0df670814c1a84edf7332e1b))
+
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
 
 - JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.
