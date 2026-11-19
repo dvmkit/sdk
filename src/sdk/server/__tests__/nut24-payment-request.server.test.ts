@@ -18,9 +18,10 @@ import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import type { CashuConfig } from "../../types";
 import { proofSetRequestId } from "../cashu-payment-request";
+import type { CreditLedgerLike } from "../credit-ledger";
+import { createDVMHost } from "../host";
 import { MemoryJobStore } from "../memory-job-store";
 import { secp256k1Auth } from "../secp256k1-auth";
-import { serve } from "../serve";
 import { createSignedRequestVerifier } from "../signed-request";
 
 const inlineContract = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/nut24-inline-result-v1.json", import.meta.url), "utf8"));
@@ -40,6 +41,7 @@ const signedSchema = z.object({
 
 interface Host {
   url: string;
+  ledger: CreditLedgerLike;
   info: {
     auth_audience?: { dvm_id: string; builder_pubkey: string };
     cashu: { mints: string[]; lock_pubkeys: string[] };
@@ -67,7 +69,7 @@ function handlerGate() {
   return { release, enter: () => held };
 }
 
-async function startHost(signed: boolean, options: { wait?: number; cashu?: CashuConfig; prompt?: boolean; fail?: boolean; artifact?: ArtifactContent; redactOnMessageRead?: boolean; onStart?: () => void | Promise<void> } = {}): Promise<Host> {
+async function startHost(signed: boolean, options: { wait?: number; cashu?: CashuConfig; prompt?: boolean; fail?: boolean; artifact?: ArtifactContent; redactOnMessageRead?: boolean; onStart?: (jobId: string) => void | Promise<void> } = {}): Promise<Host> {
   let handlerStarted = false;
   const processingReaders = new Set<() => void>();
   class ObservedStore extends MemoryJobStore {
@@ -114,7 +116,7 @@ async function startHost(signed: boolean, options: { wait?: number; cashu?: Cash
         price: PRICE,
         async onJob(ctx) {
           handlerStarted = true;
-          await options.onStart?.();
+          await options.onStart?.(ctx.jobId);
           if (options.prompt) await ctx.prompt("next", "Continue?");
           if (options.fail) { ctx.fail("cannot complete"); return; }
           if (options.artifact) ctx.artifact(options.artifact);
@@ -124,11 +126,16 @@ async function startHost(signed: boolean, options: { wait?: number; cashu?: Cash
     },
     ...(signed ? { auth: secp256k1Auth({ allowUnsignedPaid: true }) } : {}),
   });
-  const running = await serve(descriptor, { devMode: true, port: 0, env: {}, jobStore, mints: [LOCAL_MINT_URL], fx });
+  const host = createDVMHost({ devMode: true, port: 0, env: {}, jobStore, mints: [LOCAL_MINT_URL], fx });
+  host.mount(descriptor);
+  const running = await host.serve();
   closers.push(() => running.close());
+  const ledger = host.creditLedger;
+  if (!ledger) throw new Error("Cashu test host has no credit ledger");
   const info = (await (await fetch(`${running.url}/v1/info`)).json()) as Host["info"];
   return {
     url: running.url,
+    ledger,
     info,
     setRate: (next) => (rate = next),
     nextProcessingRead: () => new Promise((resolve) => { processingReaders.add(resolve); }),
@@ -382,18 +389,28 @@ describe.skipIf(!live)("NUT-24 payment requests", () => {
         expect((await other).status).toBe(402);
       }, 60_000);
 
-      it("accepts a payment covering the previous rate snapshot's amount, not one two snapshots back", async () => {
-        const host = await startHost(signed);
+      it("funds and draws the full price at the previous rate and rejects a payment two snapshots old", async () => {
+        let fundedMicro: number | undefined;
+        let drawnMicro: number | undefined;
+        const host = await startHost(signed, {
+          async onStart(jobId) {
+            // The balance still includes the funding while the draw is pending.
+            const draw = await host.ledger.getDrawByJobId(jobId);
+            drawnMicro = draw?.amountMicro;
+            fundedMicro = draw && (await host.ledger.get(draw.creditId))?.balanceMicro;
+          },
+        });
         const before = await paymentRequest(host, "held");
         expect(before.amount?.toNumber()).toBe(16);
 
         host.setRate(80_000);
+        const current = await paymentRequest(host, "stale");
+        expect(current.amount?.toNumber()).toBe(20);
         const paid = await submit(host, "held", await payRequest(before));
         expect(paid.status).toBe(200);
         expect(((await paid.json()) as Job).summary).toBe("result:held");
+        expect({ fundedMicro, drawnMicro }).toEqual({ fundedMicro: 16_000, drawnMicro: 16_000 });
 
-        const stale = await paymentRequest(host, "stale");
-        expect(stale.amount?.toNumber()).toBe(20);
         host.setRate(64_000);
         await expectRefused(await submit(host, "stale", await payRequest(before)), 400, "payment_insufficient");
       }, 60_000);
