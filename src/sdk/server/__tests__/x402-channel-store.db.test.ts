@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { formatPostgresApplicationName } from "../../../lib/pg-retry";
+import type { SignedRequestDomain } from "../../../lib/signed-request-statement";
 import { encodeSettleResponseHeader } from "../../../lib/x402/spec";
 import { loggers } from "../../../observability/loggers";
 import { configureDVM } from "../../configure";
@@ -31,6 +32,7 @@ import { createDVMServer, type AppEnv } from "../app";
 import { CreditLedger } from "../credit-ledger";
 import { CREDIT_REQUEST_SCHEMA, handleCreditRequest } from "../credit-routes";
 import { fundingCommitment } from "../funding";
+import { createDVMHost } from "../host";
 import { MemoryJobStore } from "../memory-job-store";
 import { PostgresProcessedPaymentStore } from "../processed-payment-store";
 import { secp256k1Auth } from "../secp256k1-auth";
@@ -163,8 +165,9 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     creditId: string;
     fundId: string;
     amountMicro: number;
+    authDomain?: SignedRequestDomain;
   }) {
-    const { server, config, receiver, creditId, fundId, amountMicro } = args;
+    const { server, config, receiver, creditId, fundId, amountMicro, authDomain } = args;
     const processedPayments = new PostgresProcessedPaymentStore(pool);
     await processedPayments.init();
     const [requirements] = await server.buildRequirements(String(amountMicro));
@@ -179,14 +182,16 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     };
     const app = new Hono<AppEnv>();
     const auth = secp256k1Auth();
+    let fundingOffered = true;
     app.post("/v1/credit", (c) =>
       handleCreditRequest(c, {
         auth,
+        authDomain,
         ledger,
         fxFetcher,
         menu: async () => ({
           currency: "usd",
-          funding: ["x402"],
+          funding: fundingOffered ? ["x402"] : [],
           min_micro: amountMicro,
           max_micro: 1_000_000,
           ttl_ms: 86_400_000,
@@ -222,12 +227,13 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
           amount_micro: amountMicro,
           commitment: fundingCommitment(paymentHeader),
         },
-      })
+      }, undefined, authDomain)
     );
     return {
       channelId,
-      fund: () =>
-        app.request("/v1/credit", {
+      setFundingOffered: (offered: boolean) => { fundingOffered = offered; },
+      fund: (target: Pick<Hono<AppEnv>, "request"> = app) =>
+        target.request("/v1/credit", {
           method: "POST",
           headers: { "Content-Type": "application/json", "PAYMENT-SIGNATURE": paymentHeader },
           body: signedBody,
@@ -1541,7 +1547,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     }
   );
 
-  it("reports an unknown deposit outcome and recovers the mined deposit on the identical funding request", async () => {
+  it.each([false, true])("recovers a mined deposit on the identical funding request (x402 excluded: %s)", async (excluded) => {
     const receiver = privateKeyToAccount(generatePrivateKey());
     const minedTransaction = `0x${"67".repeat(32)}`;
     const balances = new Map<string, bigint>();
@@ -1586,11 +1592,11 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     });
 
     try {
-      const creditId = "reported-failure-recovery-credit";
+      const creditId = `reported-failure-recovery-credit-${excluded ? "excluded" : "offered"}`;
       const fundId = "fund-1";
       const effectId = `${creditId}:${fundId}`;
       const amountMicro = 100;
-      const { fund, channelId } = await signedDepositRequest({
+      const { fund, channelId, setFundingOffered } = await signedDepositRequest({
         server,
         config,
         receiver: receiver.address,
@@ -1600,9 +1606,9 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       });
 
       const failed = await fund();
+      expect(failed.status).toBe(503);
       expect(facilitator.settle).toHaveBeenCalledOnce();
       expect(balances.get(channelId.toLowerCase())).toBe(1000n);
-      expect(failed.status).toBe(503);
       const failure = await failed.json();
       expect(failure).toMatchObject({
         error: "x402_settlement_submission_failed",
@@ -1619,6 +1625,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
         submissionBlock: "100",
       });
 
+      setFundingOffered(!excluded);
       const recovered = await fund();
       expect(recovered.status).toBe(200);
       expect(await recovered.json()).toMatchObject({ funded_micro: amountMicro, replayed: false });
@@ -1645,6 +1652,90 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
         status: "complete",
         response: { success: true, transaction: minedTransaction, amount: "1000" },
       });
+      const replay = await fund();
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ funded_micro: amountMicro, replayed: true });
+      expect(facilitator.settle).toHaveBeenCalledOnce();
+      expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: amountMicro });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("books a settled deposit after the host excludes x402", async () => {
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const facilitator = recordingFacilitator(new Map());
+    const config = {
+      facilitatorClient: facilitator,
+      receiverAuthorizerSigner: receiver,
+      autoSettlement: false as const,
+    };
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK,
+      payTo: receiver.address,
+      db: pool,
+      earnedNative: earnedNothing,
+      config,
+      settlementEvidenceReader: {
+        getBlockNumber: async () => 100n,
+        findAppliedSettlement: async () => undefined,
+      },
+    });
+    const host = createDVMHost({
+      devMode: true,
+      pool,
+      env: {},
+      paymentMethods: [],
+      x402: { network: NETWORK, payTo: receiver.address, batchSettlement: config },
+      fx: {
+        fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
+        supportedCurrencies: () => ["usd"],
+      },
+    });
+    const stopBeforeListen = new Error("stop before listen");
+    host.mount(configureDVM({
+      name: "batch-funding-recovery",
+      capability: "run",
+      auth: secp256k1Auth(),
+      credit: { min: "$0.0001", max: "$1.00" },
+      onJob(ctx) { ctx.complete("done"); },
+      async onBoot() {
+        const info = await (await host.app.request("/v1/info")).json();
+        expect(info.credit.funding).toEqual([]);
+        expect(info.credit).not.toHaveProperty("x402");
+        const creditId = "excluded-host-funding-credit";
+        const fundId = "fund-1";
+        const amountMicro = 100;
+        const effectId = `${creditId}:${fundId}`;
+        const { fund } = await signedDepositRequest({
+          server, config, receiver: receiver.address, creditId, fundId, amountMicro,
+          authDomain: { audience: info.auth_audience, method: "POST", path: "/v1/credit", capability: null },
+        });
+        const complete = vi.spyOn(PostgresX402ChannelStorage.prototype, "completeSettlement")
+          .mockRejectedValueOnce(new Error("simulated crash before ledger commit"));
+        try {
+          expect((await fund()).ok).toBe(false);
+          expect(await storage.getSettlement("fund", effectId)).toMatchObject({ status: "settled" });
+          expect(await ledger.getFunding({ creditId, fundId })).toBeUndefined();
+          expect(facilitator.settle).toHaveBeenCalledOnce();
+
+          const recovered = await fund(host.app);
+          expect(recovered.status).toBe(200);
+          expect(await recovered.json()).toMatchObject({ funded_micro: amountMicro, replayed: false });
+          const replay = await fund(host.app);
+          expect(replay.status).toBe(200);
+          expect(await replay.json()).toMatchObject({ funded_micro: amountMicro, replayed: true });
+          expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: amountMicro });
+          expect(await storage.getSettlement("fund", effectId)).toMatchObject({ status: "complete" });
+          expect(facilitator.settle).toHaveBeenCalledOnce();
+        } finally {
+          complete.mockRestore();
+        }
+        throw stopBeforeListen;
+      },
+    }));
+    try {
+      await expect(host.serve()).rejects.toBe(stopBeforeListen);
     } finally {
       await server.stop();
     }
@@ -1681,7 +1772,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       const fundId = "fund-1";
       const effectId = `${creditId}:${fundId}`;
       const amountMicro = 100;
-      const { fund, channelId } = await signedDepositRequest({
+      const { fund, channelId, setFundingOffered } = await signedDepositRequest({
         server,
         config,
         receiver: receiver.address,
@@ -1719,6 +1810,12 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       expect(balances.has(channelId.toLowerCase())).toBe(false);
       expect(await ledger.getFunding({ creditId, fundId })).toBeUndefined();
 
+      setFundingOffered(false);
+      const withheld = await fund();
+      expect(withheld.status).toBe(402);
+      expect(withheld.headers.get("PAYMENT-REQUIRED")).toBeNull();
+      expect(facilitator.settle).toHaveBeenCalledTimes(1);
+      setFundingOffered(true);
       chainHead = 101n;
       const funded = await fund();
       expect(funded.status).toBe(200);

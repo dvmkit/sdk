@@ -193,6 +193,7 @@ import {
   hasPaymentProof,
   PAYMENT_PROOF_KEYS,
   paymentErrorBody,
+  paymentScheme,
   repairX402ExactSettlementEffect,
   UNSIGNED_LOCK_REFUSAL_HINT,
   verifyUpfrontPayment,
@@ -352,6 +353,8 @@ export interface SDKServerOpts {
   /** Payment methods this DVM accepts. Default: derived from configured rails — adds "cashu" when `mints` is set, "x402" when `x402` is set, "tempo" when `tempo` is set. */
   paymentMethods?: PaymentMethod[];
   x402?: X402Config;
+  /** Configured batch backend for deposit recovery after a host excludes x402 payments. */
+  x402BatchRecovery?: X402Config;
   /**
    * Path a host mounts this server under, such as `/feed`, or `""` at the
    * root. Boot checks size the x402 route's challenge at the address it will
@@ -653,6 +656,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   const platformToken = opts.platformToken ?? envMaybe.DVMKIT_PLATFORM_TOKEN;
   const platformUrl = opts.platformUrl ?? envMaybe.DVMKIT_PLATFORM_URL;
   const dvmId = opts.dvmId;
+  const x402BatchConfigSource = opts.x402 ?? opts.x402BatchRecovery;
 
   // Settlement history is decided by the first initializer to run: it must
   // precede every store below that creates a financial or report table.
@@ -682,19 +686,19 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
       // the database can no longer claim every effect has an original record.
       await hostedSettlementReports.markHistoryIncomplete();
     }
-    if (opts.x402?.batchSettlement) {
+    if (x402BatchConfigSource?.batchSettlement) {
       // An open batch from before reservations existed cannot be bound to
       // them, so a database with incomplete history keeps its earlier x402
       // reporting. Only the SDK's own channel storage can reserve atomically.
-      if (discharged && !opts.x402.batchSettlement.storage &&
+      if (discharged && !x402BatchConfigSource.batchSettlement.storage &&
         await hostedSettlementReports.hasCompleteHistory()) {
-        const network = x402NetworkByCaip2(opts.x402.network);
+        const network = x402NetworkByCaip2(x402BatchConfigSource.network);
         if (!network) throw new Error("Hosted x402 batch network is unsupported");
         hostedSettlementReports.configureX402({
-          network: opts.x402.network,
-          receiver: opts.x402.payTo,
+          network: x402BatchConfigSource.network,
+          receiver: x402BatchConfigSource.payTo,
           token: network.usdc,
-          ...(opts.x402.batchSettlement.rpcUrl ? { rpcUrl: opts.x402.batchSettlement.rpcUrl } : {}),
+          ...(x402BatchConfigSource.batchSettlement.rpcUrl ? { rpcUrl: x402BatchConfigSource.batchSettlement.rpcUrl } : {}),
         });
         hostedX402Reports = hostedSettlementReports;
       } else {
@@ -852,7 +856,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
     ? (opts.x402FacilitatorHealth?.support() ?? configuredX402FacilitatorSupport(opts.x402))
     : undefined;
   const x402Config = opts.x402;
-  const x402BatchConfig = x402Config?.batchSettlement;
+  const x402BatchConfig = x402BatchConfigSource?.batchSettlement;
   const selfRelayEnabled = !!x402BatchConfig?.selfRelay;
   const effectiveX402BatchConfig = x402BatchConfig?.selfRelay
     ? {
@@ -889,9 +893,9 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   // durable settlement state without a facilitator. Initialize its table before
   // fail-closed reads. Share the store with the settlement factory to keep one pool.
   x402ChannelStorage =
-    opts.db && x402Config && effectiveX402BatchConfig && !effectiveX402BatchConfig.storage
+    opts.db && x402BatchConfigSource && effectiveX402BatchConfig && !effectiveX402BatchConfig.storage
       ? new PostgresX402ChannelStorage(opts.db, {
-          ...(hostedX402Reports ? { hostedNetwork: x402Config.network } : {}),
+          ...(hostedX402Reports ? { hostedNetwork: x402BatchConfigSource.network } : {}),
           terminalizeUnbackedCredit: (evidence, tx) =>
             creditLedger.terminalizeX402Credit(evidence, tx),
         })
@@ -902,14 +906,14 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
   }
 
   const x402BatchSettlementFactory =
-    x402Config && effectiveX402BatchConfig
+    x402BatchConfigSource && effectiveX402BatchConfig
       ? () =>
           x402ShutdownClaimEnvironment.run(opts.env, () => createX402BatchSettlementServer({
             channelStorage: x402ChannelStorage,
-            network: x402Config.network,
-            payTo: x402Config.payTo,
-            facilitator: x402Config.facilitator,
-            ...(x402Config.facilitatorAuth ? { facilitatorAuth: x402Config.facilitatorAuth } : {}),
+            network: x402BatchConfigSource.network,
+            payTo: x402BatchConfigSource.payTo,
+            facilitator: x402BatchConfigSource.facilitator,
+            ...(x402BatchConfigSource.facilitatorAuth ? { facilitatorAuth: x402BatchConfigSource.facilitatorAuth } : {}),
             config: effectiveX402BatchConfig,
             db: opts.db,
             allowInMemory: opts.devMode,
@@ -922,7 +926,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
           }))
       : undefined;
   x402BatchSettlement =
-    x402BatchSettlementFactory && (bootX402Support?.batchSettlement || selfRelayEnabled)
+    x402Config && x402BatchSettlementFactory && (bootX402Support?.batchSettlement || selfRelayEnabled)
       ? await x402BatchSettlementFactory()
       : undefined;
   // Exact settlement recovery is a durable production primitive. Dev servers
@@ -2015,7 +2019,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    * advertising it then would hand the caller an option that
    * fails on use, while the other rails would have closed the sale.
    */
-  private resolveFundingMethods(): FundingMethod[] {
+  private resolveFundingMethods(x402Schemes: { scheme: string }[]): FundingMethod[] {
     // A one-shot MPP `charge` can fund the durable credit ledger even when the
     // reusable session optimization is unavailable. The distinction belongs
     // in the `credit.mpp.methods` menu, not in the top-level funding rail.
@@ -2032,8 +2036,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
     if (
       (this.opts.paymentMethods === undefined || this.opts.paymentMethods.includes("x402")) &&
-      this.x402CurrencySupported() &&
-      this.x402BatchAvailable() &&
+      x402Schemes.some(({ scheme }) => scheme === X402_BATCH_SETTLEMENT_SCHEME) &&
       !methods.includes("x402")
     ) {
       methods.push("x402");
@@ -2100,15 +2103,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!this.x402CurrencySupported() || !x402 || !support) return [];
     return [
       ...(support.available ? [{ scheme: X402_EXACT_SCHEME, network: x402.network }] : []),
-      ...(this.x402BatchAvailable()
+      ...((x402.dualServe ?? true) && this.x402BatchAvailable(support)
         ? [{ scheme: X402_BATCH_SETTLEMENT_SCHEME, network: x402.network }]
         : []),
     ];
   }
 
-  private x402BatchAvailable(): boolean {
+  private x402BatchAvailable(support = this.x402Support()): boolean {
     return (
-      !!this.x402Support()?.batchSettlement &&
+      !!support?.batchSettlement &&
       !!(this.opts.x402BatchSettlement ?? this.opts.x402BatchSettlementFactory)
     );
   }
@@ -2176,8 +2179,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       : IMPLICIT_CREDIT_TTL_MS;
   }
 
-  private async resolveX402BatchSettlement(): Promise<X402BatchSettlementServer | undefined> {
-    if (!this.x402BatchAvailable()) return undefined;
+  private async resolveX402BatchSettlement(recoverExcludedRail = false): Promise<X402BatchSettlementServer | undefined> {
+    if (!recoverExcludedRail && !this.x402BatchAvailable()) return undefined;
     if (this.x402BatchSettlement) return this.x402BatchSettlement;
 
     const factory = this.opts.x402BatchSettlementFactory;
@@ -2247,18 +2250,23 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       lockPubkeys = activePubkeySet(active);
     }
     const x402Support = this.x402Support();
-    const x402BatchSettlement = await this.resolveX402BatchSettlement();
+    const paymentSignature = c.req.header("PAYMENT-SIGNATURE");
+    const recoveryHeader = this.opts.x402BatchRecovery && c.req.path.endsWith("/v1/credit") &&
+      paymentSignature && paymentScheme(paymentSignature) === X402_BATCH_SETTLEMENT_SCHEME
+      ? paymentSignature
+      : undefined;
+    const x402BatchSettlement = await this.resolveX402BatchSettlement(!!recoveryHeader);
     const x402Payment = this.x402CurrencySupported()
       ? x402Support?.exact.v2 || x402Support?.batchSettlement
-        ? c.req.header("PAYMENT-SIGNATURE")
+        ? paymentSignature
         : undefined
-      : (c.req.header("PAYMENT-SIGNATURE") ?? c.req.header("X-PAYMENT"));
+      : (paymentSignature ?? c.req.header("X-PAYMENT"));
     return {
       cashuToken: c.req.header("X-Cashu"),
       mints: this.opts.mints,
       // Prefer v2 only when the facilitator advertises it; otherwise accept
       // the v1 compatibility header only when that generation is supported.
-      x402Payment: x402Payment ?? (x402Support?.exact.v1 ? c.req.header("X-PAYMENT") : undefined),
+      x402Payment: recoveryHeader ?? x402Payment ?? (x402Support?.exact.v1 ? c.req.header("X-PAYMENT") : undefined),
       x402Config: this.opts.x402,
       x402ExactSettlement: this.x402ExactSettlement,
       x402ExactVersions: x402Support?.exact,
@@ -2326,14 +2334,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       this.opts.lightningReceive?.ensureFresh(),
     ]);
     const mppSplit = this.creditMppSplit();
+    const x402Schemes = this.creditX402Schemes();
     const menu = await buildCreditMenu({
       runtime: "container",
       config: this.descriptor.credit,
       currency,
-      funding: this.resolveFundingMethods(),
+      funding: this.resolveFundingMethods(x402Schemes),
       tempoMethods: mppSplit.offered,
       tempoWithheld: mppSplit.withheld,
-      x402Schemes: this.creditX402Schemes(),
+      x402Schemes,
       lightningFundingMinSats: this.opts.lightningReceive?.fundingMinSats,
       stripeNetworkId: this.opts.stripeCredit?.networkId,
       stripeMinMicro: this.opts.stripeCredit?.minMicro,

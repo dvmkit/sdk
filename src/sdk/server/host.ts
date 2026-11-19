@@ -517,7 +517,16 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
       const methods = opts.paymentMethods ?? entry.descriptor.paymentMethods;
       return methods === undefined || methods.includes(rail);
     };
-    const needsHostX402 = mounts.some((entry) => mountAllowsRail(entry, "x402") && !entry.descriptor.x402);
+    const mountRetainsX402Recovery = ({ descriptor }: MountEntry): boolean => {
+      if (!pgPool || !descriptor.credit || !descriptor.auth) return false;
+      const config = descriptor.x402 ?? opts.x402;
+      return config
+        ? !!config.batchSettlement && !config.batchSettlement.storage
+        : !!envMaybe.DVMKIT_X402_PAY_TO && envMaybe.DVMKIT_X402_BATCH_SETTLEMENT === "true";
+    };
+    const needsHostX402 = mounts.some((entry) => !entry.descriptor.x402 && (
+      mountAllowsRail(entry, "x402") || mountRetainsX402Recovery(entry)
+    ));
     const needsHostMpp = mounts.some((entry) => mountAllowsRail(entry, "tempo") && !entry.descriptor.mpp);
     const tempoEnabled = mounts.some((entry) => mountAllowsRail(entry, "tempo"));
 
@@ -1032,10 +1041,11 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     for (const entry of mounts) {
       const descriptor = entry.descriptor;
       const paymentMethods = opts.paymentMethods ?? descriptor.paymentMethods;
-      const descX402 = mountAllowsRail(entry, "x402")
+      const x402Enabled = mountAllowsRail(entry, "x402");
+      const descX402 = x402Enabled || mountRetainsX402Recovery(entry)
         ? descriptor.x402 ? normalizeX402Config(descriptor.x402) : x402WithDualServe
         : undefined;
-      const descX402WithDualServe = descX402
+      const descX402WithDualServe = x402Enabled && descX402
         ? {
             ...descX402,
             dualServe: dualServeEnabled ? (descX402.dualServe ?? true) : false,
@@ -1087,6 +1097,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
         paymentMode,
         paymentMethods,
         x402: descX402WithDualServe,
+        x402BatchRecovery: x402Enabled ? undefined : descX402,
         x402FacilitatorHealth: descX402Health,
         mpp: descMpp,
         stripeCredit,
