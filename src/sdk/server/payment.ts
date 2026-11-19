@@ -1264,11 +1264,14 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
     paymentScheme(x402Payment) === X402_BATCH_SETTLEMENT_SCHEME
   ) {
     if (!x402PriceFiat) return x402NotOfferedResult(opts.priceFiat?.currency);
-    if (!opts.fundOnly || !opts.x402BatchSettlement) {
+    if (!opts.fundOnly) {
       return creditRefusal(
         "payment_invalid",
         "Reusable x402 channels are accepted only by POST /v1/credit."
       );
+    }
+    if (!opts.x402BatchSettlement) {
+      return creditRefusal("payment_invalid", "This DVM does not offer reusable x402 channel funding.");
     }
     if (rateOutage) return rateUnavailableResult();
     if (!ledgerCtx?.fundOnly?.creditId) {

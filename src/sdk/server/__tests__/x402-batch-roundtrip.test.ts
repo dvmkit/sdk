@@ -20,7 +20,7 @@ import { decodePaymentRequiredHeader, encodeSettleResponseHeader } from "../../.
 import { diagnosticConsole } from "../../../observability/diagnostic-console";
 import { configureDVM } from "../../configure";
 import { MemoryKVStore } from "../../store";
-import { createDVMServer } from "../app";
+import { createDVMServer, type SDKServerOpts } from "../app";
 import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
 import { derivedFundCreditId, fundingCommitment } from "../funding";
 import { MemoryJobStore } from "../memory-job-store";
@@ -179,15 +179,18 @@ async function mainnetCreditServer({
   selfRelay,
   dualServe = true,
   allowOneShotStablecoin = true,
+  paymentMethods,
 }: {
   exact: boolean;
   selfRelay: boolean;
   dualServe?: boolean;
   allowOneShotStablecoin?: boolean;
+  paymentMethods?: SDKServerOpts["paymentMethods"];
 }) {
   const receiver = privateKeyToAccount(`0x${"22".repeat(32)}`);
   const storage = new InMemoryChannelStorage();
   const ledger = durableLedger();
+  const facilitator = new StatefulFacilitator(MAINNET);
   const x402 = {
     network: MAINNET,
     payTo: receiver.address,
@@ -195,7 +198,7 @@ async function mainnetCreditServer({
     ...(selfRelay && {
       batchSettlement: {
         storage,
-        facilitatorClient: new StatefulFacilitator(MAINNET),
+        facilitatorClient: facilitator,
         receiverAuthorizerSigner: receiver,
         selfRelay: { privateKey: `0x${"11".repeat(32)}` as const, rpcUrl: "https://base.example.com" },
         autoSettlement: false as const,
@@ -227,10 +230,11 @@ async function mainnetCreditServer({
       fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
       supportedCurrencies: () => ["usd"],
     },
+    paymentMethods,
     x402,
     x402FacilitatorHealth,
   });
-  return { ...server, receiver, ledger };
+  return { ...server, receiver, ledger, facilitator };
 }
 
 function fundCreditRequest(
@@ -267,12 +271,13 @@ function fundCreditRequest(
 
 describe("x402 credit funding with a Base mainnet self-relay", () => {
   it.each([
-    { exact: true, selfRelay: true, schemes: ["batch-settlement", "exact"] },
-    { exact: true, selfRelay: false, schemes: ["exact"] },
-    { exact: false, selfRelay: true, schemes: ["batch-settlement"] },
-    { exact: false, selfRelay: false, schemes: [] },
-    { exact: false, selfRelay: true, dualServe: false, schemes: [] },
-  ])("agrees on funding schemes for $schemes (exact=$exact, self-relay=$selfRelay)", async ({ schemes, ...config }) => {
+    { setting: "both rails", exact: true, selfRelay: true, schemes: ["batch-settlement", "exact"] },
+    { setting: "hosted exact only", exact: true, selfRelay: false, schemes: ["exact"] },
+    { setting: "self-relay only", exact: false, selfRelay: true, schemes: ["batch-settlement"] },
+    { setting: "neither rail", exact: false, selfRelay: false, schemes: [] },
+    { setting: "dual-serve disabled", exact: false, selfRelay: true, dualServe: false, schemes: [] },
+    { setting: "x402 excluded", exact: false, selfRelay: true, paymentMethods: [], schemes: [] },
+  ])("agrees on funding schemes with $setting", async ({ schemes, ...config }) => {
     const server = await mainnetCreditServer(config);
     try {
       const info = await (await server.app.request("/v1/info")).json() as {
@@ -340,15 +345,18 @@ describe("x402 credit funding with a Base mainnet self-relay", () => {
       });
       expect(await server.ledger.get(creditId)).toMatchObject({ x402ChannelId: channelId });
 
-      const unavailable = await mainnetCreditServer({ exact: false, selfRelay: false });
-      try {
-        const refusedRequest = fundCreditRequest(unavailable, "open-channel", header(deposit, requirements));
-        const refused = await refusedRequest.send();
-        expect(refused.status).toBe(402);
-        expect(refused.headers.get("PAYMENT-REQUIRED")).toBeNull();
-        expect(await unavailable.ledger.get(creditId)).toBeUndefined();
-      } finally {
-        await unavailable.shutdown();
+      for (const config of [{ selfRelay: false }, { selfRelay: true, paymentMethods: [] }]) {
+        const unavailable = await mainnetCreditServer({ exact: false, ...config });
+        try {
+          const refusedRequest = fundCreditRequest(unavailable, "open-channel", header(deposit, requirements));
+          const refused = await refusedRequest.send();
+          expect(refused.status).toBe(402);
+          expect(refused.headers.get("PAYMENT-REQUIRED")).toBeNull();
+          expect(unavailable.facilitator.settle).not.toHaveBeenCalled();
+          expect(await unavailable.ledger.get(creditId)).toBeUndefined();
+        } finally {
+          await unavailable.shutdown();
+        }
       }
     } finally {
       await server.shutdown();

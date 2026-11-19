@@ -7,7 +7,7 @@ import { Errors as MppxErrors } from "mppx";
 import { z } from "zod";
 
 import type { SignedRequestDomain } from "../../lib/signed-request-statement";
-import { encodeSettleResponseHeader } from "../../lib/x402/spec";
+import { encodeSettleResponseHeader, X402_BATCH_SETTLEMENT_SCHEME } from "../../lib/x402/spec";
 import { isX402SettlementReconciliationReason } from "../../lib/x402/types";
 import { loggers } from "../../observability/loggers";
 import type { FxFetcher, FxRateSnapshot } from "../pricing/fx";
@@ -2035,6 +2035,10 @@ async function handleFund(
   }
 
   const railOpts = await deps.railOpts(c);
+  // Custom handlers can advertise x402 funding without scheme metadata.
+  const batchFundingOffered = menu.funding.includes("x402") && (
+    menu.x402?.schemes.some(({ scheme }) => scheme === X402_BATCH_SETTLEMENT_SCHEME) ?? true
+  );
   const compatibility = c.get("clientCompatibility");
   if (
     fund.method === "stripe" &&
@@ -2072,6 +2076,7 @@ async function handleFund(
             })
           : verifyUpfrontPayment({
               ...railOpts,
+              x402BatchSettlement: batchFundingOffered ? railOpts.x402BatchSettlement : undefined,
               requiredMsats,
               priceFiat: { currency: menu.currency, amountMicro: fund.amount_micro },
               callerPubkey: args.callerPubkey,
