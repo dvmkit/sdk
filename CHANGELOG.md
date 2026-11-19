@@ -6,6 +6,10 @@
 - When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
 - When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
 
+### Breaking API changes
+
+Against `0.41.0`, no supported use stops working. The Hono context variables that `@dvmkit/sdk/server` types as `AppEnv` gain an optional `prefixedDVMRequest` flag, which the host sets on requests under another DVM's mount prefix. `CreditRouteDeps` and `handleCreditRequest` change signature only because they reach `AppEnv` through their Hono context. Code that builds or reads that context compiles unchanged.
+
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
