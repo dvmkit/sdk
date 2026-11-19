@@ -1,5 +1,10 @@
 import pg from "pg";
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { Credential } from "mppx";
+import { tempo as tempoClient } from "mppx/client";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, keccak256, toHex, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { Abis, Transaction } from "viem/tempo";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
@@ -17,6 +22,7 @@ import { CreditLedger } from "../credit-ledger";
 import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
 import { drawSettlementRef, fundingCommitment } from "../funding";
 import { LightningReceive } from "../lightning-receive";
+import { createMppFromOpts, readTempoChargePayer } from "../mpp-setup";
 import {
   creditDepositPayload,
   verifyIncomingPayment,
@@ -47,6 +53,16 @@ const DVM_SCHEMA = `dvm_deposit_outbox_${process.pid}`;
 const AUTOWIRE_PRIVKEY = new Uint8Array(32).fill(13);
 const AUTOWIRE_CALLER = Buffer.from(schnorr.getPublicKey(AUTOWIRE_PRIVKEY)).toString("hex");
 const { payerAddress } = unsignedReports.x402_exact_deposit.body;
+const tempoDeposit = unsignedReports.tempo_charge_deposit.body;
+const TEMPO_PAYER = privateKeyToAccount(`0x${"11".repeat(32)}`);
+const TEMPO_SPONSOR = privateKeyToAccount(`0x${"22".repeat(32)}`);
+const TEMPO_RECIPIENT = `0x${"33".repeat(20)}` as const;
+const TEMPO_TOKEN = `0x${"44".repeat(20)}` as const;
+const TEMPO_HASH = `0x${"aa".repeat(32)}` as const;
+
+function paymentMemo(challenge: { id: string; realm: string }): Hex {
+  return `0x${keccak256(toHex("mpp")).slice(2, 10)}01${keccak256(toHex(challenge.realm)).slice(2, 22)}${"00".repeat(10)}${keccak256(toHex(challenge.id)).slice(2, 16)}`;
+}
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
@@ -358,6 +374,204 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
       amountMicro: PRICE_MICRO / 2,
     });
     expect(payload).not.toHaveProperty("payerAddress");
+  });
+
+  function tempoServer() {
+    return createMppFromOpts({ tempoRecipient: TEMPO_RECIPIENT, realm: "payments.example.com" }, {
+      DVMKIT_TEMPO_SECRET_KEY: "42".repeat(32),
+      DVMKIT_TEMPO_CURRENCY: TEMPO_TOKEN,
+    })!;
+  }
+
+  it.each([
+    "push", "sponsored push", "pull", "sponsored pull", "top-up", "explicit fund-and-draw", "unverified",
+    "reverted", "missing transfer evidence", "wrong transfer token", "wrong transfer recipient",
+    "wrong memo on conflicting receipt", "missing receipt reference", "stalled receipt reread",
+  ] as const)("reports only the settled one-request Tempo payer for %s", async (scenario) => {
+    const mpp = tempoServer();
+    const topUp = scenario === "top-up";
+    const explicitFunding = scenario === "explicit fund-and-draw";
+    const creditId = "tempo-reusable-credit";
+    const drawId = "first-draw";
+    const pull = scenario === "pull" || scenario === "sponsored pull" || scenario === "reverted";
+    const sponsored = scenario.startsWith("sponsored");
+    const conflictingTransfer = scenario === "missing transfer evidence" || scenario === "wrong memo on conflicting receipt" ||
+      scenario === "wrong transfer token" || scenario === "wrong transfer recipient";
+    const resourcePath = topUp ? "/v1/credit" : "/v1/job";
+    const challenge = await mpp.issueChallenge("tempo", "charge", {
+      amount: "0.10",
+      meta: { path: resourcePath, nonce: "test-charge" },
+    });
+    const memo = paymentMemo(challenge);
+    const signature = pull ? await TEMPO_PAYER.signTransaction({
+      type: "tempo",
+      chainId: 4217,
+      nonce: 1,
+      gas: 200_000n,
+      maxFeePerGas: 20_000_000_000n,
+      maxPriorityFeePerGas: 1n,
+      calls: [{
+        to: TEMPO_TOKEN,
+        data: encodeFunctionData({
+          abi: Abis.tip20,
+          functionName: "transferWithMemo",
+          args: [TEMPO_RECIPIENT, BigInt(PRICE_MICRO), memo],
+        }),
+      }],
+      ...(sponsored && { feePayer: TEMPO_SPONSOR }),
+    }, { serializer: Transaction.serialize }) : undefined;
+    const source = sponsored && !pull ? TEMPO_PAYER.address : TEMPO_SPONSOR.address;
+    const mppCredential = Credential.serialize(Credential.from({
+      challenge: scenario === "unverified" ? { ...challenge, id: "invalid-challenge" } : challenge,
+      payload: signature ? { type: "transaction", signature } : { type: "hash", hash: TEMPO_HASH },
+      ...(pull || sponsored ? { source: `did:pkh:eip155:4217:${source}` } : {}),
+    }));
+    const transferLog = (
+      from: Hex, amount: number, logIndex: Hex, address: Hex = TEMPO_TOKEN, to: Hex = TEMPO_RECIPIENT,
+      transferMemo = memo
+    ) => ({
+      address,
+      topics: encodeEventTopics({
+        abi: Abis.tip20, eventName: "TransferWithMemo", args: { from, to, memo: transferMemo },
+      }),
+      data: encodeAbiParameters([{ type: "uint256" }], [BigInt(amount)]),
+      logIndex,
+    });
+    const responseHash = signature ? keccak256(signature) : TEMPO_HASH;
+    let receiptReads = 0;
+    const stalledBody = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+    const deliveries: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "https://platform.invalid/_internal/credit-deposit") {
+        deliveries.push(JSON.parse(String(init?.body)));
+        return new Response(null, { status: deliveries.length === 1 ? 503 : 200 });
+      }
+      const rpc = JSON.parse(input instanceof Request ? await input.text() : String(init?.body));
+      let result: unknown;
+      if (rpc.method === "eth_call") {
+        result = "0x";
+      } else if (rpc.method === "eth_getTransactionReceipt" || rpc.method === "eth_sendRawTransactionSync") {
+        if (rpc.method === "eth_getTransactionReceipt") {
+          expect(rpc.params).toEqual([TEMPO_HASH]);
+          receiptReads++;
+          if (scenario === "stalled receipt reread" && receiptReads > 2) {
+            return new Response(new ReadableStream<Uint8Array>({
+              start(controller) { stalledBody.resolve(controller); },
+            }), { headers: { "Content-Type": "application/json" } });
+          }
+        }
+        // A contradictory RPC result can still contain a valid payment from
+        // its stated sender. It must not attribute a decoy to the preflight sender.
+        const conflictingReceipt = conflictingTransfer && receiptReads === 2;
+        result = {
+          status: scenario === "reverted" ? "0x0" : "0x1",
+          ...(scenario !== "missing receipt reference" || receiptReads !== 2
+            ? { transactionHash: responseHash } : {}),
+          from: (sponsored && !pull) || conflictingReceipt ? TEMPO_SPONSOR.address : TEMPO_PAYER.address,
+          to: TEMPO_TOKEN,
+          logs: [
+            transferLog(TEMPO_SPONSOR.address, sponsored || conflictingReceipt ? PRICE_MICRO : PRICE_MICRO - 1, "0x0"),
+            transferLog(
+              TEMPO_PAYER.address,
+              scenario === "missing transfer evidence" && receiptReads >= 2 ? PRICE_MICRO - 1 : PRICE_MICRO,
+              "0x1",
+              conflictingReceipt && scenario === "wrong transfer token" ? TEMPO_RECIPIENT : TEMPO_TOKEN,
+              conflictingReceipt && scenario === "wrong transfer recipient" ? TEMPO_TOKEN : TEMPO_RECIPIENT,
+              conflictingReceipt && scenario === "wrong memo on conflicting receipt"
+                ? paymentMemo({ ...challenge, id: "different-challenge" }) : memo
+            ),
+          ],
+        };
+      } else {
+        throw new Error(`Unexpected test RPC method: ${rpc.method}`);
+      }
+      return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+    }));
+    const { x402Payment: _, x402Config: __, ...opts } = upfrontOpts("tempo-charge");
+    const booking = verifyUpfrontPayment({
+      ...opts,
+      mpp,
+      mppCredential,
+      resourcePath,
+      fxFetcher: stubFx,
+      ...(explicitFunding && { creditEnvelope: {
+        creditId,
+        drawId,
+        fund: { amountMicro: PRICE_MICRO, commitment: fundingCommitment(mppCredential) },
+      } }),
+      ...(topUp && { fundOnly: {
+        creditId: "tempo-top-up",
+        fundId: "first-funding",
+        commitment: fundingCommitment(mppCredential),
+        allowOneShotStablecoin: true,
+      } }),
+    });
+    if (scenario === "stalled receipt reread") {
+      const body = await Promise.race([booking.then(() => undefined), stalledBody.promise]);
+      if (body) {
+        let bookedWhileStalled: boolean;
+        try {
+          bookedWhileStalled = await Promise.race([
+            booking.then(() => true),
+            new Promise<false>((resolve) => setTimeout(resolve, 1_350, false)),
+          ]);
+        } finally {
+          body.error(new Error("Test released the stalled receipt body"));
+          await booking;
+        }
+        expect(bookedWhileStalled, "A stalled optional receipt read held up deposit booking").toBe(true);
+      }
+      expect(receiptReads).toBe(2);
+    }
+    const result = await booking;
+
+    if (scenario === "unverified" || scenario === "reverted") {
+      expect(result.error?.status).toBe(402);
+      expect(await pendingDeposits()).toEqual([]);
+      return;
+    }
+    expect(result.error).toBeUndefined();
+    const deposits = await pendingDeposits();
+    expect(deposits).toEqual([{ payload: expect.objectContaining({
+      rail: tempoDeposit.rail,
+      instrument: tempoDeposit.instrument,
+      callerPubkey: CALLER,
+      amountMicro: PRICE_MICRO,
+    }) }]);
+    if (explicitFunding) {
+      expect(deposits[0]?.payload).toHaveProperty("creditId", creditId);
+      expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ amountMicro: PRICE_MICRO });
+      expect(creditDepositPayload(DVM_ID, result.funding!)).not.toHaveProperty("payerAddress");
+    }
+    if (topUp || explicitFunding || conflictingTransfer || scenario === "missing receipt reference") {
+      if (conflictingTransfer) expect(receiptReads).toBe(2);
+      expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
+      return;
+    }
+    expect(deposits[0]?.payload).toHaveProperty("payerAddress", tempoDeposit.payerAddress);
+    if (scenario === "sponsored push") {
+      await reporter.drainPending();
+      await pool.query("UPDATE pending_dvm_reports SET next_retry_at = 0");
+      await reporter.drainPending();
+      expect(deliveries).toEqual([deposits[0]?.payload, deposits[0]?.payload]);
+      expect(await pendingDeposits()).toEqual([]);
+    }
+  });
+
+  it("does not attribute a verified zero-amount Tempo proof to a transfer payer", async () => {
+    const mpp = tempoServer();
+    const challenge = await mpp.challenge.tempo.charge({ amount: "0" });
+    const client = tempoClient.charge({ account: TEMPO_PAYER });
+    const credential = await client.createCredential({ challenge, context: { account: TEMPO_PAYER } });
+    const receipt = await mpp.broadcastCredential(credential);
+    expect(receipt.status).toBe("success");
+    expect(readTempoChargePayer(receipt)).toBeUndefined();
+    const { x402Payment: _, x402Config: __, ...opts } = upfrontOpts("tempo-proof");
+    await verifyUpfrontPayment({
+      ...opts, requiredMsats: 0, priceFiat: { currency: "usd", amountMicro: 0 },
+      mpp, mppCredential: credential,
+    });
+    expect(await pendingDeposits()).toEqual([]);
   });
 
   it("queues a fund-only top-up once across a retry", async () => {

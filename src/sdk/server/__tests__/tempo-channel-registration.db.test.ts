@@ -215,7 +215,8 @@ describe.skipIf(!RUN)("— a first Tempo voucher registers its channel", () => {
     expect(result.error).toBeUndefined();
     // Pre-fix this block was absent: the commit callback read the channel
     // before the acceptance transaction had inserted it.
-    expect(await pendingDeposits()).toEqual([
+    const deposits = await pendingDeposits();
+    expect(deposits).toEqual([
       {
         payload: expect.objectContaining({
           creditId: "credit-tempo-1995",
@@ -234,6 +235,7 @@ describe.skipIf(!RUN)("— a first Tempo voucher registers its channel", () => {
         }),
       },
     ]);
+    expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
   });
 
   it("still reports the binding on a later voucher against an existing row", async () => {

@@ -75,7 +75,7 @@ import type { TopUpCapUnenforcedReason } from "./job-store";
 import { UNCAPPABLE_ASK_TOTAL } from "./job-store";
 import type { ArrivalBalanceReason, BalanceLanding as LedgerBalanceLanding } from "./payment-arrival";
 import type { MintHealthTracker } from "./mint-health-tracker";
-import { challengeMeta, type MppxServer } from "./mpp-setup";
+import { challengeMeta, type MppxServer, readTempoChargePayer } from "./mpp-setup";
 import {
   fiatMicroToMethodAmount,
   methodNativeAmountFromDecimal,
@@ -1758,7 +1758,7 @@ async function verifyUpfrontPaymentInScope(
       // HMAC-bound and server-issued, so trusting the credential's value for
       // the rebuild is sound; the path is *not* HMAC-bound across endpoints,
       // which is exactly why this comparison has to be against the live path.
-      let tempoReceipt: { reference?: unknown; txHash?: unknown } | undefined;
+      let tempoReceipt: Awaited<ReturnType<MppxServer["broadcastCredential"]>> | undefined;
       const broadcast = async () => {
         const receipt = await loggers.tempo.span(
           "tempo.verify_credential",
@@ -1777,7 +1777,7 @@ async function verifyUpfrontPaymentInScope(
             })),
         { onError: paymentFailureFields }
         );
-        tempoReceipt = receipt as { reference?: unknown; txHash?: unknown };
+        tempoReceipt = receipt;
         return receipt;
       };
       let credited: CommittedFunding | undefined;
@@ -1898,6 +1898,9 @@ async function verifyUpfrontPaymentInScope(
             paidMsats: requiredMsats,
             nativeAmount: methodNativeAmountFromDecimal(expectedAmount, cred.challenge.method),
             nativeAsset: methodNativeAsset(cred.challenge.method),
+            payerAddress: tempoReceipt && !ledgerCtx.fundOnly && !ledgerCtx.creditEnvelope?.fund
+              ? readTempoChargePayer(tempoReceipt)
+              : undefined,
           });
         } catch (err) {
           const mapped = mapLedgerCommitError(err, x402Requirements, true);
@@ -5039,7 +5042,8 @@ async function fundAndDrawInScope(
       expiryMs: credit.expiryMs,
       callerPubkey: credit.callerPubkey,
       ...(instrument && { instrument }),
-      ...(createsDepositLiability && oneRequest && instrument === "x402_exact" && funding.payerAddress &&
+      ...(createsDepositLiability && oneRequest &&
+        (instrument === "x402_exact" || instrument === "tempo_charge") && funding.payerAddress &&
         { payerAddress: funding.payerAddress }),
     };
     if (createsDepositLiability && enqueue && tx) {
@@ -5300,7 +5304,7 @@ export function creditDepositPayload(
     fundedAt: funding.fundedAt,
     expiryMs: funding.expiryMs,
     ...(funding.instrument && { instrument: funding.instrument }),
-    ...(funding.instrument === "x402_exact" && funding.payerAddress &&
+    ...((funding.instrument === "x402_exact" || funding.instrument === "tempo_charge") && funding.payerAddress &&
       /^0x[0-9a-f]{40}$/.test(funding.payerAddress) && { payerAddress: funding.payerAddress }),
     // label a session-funded deposit as one, whether or not the chain
     // binding below could be read. `rail: "tempo"` alone does not say — a

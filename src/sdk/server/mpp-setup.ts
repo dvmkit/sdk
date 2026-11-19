@@ -1,4 +1,5 @@
 /** Mppx upgrades require independent-client conformance, beyond same-library round trips. */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 
 import type { Challenge, Credential, Method, Receipt, Store } from "mppx";
@@ -6,7 +7,8 @@ import { Credential as MppCredential, Errors as MppxErrors, PaymentRequest } fro
 import { Mppx, tempo } from "mppx/server";
 import { Session as TempoSession } from "mppx/tempo";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
-import type { Account, Client, Hex } from "viem";
+import { parseEventLogs, type Account, type Client, type Hex, type RpcTransactionReceipt } from "viem";
+import { Abis } from "viem/tempo";
 
 import { loggers } from "../../observability/loggers";
 import type { CreditDrainRecord, CreditLedgerLike, CreditLedgerQuerier, TempoCreditLoss } from "./credit-ledger";
@@ -484,6 +486,112 @@ export function challengeMeta(challenge: Challenge.Challenge): Record<string, st
   return challenge.meta;
 }
 
+const tempoChargePayers = new WeakMap<Receipt.Receipt, () => string | undefined>();
+
+export function readTempoChargePayer(receipt: Receipt.Receipt): string | undefined {
+  try {
+    return tempoChargePayers.get(receipt)?.();
+  } catch {
+    // Optional evidence must leave settlement bookable even when decoding fails.
+    return undefined;
+  }
+}
+
+function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
+  type ReceiptCapture = { receipt?: RpcTransactionReceipt };
+  const pushReceipts = new AsyncLocalStorage<ReceiptCapture>();
+  const charge = tempo.charge({
+    ...options,
+    async getClient({ chainId }) {
+      const [{ createClient, http }, { tempo: mainnet, tempoModerato }] = await Promise.all([
+        import("viem"), import("viem/tempo/chains"),
+      ]);
+      const chain = chainId === TEMPO_MODERATO_CHAIN_ID ? tempoModerato : mainnet;
+      if (chainId && chainId !== chain.id) throw new Error("Unsupported Tempo charge chain");
+      const client = createClient({ chain, transport: http() });
+      const push = pushReceipts.getStore();
+      if (!push) return client;
+      // Capture the receipts mppx already reads during validation and broadcast.
+      const request = new Proxy(client.request, {
+        async apply(target, receiver, args) {
+          const result: unknown = await Reflect.apply(target, receiver, args);
+          if (args[0]?.method === "eth_getTransactionReceipt") {
+            push.receipt = result as RpcTransactionReceipt;
+          }
+          return result;
+        },
+      });
+      return { ...client, request };
+    },
+  });
+  const validate = charge.validate!;
+  const broadcast = charge.broadcast!;
+  const preflights = new WeakMap<object, ReceiptCapture & { validation: Awaited<ReturnType<typeof validate>> }>();
+  return {
+    ...charge,
+    validate: async (input: Parameters<typeof validate>[0]) => {
+      const capture: ReceiptCapture = {};
+      const validation = input.credential.payload.type === "hash"
+        ? await pushReceipts.run(capture, () => validate(input))
+        : await validate(input);
+      preflights.set(input.credential, { validation, receipt: capture.receipt });
+      return validation;
+    },
+    broadcast: async (input: Parameters<typeof broadcast>[0]) => {
+      const preflight = preflights.get(input.credential);
+      preflights.delete(input.credential);
+      const push: ReceiptCapture = {};
+      const receipt = input.credential.payload.type === "hash"
+        ? await pushReceipts.run(push, () => broadcast(input))
+        : await broadcast(input);
+      if (preflight && receipt && typeof receipt === "object") {
+        tempoChargePayers.set(receipt, () => {
+          const { validation } = preflight;
+          const details = validation.details as { mode?: unknown; sender?: unknown } | undefined;
+          const sender = details?.sender;
+          if (receipt.status !== "success" || typeof sender !== "string" ||
+              !HEX_ADDRESS_RE.test(sender)) return undefined;
+          if (details?.mode === "pull") return sender.toLowerCase();
+          if (details?.mode !== "push" || !push.receipt || input.credential.payload.type !== "hash") {
+            return undefined;
+          }
+          const { hash } = input.credential.payload;
+          const { currency, recipient, amount } = validation.request;
+          if (!recipient || !/^0x[0-9a-fA-F]{64}$/.test(hash) || typeof receipt.reference !== "string" ||
+              receipt.reference.toLowerCase() !== hash.toLowerCase()) return undefined;
+          // With no credential source, mppx selects the receipt's from on
+          // each read. Conflicting receipts cannot vouch for the same payer.
+          const preflightFrom = preflight.receipt?.from;
+          if (preflight.receipt?.transactionHash?.toLowerCase() !== hash.toLowerCase() ||
+              typeof preflightFrom !== "string" || !HEX_ADDRESS_RE.test(preflightFrom) ||
+              push.receipt.from?.toLowerCase() !== preflightFrom.toLowerCase()) return undefined;
+          return readTempoPushPayer(push.receipt, { hash, currency, recipient, amount, sender });
+        });
+      }
+      return receipt;
+    },
+  };
+}
+
+function readTempoPushPayer(settled: RpcTransactionReceipt, args: {
+  hash: string; currency: string; recipient: string; amount: string; sender: string;
+}): string | undefined {
+  if (settled.status !== "0x1" ||
+      settled.transactionHash?.toLowerCase() !== args.hash.toLowerCase()) return undefined;
+  // Select the validated sender's transfer even if this receipt contains
+  // another transfer of the same amount.
+  const amount = BigInt(args.amount);
+  const transfer = parseEventLogs({
+    abi: Abis.tip20, eventName: ["Transfer", "TransferWithMemo"], logs: settled.logs,
+  }).find(({ address, args: log }) =>
+    address.toLowerCase() === args.currency.toLowerCase() &&
+    log.to.toLowerCase() === args.recipient.toLowerCase() &&
+    log.amount === amount &&
+    log.from.toLowerCase() === args.sender.toLowerCase()
+  );
+  return transfer?.args.from.toLowerCase();
+}
+
 /**
  * Build an `Mppx.create(...)` handle from `opts` and `env`. Returns
  * `undefined` when no rail is configured (no `tempoRecipient`). Throws when
@@ -735,7 +843,7 @@ function buildMppMethods(
       }),
     };
     methods.push(
-      tempo.charge({
+      tempoChargeWithPayer({
         recipient: opts.tempoRecipient as `0x${string}`,
         currency: tempoCurrency as `0x${string}`,
         // mppx resolves the route's verification requirement from `testnet`.
@@ -744,6 +852,7 @@ function buildMppMethods(
         // returns and fail before payment verification.
         testnet: chainId === TEMPO_MODERATO_CHAIN_ID,
         decimals: 6,
+        waitForConfirmation: true,
         // Without this mppx installs `Store.memory()`, so the consumed-hash
         // guard is per-process and a credential replayed onto a sibling machine
         // (or after a restart) reaches a broadcast the chain then rejects
