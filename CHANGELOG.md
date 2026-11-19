@@ -25,6 +25,27 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
+
+
+### Features
+
+* **server:** paginate JSON job messages ([ce59a80](https://github.com/dvmkit/sdk/commit/ce59a8071a21b8abbefc006dd91ceaaf80007061))
+
+
+### Bug Fixes
+
+* **observability:** exclude sibling mounts from root request spans ([576a2b0](https://github.com/dvmkit/sdk/commit/576a2b0a533d25d1dab959982ef2ef1c61b112bb))
+* **server:** clarify ambiguous x402 deposit outcomes ([6e78752](https://github.com/dvmkit/sdk/commit/6e78752fec9d4f5d0fb4c8eb48cf98c36444b2f9))
+* **server:** make absent x402 deposits retryable ([7c652a4](https://github.com/dvmkit/sdk/commit/7c652a4e13b59ee9f173dcac3338803484093c79))
+* **server:** preserve paid pieces on notification resume ([1a498af](https://github.com/dvmkit/sdk/commit/1a498afd84a2904b9eb49844b03e07ecc46374df))
+* **server:** recover jobs after signed credit payments ([65c6c02](https://github.com/dvmkit/sdk/commit/65c6c0237bd1483e36436e60d3a2af3702d6b0c2))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.41.0 ([#200](https://github.com/dvmkit/sdk/issues/200)) ([7e4658d](https://github.com/dvmkit/sdk/commit/7e4658df22852774f6214b758f05627db3245136))
+
 ## [0.41.0](https://github.com/dvmkit/sdk/compare/v0.40.0...v0.41.0) (2026-11-17)
 
 
