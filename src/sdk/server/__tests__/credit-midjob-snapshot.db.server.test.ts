@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import snapshotFailure from "../../../../protocol-fixtures/job-snapshot-unavailable.json";
+import type { Message } from "../../../lib/messages/types";
 import { encodePayment } from "../../../lib/x402/spec";
 import { servedApps } from "../../../test-support/served-app";
 import { configureDVM } from "../../configure";
@@ -134,10 +135,15 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       expect(submit.status).toBe(202);
       const job = await submit.json() as { job_id: string; job_token: string };
       const headers = { "Content-Type": "application/json", "X-Job-Token": job.job_token };
-      const messages = await fetch(`${url}/v1/job/${job.job_id}/messages`, { headers });
-      const asked = await messages.json() as { messages: { type: string; content: { x402?: { nonce?: string } } }[] };
-      const nonce = asked.messages.find(message => message.type === "payment-request")?.content.x402?.nonce;
-      expect(nonce).toBeTruthy();
+      // The submit response can arrive while the handler is still preparing the ask.
+      const nonce = await vi.waitFor(async () => {
+        const response = await fetch(`${url}/v1/job/${job.job_id}/messages`, { headers });
+        expect(response.status).toBe(200);
+        const { messages } = await response.json() as { messages: Message[] };
+        const nonce = messages.find(message => message.type === "payment-request")?.content.x402?.nonce;
+        if (!nonce) throw new Error("The mid-job payment request has no published x402 nonce");
+        return nonce;
+      });
       // Message delivery can precede both asks' yield snapshots. Drain those
       // writes so they cannot consume faults intended for payment recovery.
       await Promise.all(initial.snapshots.mock.results.map(result => result.value));
@@ -170,7 +176,7 @@ describe.skipIf(!RUN)("HTTP payment accounting survives a later snapshot failure
       target.failures = failures;
       const payment = encodePayment({ x402Version: 1, scheme: "exact", network: "base-sepolia", payload: {
         signature: "0xdeadbeef", authorization: { from: "0xfrom", to: "0x1111111111111111111111111111111111111111",
-          value: String(TOPUP), validAfter: "0", validBefore: "9999999999", nonce: nonce! },
+          value: String(TOPUP), validAfter: "0", validBefore: "9999999999", nonce },
       } });
       async function send(type: string, content: object) {
         return fetch(`${url}/v1/job/${job.job_id}/messages`, { method: "POST", headers, body: JSON.stringify({ type, content }) });
