@@ -1592,7 +1592,7 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
     });
 
     try {
-      const creditId = "reported-failure-recovery-credit";
+      const creditId = `reported-failure-recovery-credit-${excluded ? "excluded" : "offered"}`;
       const fundId = "fund-1";
       const effectId = `${creditId}:${fundId}`;
       const amountMicro = 100;
@@ -1606,9 +1606,9 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
       });
 
       const failed = await fund();
+      expect(failed.status).toBe(503);
       expect(facilitator.settle).toHaveBeenCalledOnce();
       expect(balances.get(channelId.toLowerCase())).toBe(1000n);
-      expect(failed.status).toBe(503);
       const failure = await failed.json();
       expect(failure).toMatchObject({
         error: "x402_settlement_submission_failed",
