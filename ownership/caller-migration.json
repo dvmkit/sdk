@@ -25031,11 +25031,11 @@
         {
           "decision": "retain",
           "destination": "sdk",
-          "reason": "Standing-mandate settlement of open asks from caller credit, sharing the balance payment's atomic job, draw, inbound and replay accounting, used by the supported Postgres host.",
+          "reason": "Standing-mandate settlement and recovery of committed credit payments for open asks in the supported Postgres host.",
           "symbols": [
             "MandateSettlement",
             "MandateSkipReason",
-            "findQuietMandatedAsks",
+            "findQuietCreditAsks",
             "mandatePaymentId",
             "reportMandateSkip",
             "settleMandateAsk"

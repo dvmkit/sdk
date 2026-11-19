@@ -52,7 +52,7 @@ import {
   type StalePendingDrawCursor,
 } from "./credit-ledger";
 import { deferredX402IntentId } from "./funding";
-import { findQuietMandatedAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
+import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -552,18 +552,24 @@ export interface JobManagerOpts {
    */
   reactivationClaimGraceMs?: number;
   /**
-   * Resume an `awaiting-input` job whose ask a standing mandate has paid but no worker here is
-   * running. The app supplies its reactivation path; the job manager cannot replay on its own.
+   * Resume an `awaiting-input` job with a paid ask and no local worker. The app supplies its
+   * reactivation path.
    */
   resumePaidAsk?: (jobId: string) => Promise<void>;
   /**
-   * How long a mandated ask may sit unsettled or unclaimed before the stale sweep settles and
-   * resumes it. Default: `DEFAULT_MANDATE_RESUME_GRACE_MS`.
+   * Grace period before the stale sweep settles a mandated ask or resumes a credit-paid ask.
+   * Default: `DEFAULT_MANDATE_RESUME_GRACE_MS`.
    */
   mandateResumeGraceMs?: number;
 }
 
 type ResolvedInput<I extends ZodLike | undefined> = I extends ZodLike<infer O> ? O : string;
+
+type ReactivationWait = {
+  askSeq: number;
+  startedAtMs?: number;
+  lastPromptOrTerminalSeq?: number;
+};
 
 /**
  * A deposit this payment funded that the job row did **not** take.
@@ -728,7 +734,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly statusChecksQueued = new Set<string>();
   // Bind live resolvers and recovery scaffolds to the store-allocated ask identity.
   private readonly paymentAskSeqs = new WeakMap<object, number>();
-  private readonly reactivationAskSeqs = new WeakMap<ServerJob, number>();
+  private readonly reactivationWaits = new WeakMap<ServerJob, ReactivationWait>();
   private readonly pendingPaymentMessages = new WeakMap<ServerJob, Map<number | object, Message>>();
   /** How many times idle expiry has found a payment holding each job open. */
   private readonly idleIntentWaits = new WeakMap<ServerJob, number>();
@@ -1404,17 +1410,28 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     return this.claimInputForAsk(job.id, askSeq);
   }
 
-  private async claimInputForAsk(jobId: string, askSeq: number | undefined): Promise<boolean> {
+  private async claimInputForAsk(jobId: string, askSeq: number | undefined, wait?: ReactivationWait): Promise<boolean> {
     if (!isStreamableJobStore(this.jobStore)) return true;
     if (askSeq === undefined || !this.opts.db || !(this.jobStore instanceof PostgresJobStore)) return this.jobStore.claimForProcessing(jobId);
     const tx = await this.opts.db.connect();
     try {
       await tx.query("BEGIN");
-      const { rows: [record] } = await tx.query("SELECT status FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
-      const { rows: [ask] } = await tx.query(
-        `SELECT MAX(seq) AS seq FROM job_messages WHERE job_id=$1 AND status='verified'
-         AND data->>'from'='provider' AND data->>'type'='payment-request'`, [jobId]);
-      if (record?.status !== "awaiting-input" || Number(ask?.seq) !== askSeq) {
+      const { rows: [record] } = await tx.query<{ status: string; awaiting_input_at_ms: string | null }>(
+        "SELECT status, awaiting_input_at_ms FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
+      const { rows: [history] } = await tx.query<{ ask_seq: string | null; last_prompt_or_terminal_seq: string | null }>(
+        `SELECT (SELECT seq FROM job_messages WHERE job_id=$1 AND status='verified'
+                 AND data->>'from'='provider' AND data->>'type'='payment-request'
+                 ORDER BY seq DESC LIMIT 1) AS ask_seq,
+                CASE WHEN $2::boolean THEN (SELECT seq FROM job_messages WHERE job_id=$1 AND status='verified'
+                 AND data->>'from'='provider' AND data->>'type' IN ('prompt', 'complete', 'cancel')
+                 ORDER BY seq DESC LIMIT 1) END AS last_prompt_or_terminal_seq`, [jobId, wait !== undefined]);
+      // A live worker can claim the payment and open a prompt between grace polls. Check the
+      // original wait under the row lock, including its message boundary for same-tick yields.
+      const startedAt = record?.awaiting_input_at_ms;
+      const lastPromptOrTerminal = history.last_prompt_or_terminal_seq;
+      const sameWait = !wait || ((startedAt == null ? undefined : Number(startedAt)) === wait.startedAtMs &&
+        (lastPromptOrTerminal === null ? undefined : Number(lastPromptOrTerminal)) === wait.lastPromptOrTerminalSeq);
+      if (record?.status !== "awaiting-input" || history.ask_seq === null || Number(history.ask_seq) !== askSeq || !sameWait) {
         await tx.query("ROLLBACK");
         return false;
       }
@@ -1447,11 +1464,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * The stale sweep's mandate arm. A mandated ask settles in its own transaction after the ask
-   * commits, so a worker that dies between the two, or whose wake-up is lost, leaves a paid-for
-   * job suspended with no caller message coming to move it. Past the grace window this settles
-   * the ask (idempotently) and resumes the job: through the live resolver when it runs here,
-   * otherwise through the app's reactivation, whose claim keeps it to one execution.
+   * Recover unsettled mandated asks and credit payments whose worker stopped before resuming.
+   * After the grace period, wake the local resolver or let app reactivation claim the paid ask.
    */
   async sweepMandateAsks(nowMs = Date.now()): Promise<void> {
     const db = this.opts.db;
@@ -1465,11 +1479,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Paged to the end: asks a limit keeps open stay oldest and would otherwise hide newer ones.
       let after: { lastActivityAt: number; id: string } | undefined;
       for (;;) {
-        const page = await findQuietMandatedAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
-        for (const { id: jobId } of page) {
+        const page = await findQuietCreditAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
+        for (const { id: jobId, hasMandate } of page) {
           try {
-            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
             const local = this._activeJobs.get(jobId);
+            if (!hasMandate) {
+              if (local) await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+              else await this.opts.resumePaidAsk?.(jobId);
+              continue;
+            }
+            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
             const settlement = local
               ? await this.payAskFromMandate(local, false)
               : await settleMandateAsk({ pool: db, ledger, jobId, dvmId });
@@ -3114,7 +3133,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (!isStreamableJobStore(this.jobStore)) return true;
     const store = this.jobStore;
     const scaffold = this._activeJobs.get(jobId);
-    const askSeq = scaffold ? this.reactivationAskSeqs.get(scaffold) : undefined;
+    const wait = scaffold ? this.reactivationWaits.get(scaffold) : undefined;
     // Both samples read the non-regressing clock. Off the wall this
     // is the same two-sample shape as the stale sweep, and a backwards step
     // between them holds the deadline out of reach: the loop keeps polling
@@ -3127,7 +3146,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         // Window elapsed; either we win the CAS (original worker absent) or a
         // just-woken original handler beat us to it (CAS returns false).
         if (scaffold && this._activeJobs.get(jobId) !== scaffold) return false;
-        return this.claimInputForAsk(jobId, askSeq);
+        return this.claimInputForAsk(jobId, wait?.askSeq, wait);
       }
       const record = await store.get(jobId);
       if (record?.status !== "awaiting-input") return false;
@@ -3289,7 +3308,13 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
     const job = fromJobRecord(record);
     const ask = record.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
-    if (ask) this.reactivationAskSeqs.set(job, ask.seq);
+    if (ask) {
+      const lastPromptOrTerminal = record.messages.findLast((message) => message.from === "provider" &&
+        (message.type === "prompt" || message.type === "complete" || message.type === "cancel"));
+      this.reactivationWaits.set(job, {
+        askSeq: ask.seq, startedAtMs: record.awaitingInputAtMs, lastPromptOrTerminalSeq: lastPromptOrTerminal?.seq,
+      });
+    }
     this._activeJobs.set(job.id, job);
     this.wireMessageAppender(job);
     this.watchDurableStatus(job);

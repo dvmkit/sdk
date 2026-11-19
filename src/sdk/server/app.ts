@@ -5383,18 +5383,41 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
     if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
-    const fresh = await jm.store.get(id);
+    const store = jm.store;
+    const fresh = await store.get(id);
     if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
-    fresh.messages = await jm.store.getMessages(id, 0);
+    // Internal replay needs the committed payment even if an earlier verification still
+    // holds back the public message stream.
+    fresh.messages = await store.getMessages(id, 0, { includeHeld: true });
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
-    const payment = ask && fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
-      message.seq > ask.seq);
-    if (!ask || !payment || (requestSeq !== undefined && ask.seq !== requestSeq) || jm.activeJobs.has(id)) return;
-    const { job } = jm.reactivateJob(fresh);
-    const lock = await jm.store.tryReactivationLock(id, () =>
-      this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status));
-    if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
+    if (!ask || (requestSeq !== undefined && ask.seq !== requestSeq)) return;
+    let paymentSeq: number | undefined;
+    if (requestSeq === undefined) {
+      if (!this.opts.db) return;
+      const { rows: [accepted] } = await this.opts.db.query<{ response: { seq: number } }>(
+        "SELECT response FROM credit_balance_payments WHERE job_id=$1 AND request_seq=$2", [id, ask.seq]);
+      if (accepted) {
+        if ((fresh.pendingPaymentFiatMicro ?? 0) !== 0 || !Number.isSafeInteger(accepted.response.seq)) return;
+        paymentSeq = accepted.response.seq;
+      } else if (!fresh.mandate) {
+        return;
+      }
+      // The caller may have answered a concurrent prompt before paying. A prompt posted
+      // after the committed payment belongs to a later wait.
+      if (fresh.messages.some((message) => message.from === "provider" && (
+        (message.type === "prompt" && message.seq > (paymentSeq ?? ask.seq)) ||
+        ((message.type === "complete" || message.type === "cancel") && message.seq > ask.seq)
+      ))) return;
+    }
+    const payment = fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
+      message.seq > ask.seq && (paymentSeq === undefined || message.seq === paymentSeq));
+    if (!payment) return;
+    await store.tryReactivationLock(id, async () => {
+      if (jm.activeJobs.has(id)) return;
+      const { job } = jm.reactivateJob(fresh);
+      await this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status);
+    });
   }
 
   /**
