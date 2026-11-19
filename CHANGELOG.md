@@ -14,14 +14,11 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
-## Unreleased
+## [0.43.0](https://github.com/dvmkit/sdk/compare/v0.42.0...v0.43.0) (2026-11-19)
 
-- A resent x402 channel deposit whose payment terms changed after the DVM already took it is answered from its stored attempt (settled, reconciled on chain, or already complete) instead of `requirements_mismatch`; a stored deposit that never left is refused with `requirements_mismatch` and is never settled under the old terms. A caller that re-signs under the changed terms replaces an expired `prepared` deposit for the same credit effect instead of failing on an identity conflict. Breaking API changes: none. Migrations: none. Compatibility requirements: none. dvmctl and platform prerequisites: none.
-
+- A resent x402 channel deposit whose payment terms changed after the DVM already took it is answered from its stored attempt (settled, reconciled on chain, or already complete) instead of `requirements_mismatch`; a stored deposit that never left is refused with `requirements_mismatch` and is never settled under the old terms. A caller that re-signs under the changed terms replaces an expired `prepared` deposit for the same credit effect instead of failing on an identity conflict.
 - Credit-deposit reports for settled one-request Tempo charges can include the verified transfer payer as an optional lowercase `payerAddress`.
-
 - Credit-deposit reports for settled one-request x402 exact payments can include the verified EIP-3009 authorizer as an optional lowercase `payerAddress`. The authenticated caller key remains separate.
-
 - A standing-mandate ask the provider will not pay now carries `content.mandate_skipped.reason` on its `payment-request`, so a caller can pay the open ask at once instead of waiting out settlement timing. Providers advertise it as `credit.mandate_skipped: true` on `/v1/info`. The portable shape is in `protocol-fixtures/standing-mandate-v1.json`.
 
 ### Breaking API changes
@@ -37,6 +34,28 @@ Every other signature change against `0.42.0` is additive, and needs no code cha
 ### Migrations
 
 - New Postgres job tables omit `received_proofs`. Existing columns can stay in place with their original empty-array default. Regular job reads and writes ignore the column, and the content sweep still erases historical values where the column exists.
+
+### ⚠ BREAKING CHANGES
+
+* **server:** JobRecord drops receivedProofs. Custom job stores should remove the property from readers and writers. Existing Postgres job tables retain their legacy proof column and the content sweep still clears it.
+
+### Features
+
+* **server:** report the verified Tempo charge payer on per-call deposits ([#207](https://github.com/dvmkit/sdk/issues/207)) ([31a4965](https://github.com/dvmkit/sdk/commit/31a496506cad43ca9631456ea3614a6012016ef7))
+* **server:** report the verified x402 payer on per-call deposits ([#206](https://github.com/dvmkit/sdk/issues/206)) ([464d9e3](https://github.com/dvmkit/sdk/commit/464d9e37000c989b081473c0ff014619474b912c))
+* **server:** show callers when a standing mandate will not pay an ask ([9851911](https://github.com/dvmkit/sdk/commit/9851911753776919940566a6185958761dd1c27d))
+
+
+### Bug Fixes
+
+* **server:** answer a changed-terms deposit resend from its stored attempt ([a98e93d](https://github.com/dvmkit/sdk/commit/a98e93d6d18fb5fc85ea0f947a24b8a8a78ebb3c))
+* **server:** fund x402 credit without hosted exact support ([80d7992](https://github.com/dvmkit/sdk/commit/80d799210c985bb8fa8e69dc8a40fb33d2b4fe04))
+* **server:** retire duplicate job proof storage ([b064bc4](https://github.com/dvmkit/sdk/commit/b064bc407f00a45e77ba4dd7fe8cd48fec8d5e04))
+
+
+### Documentation
+
+* disclose the additive signature changes since 0.42.0 ([#210](https://github.com/dvmkit/sdk/issues/210)) ([21a8ada](https://github.com/dvmkit/sdk/commit/21a8adae3f5aa78b0df670814c1a84edf7332e1b))
 
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
 
