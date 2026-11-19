@@ -836,14 +836,32 @@ export async function createX402BatchSettlementServer(
       }
       const requirements = (await buildRequirements(args.amount)) as PaymentRequirements[];
       const matched = resource.findMatchingRequirements(requirements, payload);
-      if (!matched) {
-        return {
-          ok: false as const,
-          reason: "requirements_mismatch",
-          requirements: requirements as PaymentRequirementsV2[],
-        };
-      }
       const raw = payload.payload;
+      const requirementsMismatch = {
+        ok: false as const,
+        reason: "requirements_mismatch",
+        requirements: requirements as PaymentRequirementsV2[],
+      };
+      // A fund deposit signed against terms this DVM no longer offers may
+      // still be one it already took. Only the stored attempt can say, so it
+      // is looked up under the channel lock below; everything else is refused
+      // here, as before. Voucher-only headers never get a settlement row.
+      const storedAttemptCandidate =
+        !matched &&
+        postgres !== undefined &&
+        args.operation === "fund" &&
+        isBatchSettlementDepositPayload(raw);
+      if (!matched && !storedAttemptCandidate) return requirementsMismatch;
+      if (!matched) {
+        // A payload that carries no usable voucher or authorization identity
+        // cannot name a stored attempt; it was a plain mismatch before.
+        try {
+          batchVoucher(raw);
+          depositAuthorizationPaymentId(raw);
+        } catch {
+          return requirementsMismatch;
+        }
+      }
       const isRefund = isBatchSettlementRefundPayload(raw);
       if ((args.operation === "refund") !== isRefund) {
         return {
@@ -913,7 +931,7 @@ export async function createX402BatchSettlementServer(
         // present the same voucher base under a fresh drain id. Keep that new
         // effect out of the old row's `(operation, payment_id)` replay slot
         paymentId: isRefund ? `${paymentBase}:${settlementId}` : (depositPaymentId ?? paymentBase),
-        amount: matched.amount,
+        amount: (matched ?? payload.accepted).amount,
       };
       const external = isBatchSettlementDepositPayload(raw) || isRefund;
       let channelBeforeVerify: Channel | undefined;
@@ -933,13 +951,36 @@ export async function createX402BatchSettlementServer(
       // intent to mark; the read is wasted only when that prepare comes back
       // already `settled` and the recovery path returns early.
       const submissionBlock =
-        external && postgres && !recoveryOnly
+        external && postgres && !recoveryOnly && matched
           ? (await settlementEvidence.getBlockNumber()).toString()
           : undefined;
       const runLocked = async (tx?: CreditLedgerQuerier) => {
         let prior = external
           ? await postgres?.getSettlement(args.operation, args.effectId)
           : undefined;
+        if (!matched) {
+          // Terms the payload was not signed against: settle nothing under
+          // them. Only an attempt this DVM already took for this very
+          // effect, byte-for-byte this payload and these terms, is answered
+          // — from the terms it stored. The same authorization under another
+          // effect id finds no row here, and `(operation, payment_id)` is
+          // unique, so it cannot open a second one either.
+          if (
+            !prior ||
+            prior.settlementId !== settlementId ||
+            !isDeepStrictEqual(prior.payload, payload) ||
+            !isDeepStrictEqual(prior.requirements, payload.accepted) ||
+            !(
+              prior.status === "complete" ||
+              prior.status === "written_off" ||
+              prior.status === "submitting" ||
+              (prior.status === "settled" && prior.response)
+            )
+          ) {
+            return requirementsMismatch;
+          }
+        }
+        const terms = matched ?? prior?.requirements;
         if (recoveryOnly && prior?.status !== "submitting" && !(prior?.status === "settled" && prior.response)) {
           return unavailableFunding;
         }
@@ -949,7 +990,7 @@ export async function createX402BatchSettlementServer(
             settlementId,
             funding,
             payload,
-            matched
+            terms!
           );
           if (retryIdentity === "legacy_fund" || retryIdentity === "legacy_refund") {
             prior = await postgres.normalizeLegacyPaymentId(
@@ -995,7 +1036,7 @@ export async function createX402BatchSettlementServer(
               intent: prior,
               funding,
               payload,
-              matched,
+              matched: terms!,
               commit: args.commit,
               complete: args.complete,
               tx,
@@ -1016,6 +1057,10 @@ export async function createX402BatchSettlementServer(
                 // goes through verification and records its own bookmark.
                 await postgres.markSettlementRetryable(prior.settlementId);
                 if (recoveryOnly) return unavailableFunding;
+                // A resend of this header meets the same mismatch, so a
+                // "send it again" answer would loop. The row is retryable now;
+                // the caller needs the current terms to re-sign.
+                if (!matched) return requirementsMismatch;
                 if (args.operation === "fund") {
                   return {
                     ok: false as const,
@@ -1053,7 +1098,7 @@ export async function createX402BatchSettlementServer(
               intent: { ...prior, status: "settled", response: reconciled },
               funding,
               payload,
-              matched,
+              matched: terms!,
               commit: args.commit,
               complete: args.complete,
               tx,
@@ -1062,6 +1107,10 @@ export async function createX402BatchSettlementServer(
           }
           await releaseIntentAdmission(postgres, funding.channelId, prior.pendingId);
         }
+
+        // Nothing below may verify or settle against terms the payload does
+        // not carry.
+        if (!matched) return requirementsMismatch;
 
         channelBeforeVerify = await storage.get(funding.channelId);
         // Upstream's local verifier carries the mirrored withdrawal timestamp
@@ -2305,26 +2354,26 @@ function assertSettlementRetry(
   payload: PaymentPayload,
   requirements: PaymentRequirements
 ): "current" | "legacy_fund" | "legacy_refund" | "prepared_refresh" {
-  if (
-    intent.settlementId !== settlementId ||
-    intent.channelId !== funding.channelId ||
-    !isDeepStrictEqual(intent.requirements, requirements)
-  ) {
+  if (intent.settlementId !== settlementId || intent.channelId !== funding.channelId) {
     throw new Error("x402 settlement retry does not match its durable credit effect");
   }
-  if (!isDeepStrictEqual(intent.payload, payload)) {
-    const priorPayload = intent.payload.payload;
-    if (
-      intent.status === "prepared" &&
-      intent.operation === "fund" &&
-      isBatchSettlementDepositPayload(priorPayload) &&
-      isBatchSettlementDepositPayload(payload.payload)
-    ) {
-      // The store owns the stricter expiry/shape/CAS check. Reaching it is
-      // necessary because a replacement ERC-3009 authorization has a fresh
-      // salt and therefore a fresh payment identity by design.
-      return "prepared_refresh";
-    }
+  // A prepared deposit never submitted, so a re-sign under the DVM's changed
+  // terms may replace it once its authorization has expired. The store owns
+  // the stricter expiry/shape/CAS check; reaching it is necessary because a
+  // replacement ERC-3009 authorization has a fresh salt and therefore a fresh
+  // payment identity by design.
+  const preparedDepositRefresh =
+    intent.status === "prepared" &&
+    intent.operation === "fund" &&
+    isBatchSettlementDepositPayload(intent.payload.payload) &&
+    isBatchSettlementDepositPayload(payload.payload);
+  if (preparedDepositRefresh && !isDeepStrictEqual(intent.payload, payload)) {
+    return "prepared_refresh";
+  }
+  if (
+    !isDeepStrictEqual(intent.requirements, requirements) ||
+    !isDeepStrictEqual(intent.payload, payload)
+  ) {
     throw new Error("x402 settlement retry does not match its durable credit effect");
   }
   const legacyFundPaymentId = `${funding.channelId}:${funding.maxClaimableAmount}`;
