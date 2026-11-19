@@ -11,7 +11,7 @@ import { commitBalancePayment } from "../balance-payment";
 import { getStandingMandate } from "../credit-envelope";
 import { PostgresJobStore } from "../postgres-job-store";
 import { CreditLedger } from "../credit-ledger";
-import { createDVMHost } from "../host";
+import { createDVMHost, type DVMHostOpts } from "../host";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
 
@@ -43,8 +43,17 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     await dropSchemas(schema);
   });
 
-  async function server(outcome: "complete" | "fail" | "wait" | "twice" = "complete", enabled = true, reporting = false, priced = false) {
-    const host = createDVMHost({ pool, port: 0, env: { ...attestationEnv(attestation), ...(reporting && { DVMKIT_PLATFORM_URL: "http://127.0.0.1:1", DVMKIT_PLATFORM_TOKEN: "test-platform-token" }), ...(!enabled && { DVMKIT_BALANCE_PAYMENTS: "false" }) } });
+  async function server(
+    outcome: "complete" | "fail" | "wait" | "twice" = "complete",
+    enabled = true,
+    reporting = false,
+    { priced = false, onPaidJobCompleted }: { priced?: boolean; onPaidJobCompleted?: DVMHostOpts["onPaidJobCompleted"] } = {},
+  ) {
+    const host = createDVMHost({ pool, port: 0, onPaidJobCompleted, env: {
+      ...attestationEnv(attestation),
+      ...(reporting && { DVMKIT_PLATFORM_URL: "http://127.0.0.1:1", DVMKIT_PLATFORM_TOKEN: "test-platform-token" }),
+      ...(!enabled && { DVMKIT_BALANCE_PAYMENTS: "false" }),
+    } });
     hosts.push(host);
     const worker = hosts.length;
     host.mount(configureDVM({ name: "balance-service", credit: {}, auth: secp256k1Auth(), capabilities: {
@@ -59,8 +68,8 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     } }));
     return (await host.serve()).url;
   }
-  function post(url: string, body: unknown, token?: string) {
-    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Job-Token": token } : {}) }, body: JSON.stringify(body) });
+  function post(url: string, body: unknown, token?: string, signal?: AbortSignal) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Job-Token": token } : {}) }, body: JSON.stringify(body), signal });
   }
   async function pending(url: string) {
     expect((await (await fetch(`${url}/v1/info`)).json()).auth_audience).toEqual(audience);
@@ -85,7 +94,7 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
   }
 
   it.each([false, true])("persists a standing mandate across a provider restart (upfront=%s)", async (priced) => {
-    const url = await server("complete", true, false, priced);
+    const url = await server("complete", true, false, { priced });
     expect((await (await fetch(`${url}/v1/info`)).json()).credit.standing_mandate).toBe(true);
     const creditId = `mandate-credit-${priced}`;
     await fund(creditId);
@@ -107,7 +116,13 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
   }, 20_000);
 
   it("accepts an ordinary signed per-ask payment on a zero-upfront mandated job", async () => {
-    const url = await server();
+    let submittedJobId: string | undefined;
+    const settled = Promise.withResolvers<void>();
+    const url = await server("complete", true, false, {
+      onPaidJobCompleted: ({ jobId }) => {
+        if (jobId === submittedJobId) settled.resolve();
+      },
+    });
     const creditId = "mandate-fallback-credit";
     const drawId = `draw-${creditId}`;
     await fund(creditId);
@@ -118,11 +133,13 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
     const created = await post(`${url}/v1/job`, { capability: "run", data });
     expect(created.status).toBe(202);
     const job = await created.json();
+    submittedJobId = job.job_id;
     await expect.poll(async () => (await pool.query("SELECT pending_payment_fiat_micro FROM jobs WHERE id=$1", [job.job_id])).rows[0]?.pending_payment_fiat_micro).toBe("1000");
     const ask = (await pool.query("SELECT data FROM job_messages WHERE job_id=$1 AND data->>'type'='payment-request'", [job.job_id])).rows[0].data;
     const paid = await post(`${url}/v1/job/${job.job_id}/messages`, payment({ ...job, ask }, creditId, drawId), job.job_token);
     expect(paid.status, await paid.clone().text()).toBe(201);
-    await expect.poll(async () => (await ledger.getDraw({ creditId, drawId }))?.status).toBe("settled");
+    await settled.promise;
+    expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "settled", amountMicro: 1_000 });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(9000);
     expect((await new PostgresJobStore(pool).get(job.job_id))?.creditId).toBe(creditId);
   }, 20_000);
@@ -156,21 +173,42 @@ describe.skipIf(!process.env.DATABASE_URL)("balance payments through production 
   }, 20_000);
 
   it("recovers an accepted payment after the worker stopped before saving progress or replying", async () => {
+    const before = completionWorkers.length;
     const url = await server();
     const originalHost = hosts[hosts.length - 1];
     const job = await pending(url);
     await originalHost.shutdown();
-    await fund("lost-response-credit");
-    const body = payment(job, "lost-response-credit");
+    const creditId = "lost-response-credit";
+    const drawId = `draw-${creditId}`;
+    await fund(creditId);
+    const body = payment(job, creditId, drawId);
     const accepted = await commitBalancePayment({ pool, ledger, auth: secp256k1Auth(),
       domain: { audience, method: "POST", path: `/v1/job/${job.job_id}/messages`, capability: null },
       jobId: job.job_id, dvmId: audience.dvm_id, raw: body.content.credit });
-    const recovered = await server();
-    const replay = await post(`${recovered}/v1/job/${job.job_id}/messages`, body, job.job_token);
-    expect(replay.status).toBe(201);
-    expect(await replay.json()).toEqual(accepted.response);
-    await expect.poll(async () => (await ledger.getDraw({ creditId: "lost-response-credit", drawId: "draw-lost-response-credit" }))?.status).toBe("settled");
-    expect((await ledger.get("lost-response-credit"))?.balanceMicro).toBe(9_000);
+    expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "pending", amountMicro: 1_000 });
+
+    const settled = Promise.withResolvers<void>();
+    const recovered = await server("complete", true, false, {
+      onPaidJobCompleted: ({ jobId }) => {
+        if (jobId === job.job_id) settled.resolve();
+      },
+    });
+    const creditLock = await pool.connect();
+    try {
+      // The replay can acknowledge acceptance while another transaction blocks settlement.
+      await creditLock.query("BEGIN");
+      await creditLock.query("SELECT credit_id FROM credits WHERE credit_id=$1 FOR UPDATE", [creditId]);
+      const replay = await post(`${recovered}/v1/job/${job.job_id}/messages`, body, job.job_token, AbortSignal.timeout(10_000));
+      expect(replay.status).toBe(201);
+      expect(await replay.json()).toEqual(accepted.response);
+      expect((await ledger.getDraw({ creditId, drawId }))?.status).toBe("pending");
+    } finally {
+      await creditLock.query("ROLLBACK").finally(() => creditLock.release());
+    }
+    await settled.promise;
+    expect(await ledger.getDraw({ creditId, drawId })).toMatchObject({ status: "settled", amountMicro: 1_000 });
+    expect((await ledger.get(creditId))?.balanceMicro).toBe(9_000);
+    expect(completionWorkers.slice(before)).toEqual([2]);
   }, 20_000);
 
   it.each([false, true])("keeps a later ask unpaid after a delayed real COMMIT acknowledgement (remote=%s)", async (remote) => {
