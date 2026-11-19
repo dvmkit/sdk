@@ -74,7 +74,7 @@ Upgrading adds `exhausted` and `unmatched` to the report-state constraint and th
 
 ### Settlement-report history
 
-Credit-deposit reports include an optional lowercase `payerAddress` for settled one-request x402 exact payments, including deferred settlement and repair. It comes from the verified EIP-3009 authorization and is independent of `callerPubkey`. Reusable credit, top-ups, and channel deposits omit the field. See the [deposit examples](../protocol-fixtures/unsigned-caller-reports-v1.json).
+Credit-deposit reports include an optional lowercase `payerAddress` for settled one-request x402 exact payments, including deferred settlement and repair. It comes from the verified EIP-3009 authorization. Settled one-request Tempo charges can also include `payerAddress`, derived from the verified transfer for a push or the signed transaction sender for a pull. This field is independent of `callerPubkey`. Proof-only charges, reusable credit, top-ups, and channel deposits omit it. See the [deposit examples](../protocol-fixtures/unsigned-caller-reports-v1.json).
 
 Every `createDVMHost` or `createDVMServer` boot with a PostgreSQL pool and a DVM ID creates `sdk_hosted_settlement_report_history`, `sdk_hosted_settlement_report_obligations`, and `sdk_hosted_settlement_report_identity` before any financial or report table, with no secret, scope, price, payment rail, or first payment. A host given its own `jobStore` still initializes them on the `pool`, `database`, or `DATABASE_URL` it was configured with when `DVMKIT_DVM_ID` is set.
 

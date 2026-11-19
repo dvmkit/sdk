@@ -55,6 +55,13 @@
       ],
       "behavior": "Settled one-request x402 exact credit deposits may report the verified EIP-3009 authorizer as a lowercase 0x-prefixed address. The authenticated callerPubkey is independent."
     },
+    "tempoChargeCreditDeposit": {
+      "fixture": "protocol-fixtures/unsigned-caller-reports-v1.json",
+      "optionalFields": [
+        "payerAddress"
+      ],
+      "behavior": "Settled one-request Tempo charges may report the verified transfer payer as a lowercase 0x-prefixed address. Proof-only charges, sessions, reusable credit, and top-ups omit the field."
+    },
     "jobMessagePages": {
       "fixture": "protocol-fixtures/job-messages-page-v1.json",
       "behavior": "JSON limit 1 through 50 returns messages in ascending sequence order, next_after and has_more for currently releasable history; the legacy JSON and SSE contracts remain available"

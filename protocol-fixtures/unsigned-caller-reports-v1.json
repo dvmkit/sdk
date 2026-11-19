@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Unsigned payments retain their accounting records with a null caller. Platform report routes must accept null callerPubkey. A settled one-request x402 exact deposit may carry its verified EIP-3009 authorizer as a lowercase payerAddress. Draw and revenue reports omit caller identity; terminal job receipts use requester_pubkey: null.",
+  "description": "Unsigned payments retain their accounting records with a null caller. Platform report routes must accept null callerPubkey. A settled one-request x402 exact deposit may carry its verified EIP-3009 authorizer as a lowercase payerAddress. A settled one-request Tempo charge may carry its verified transfer payer in the same field. Draw and revenue reports omit caller identity; terminal job receipts use requester_pubkey: null.",
   "deposit": {
     "endpoint": "/_internal/credit-deposit",
     "body": {
@@ -35,6 +35,25 @@
       "expiryMs": 1797776000000,
       "instrument": "x402_exact",
       "payerAddress": "0xabababababababababababababababababababab"
+    }
+  },
+  "tempo_charge_deposit": {
+    "endpoint": "/_internal/credit-deposit",
+    "body": {
+      "dvmId": "test-dvm",
+      "creditId": "imp:tempo:tempo-charge-example",
+      "callerPubkey": null,
+      "fundingId": "tempo-charge-example",
+      "rail": "tempo",
+      "paidMsats": 16000,
+      "nativeAmount": 16000,
+      "nativeAsset": "usdc",
+      "amountMicro": 16000,
+      "creditCurrency": "usd",
+      "fundedAt": 1790000000000,
+      "expiryMs": 1797776000000,
+      "instrument": "tempo_charge",
+      "payerAddress": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a"
     }
   },
   "expiry_release": {
