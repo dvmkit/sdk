@@ -16,6 +16,8 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 ## Unreleased
 
+- A resent x402 channel deposit whose payment terms changed after the DVM already took it is answered from its stored attempt (settled, reconciled on chain, or already complete) instead of `requirements_mismatch`; a stored deposit that never left is refused with `requirements_mismatch` and is never settled under the old terms. A caller that re-signs under the changed terms replaces an expired `prepared` deposit for the same credit effect instead of failing on an identity conflict. Breaking API changes: none. Migrations: none. Compatibility requirements: none. dvmctl and platform prerequisites: none.
+
 - Credit-deposit reports for settled one-request Tempo charges can include the verified transfer payer as an optional lowercase `payerAddress`.
 
 - Credit-deposit reports for settled one-request x402 exact payments can include the verified EIP-3009 authorizer as an optional lowercase `payerAddress`. The authenticated caller key remains separate.

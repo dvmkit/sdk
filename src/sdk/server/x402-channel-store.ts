@@ -746,7 +746,7 @@ export class PostgresX402ChannelStorage implements ChannelStorage, ChannelLockSt
       const refreshed = await settlements.query<X402SettlementRow>(
         `UPDATE x402_batch_settlements
             SET payment_id = $2, payment_payload = $3, channel_before = $4,
-                pending_id = $5, updated_at = NOW()
+                pending_id = $5, payment_requirements = $8, updated_at = NOW()
           WHERE settlement_id = $1 AND status = 'prepared'
             AND payment_id = $6 AND payment_payload = $7
           RETURNING *`,
@@ -759,6 +759,8 @@ export class PostgresX402ChannelStorage implements ChannelStorage, ChannelLockSt
           stored.paymentId,
           // The row as stored, which may predate withBatchSettlementResource.
           rows[0]!.payment_payload,
+          // A re-sign after the DVM's terms changed carries the new ones.
+          intent.requirements,
         ]
       );
       if (refreshed.rows[0]) return toSettlementIntent(refreshed.rows[0]);
@@ -1520,21 +1522,23 @@ function canRefreshPreparedDepositAuthorization(
   intent: X402SettlementIdentity,
   nowMs: number
 ): boolean {
-  if (
-    stored.status !== "prepared" ||
-    stored.operation !== "fund" ||
-    !isDeepStrictEqual(stored.requirements, intent.requirements)
-  )
-    return false;
-  const before = refreshableDepositAuthorization(stored.payload);
-  const after = refreshableDepositAuthorization(intent.payload);
+  // Requirements may differ: the DVM's terms can change between the first
+  // signature and the re-sign. They are not compared; the prepared row never
+  // submitted, so nothing has been bound to the old ones.
+  if (stored.status !== "prepared" || stored.operation !== "fund") return false;
+  // The voucher's cumulative maximum follows the requirements' amount, so a
+  // re-sign under changed terms legitimately carries a new one.
+  const termsChanged = !isDeepStrictEqual(stored.requirements, intent.requirements);
+  const before = refreshableDepositAuthorization(stored.payload, termsChanged);
+  const after = refreshableDepositAuthorization(intent.payload, termsChanged);
   if (!before || !after || !isDeepStrictEqual(before.shape, after.shape)) return false;
   const nowSeconds = BigInt(Math.floor(nowMs / 1_000));
   return before.validBefore < nowSeconds && after.validBefore > nowSeconds;
 }
 
 function refreshableDepositAuthorization(
-  payload: PaymentPayload
+  payload: PaymentPayload,
+  ignoreVoucherTerms: boolean
 ): { validBefore: bigint; shape: PaymentPayload } | undefined {
   const shape = structuredClone(payload);
   const body = objectRecord(shape.payload);
@@ -1552,6 +1556,16 @@ function refreshableDepositAuthorization(
     signature.length === 0
   )
     return undefined;
+  // The terms the payload was signed against are the caller's `accepted`
+  // echo; whether they changed is not a property of the authorization.
+  delete (shape as Partial<PaymentPayload>).accepted;
+  if (ignoreVoucherTerms) {
+    const voucher = objectRecord(body.voucher);
+    if (voucher) {
+      delete voucher.maxClaimableAmount;
+      delete voucher.signature;
+    }
+  }
   delete authorization.validBefore;
   delete authorization.salt;
   delete authorization.signature;

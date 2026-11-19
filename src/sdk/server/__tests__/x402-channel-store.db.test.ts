@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { FacilitatorClient } from "@x402/core/server";
 import type {
@@ -952,6 +952,330 @@ describe.skipIf(!RUN)("Postgres x402 ChannelStorage", () => {
         ...drifted,
         paymentId: `${CHANNEL_ID}:deposit:drifted-refresh`,
         payload: changedAmount,
+      })
+    ).rejects.toThrow("x402 settlement identity conflicts with a prior credit effect");
+  });
+
+  /**
+   * A deposit signed against the DVM's terms at "100", then a DVM whose terms
+   * ask "101": `accept` is called with the stale header and the changed amount.
+   */
+  async function changedTermsFixture() {
+    const payer = privateKeyToAccount(generatePrivateKey());
+    const receiver = privateKeyToAccount(generatePrivateKey());
+    const balances = new Map<string, bigint>();
+    const facilitator = recordingFacilitator(balances);
+    const minedTransaction = `0x${"77".repeat(32)}`;
+    const server = await createX402BatchSettlementServer({
+      network: NETWORK,
+      payTo: receiver.address,
+      db: pool,
+      earnedNative: earnedNothing,
+      config: {
+        facilitatorClient: facilitator,
+        receiverAuthorizerSigner: receiver,
+        autoSettlement: false,
+      },
+      settlementEvidenceReader: {
+        getBlockNumber: async () => 100n,
+        findAppliedSettlement: async () =>
+          balances.size > 0 ? { transaction: minedTransaction, amount: "1000" } : undefined,
+      },
+    });
+    const [built] = await server.buildRequirements("100");
+    const requirements = built as PaymentRequirements;
+    const [changedBuilt] = await server.buildRequirements("101");
+    const changedRequirements = changedBuilt as PaymentRequirements;
+    const channelConfig: Channel["channelConfig"] = {
+      payer: payer.address,
+      payerAuthorizer: payer.address,
+      receiver: receiver.address,
+      receiverAuthorizer: receiver.address,
+      token: requirements.asset as `0x${string}`,
+      withdrawDelay: 86_400,
+      salt: generatePrivateKey(),
+    };
+    const channelId = computeChannelId(channelConfig, NETWORK);
+    const deposit = await createBatchSettlementEIP3009DepositPayload(
+      payer,
+      2,
+      requirements,
+      channelConfig,
+      "1000",
+      "100"
+    );
+    const effectId = `terms-changed-${randomUUID()}:fund-1`;
+    const header = encodeHeader(deposit, requirements);
+    return {
+      server,
+      facilitator,
+      balances,
+      minedTransaction,
+      payer,
+      requirements,
+      changedRequirements,
+      channelConfig,
+      channelId,
+      deposit,
+      effectId,
+      header,
+      sendOriginal: (amount: string, commit: () => Promise<string> = async () => "committed") =>
+        server.accept({
+          paymentHeader: header,
+          amount,
+          operation: "fund",
+          effectId,
+          commit,
+        }),
+    };
+  }
+
+  const settlementRows = async (effectId: string) =>
+    (await pool.query("SELECT 1 FROM x402_batch_settlements WHERE effect_id = $1", [effectId]))
+      .rowCount;
+
+  it("answers a changed-terms resend of a settled deposit from its stored attempt", async () => {
+    const f = await changedTermsFixture();
+    const complete = vi
+      .spyOn(PostgresX402ChannelStorage.prototype, "completeSettlement")
+      .mockRejectedValueOnce(new Error("simulated crash before the ledger leg completed"));
+    try {
+      await expect(f.sendOriginal("100")).rejects.toThrow("simulated crash");
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({ status: "settled" });
+
+      await expect(f.sendOriginal("101", async () => "recovered")).resolves.toMatchObject({
+        ok: true,
+        value: { committed: "recovered", settlement: { success: true } },
+      });
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "complete",
+        requirements: f.requirements,
+      });
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+    } finally {
+      complete.mockRestore();
+      await f.server.stop();
+    }
+  });
+
+  it("reconciles a changed-terms resend of a submitting deposit that is on chain", async () => {
+    const f = await changedTermsFixture();
+    const persist = vi
+      .spyOn(PostgresX402ChannelStorage.prototype, "recordSettlementResponse")
+      .mockRejectedValueOnce(new Error("simulated crash before settlement response persistence"));
+    try {
+      await expect(f.sendOriginal("100")).rejects.toThrow("simulated crash");
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "submitting",
+      });
+
+      await expect(f.sendOriginal("101", async () => "recovered")).resolves.toMatchObject({
+        ok: true,
+        value: { committed: "recovered", settlement: { transaction: f.minedTransaction } },
+      });
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "complete",
+      });
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+    } finally {
+      persist.mockRestore();
+      await f.server.stop();
+    }
+  });
+
+  it("keeps the completed answer for a changed-terms resend of a finished deposit", async () => {
+    const f = await changedTermsFixture();
+    try {
+      await expect(f.sendOriginal("100")).resolves.toMatchObject({ ok: true });
+      await expect(f.sendOriginal("101")).resolves.toMatchObject({
+        ok: false,
+        reason: "settlement_already_complete",
+      });
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+    } finally {
+      await f.server.stop();
+    }
+  });
+
+  it("refuses a changed-terms resend without settling when the deposit never left", async () => {
+    const f = await changedTermsFixture();
+    vi.mocked(f.facilitator.settle).mockResolvedValueOnce({
+      success: false,
+      transaction: "",
+      network: NETWORK,
+      errorReason: "invalid_batch_settlement_evm_deposit_transaction_failed",
+    });
+    try {
+      await expect(f.sendOriginal("100")).rejects.toThrow();
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "submitting",
+      });
+      // Chain absence: the answer must be a re-sign prompt, not "resend this".
+      f.balances.clear();
+      const absent = await f.sendOriginal("101");
+      expect(absent).toMatchObject({ ok: false, reason: "requirements_mismatch" });
+      expect(absent).not.toHaveProperty("corrective", false);
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "prepared",
+      });
+
+      // A prepared row plus a mismatch is refused outright, never settled.
+      await expect(f.sendOriginal("101")).resolves.toMatchObject({
+        ok: false,
+        reason: "requirements_mismatch",
+      });
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "prepared",
+        requirements: f.requirements,
+      });
+    } finally {
+      await f.server.stop();
+    }
+  });
+
+  it("writes nothing for a changed-terms deposit the DVM never took", async () => {
+    const f = await changedTermsFixture();
+    try {
+      await expect(f.sendOriginal("101")).resolves.toMatchObject({
+        ok: false,
+        reason: "requirements_mismatch",
+      });
+      expect(await settlementRows(f.effectId)).toBe(0);
+      expect(f.facilitator.verify).not.toHaveBeenCalled();
+      expect(f.facilitator.settle).not.toHaveBeenCalled();
+    } finally {
+      await f.server.stop();
+    }
+  });
+
+  it("does not open a second settlement for the same authorization under another effect", async () => {
+    const f = await changedTermsFixture();
+    try {
+      await expect(f.sendOriginal("100")).resolves.toMatchObject({ ok: true });
+      const otherEffect = `${f.effectId}-second`;
+      await expect(
+        f.server.accept({
+          paymentHeader: f.header,
+          amount: "101",
+          operation: "fund",
+          effectId: otherEffect,
+          commit: async () => "must-not-commit",
+        })
+      ).resolves.toMatchObject({ ok: false, reason: "requirements_mismatch" });
+      expect(await settlementRows(otherEffect)).toBe(0);
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+    } finally {
+      await f.server.stop();
+    }
+  });
+
+  it("lets a re-sign under changed terms replace an expired prepared deposit", async () => {
+    const f = await changedTermsFixture();
+    try {
+      const expired = structuredClone(f.deposit);
+      (
+        expired.payload as {
+          deposit: { authorization: { erc3009Authorization: { validBefore: string } } };
+        }
+      ).deposit.authorization.erc3009Authorization.validBefore = "1";
+      const expiredPayload = JSON.parse(
+        Buffer.from(encodeHeader(expired, f.requirements), "base64").toString("utf8")
+      ) as PaymentPayload;
+      const raw = expired.payload as {
+        voucher: { signature: `0x${string}` };
+        deposit: { authorization: { erc3009Authorization: { salt: string } } };
+      };
+      const settlementId = createHash("sha256")
+        .update("fund")
+        .update("\0")
+        .update(f.effectId)
+        .digest("hex");
+      await storage.prepareSettlement({
+        settlementId,
+        channelId: f.channelId,
+        operation: "fund",
+        effectId: f.effectId,
+        paymentId: `${f.channelId.toLowerCase()}:deposit:${raw.deposit.authorization.erc3009Authorization.salt.toLowerCase()}`,
+        payload: expiredPayload,
+        requirements: f.requirements,
+        channelBefore: {
+          channelId: f.channelId,
+          channelConfig: f.channelConfig,
+          chargedCumulativeAmount: "0",
+          signedMaxClaimable: "0",
+          signature: raw.voucher.signature,
+          balance: "0",
+          totalClaimed: "0",
+          withdrawRequestedAt: 0,
+          refundNonce: 0,
+          onchainSyncedAt: Date.now(),
+          lastRequestTimestamp: Date.now(),
+        },
+      });
+      // The stale header meets changed terms: refused, and the row is untouched.
+      await expect(f.sendOriginal("101")).resolves.toMatchObject({
+        ok: false,
+        reason: "requirements_mismatch",
+      });
+      expect(f.facilitator.settle).not.toHaveBeenCalled();
+
+      // The caller re-signs against the current terms under the same effect.
+      const resigned = await createBatchSettlementEIP3009DepositPayload(
+        f.payer,
+        2,
+        f.changedRequirements,
+        f.channelConfig,
+        "1000",
+        "101"
+      );
+      await expect(
+        f.server.accept({
+          paymentHeader: encodeHeader(resigned, f.changedRequirements),
+          amount: "101",
+          operation: "fund",
+          effectId: f.effectId,
+          commit: async () => "resigned",
+        })
+      ).resolves.toMatchObject({ ok: true });
+      expect(await storage.getSettlement("fund", f.effectId)).toMatchObject({
+        status: "complete",
+        requirements: f.changedRequirements,
+      });
+      expect(f.facilitator.settle).toHaveBeenCalledOnce();
+    } finally {
+      await f.server.stop();
+    }
+  });
+
+  it("refuses to replace an unexpired prepared deposit with a re-sign under changed terms", async () => {
+    const requirements = settlementRequirements();
+    const changed = { ...requirements, amount: "2" };
+    const validBefore = String(Math.floor(Date.now() / 1_000) + 3_600);
+    const identity = {
+      settlementId: "settlement-unexpired-changed-terms",
+      channelId: CHANNEL_ID,
+      operation: "fund" as const,
+      effectId: "credit:fund-unexpired-changed-terms",
+      paymentId: `${CHANNEL_ID}:deposit:unexpired-changed-terms`,
+      channelBefore: channel(),
+    };
+    await storage.prepareSettlement({
+      ...identity,
+      requirements,
+      payload: settlementDepositPayload(requirements, validBefore, "0xcurrent"),
+    });
+    await expect(
+      storage.prepareSettlement({
+        ...identity,
+        paymentId: `${CHANNEL_ID}:deposit:unexpired-changed-terms-b`,
+        requirements: changed,
+        payload: settlementDepositPayload(
+          changed,
+          String(BigInt(validBefore) + 60n),
+          "0xnext",
+          `0x${"78".repeat(32)}`
+        ),
       })
     ).rejects.toThrow("x402 settlement identity conflicts with a prior credit effect");
   });
