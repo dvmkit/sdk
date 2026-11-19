@@ -1,16 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.
-- A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
-- When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
-- When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
-
-### Breaking API changes
-
-Against `0.41.0`, no supported use stops working. The Hono context variables that `@dvmkit/sdk/server` types as `AppEnv` gain an optional `prefixedDVMRequest` flag, which the host sets on requests under another DVM's mount prefix. `CreditRouteDeps` and `handleCreditRequest` change signature only because they reach `AppEnv` through their Hono context. Code that builds or reads that context compiles unchanged.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -26,6 +15,18 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
+
+- JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.
+- A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
+- When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
+- When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
+
+### Breaking API changes
+
+Against `0.41.0`, no supported use stops working. All signature changes are additive:
+
+- The Hono context variables that `@dvmkit/sdk/server` types as `AppEnv` gain an optional `prefixedDVMRequest` flag, which the host sets on requests under another DVM's mount prefix. `CreditRouteDeps` and `handleCreditRequest` change signature only because they reach `AppEnv` through their Hono context.
+- `PostgresJobStore` gains `getMessageReadState(jobId)`, which reads a job's ownership and retention metadata without loading its message history, and `getMessages` accepts an optional `cancellationOnly` flag.
 
 
 ### Features
