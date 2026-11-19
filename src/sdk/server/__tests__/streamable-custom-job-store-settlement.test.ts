@@ -1,9 +1,3 @@
-/*
- * A custom `StreamableJobStore` that keeps no piece accounting of its own (it reports no pieces
- * from `verifyAndCredit`) still settles by the piece: the SDK adds the piece to its own view of
- * the job and freezes the settlement on the terminal snapshot. Without that fallback the job
- * settled on the upfront draw alone and the builder was underpaid.
- */
 import { describe, expect, it, vi } from "vitest";
 
 import { encodePayment } from "../../../lib/x402/spec";
@@ -36,8 +30,6 @@ class PiecelessStreamableStore extends MemoryJobStore {
     const row = this.rows.get(id);
     return record && row ? { ...record, pieces: row.pieces, settlement: row.settlement } : record;
   }
-  /** No push channel: the paying request resumes the handler itself, in this process. */
-  override subscribeNotifications() { return Promise.resolve(() => undefined); }
   override async verifyAndCredit(jobId: string, seq: number, credit: PaymentCreditDelta | null, opts?: VerifyAndCreditOptions): Promise<VerifyAndCreditResult> {
     const result = await super.verifyAndCredit(jobId, seq, credit && { ...credit, piece: undefined }, opts);
     const counters = { ...result.counters, pieces: undefined };
@@ -46,9 +38,13 @@ class PiecelessStreamableStore extends MemoryJobStore {
 }
 
 describe("a streamable custom job store that keeps no pieces of its own", () => {
-  it("settles $0.10 upfront and a $0.20 piece finished at $0.05 as $0.15", async () => {
+  it.each([
+    { resume: "local dispatch", notify: false },
+    { resume: "notification", notify: true },
+  ])("settles the discounted piece after resume by $resume", async ({ notify }) => {
     const ledger = new MemoryCreditLedger();
     const jobStore = new PiecelessStreamableStore();
+    if (!notify) vi.spyOn(jobStore, "subscribeNotifications").mockResolvedValue(() => undefined);
     let finish!: () => void;
     const working = new Promise<void>((resolve) => { finish = resolve; });
     const jm = new JobManager(configureDVM({
@@ -79,7 +75,7 @@ describe("a streamable custom job store that keeps no pieces of its own", () => 
       const payment = { type: "payment" as const, content: { x402_payment: header(job.pendingX402Nonce!) } };
       const seq = await jm.recordInboundPending(job, payment.type, payment.content);
       expect((await jm.processPayment(job, payment, seq)).error).toBeUndefined();
-      await jm.dispatchMessage(job, payment.type, payment.content);
+      if (!notify) await jm.dispatchMessage(job, payment.type, payment.content);
       finish();
       await vi.waitFor(() => expect(job.terminalWork).toBeDefined());
       await job.terminalWork;

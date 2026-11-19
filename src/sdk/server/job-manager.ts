@@ -112,7 +112,7 @@ import type { ReceiptIssuer } from "./receipt-issuer";
 import { isReceiptableStatus } from "./receipt-issuer";
 import { stripProtocolEnvelope } from "./request-envelope";
 import { settledDrawRevenue } from "./settled-draw-revenue";
-import { appendPiece, endPieces, terminalEnding } from "./pieces";
+import { appendPiece, endPieces, reconcilePaidPieces, terminalEnding } from "./pieces";
 import { drawChargedMicro, drawHeldMicro, frozenSettleMicro, receiptCreditFor, receiptSettlementFor } from "./piece-settlement";
 import type {
   CreditDepositEnqueue,
@@ -1534,7 +1534,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.pendingMppChallengeIds = record.pendingMppChallengeIds;
     job.pendingX402Nonce = record.pendingX402Nonce;
     job.pendingX402AmountUsdcMicro = record.pendingX402AmountUsdcMicro;
-    job.pieces = record.pieces;
+    job.pieces = reconcilePaidPieces(job.pieces, record.pieces);
     return true;
   }
 

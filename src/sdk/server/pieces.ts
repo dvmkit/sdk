@@ -75,6 +75,18 @@ export function appendPiece(pieces: readonly JobPiece[], amountMicro: number, pa
   return [...pieces, { amountMicro, paidSeq, state: "running" }];
 }
 
+export function reconcilePaidPieces(local: JobPiece[] | undefined, stored: JobPiece[] | undefined): JobPiece[] | undefined {
+  if (!local?.length) return stored ?? local;
+  if (!stored?.length) return local;
+
+  const byPaidSeq = new Map(stored.map((piece) => [piece.paidSeq, piece]));
+  if (local.every((piece) => byPaidSeq.has(piece.paidSeq))) return stored;
+
+  // A snapshot missing local payments can also lag the handler's progress on earlier pieces.
+  for (const piece of local) byPaidSeq.set(piece.paidSeq, piece);
+  return [...byPaidSeq.values()].sort((a, b) => a.paidSeq - b.paidSeq);
+}
+
 /**
  * Finish the running piece, at `chargeMicro` when that is a valid charge below its price. An
  * invalid charge is refused earlier, where the handler can see the error; here it is simply not
