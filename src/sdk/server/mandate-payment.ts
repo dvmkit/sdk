@@ -147,9 +147,10 @@ export async function settleMandateAsk(args: {
 
 /**
  * Find quiet credit asks that could need settlement or resume. Without a mandate the sweep can
- * only resume, so require a committed balance payment for the latest provider ask. An unanswered
- * prompt can keep an already resumed job in `awaiting-input`, so skip those jobs unless a standing
- * decline is waiting to end the unpaid ask.
+ * only resume, so require a committed balance payment for the latest ask. Provider progress can
+ * arrive during a wait. Only a new ask, prompt, or terminal message supersedes that wait.
+ * An unanswered prompt can keep an already resumed job in `awaiting-input`, so skip those jobs
+ * unless a standing decline is waiting to end the unpaid ask.
  * A provider prompt carries its id as `content.id`; the caller's answer names it as `prompt_id`.
  * Oldest first; pass the last row back as `after` for the next page.
  */
@@ -162,6 +163,7 @@ export async function findQuietCreditAsks(pool: Pool, args: {
      JOIN LATERAL (
        SELECT m.seq, m.data->>'type' AS type FROM job_messages m
        WHERE m.job_id=j.id AND m.status='verified' AND m.data->>'from'='provider'
+         AND m.data->>'type' IN ('payment-request', 'prompt', 'complete', 'cancel')
        ORDER BY m.seq DESC LIMIT 1
      ) latest ON latest.type='payment-request'
      WHERE j.status='awaiting-input' AND j.last_activity_at < $1

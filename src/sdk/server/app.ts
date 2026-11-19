@@ -5386,15 +5386,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const store = jm.store;
     const fresh = await store.get(id);
     if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
-    fresh.messages = await store.getMessages(id, 0);
+    // Internal replay needs the committed payment even if an earlier verification still
+    // holds back the public message stream.
+    fresh.messages = await store.getMessages(id, 0, { includeHeld: true });
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
     if (!ask || (requestSeq !== undefined && ask.seq !== requestSeq)) return;
+    if (requestSeq === undefined && fresh.messages.some((message) => message.seq > ask.seq && message.from === "provider" &&
+        (message.type === "prompt" || message.type === "complete" || message.type === "cancel"))) return;
     const recoveringSignedPayment = requestSeq === undefined && !fresh.mandate;
     let paymentSeq: number | undefined;
     if (recoveringSignedPayment) {
-      if (!this.opts.db || (fresh.pendingPaymentFiatMicro ?? 0) !== 0 ||
-          fresh.messages.findLast((message) => message.from === "provider") !== ask) return;
+      if (!this.opts.db || (fresh.pendingPaymentFiatMicro ?? 0) !== 0) return;
       // The sweep's candidate can go stale while the live worker advances. Match the verified
       // history to the committed payment for the ask we are about to replay.
       const { rows: [accepted] } = await this.opts.db.query<{ response: { seq: number } }>(
@@ -5406,11 +5409,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       message.seq > ask.seq && (paymentSeq === undefined || message.seq === paymentSeq));
     if (!payment) return;
     await store.tryReactivationLock(id, async () => {
-      if (recoveringSignedPayment) {
-        const current = await store.get(id);
-        if (current?.status !== "awaiting-input" || current.lastActivityAt !== fresh.lastActivityAt ||
-            current.awaitingInputAtMs !== fresh.awaitingInputAtMs) return;
-      }
       if (jm.activeJobs.has(id)) return;
       const { job } = jm.reactivateJob(fresh);
       await this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status);
