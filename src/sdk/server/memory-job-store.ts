@@ -161,7 +161,9 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     // `claimReceiptSeq`, never by the snapshot path — mirrors the Postgres
     // store, whose `save` statement simply doesn't list those columns. Without
     // this, a snapshot taken before the receipt was signed would clear it.
-    const snapshot = structuredClone(record);
+    // Older callers can supply the removed field as an extra property on JobRecord.
+    const { receivedProofs: _legacyProofs, ...jobFields } = record as JobRecord & { receivedProofs?: unknown };
+    const snapshot = structuredClone(jobFields);
     delete snapshot.pieceEnding;
     if (existing) {
       snapshot.createdAt = existing.createdAt;
