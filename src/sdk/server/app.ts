@@ -2015,7 +2015,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    * advertising it then would hand the caller an option that
    * fails on use, while the other rails would have closed the sale.
    */
-  private resolveFundingMethods(): FundingMethod[] {
+  private resolveFundingMethods(x402Schemes: { scheme: string }[]): FundingMethod[] {
     // A one-shot MPP `charge` can fund the durable credit ledger even when the
     // reusable session optimization is unavailable. The distinction belongs
     // in the `credit.mpp.methods` menu, not in the top-level funding rail.
@@ -2032,8 +2032,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     );
     if (
       (this.opts.paymentMethods === undefined || this.opts.paymentMethods.includes("x402")) &&
-      this.x402CurrencySupported() &&
-      this.x402BatchAvailable() &&
+      x402Schemes.some(({ scheme }) => scheme === X402_BATCH_SETTLEMENT_SCHEME) &&
       !methods.includes("x402")
     ) {
       methods.push("x402");
@@ -2100,15 +2099,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!this.x402CurrencySupported() || !x402 || !support) return [];
     return [
       ...(support.available ? [{ scheme: X402_EXACT_SCHEME, network: x402.network }] : []),
-      ...(this.x402BatchAvailable()
+      ...((x402.dualServe ?? true) && this.x402BatchAvailable(support)
         ? [{ scheme: X402_BATCH_SETTLEMENT_SCHEME, network: x402.network }]
         : []),
     ];
   }
 
-  private x402BatchAvailable(): boolean {
+  private x402BatchAvailable(support = this.x402Support()): boolean {
     return (
-      !!this.x402Support()?.batchSettlement &&
+      !!support?.batchSettlement &&
       !!(this.opts.x402BatchSettlement ?? this.opts.x402BatchSettlementFactory)
     );
   }
@@ -2326,14 +2325,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       this.opts.lightningReceive?.ensureFresh(),
     ]);
     const mppSplit = this.creditMppSplit();
+    const x402Schemes = this.creditX402Schemes();
     const menu = await buildCreditMenu({
       runtime: "container",
       config: this.descriptor.credit,
       currency,
-      funding: this.resolveFundingMethods(),
+      funding: this.resolveFundingMethods(x402Schemes),
       tempoMethods: mppSplit.offered,
       tempoWithheld: mppSplit.withheld,
-      x402Schemes: this.creditX402Schemes(),
+      x402Schemes,
       lightningFundingMinSats: this.opts.lightningReceive?.fundingMinSats,
       stripeNetworkId: this.opts.stripeCredit?.networkId,
       stripeMinMicro: this.opts.stripeCredit?.minMicro,

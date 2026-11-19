@@ -16,14 +16,25 @@ import { type Channel, type ChannelStorage, InMemoryChannelStorage } from "@x402
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 
-import { encodeSettleResponseHeader } from "../../../lib/x402/spec";
+import { decodePaymentRequiredHeader, encodeSettleResponseHeader } from "../../../lib/x402/spec";
 import { diagnosticConsole } from "../../../observability/diagnostic-console";
+import { configureDVM } from "../../configure";
+import { MemoryKVStore } from "../../store";
+import { createDVMServer } from "../app";
+import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
+import { derivedFundCreditId, fundingCommitment } from "../funding";
+import { MemoryJobStore } from "../memory-job-store";
+import { secp256k1Auth } from "../secp256k1-auth";
+import { createSignedRequestVerifier } from "../signed-request";
+import { X402FacilitatorHealth } from "../x402-facilitator-support";
 import { x402ShutdownClaimEnvironment } from "../x402-shutdown-claim";
 import { createX402BatchSettlementServer } from "../x402-batch-settlement";
 import type { HostedSettlementReportObligations } from "../hosting-settlement-report-obligations";
 import type { X402PayoutObserver } from "../payout-reporter";
+import { durableLedger } from "./__helpers__/credit-fixtures";
 
 const NETWORK = "eip155:84532" as const;
+const MAINNET = "eip155:8453" as const;
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 
 interface BatchRaw {
@@ -38,6 +49,8 @@ class StatefulFacilitator implements FacilitatorClient {
   balance = 1_000n;
   totalClaimed = 0n;
   settleNothingResponses = 0;
+
+  constructor(private readonly network: PaymentRequirements["network"] = NETWORK) {}
 
   readonly verify = vi.fn(
     async (payload: PaymentPayload): Promise<VerifyResponse> => ({
@@ -125,7 +138,7 @@ class StatefulFacilitator implements FacilitatorClient {
   );
 
   readonly getSupported = vi.fn(async () => ({
-    kinds: [{ x402Version: 2, scheme: "batch-settlement", network: NETWORK }],
+    kinds: [{ x402Version: 2, scheme: "batch-settlement", network: this.network }],
     extensions: [],
     signers: {},
   }));
@@ -156,6 +169,192 @@ function header(
     JSON.stringify({ ...payload, accepted, resource: { url: "/v1/credit" } })
   ).toString("base64");
 }
+
+const creditSigner = createSignedRequestVerifier(CREDIT_REQUEST_SCHEMA);
+const creditKey = new Uint8Array(32).fill(7);
+const topUpMicro = 250_000;
+
+async function mainnetCreditServer({
+  exact,
+  selfRelay,
+  dualServe = true,
+  allowOneShotStablecoin = true,
+}: {
+  exact: boolean;
+  selfRelay: boolean;
+  dualServe?: boolean;
+  allowOneShotStablecoin?: boolean;
+}) {
+  const receiver = privateKeyToAccount(`0x${"22".repeat(32)}`);
+  const storage = new InMemoryChannelStorage();
+  const ledger = durableLedger();
+  const x402 = {
+    network: MAINNET,
+    payTo: receiver.address,
+    dualServe,
+    ...(selfRelay && {
+      batchSettlement: {
+        storage,
+        facilitatorClient: new StatefulFacilitator(MAINNET),
+        receiverAuthorizerSigner: receiver,
+        selfRelay: { privateKey: `0x${"11".repeat(32)}` as const, rpcUrl: "https://base.example.com" },
+        autoSettlement: false as const,
+      },
+    }),
+  };
+  const x402FacilitatorHealth = new X402FacilitatorHealth(x402, {
+    client: {
+      getSupported: async () => ({
+        kinds: exact ? [{ x402Version: 2, scheme: "exact", network: MAINNET }] : [],
+        extensions: [],
+        signers: {},
+      }),
+    },
+  });
+  await x402FacilitatorHealth.refresh();
+  const server = await createDVMServer(configureDVM({
+    name: "batch-credit-roundtrip",
+    capability: "run",
+    auth: secp256k1Auth(),
+    credit: { min: "$0.10", max: "$5.00", allowOneShotStablecoin },
+    onJob(ctx) { ctx.complete("done"); },
+  }), {
+    env: {},
+    store: new MemoryKVStore(),
+    jobStore: new MemoryJobStore(),
+    creditLedger: ledger,
+    fxFetcher: {
+      fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date(0).toISOString() }),
+      supportedCurrencies: () => ["usd"],
+    },
+    x402,
+    x402FacilitatorHealth,
+  });
+  return { ...server, receiver, ledger };
+}
+
+function fundCreditRequest(
+  server: Awaited<ReturnType<typeof mainnetCreditServer>>,
+  fundId: string,
+  paymentHeader?: string,
+  creditId?: string,
+) {
+  const path = "/v1/credit";
+  const method = "POST";
+  const audience = server.authAudience;
+  if (!audience) throw new Error("Expected the mounted DVM's signing audience");
+  const signed = creditSigner.signRequest(creditKey, {
+    op: "fund",
+    ...(creditId && { credit_id: creditId }),
+    fund: {
+      fund_id: fundId,
+      amount_micro: topUpMicro,
+      commitment: fundingCommitment(paymentHeader ?? ""),
+    },
+  }, undefined, { audience, method, path, capability: null });
+  return {
+    callerPubkey: signed.pubkey,
+    send: (withPayment = true) => server.app.request(path, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...(withPayment && paymentHeader && { "PAYMENT-SIGNATURE": paymentHeader }),
+      },
+      body: JSON.stringify(signed),
+    }),
+  };
+}
+
+describe("x402 credit funding with a Base mainnet self-relay", () => {
+  it.each([
+    { exact: true, selfRelay: true, schemes: ["batch-settlement", "exact"] },
+    { exact: true, selfRelay: false, schemes: ["exact"] },
+    { exact: false, selfRelay: true, schemes: ["batch-settlement"] },
+    { exact: false, selfRelay: false, schemes: [] },
+    { exact: false, selfRelay: true, dualServe: false, schemes: [] },
+  ])("agrees on funding schemes for $schemes (exact=$exact, self-relay=$selfRelay)", async ({ schemes, ...config }) => {
+    const server = await mainnetCreditServer(config);
+    try {
+      const info = await (await server.app.request("/v1/info")).json() as {
+        credit: { funding: string[]; x402?: { schemes: { scheme: string; network: string }[] } };
+      };
+      const response = await fundCreditRequest(server, "discovery").send();
+
+      expect(info.credit.funding).toEqual(schemes.length ? ["x402"] : []);
+      expect(info.credit.x402?.schemes.slice().sort((a, b) => a.scheme.localeCompare(b.scheme)) ?? [])
+        .toEqual(schemes.map((scheme) => ({ scheme, network: MAINNET })));
+      expect(response.status).toBe(402);
+      const challenge = response.headers.get("PAYMENT-REQUIRED");
+      if (schemes.length === 0) {
+        expect(challenge).toBeNull();
+      } else {
+        expect(challenge).toBeTruthy();
+        const accepted = decodePaymentRequiredHeader(challenge!).accepts;
+        expect(accepted.map(({ scheme, network, amount }) => ({ scheme, network, amount })))
+          .toEqual(schemes.map((scheme) => ({ scheme, network: MAINNET, amount: String(topUpMicro) })));
+      }
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("opens a batch-only channel and funds credit from a subsequent voucher", async () => {
+    const server = await mainnetCreditServer({ exact: false, selfRelay: true, allowOneShotStablecoin: false });
+    try {
+      const discovery = await fundCreditRequest(server, "open-channel").send();
+      expect(discovery.status).toBe(402);
+      const challenge = discovery.headers.get("PAYMENT-REQUIRED");
+      if (!challenge) throw new Error("Expected batch requirements when hosted exact is unavailable");
+      const [requirements] = decodePaymentRequiredHeader(challenge).accepts as PaymentRequirements[];
+      const payer = privateKeyToAccount(`0x${"01".repeat(32)}`);
+      const channelConfig: Channel["channelConfig"] = {
+        payer: payer.address,
+        payerAuthorizer: payer.address,
+        receiver: server.receiver.address,
+        receiverAuthorizer: server.receiver.address,
+        token: requirements.asset as `0x${string}`,
+        withdrawDelay: 86_400,
+        salt: `0x${"44".repeat(32)}`,
+      };
+      const channelId = computeChannelId(channelConfig, MAINNET);
+      const deposit = await createBatchSettlementEIP3009DepositPayload(
+        payer, 2, requirements, channelConfig, "500000", "250000"
+      );
+      const depositRequest = fundCreditRequest(server, "open-channel", header(deposit, requirements));
+      expect((await depositRequest.send(false)).status).toBe(402);
+      const opened = await depositRequest.send();
+      expect(opened.status).toBe(200);
+      const creditId = derivedFundCreditId(depositRequest.callerPubkey, "open-channel");
+      expect(await opened.json()).toMatchObject({
+        funded_micro: 250_000,
+        credit: { credit_id: creditId, balance_micro: 250_000 },
+      });
+
+      const voucher = await signVoucher(payer, channelId, "500000", MAINNET);
+      const voucherHeader = header({ x402Version: 2, payload: { type: "voucher", channelConfig, voucher } }, requirements);
+      const funded = await fundCreditRequest(server, "top-up", voucherHeader, creditId).send();
+      expect(funded.status).toBe(200);
+      expect(await funded.json()).toMatchObject({
+        funded_micro: 250_000,
+        credit: { credit_id: creditId, balance_micro: 500_000 },
+      });
+      expect(await server.ledger.get(creditId)).toMatchObject({ x402ChannelId: channelId });
+
+      const unavailable = await mainnetCreditServer({ exact: false, selfRelay: false });
+      try {
+        const refusedRequest = fundCreditRequest(unavailable, "open-channel", header(deposit, requirements));
+        const refused = await refusedRequest.send();
+        expect(refused.status).toBe(402);
+        expect(refused.headers.get("PAYMENT-REQUIRED")).toBeNull();
+        expect(await unavailable.ledger.get(creditId)).toBeUndefined();
+      } finally {
+        await unavailable.shutdown();
+      }
+    } finally {
+      await server.shutdown();
+    }
+  });
+});
 
 describe("x402 batch-settlement stateful round trip", () => {
   it.each(

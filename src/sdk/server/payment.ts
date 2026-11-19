@@ -1015,11 +1015,7 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
   // should touch the rate provider on the payment hot path. MPP still needs
   // the conversion.
   const x402ExactVersions = opts.x402ExactVersions ?? { v1: true, v2: true };
-  const x402Advertised =
-    Boolean(x402Config) &&
-    Boolean(x402PriceFiat) &&
-    (x402Config?.dualServe ?? true) &&
-    (x402ExactVersions.v1 || x402ExactVersions.v2);
+  const x402ChallengesEnabled = x402Config !== undefined && (x402Config.dualServe ?? true);
   const needsRate = Boolean(requiredMsats) && Boolean(mpp);
   // Resolve once per request, before any rail's `try` block — a rate-provider
   // outage inside one of those would be caught by its credential-verification
@@ -1037,7 +1033,8 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
   // price is statable without a rate; other pricing currencies are gated out.
   const x402Requirements =
     x402Config &&
-    x402Advertised &&
+    x402ChallengesEnabled &&
+    (x402ExactVersions.v1 || x402ExactVersions.v2) &&
     x402PriceFiat &&
     requiredMsats &&
     (!opts.fundOnly ||
@@ -1049,10 +1046,11 @@ async function verifyUpfrontPaymentInScope(opts: UpfrontPaymentOpts): Promise<Pa
           opts.x402Deferred && deferredX402Window(opts.x402Deferred.maxRuntimeSeconds).advertisedTimeoutSeconds
         )
       : undefined;
+  // A batch server can settle through its own relay without hosted exact support.
   const x402BatchRequirements =
     opts.fundOnly &&
     opts.x402BatchSettlement &&
-    x402Advertised &&
+    x402ChallengesEnabled &&
     x402PriceFiat &&
     requiredMsats
       ? await opts.x402BatchSettlement.buildRequirements(
