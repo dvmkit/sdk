@@ -1686,16 +1686,21 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
     });
   }
 
-  async getMessages(jobId: string, afterSeq: number, options?: { includeHeld?: boolean; limit?: number }): Promise<Message[]> {
+  async getMessages(
+    jobId: string,
+    afterSeq: number,
+    options?: { includeHeld?: boolean; limit?: number; cancellationOnly?: boolean },
+  ): Promise<Message[]> {
     if (options?.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1)) {
       throw new RangeError("Message limit must be a positive safe integer");
     }
+    // A surviving incremental row takes precedence over its snapshot copy even if their types differ.
     const { rows } = await this.pool.query<{ data: Message | string }>(
       `WITH terminal AS (
          SELECT messages FROM jobs WHERE id = $1 AND status IN ('completed', 'failed', 'cancelled')
        ), history AS (
          SELECT seq, data, 0 AS origin FROM job_messages
-         WHERE job_id = $1 AND seq > $2 AND status = 'verified'
+         WHERE job_id = $1 AND seq > $2::bigint AND status = 'verified'
            AND ($3::boolean OR EXISTS (SELECT 1 FROM terminal)
              OR EXISTS (SELECT 1 FROM job_messages WHERE job_id = $1 AND status = 'verified'
                AND data->>'from' = 'provider' AND data->>'type' IN ('complete', 'cancel'))
@@ -1704,9 +1709,14 @@ export class PostgresJobStore implements StreamableJobStore, ReceiptIssuingStore
          UNION ALL
          SELECT (message->>'seq')::bigint, message, 1 AS origin
          FROM terminal CROSS JOIN LATERAL jsonb_array_elements(terminal.messages) AS snapshot(message)
-         WHERE (message->>'seq')::bigint > $2
-       ) SELECT DISTINCT ON (seq) data FROM history ORDER BY seq, origin LIMIT $4`,
-      [jobId, afterSeq, options?.includeHeld ?? false, options?.limit ?? null]
+         WHERE (message->>'seq')::bigint > $2::bigint
+       ), deduplicated AS (
+         SELECT DISTINCT ON (seq) seq, data FROM history ORDER BY seq, origin
+       )
+       SELECT data FROM deduplicated
+       WHERE NOT $5::boolean OR data->>'type' = 'cancel'
+       ORDER BY seq LIMIT $4`,
+      [jobId, afterSeq, options?.includeHeld ?? false, options?.limit ?? null, options?.cancellationOnly ?? false]
     );
     return rows.map((r) => (typeof r.data === "string" ? JSON.parse(r.data) : r.data) as Message);
   }

@@ -5,6 +5,9 @@
     "PostgresJobStore.getMessageReadState": {
       "behavior": "reads job ownership and content retention metadata, with active holds, without loading the transcript"
     },
+    "PostgresJobStore.getMessages": {
+      "cancellationOnly": "optional boolean; return only cancel messages after deduplication and before applying the limit"
+    },
     "StreamableJobStore.getMessages": {
       "options": "optional { includeHeld?: boolean, limit?: number }",
       "includeHeld": "returns all verified messages for snapshot reconstruction, independently of the pending-payment delivery cutoff",
@@ -1462,7 +1465,7 @@
         },
         "PostgresJobStore": {
           "stability": "experimental",
-          "signature": "68cd3c7c8540c742bdc8bd4541445986cd3b70f6a97c725ab730a210c287d67a"
+          "signature": "ec8a1e854a6761f26b6914b0d1c89f70b433635948d13a1f694e6a23713f561c"
         },
         "PostgresKVStore": {
           "stability": "experimental",

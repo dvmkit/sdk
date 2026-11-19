@@ -4977,9 +4977,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         .slice(0, readLimit);
       if (streamable) {
         const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+        const options = {
+          includeHeld: terminal, limit: readLimit,
+          ...(terminalOnly && store instanceof PostgresJobStore ? { cancellationOnly: true } : {}),
+        };
         let cursor = after;
         for (;;) {
-          const batch = await store.getMessages(id, cursor, { includeHeld: terminal, limit: readLimit });
+          const batch = await store.getMessages(id, cursor, options);
           if (batch.length === 0) {
             if (cursor === after && terminal) {
               if ("messages" in record) messages = fromSnapshot(record.messages);
