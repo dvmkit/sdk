@@ -1,16 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.
-- A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
-- When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
-- When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
-
-### Breaking API changes
-
-Against `0.41.0`, no supported use stops working. The Hono context variables that `@dvmkit/sdk/server` types as `AppEnv` gain an optional `prefixedDVMRequest` flag, which the host sets on requests under another DVM's mount prefix. `CreditRouteDeps` and `handleCreditRequest` change signature only because they reach `AppEnv` through their Hono context. Code that builds or reads that context compiles unchanged.
-
 ## Upgrade details
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
@@ -24,6 +13,39 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Breaking changes
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
+
+## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
+
+- JSON job message reads accept `limit` for pages of up to 50 messages, with `next_after` and `has_more` for continuation. Omitting `limit` keeps the existing full response, and SSE keeps its streaming contract.
+- A root-mounted DVM no longer records request spans for requests under another DVM's mount prefix on the same host. Sibling health and internal requests remain excluded from request spans.
+- When a reusable x402 channel deposit is confirmed absent on chain, credit funding returns a retryable `503 settlement_not_on_chain` that asks the caller to resend the same signed request.
+- When an x402 channel deposit submission returns an error, credit funding reports an unknown deposit outcome and asks the caller to resend the original signed request.
+
+### Breaking API changes
+
+Against `0.41.0`, no supported use stops working. All signature changes are additive:
+
+- The Hono context variables that `@dvmkit/sdk/server` types as `AppEnv` gain an optional `prefixedDVMRequest` flag, which the host sets on requests under another DVM's mount prefix. `CreditRouteDeps` and `handleCreditRequest` change signature only because they reach `AppEnv` through their Hono context.
+- `PostgresJobStore` gains `getMessageReadState(jobId)`, which reads a job's ownership and retention metadata without loading its message history, and `getMessages` accepts an optional `cancellationOnly` flag.
+
+
+### Features
+
+* **server:** paginate JSON job messages ([ce59a80](https://github.com/dvmkit/sdk/commit/ce59a8071a21b8abbefc006dd91ceaaf80007061))
+
+
+### Bug Fixes
+
+* **observability:** exclude sibling mounts from root request spans ([576a2b0](https://github.com/dvmkit/sdk/commit/576a2b0a533d25d1dab959982ef2ef1c61b112bb))
+* **server:** clarify ambiguous x402 deposit outcomes ([6e78752](https://github.com/dvmkit/sdk/commit/6e78752fec9d4f5d0fb4c8eb48cf98c36444b2f9))
+* **server:** make absent x402 deposits retryable ([7c652a4](https://github.com/dvmkit/sdk/commit/7c652a4e13b59ee9f173dcac3338803484093c79))
+* **server:** preserve paid pieces on notification resume ([1a498af](https://github.com/dvmkit/sdk/commit/1a498afd84a2904b9eb49844b03e07ecc46374df))
+* **server:** recover jobs after signed credit payments ([65c6c02](https://github.com/dvmkit/sdk/commit/65c6c0237bd1483e36436e60d3a2af3702d6b0c2))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.41.0 ([#200](https://github.com/dvmkit/sdk/issues/200)) ([7e4658d](https://github.com/dvmkit/sdk/commit/7e4658df22852774f6214b758f05627db3245136))
 
 ## [0.41.0](https://github.com/dvmkit/sdk/compare/v0.40.0...v0.41.0) (2026-11-17)
 
