@@ -4706,16 +4706,21 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     };
   }
 
-  private async contentFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt; creditId?: string }): Promise<Record<string, unknown>> {
+  private async contentFields(
+    job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; receipt?: JobReceipt; creditId?: string },
+    page?: { gate: OutputGate | undefined },
+  ): Promise<Record<string, unknown>> {
     const store = this.jobManager.store;
     const responseStatus = job.status;
     const evidence = isTerminal(job.status) && this.jobManager.receiptsEnabled && !job.receipt
       ? { receipt_pending: true } : {};
-    const gate = await this.outputGate(job);
+    const gate = page ? page.gate : await this.outputGate(job);
     const withheld = gate && "reason" in gate
       ? { content_available: false, content_withheld: gate.reason } : {};
     if (isContentHoldStore(store)) {
-      const snapshot = await store.getContentSnapshot(job.id);
+      const snapshot = page && store instanceof PostgresJobStore
+        ? await store.getMessageReadState(job.id)
+        : await store.getContentSnapshot(job.id);
       if (snapshot) return { ...evidence, ...contentMetadata({ ...snapshot.job, status: responseStatus }, this.descriptor.jobRetentionDays, snapshot.history.holds), ...withheld };
     }
     // Unsupported custom stores cannot vouch for durable availability or holds.
@@ -4785,6 +4790,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const accept = c.req.header("Accept") ?? "";
     const store = this.jobManager.store;
     if (job && !isJobOwner(c, job)) return c.json({ error: "Job not found" }, 404);
+    const limit = c.req.query("limit");
+    if (limit !== undefined && !accept.includes("text/event-stream")) {
+      return this.handleGetMessagePage(c, id, job, limit);
+    }
 
     if (!job || isStreamableJobStore(store)) {
       if (job) await job.messageAppenderTail;
@@ -4933,6 +4942,71 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
 
     return c.json(await this.messageFields(job, visibleJobMessages(job).filter((m) => m.seq > after)));
+  }
+
+  private async handleGetMessagePage(
+    c: Context<AppEnv>, id: string, job: ServerJob | undefined, rawLimit: string,
+  ): Promise<Response> {
+    const store = this.jobManager.store;
+    const streamable = isStreamableJobStore(store);
+    const localSnapshot = job && !streamable;
+    if (!localSnapshot) await job?.messageAppenderTail;
+    const record = localSnapshot ? job
+      : store instanceof PostgresJobStore ? (await store.getMessageReadState(id))?.job
+      : await store.get(id);
+    if (!record || !isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
+
+    const limit = Number(rawLimit);
+    if (!/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_JOB_MESSAGE_PAGE_SIZE) {
+      return c.json({ error: "invalid_query", message: `limit must be an integer in 1..${MAX_JOB_MESSAGE_PAGE_SIZE}.` }, 400);
+    }
+    const rawAfter = c.req.query("after") ?? "0";
+    const after = Number(rawAfter);
+    if (!/^\d+$/.test(rawAfter) || !Number.isSafeInteger(after)) {
+      return c.json({ error: "invalid_query", message: "after must be a non-negative safe integer." }, 400);
+    }
+
+    const gate = await this.outputGate(record);
+    const readLimit = limit + 1;
+    let messages: Message[] = [];
+    if (!("redactedAt" in record && record.redactedAt !== undefined) && !(gate && "reason" in gate)) {
+      const terminalOnly = gate !== undefined;
+      const fromSnapshot = (history: Message[]) => history
+        .filter((message) => message.seq > after && (!terminalOnly || message.type === "cancel"))
+        .sort((a, b) => a.seq - b.seq)
+        .slice(0, readLimit);
+      if (streamable) {
+        const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+        let cursor = after;
+        for (;;) {
+          const batch = await store.getMessages(id, cursor, { includeHeld: terminal, limit: readLimit });
+          if (batch.length === 0) {
+            if (cursor === after && terminal) {
+              if ("messages" in record) messages = fromSnapshot(record.messages);
+              // Postgres merges the persisted terminal snapshot in getMessages. The live
+              // worker can already be terminal while its most recent saved snapshot is not.
+              else if (!isTerminal(record.status)) messages = fromSnapshot((await store.get(id))?.messages ?? []);
+            }
+            break;
+          }
+          const releasable = terminalOnly ? batch.filter((message) => message.type === "cancel") : batch;
+          messages.push(...releasable.slice(0, readLimit - messages.length));
+          if (!terminalOnly || messages.length === readLimit || batch.length < readLimit) break;
+          cursor = batch[batch.length - 1].seq;
+        }
+      } else if ("messages" in record) {
+        messages = fromSnapshot(localSnapshot ? visibleJobMessages(job) : record.messages);
+      }
+    }
+
+    // A sweep can redact the transcript while the page is being read.
+    const fields = await this.contentFields(record, { gate });
+    if (fields.content_available === false) messages = [];
+    const hasMore = messages.length > limit;
+    if (hasMore) messages.pop();
+    return c.json({
+      messages, next_after: messages.at(-1)?.seq ?? after, has_more: hasMore, ...fields,
+    });
   }
 
   /**
@@ -5777,6 +5851,8 @@ async function awaitTerminalWork(work: () => Promise<void>): Promise<void> {
     clearTimeout(timer);
   }
 }
+
+const MAX_JOB_MESSAGE_PAGE_SIZE = 50;
 
 /** Why a deferred-x402 job's output is not readable yet; see `outputGate`. */
 type OutputGate = { reason: "payment_pending" | "payment_unsettled" } | { terminalOnly: true };

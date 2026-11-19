@@ -43,6 +43,10 @@ export interface ContentHoldHistory {
   events: ContentHoldEvent[];
 }
 
+export type JobMessageReadState = Pick<JobRecord,
+  "id" | "status" | "requesterId" | "requesterTokenHash" | "creditId" | "lastActivityAt" | "redactedAt" | "receipt"
+>;
+
 export type ContentHoldMutation =
   | { action: "placed"; purpose: "support" | "dispute"; reason: string; review_due_at: number; actor: string; at: number }
   | { action: "renewed"; hold_id: string; reason: string; review_due_at: number; actor: string; at: number }

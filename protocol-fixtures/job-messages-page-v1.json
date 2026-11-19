@@ -1,0 +1,38 @@
+{
+  "method": "GET",
+  "path": "/v1/job/example-job/messages",
+  "history": [
+    { "seq": 1, "from": "provider", "type": "text", "timestamp": 1700000000, "content": { "text": "Started" } },
+    { "seq": 3, "from": "provider", "type": "artifact", "timestamp": 1700000001, "content": { "encoding": "base64", "data": "AAEC" } },
+    { "seq": 6, "from": "provider", "type": "text", "timestamp": 1700000002, "content": { "text": "Artifact saved" } },
+    { "seq": 9, "from": "provider", "type": "complete", "timestamp": 1700000003, "content": { "summary": "Done" } }
+  ],
+  "pages": [
+    {
+      "query": "?limit=2",
+      "body": {
+        "messages": [
+          { "seq": 1, "from": "provider", "type": "text", "timestamp": 1700000000, "content": { "text": "Started" } },
+          { "seq": 3, "from": "provider", "type": "artifact", "timestamp": 1700000001, "content": { "encoding": "base64", "data": "AAEC" } }
+        ],
+        "next_after": 3,
+        "has_more": true
+      }
+    },
+    {
+      "query": "?limit=2&after=3",
+      "body": {
+        "messages": [
+          { "seq": 6, "from": "provider", "type": "text", "timestamp": 1700000002, "content": { "text": "Artifact saved" } },
+          { "seq": 9, "from": "provider", "type": "complete", "timestamp": 1700000003, "content": { "summary": "Done" } }
+        ],
+        "next_after": 9,
+        "has_more": false
+      }
+    },
+    {
+      "query": "?limit=2&after=9",
+      "body": { "messages": [], "next_after": 9, "has_more": false }
+    }
+  ]
+}

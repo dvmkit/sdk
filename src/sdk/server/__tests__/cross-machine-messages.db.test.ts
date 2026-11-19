@@ -5,10 +5,12 @@ import type { Message, MessageType } from "../../../lib/messages/types";
 import { configureDVM } from "../../configure";
 import type { FxFetcher } from "../../pricing/index";
 import { MemoryKVStore } from "../../store";
+import { createDVMServer } from "../app";
 import { providerMessage } from "../job";
 import { JobManager } from "../job-manager";
 import type { JobRecord } from "../job-store";
 import { PostgresJobStore } from "../postgres-job-store";
+import { ACTIVITY, contentJob, TOKEN } from "./__helpers__/content-fixtures";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const RUN = !!DATABASE_URL && /\/dvmkit_test(_[0-9a-f]{8})?(\?|$)/.test(DATABASE_URL);
@@ -104,6 +106,48 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     expect(await store.getMessages(jobId, 3, { includeHeld: true, limit: 2 })).toEqual([messages[0]]);
     expect(await store.getMessages(jobId, 5, { limit: 2 })).toEqual([]);
     expect(await store.getMessages(jobId, 0)).toEqual([messages[1], duplicate, messages[0]]);
+  });
+
+  it("serves archived pages and drops a page if content is redacted during its read", async () => {
+    const runtime = await createDVMServer(configureDVM({ name: "example", capability: "work", jobRetentionDays: 0, onJob() {} }), {
+      env: {}, store: new MemoryKVStore(), jobStore: store, devMode: true,
+    });
+    const job = contentJob("archived-pages");
+    const messages: Message[] = [1, 3, 5].map(seq => ({
+      seq, from: "provider", timestamp: 1, type: "artifact", content: { data: `artifact-${seq}` },
+    }));
+    const read = (after: number) => runtime.app.request(`/v1/job/${job.id}/messages?limit=2&after=${after}`, {
+      headers: { "X-Job-Token": TOKEN },
+    });
+    try {
+      await store.save({ ...job, messages, seq: 5 });
+      const snapshotRead = vi.spyOn(store, "get");
+      const first = await read(0);
+      expect(first.status).toBe(200);
+      expect(await first.json()).toMatchObject({
+        messages: messages.slice(0, 2), next_after: 3, has_more: true, content_available: true,
+      });
+      const last = await read(3);
+      expect(last.status).toBe(200);
+      expect(await last.json()).toMatchObject({
+        messages: messages.slice(2), next_after: 5, has_more: false, content_available: true,
+      });
+      expect(snapshotRead).not.toHaveBeenCalled();
+
+      const getMessages = store.getMessages.bind(store);
+      vi.spyOn(store, "getMessages").mockImplementationOnce(async (...args) => {
+        const selected = await getMessages(...args);
+        await store.redactJob({ jobId: job.id, expectedLastActivityAt: ACTIVITY, redactedAt: ACTIVITY + 1 });
+        return selected;
+      });
+      const redacted = await read(3);
+      expect(redacted.status).toBe(200);
+      expect(await redacted.json()).toMatchObject({
+        messages: [], next_after: 3, has_more: false, content_available: false,
+      });
+    } finally {
+      await runtime.shutdown();
+    }
   });
 
   it.each([0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid message page limit %s", async (limit) => {
