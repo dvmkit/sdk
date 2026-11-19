@@ -58,7 +58,6 @@ import {
   fiatAmountMicro,
   type FiatDenomination,
   deferredX402Id,
-  deferredX402IntentId,
   DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER,
   deferredX402Window,
   fundedMicroFor,
@@ -5032,14 +5031,15 @@ async function fundAndDrawInScope(
     // read from the same snapshot for the same reason: the report names what
     // the credit is bound to, not what this request's artifact looked like.
     const instrument = credit.rail ? storedCreditBinding(credit).instrument : undefined;
-    const oneRequest = !ctx.fundOnly && !ctx.midJob && !ctx.topUp &&
-      (!env || deferredX402IntentId(env.creditId) !== undefined);
+    // An explicit fund-and-draw must carry a funding commitment. The envelope
+    // created by deferred exact admission carries only the credit and draw IDs.
+    const oneRequest = !ctx.fundOnly && !ctx.midJob && !ctx.topUp && !env?.fund;
     const report: CreditFundingReport = {
       ...deposit,
       expiryMs: credit.expiryMs,
       callerPubkey: credit.callerPubkey,
       ...(instrument && { instrument }),
-      ...(oneRequest && instrument === "x402_exact" && funding.payerAddress &&
+      ...(createsDepositLiability && oneRequest && instrument === "x402_exact" && funding.payerAddress &&
         { payerAddress: funding.payerAddress }),
     };
     if (createsDepositLiability && enqueue && tx) {

@@ -18,6 +18,7 @@ import { CREDIT_REQUEST_SCHEMA } from "../credit-routes";
 import { drawSettlementRef, fundingCommitment } from "../funding";
 import { LightningReceive } from "../lightning-receive";
 import {
+  creditDepositPayload,
   verifyIncomingPayment,
   type VerifyIncomingSnapshot,
   verifyUpfrontPayment,
@@ -306,11 +307,30 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
     expect(JSON.stringify(settleResponse).toLowerCase()).not.toContain(payerAddress);
   });
 
-  it("omits the authorizer from explicit reusable credit funding", async () => {
+  it.each([
+    { creditId: "reusable-credit", existing: false },
+    { creditId: `x402d:${"ad".repeat(32)}`, existing: true },
+  ])("omits the authorizer from explicit reusable funding for $creditId", async ({ creditId, existing }) => {
+    if (existing) {
+      await ledger.fund({
+        creditId,
+        callerPubkey: CALLER,
+        currency: "usd",
+        amountMicro: PRICE_MICRO,
+        expiryMs: FUTURE_MS,
+        basis: {
+          rail: "x402",
+          paidMsats: PRICE_MSATS,
+          nativeAmount: PRICE_MICRO,
+          nativeAsset: "usdc",
+          fundingRef: "0xearlier",
+        },
+      });
+    }
     const result = await verifyUpfrontPayment({
       ...upfrontOpts("0xreusable"),
       creditEnvelope: {
-        creditId: "reusable-credit",
+        creditId,
         drawId: "first-draw",
         fund: { amountMicro: PRICE_MICRO, commitment: fundingCommitment(ARTIFACT) },
       },
@@ -318,8 +338,26 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
     expect(result.error).toBeUndefined();
     const deposits = await pendingDeposits();
     expect(deposits).toHaveLength(1);
-    expect(deposits[0]?.payload).toMatchObject({ creditId: "reusable-credit", instrument: "x402_exact" });
+    expect(deposits[0]?.payload).toMatchObject({ creditId, callerPubkey: CALLER, instrument: "x402_exact" });
     expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
+  });
+
+  it("omits the authorizer from the callback payload when a short upfront payment creates no deposit", async () => {
+    const opts = upfrontOpts("0xshort");
+    settles("0xshort", PRICE_MSATS / 2);
+
+    const result = await verifyUpfrontPayment(opts);
+
+    expect(result.error).toBeUndefined();
+    expect(await pendingDeposits()).toEqual([]);
+    const payload = creditDepositPayload(DVM_ID, result.funding!);
+    expect(payload).toMatchObject({
+      fundingId: "0xshort",
+      callerPubkey: CALLER,
+      instrument: "x402_exact",
+      amountMicro: PRICE_MICRO / 2,
+    });
+    expect(payload).not.toHaveProperty("payerAddress");
   });
 
   it("queues a fund-only top-up once across a retry", async () => {
