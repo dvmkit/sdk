@@ -5383,18 +5383,38 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
     if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
-    const fresh = await jm.store.get(id);
+    const store = jm.store;
+    const fresh = await store.get(id);
     if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
-    fresh.messages = await jm.store.getMessages(id, 0);
+    fresh.messages = await store.getMessages(id, 0);
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
-    const payment = ask && fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
-      message.seq > ask.seq);
-    if (!ask || !payment || (requestSeq !== undefined && ask.seq !== requestSeq) || jm.activeJobs.has(id)) return;
-    const { job } = jm.reactivateJob(fresh);
-    const lock = await jm.store.tryReactivationLock(id, () =>
-      this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status));
-    if (!lock.acquired) this.teardownReactivationScaffold(jm, job);
+    if (!ask || (requestSeq !== undefined && ask.seq !== requestSeq)) return;
+    const recoveringSignedPayment = requestSeq === undefined && !fresh.mandate;
+    let paymentSeq: number | undefined;
+    if (recoveringSignedPayment) {
+      if (!this.opts.db || (fresh.pendingPaymentFiatMicro ?? 0) !== 0 ||
+          fresh.messages.findLast((message) => message.from === "provider") !== ask) return;
+      // The sweep's candidate can go stale while the live worker advances. Match the verified
+      // history to the committed payment for the ask we are about to replay.
+      const { rows: [accepted] } = await this.opts.db.query<{ response: { seq: number } }>(
+        "SELECT response FROM credit_balance_payments WHERE job_id=$1 AND request_seq=$2", [id, ask.seq]);
+      if (!accepted || !Number.isSafeInteger(accepted.response.seq)) return;
+      paymentSeq = accepted.response.seq;
+    }
+    const payment = fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
+      message.seq > ask.seq && (paymentSeq === undefined || message.seq === paymentSeq));
+    if (!payment) return;
+    await store.tryReactivationLock(id, async () => {
+      if (recoveringSignedPayment) {
+        const current = await store.get(id);
+        if (current?.status !== "awaiting-input" || current.lastActivityAt !== fresh.lastActivityAt ||
+            current.awaitingInputAtMs !== fresh.awaitingInputAtMs) return;
+      }
+      if (jm.activeJobs.has(id)) return;
+      const { job } = jm.reactivateJob(fresh);
+      await this.runReactivation(jm, job, { type: "payment", content: { ...payment.content } }, fresh.status);
+    });
   }
 
   /**

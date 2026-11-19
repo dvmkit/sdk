@@ -52,7 +52,7 @@ import {
   type StalePendingDrawCursor,
 } from "./credit-ledger";
 import { deferredX402IntentId } from "./funding";
-import { findQuietMandatedAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
+import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -552,13 +552,13 @@ export interface JobManagerOpts {
    */
   reactivationClaimGraceMs?: number;
   /**
-   * Resume an `awaiting-input` job whose ask a standing mandate has paid but no worker here is
-   * running. The app supplies its reactivation path; the job manager cannot replay on its own.
+   * Resume an `awaiting-input` job with a paid ask and no local worker. The app supplies its
+   * reactivation path.
    */
   resumePaidAsk?: (jobId: string) => Promise<void>;
   /**
-   * How long a mandated ask may sit unsettled or unclaimed before the stale sweep settles and
-   * resumes it. Default: `DEFAULT_MANDATE_RESUME_GRACE_MS`.
+   * Grace period before the stale sweep settles a mandated ask or resumes a credit-paid ask.
+   * Default: `DEFAULT_MANDATE_RESUME_GRACE_MS`.
    */
   mandateResumeGraceMs?: number;
 }
@@ -1447,11 +1447,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   /**
-   * The stale sweep's mandate arm. A mandated ask settles in its own transaction after the ask
-   * commits, so a worker that dies between the two, or whose wake-up is lost, leaves a paid-for
-   * job suspended with no caller message coming to move it. Past the grace window this settles
-   * the ask (idempotently) and resumes the job: through the live resolver when it runs here,
-   * otherwise through the app's reactivation, whose claim keeps it to one execution.
+   * Recover unsettled mandated asks and credit payments whose worker stopped before resuming.
+   * After the grace period, wake the local resolver or let app reactivation claim the paid ask.
    */
   async sweepMandateAsks(nowMs = Date.now()): Promise<void> {
     const db = this.opts.db;
@@ -1465,11 +1462,16 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Paged to the end: asks a limit keeps open stay oldest and would otherwise hide newer ones.
       let after: { lastActivityAt: number; id: string } | undefined;
       for (;;) {
-        const page = await findQuietMandatedAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
-        for (const { id: jobId } of page) {
+        const page = await findQuietCreditAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
+        for (const { id: jobId, hasMandate } of page) {
           try {
-            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
             const local = this._activeJobs.get(jobId);
+            if (!hasMandate) {
+              if (local) await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+              else await this.opts.resumePaidAsk?.(jobId);
+              continue;
+            }
+            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
             const settlement = local
               ? await this.payAskFromMandate(local, false)
               : await settleMandateAsk({ pool: db, ledger, jobId, dvmId });

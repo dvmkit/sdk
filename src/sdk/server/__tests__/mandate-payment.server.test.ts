@@ -134,17 +134,18 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       expiryMs: Date.now() + 86_400_000, basis: { rail: "cashu", paidMsats: Math.floor(amountMicro / 2) } });
   }
   async function submit(url: string, opts: { creditId: string; drawId?: string; priced?: boolean; script: Script;
-    maxTotal: number; maxAsk?: number; expiresInMs?: number }) {
+    maxTotal?: number; maxAsk?: number; expiresInMs?: number }) {
     const capability = opts.priced ? "paid" : "run";
-    const mandate = { max_total_micro: opts.maxTotal, max_ask_micro: opts.maxAsk ?? ASK,
-      expires_at_ms: Date.now() + (opts.expiresInMs ?? 86_400_000) };
     const drawId = opts.drawId ?? `draw-${opts.creditId}`;
-    const data = signer.signRequest(key, { action: opts.script, credit_id: opts.creditId, draw_id: drawId, mandate },
+    const expiresAtMs = Date.now() + (opts.expiresInMs ?? 86_400_000);
+    const mandate = opts.maxTotal === undefined ? {} : { credit_id: opts.creditId, draw_id: drawId,
+      mandate: { max_total_micro: opts.maxTotal, max_ask_micro: opts.maxAsk ?? ASK, expires_at_ms: expiresAtMs } };
+    const data = signer.signRequest(key, { action: opts.script, ...mandate },
       undefined, { audience, method: "POST", path: "/v1/job", capability });
     const created = await post(`${url}/v1/job`, { capability, data });
     expect(created.status, await created.clone().text()).toBe(202);
     const job = await created.json() as { job_id: string; job_token: string };
-    return { ...job, creditId: opts.creditId, drawId, expiresAtMs: mandate.expires_at_ms };
+    return { ...job, creditId: opts.creditId, drawId, expiresAtMs };
   }
   type Stored = { seq: number; from: string; type: string; content: Record<string, unknown> };
   // Live rows while the job runs; a terminal job's history is compacted onto its row.
@@ -212,19 +213,19 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     });
     return { failed: () => failed, restore };
   }
-  /** A mandated job whose asking worker stopped before its settlement committed. */
-  async function strandedAsk(creditId: string) {
+  /** An unpaid ask whose worker stopped before settling it. */
+  async function strandedAsk(creditId: string, withMandate = true) {
     const url = await server();
     await fund(creditId);
-    const failure = failSettlements();
+    const failure = withMandate ? failSettlements() : undefined;
     try {
-      const job = await submit(url, { creditId, script: "one", maxTotal: 5 * ASK });
+      const job = await submit(url, { creditId, script: "one", maxTotal: withMandate ? 5 * ASK : undefined });
       const ask = await openAsk(job.job_id);
-      await expect.poll(failure.failed).toBeGreaterThan(0);
+      if (failure) await expect.poll(failure.failed).toBeGreaterThan(0);
       await hosts[0].shutdown();
       return { job, ask };
     } finally {
-      failure.restore();
+      failure?.restore();
     }
   }
   async function expectPaidOnceAndDone(job: { job_id: string; drawId: string }, creditId: string, askSeq: number) {
@@ -617,18 +618,22 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - ASK);
   }, 40_000);
 
-  it("resumes a signed-paid ask from the sweep after the receiving worker stops before resume", async () => {
-    const creditId = "sweep-signed-crash";
-    const { job, ask } = await strandedAsk(creditId);
+  it.each([
+    { mandate: true, sweepers: 2 },
+    { mandate: false, sweepers: 1 },
+    { mandate: false, sweepers: 2 },
+  ])("resumes a committed signed payment after worker loss (mandate=$mandate, sweepers=$sweepers)", async ({ mandate, sweepers }) => {
+    const creditId = `sweep-signed-crash-${mandate}-${sweepers}`;
+    const { job, ask } = await strandedAsk(creditId, mandate);
     const receiving = await server();
     let written = false;
     let committed = false;
     let failed = false;
-    const restore = observeQueries((sql) => {
+    const restore = observeQueries((sql, params) => {
       if (typeof sql !== "string") return;
       if (sql.startsWith("INSERT INTO credit_balance_payments")) written = true;
       if (written && sql === "COMMIT") committed = true;
-      if (!failed && committed && sql === "SELECT pg_notify('job_messages', $1)") {
+      if (!failed && committed && sql === "SELECT pg_notify('job_messages', $1)" && (params as unknown[])[0] === job.job_id) {
         failed = true;
         throw new Error("worker stopped before resume");
       }
@@ -637,20 +642,70 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       const paid = await post(`${receiving}/v1/job/${job.job_id}/messages`, signedPayment(job, ask.seq, creditId, job.drawId), job.job_token);
       expect(paid.status, await paid.clone().text()).toBe(201);
       expect(failed).toBe(true);
-      expect(await status(job.job_id)).toBe("awaiting-input");
+      expect(await latestManager().store.get(job.job_id)).toMatchObject({
+        status: "awaiting-input", drawId: job.drawId, pendingPaymentMsats: undefined,
+      });
       await hosts[1].shutdown();
     } finally { restore(); }
     await server();
     const first = latestManager();
-    await server();
-    await Promise.all([first.sweepMandateAsks(afterGrace()), latestManager().sweepMandateAsks(afterGrace())]);
+    if (sweepers === 1) {
+      await first.sweepMandateAsks(afterGrace());
+    } else {
+      await server();
+      const second = latestManager();
+      const both = Promise.withResolvers<void>();
+      let claims = 0;
+      const restoreClaims = observeQueries((sql, params) => {
+        // Both workers must reach the real advisory lock before either tries to acquire it.
+        if (sql === "SELECT pg_try_advisory_xact_lock(hashtext($1)) AS got" && (params as unknown[])[0] === job.job_id) {
+          if (++claims === 2) both.resolve();
+          return both.promise;
+        }
+      });
+      try {
+        const sweep = Promise.all([first.sweepMandateAsks(afterGrace()), second.sweepMandateAsks(afterGrace())]);
+        try {
+          await expect.poll(() => claims).toBe(2);
+        } finally {
+          both.resolve();
+          await sweep;
+        }
+      } finally {
+        restoreClaims();
+      }
+    }
     await expect.poll(() => status(job.job_id), { timeout: 15_000 }).toBe("completed");
     expect(completions.get(job.job_id)).toBe(1);
     expect(await balancePayments(job.job_id)).toEqual([{ payment_id: `signed-${job.job_id}-${ask.seq}`, request_seq: String(ask.seq) }]);
-    expect((await messages(job.job_id)).filter((m) => m.from === "requester" && m.type === "payment")).toHaveLength(1);
+    expect((await messages(job.job_id)).filter((m) => m.from === "requester" && m.type !== "request"))
+      .toEqual([expect.objectContaining({ type: "payment", content: { credit: expect.objectContaining({ request_seq: ask.seq }) } })]);
     await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId })).toMatchObject({ status: "settled", amountMicro: ASK });
     expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - ASK);
   }, 40_000);
+
+  it.each([false, true])("leaves an unpaid ask without a mandate suspended (later verified payment=%s)", async (verified) => {
+    const url = await server();
+    const creditId = `sweep-unpaid-${verified}`;
+    const job = await submit(url, { creditId, script: "one" });
+    const ask = await openAsk(job.job_id);
+    await hosts[0].shutdown();
+    await server();
+    const manager = latestManager();
+    const store = manager.store;
+    if (!isStreamableJobStore(store)) throw new Error("expected a streaming job store");
+    if (verified) {
+      const seq = await store.recordInbound(job.job_id, { from: "requester", type: "payment",
+        timestamp: Math.floor(Date.now() / 1000), content: { credit: { credit_id: creditId, request_seq: ask.seq } } });
+      await store.verifyAndCredit(job.job_id, seq, null);
+      expect(await store.getMessages(job.job_id, ask.seq)).toEqual([expect.objectContaining({ seq, from: "requester", type: "payment" })]);
+    }
+    const run = vi.spyOn(manager, "runHandler");
+    await manager.sweepMandateAsks(afterGrace());
+    expect(run).not.toHaveBeenCalled();
+    expect(await store.get(job.job_id)).toMatchObject({ status: "awaiting-input", pendingPaymentMsats: ASK });
+    expect(await balancePayments(job.job_id)).toEqual([]);
+  });
 
   it("does not resume an expired unpaid ask with a later verified payment", async () => {
     const url = await server();

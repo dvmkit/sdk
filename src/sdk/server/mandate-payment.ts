@@ -146,25 +146,33 @@ export async function settleMandateAsk(args: {
 }
 
 /**
- * Mandated jobs suspended on an ask that has gone quiet since `beforeMs`: the newest provider
- * message is still the ask, so either its settlement never ran (the asking worker died) or it
- * settled and no worker claimed the resume. A job with an unanswered prompt is left out unless
- * a standing decline must end its unpaid ask: once
- * its paid ask is claimed it still awaits input, and the caller's answer resumes it anyway.
+ * Find quiet credit asks that could need settlement or resume. Without a mandate the sweep can
+ * only resume, so require a committed balance payment for the latest provider ask. An unanswered
+ * prompt can keep an already resumed job in `awaiting-input`, so skip those jobs unless a standing
+ * decline is waiting to end the unpaid ask.
  * A provider prompt carries its id as `content.id`; the caller's answer names it as `prompt_id`.
  * Oldest first; pass the last row back as `after` for the next page.
  */
-export async function findQuietMandatedAsks(pool: Pool, args: {
+export async function findQuietCreditAsks(pool: Pool, args: {
   dvmId: string; beforeMs: number; capabilities: string[]; limit: number;
   after?: { lastActivityAt: number; id: string };
-}): Promise<{ id: string; lastActivityAt: number }[]> {
-  const { rows } = await pool.query<{ id: string; last_activity_at: string }>(
-    `SELECT j.id, j.last_activity_at FROM jobs j
-     WHERE j.status='awaiting-input' AND j.mandate IS NOT NULL AND j.last_activity_at < $1
+}): Promise<{ id: string; lastActivityAt: number; hasMandate: boolean }[]> {
+  const { rows } = await pool.query<{ id: string; last_activity_at: string; has_mandate: boolean }>(
+    `SELECT j.id, j.last_activity_at, j.mandate IS NOT NULL AS has_mandate FROM jobs j
+     JOIN LATERAL (
+       SELECT m.seq, m.data->>'type' AS type FROM job_messages m
+       WHERE m.job_id=j.id AND m.status='verified' AND m.data->>'from'='provider'
+       ORDER BY m.seq DESC LIMIT 1
+     ) latest ON latest.type='payment-request'
+     WHERE j.status='awaiting-input' AND j.last_activity_at < $1
        AND (j.dvm_id IS NULL OR j.dvm_id=$2) AND j.capability = ANY($3::text[])
        AND ($5::bigint IS NULL OR (j.last_activity_at, j.id) > ($5::bigint, $6::text))
-       AND (SELECT m.data->>'type' FROM job_messages m WHERE m.job_id=j.id AND m.status='verified'
-            AND m.data->>'from'='provider' ORDER BY m.seq DESC LIMIT 1)='payment-request'
+       AND (j.mandate IS NOT NULL OR (
+            COALESCE(j.pending_payment_msats, 0) = 0 AND COALESCE(j.pending_payment_fiat_micro, 0) = 0
+            AND EXISTS (SELECT 1 FROM credit_balance_payments b JOIN job_messages m
+              ON m.job_id=b.job_id AND m.seq=(b.response->>'seq')::bigint
+              WHERE b.job_id=j.id AND b.request_seq=latest.seq AND m.seq > latest.seq
+                AND m.status='verified' AND m.data->>'from'='requester' AND m.data->>'type'='payment')))
        AND ((j.stop_requested AND j.pending_payment_msats > 0) OR NOT EXISTS (SELECT 1 FROM job_messages p WHERE p.job_id=j.id AND p.status='verified'
             AND p.data->>'from'='provider' AND p.data->>'type'='prompt'
             AND NOT EXISTS (SELECT 1 FROM job_messages r WHERE r.job_id=j.id AND r.status='verified'
@@ -172,7 +180,7 @@ export async function findQuietMandatedAsks(pool: Pool, args: {
               AND r.data->'content'->>'prompt_id' = p.data->'content'->>'id')))
      ORDER BY j.last_activity_at, j.id LIMIT $4`,
     [args.beforeMs, args.dvmId, args.capabilities, args.limit, args.after?.lastActivityAt ?? null, args.after?.id ?? null]);
-  return rows.map((row) => ({ id: row.id, lastActivityAt: Number(row.last_activity_at) }));
+  return rows.map((row) => ({ id: row.id, lastActivityAt: Number(row.last_activity_at), hasMandate: row.has_mandate }));
 }
 
 /** Emit the limit that left a mandated ask open. */
