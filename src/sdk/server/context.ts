@@ -29,7 +29,7 @@ import type { JobCounters } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
 import type { MppxServer } from "./mpp-setup";
 import { fiatMicroToMethodAmount, msatsToMethodAmount } from "./mpp-units";
-import { chargedIfDeclinedMicro, checkFinishedCharge, finishRunningPiece, runningPiece } from "./pieces";
+import { chargedIfDeclinedMicro, checkFinishedCharge, finishRunningPiece, reconcilePaidPieces, runningPiece } from "./pieces";
 import type { CanonicalEnvelope } from "./signed-request";
 import type { X402FacilitatorHealthLike } from "./x402-facilitator-support";
 
@@ -944,8 +944,7 @@ export function buildContext(
                   // local resume operation as the durable claim.
                   job.paidMsats = counters.paidMsats;
                   job.pendingPaymentMsats = counters.pendingPaymentMsats;
-                  // The piece this payment bought, so the next ask finishes it.
-                  if (counters.pieces) job.pieces = counters.pieces;
+                  job.pieces = reconcilePaidPieces(job.pieces, counters.pieces);
                   await doResolve({ amount_msats: amountMsats } as PaymentContent);
                 };
                 if (opts.claimForProcessing) {

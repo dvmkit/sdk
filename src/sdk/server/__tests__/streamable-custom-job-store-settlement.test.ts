@@ -1,9 +1,4 @@
-/*
- * A custom `StreamableJobStore` that keeps no piece accounting of its own (it reports no pieces
- * from `verifyAndCredit`) still settles by the piece: the SDK adds the piece to its own view of
- * the job and freezes the settlement on the terminal snapshot. Without that fallback the job
- * settled on the upfront draw alone and the builder was underpaid.
- */
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 
 import { encodePayment } from "../../../lib/x402/spec";
@@ -27,6 +22,9 @@ const X402: X402Config = { facilitator: "https://example.com/facilitator", netwo
  */
 class PiecelessStreamableStore extends MemoryJobStore {
   rows = new Map<string, JobRecord>();
+  constructor(private readonly deferCreditResult: boolean) {
+    super();
+  }
   override async save(record: JobRecord) {
     await super.save(record);
     this.rows.set(record.id, structuredClone(record));
@@ -36,27 +34,31 @@ class PiecelessStreamableStore extends MemoryJobStore {
     const row = this.rows.get(id);
     return record && row ? { ...record, pieces: row.pieces, settlement: row.settlement } : record;
   }
-  /** No push channel: the paying request resumes the handler itself, in this process. */
-  override subscribeNotifications() { return Promise.resolve(() => undefined); }
   override async verifyAndCredit(jobId: string, seq: number, credit: PaymentCreditDelta | null, opts?: VerifyAndCreditOptions): Promise<VerifyAndCreditResult> {
     const result = await super.verifyAndCredit(jobId, seq, credit && { ...credit, piece: undefined }, opts);
+    // The commit has notified subscribers. Let them run before the write returns.
+    if (this.deferCreditResult) await setImmediate();
     const counters = { ...result.counters, pieces: undefined };
     return { ...result, counters };
   }
 }
 
 describe("a streamable custom job store that keeps no pieces of its own", () => {
-  it("settles $0.10 upfront and a $0.20 piece finished at $0.05 as $0.15", async () => {
+  it.each([
+    { resume: "local dispatch", notify: false, deferCreditResult: false },
+    { resume: "notification", notify: true, deferCreditResult: false },
+    { resume: "notification before the credit result", notify: true, deferCreditResult: true },
+  ])("settles the discounted piece after resume by $resume", async ({ notify, deferCreditResult }) => {
     const ledger = new MemoryCreditLedger();
-    const jobStore = new PiecelessStreamableStore();
-    let finish!: () => void;
-    const working = new Promise<void>((resolve) => { finish = resolve; });
+    const jobStore = new PiecelessStreamableStore(deferCreditResult);
+    if (!notify) vi.spyOn(jobStore, "subscribeNotifications").mockResolvedValue(() => undefined);
+    const working = Promise.withResolvers<void>();
     const jm = new JobManager(configureDVM({
       name: "streamable-custom-store",
       capability: "work",
       onJob: async (ctx) => {
         await ctx.requestPayment({ amount: 0.2, currency: "usd" }, "piece 2");
-        await working;
+        if (!deferCreditResult) await working.promise;
         ctx.complete("done", { finishedChargeMicro: 50_000 });
       },
     }), {
@@ -79,8 +81,8 @@ describe("a streamable custom job store that keeps no pieces of its own", () => 
       const payment = { type: "payment" as const, content: { x402_payment: header(job.pendingX402Nonce!) } };
       const seq = await jm.recordInboundPending(job, payment.type, payment.content);
       expect((await jm.processPayment(job, payment, seq)).error).toBeUndefined();
-      await jm.dispatchMessage(job, payment.type, payment.content);
-      finish();
+      if (!notify) await jm.dispatchMessage(job, payment.type, payment.content);
+      working.resolve();
       await vi.waitFor(() => expect(job.terminalWork).toBeDefined());
       await job.terminalWork;
 

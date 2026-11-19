@@ -112,7 +112,7 @@ import type { ReceiptIssuer } from "./receipt-issuer";
 import { isReceiptableStatus } from "./receipt-issuer";
 import { stripProtocolEnvelope } from "./request-envelope";
 import { settledDrawRevenue } from "./settled-draw-revenue";
-import { appendPiece, endPieces, terminalEnding } from "./pieces";
+import { appendPiece, endPieces, reconcilePaidPieces, terminalEnding } from "./pieces";
 import { drawChargedMicro, drawHeldMicro, frozenSettleMicro, receiptCreditFor, receiptSettlementFor } from "./piece-settlement";
 import type {
   CreditDepositEnqueue,
@@ -736,6 +736,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private readonly paymentAskSeqs = new WeakMap<object, number>();
   private readonly reactivationWaits = new WeakMap<ServerJob, ReactivationWait>();
   private readonly pendingPaymentMessages = new WeakMap<ServerJob, Map<number | object, Message>>();
+  private readonly localPieceCredits = new WeakMap<ServerJob, Map<Promise<void>, number>>();
   /** How many times idle expiry has found a payment holding each job open. */
   private readonly idleIntentWaits = new WeakMap<ServerJob, number>();
   /** What each recorded payment arrival is for, decided under the job row lock. */
@@ -1517,8 +1518,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async adoptPaymentMetadata(job: ServerJob, pending: ServerJob["pendingPayment"]): Promise<boolean> {
-    const record = await this.jobStore.get(job.id);
+    let record = await this.jobStore.get(job.id);
     if (!record || job.pendingPayment !== pending || isTerminal(job.status) || isTerminal(record.status)) return false;
+    const localCredits = this.localPieceCredits.get(job);
+    if (localCredits) {
+      const paidSeqs = new Set(record.pieces?.map((piece) => piece.paidSeq));
+      const missingCredits = [...localCredits].filter(([, seq]) => !paidSeqs.has(seq));
+      if (missingCredits.length) {
+        // The commit can notify before the writer has added a piece the store leaves to the SDK.
+        await Promise.all(missingCredits.map(([completed]) => completed));
+        record = await this.jobStore.get(job.id);
+        if (!record || job.pendingPayment !== pending || isTerminal(job.status) || isTerminal(record.status)) return false;
+      }
+    }
     job.paidMsats = record.paidMsats;
     job.pendingPaymentMsats = record.pendingPaymentMsats;
     job.creditId = record.creditId;
@@ -1534,7 +1546,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     job.pendingMppChallengeIds = record.pendingMppChallengeIds;
     job.pendingX402Nonce = record.pendingX402Nonce;
     job.pendingX402AmountUsdcMicro = record.pendingX402AmountUsdcMicro;
-    job.pieces = record.pieces;
+    job.pieces = reconcilePaidPieces(job.pieces, record.pieces);
     return true;
   }
 
@@ -3370,8 +3382,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       arrivedAtMs: Date.now(),
     });
     let accepted: Message | undefined;
+    const pieceCredit = Promise.withResolvers<void>();
     try {
-      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, disposition, extra);
+      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, disposition, pieceCredit.promise, extra);
       // A balance landing paid no ask; it stays out of history here as it does in the store.
       if (!outcome.error && !outcome.landedAsBalance && message && pending?.get(key) === message) {
         accepted = message;
@@ -3385,6 +3398,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       throw error;
     } finally {
+      const credits = this.localPieceCredits.get(job);
+      if (credits?.delete(pieceCredit.promise) && credits.size === 0) this.localPieceCredits.delete(job);
+      pieceCredit.resolve();
       pending?.delete(key);
       if (message) releaseJobHistory(job, message.seq, accepted);
     }
@@ -3395,6 +3411,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     body: { type: MessageType; content: Record<string, unknown> },
     inboundSeq: number | null,
     disposition: PaymentDisposition,
+    pieceCredit: Promise<void>,
     extra?: {
       lockPubkeys?: LockPubkey[];
       mintHealthTracker?: MintHealthTracker;
@@ -3520,6 +3537,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let fullyUnapplied = landing !== undefined || paymentFullyUnapplied(info);
     const hadPendingPayment = job.pendingPaymentMsats !== undefined;
     if (inboundSeq !== null && isStreamableJobStore(this.jobStore)) {
+      if (!fullyUnapplied && job.pieces && info.piece && info.piece.amountMicro > 0) {
+        let credits = this.localPieceCredits.get(job);
+        if (!credits) this.localPieceCredits.set(job, credits = new Map());
+        credits.set(pieceCredit, inboundSeq);
+      }
       let result: VerifyAndCreditResult;
       try {
         result = await this.creditInbound(
