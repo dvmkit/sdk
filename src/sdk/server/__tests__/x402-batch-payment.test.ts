@@ -11,7 +11,7 @@ import { CreditLedgerError, type CreditLedgerLike, x402SettlementPending } from 
 import { CREDIT_REQUEST_SCHEMA, handleCreditRequest } from "../credit-routes";
 import { fundingCommitment } from "../funding";
 import { MemoryCreditLedger } from "../memory-credit-ledger";
-import { buildPaymentErrorResponse, verifyUpfrontPayment } from "../payment";
+import { buildPaymentErrorResponse, creditDepositPayload, verifyUpfrontPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
 import { ReceiptIssuer } from "../receipt-issuer";
 import { secp256k1Auth } from "../secp256k1-auth";
@@ -363,6 +363,7 @@ describe("x402 batch-settlement credit funding", () => {
     expect(result.error).toBeUndefined();
     expect(result.paymentTxHash).toBe(`${CHANNEL_ID}:250000`);
     expect(result.funding?.instrument).toBe("x402_channel");
+    expect(creditDepositPayload("dvm-batch-funding", result.funding!)).not.toHaveProperty("payerAddress");
     expect((await ledger.get("credit-1"))?.x402ChannelId).toBe(CHANNEL_ID);
     expect(await ledger.getFunding({ creditId: "credit-1", fundId: "fund-1" })).toMatchObject({
       amountMicro: 250_000,

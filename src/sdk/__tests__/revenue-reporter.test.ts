@@ -319,13 +319,15 @@ describe.skipIf(!RUN)("RevenueReporter", () => {
     }
   });
 
-  it("preserves a deposit's caller through durable retry", async () => {
+  it("preserves a deposit's caller and x402 authorizer through durable retry", async () => {
     const payload: CreditDepositPayload = {
       dvmId: "dvm-test-1",
       creditId: "credit-deposit-1",
       callerPubkey: "ab".repeat(32),
       fundingId: "funding-deposit-1",
-      rail: "cashu",
+      rail: "x402",
+      instrument: "x402_exact",
+      payerAddress: `0x${"ab".repeat(20)}`,
       paidMsats: 100_000,
       amountMicro: 100_000,
       creditCurrency: "usd",

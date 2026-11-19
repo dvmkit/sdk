@@ -165,6 +165,8 @@ export interface X402Receipt {
    * fresh BTC rate (lossy and racy across the boundary).
    */
   amountUsdcMicro?: number;
+  /** EIP-3009 authorizer from a verified and settled exact payment. */
+  authorizer?: string;
   /** On-chain tx hash returned by the facilitator on settlement. */
   txHash?: string;
   /**

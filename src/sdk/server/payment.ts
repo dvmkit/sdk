@@ -58,6 +58,7 @@ import {
   fiatAmountMicro,
   type FiatDenomination,
   deferredX402Id,
+  deferredX402IntentId,
   DEFERRED_X402_MAX_OUTSTANDING_PER_PAYER,
   deferredX402Window,
   fundedMicroFor,
@@ -251,6 +252,7 @@ export interface CreditFundingReport {
   expiryMs: number;
   /** The funded credit's stored instrument; absent for Cashu. */
   instrument?: CreditInstrument;
+  payerAddress?: string;
   /** TIP-1034 voucher identity, present only for session-funded credit. */
   tempoSession?: { channelId: string; cumulativeAmount: string };
   /** TIP-1034 chain binding, reported so the platform can route a close. */
@@ -1550,6 +1552,7 @@ async function verifyUpfrontPaymentInScope(
               fundedMicro,
               nativeAmount: receipt.amountUsdcMicro,
               nativeAsset: "usdc",
+              payerAddress: receipt.authorizer,
             });
           } catch (err) {
             const mapped = mapLedgerCommitError(err, x402Requirements, true);
@@ -4268,6 +4271,7 @@ interface RailFunding {
   /** TIP-1034 chain binding, reported so the platform can route a close. */
   tempoChannel?: TempoChannelReport;
   x402Channel?: { channelId: string; maxClaimableAmount: string };
+  payerAddress?: string;
 }
 
 /** Everything the ledger leg of a rail commit needs, assembled per request. */
@@ -5028,11 +5032,15 @@ async function fundAndDrawInScope(
     // read from the same snapshot for the same reason: the report names what
     // the credit is bound to, not what this request's artifact looked like.
     const instrument = credit.rail ? storedCreditBinding(credit).instrument : undefined;
+    const oneRequest = !ctx.fundOnly && !ctx.midJob && !ctx.topUp &&
+      (!env || deferredX402IntentId(env.creditId) !== undefined);
     const report: CreditFundingReport = {
       ...deposit,
       expiryMs: credit.expiryMs,
       callerPubkey: credit.callerPubkey,
       ...(instrument && { instrument }),
+      ...(oneRequest && instrument === "x402_exact" && funding.payerAddress &&
+        { payerAddress: funding.payerAddress }),
     };
     if (createsDepositLiability && enqueue && tx) {
       await enqueue(tx, creditDepositPayload(ctx.dvmId, report));
@@ -5292,6 +5300,8 @@ export function creditDepositPayload(
     fundedAt: funding.fundedAt,
     expiryMs: funding.expiryMs,
     ...(funding.instrument && { instrument: funding.instrument }),
+    ...(funding.instrument === "x402_exact" && funding.payerAddress &&
+      /^0x[0-9a-f]{40}$/.test(funding.payerAddress) && { payerAddress: funding.payerAddress }),
     // label a session-funded deposit as one, whether or not the chain
     // binding below could be read. `rail: "tempo"` alone does not say — a
     // `tempo/charge` one-shot funds a credit with no channel at all — so this is
@@ -5320,6 +5330,7 @@ export function creditDepositPayload(
 export async function repairX402ExactSettlementEffect(args: {
   effect: X402ExactSettlementEffect | undefined;
   paymentId: string;
+  payerAddress?: string;
   ledger: CreditLedgerLike;
   processedPayments?: ProcessedPaymentStore;
   enqueueCreditDeposit?: CreditDepositEnqueue;
@@ -5356,6 +5367,7 @@ export async function repairX402ExactSettlementEffect(args: {
       fundedMicro: effect.fundedMicro,
       nativeAmount: effect.nativeAmount,
       nativeAsset: "usdc",
+      payerAddress: args.payerAddress,
     },
     args.tx
   );
@@ -5422,13 +5434,18 @@ async function acceptDurableExactUpfront(args: {
         return repairX402ExactSettlementEffect({
           effect: persistedEffect,
           paymentId: receipt.txHash,
+          payerAddress: receipt.authorizer,
           ledger: args.ledgerCtx.ledger,
           processedPayments: args.ledgerCtx.processedPayments,
           enqueueCreditDeposit: args.ledgerCtx.enqueueCreditDeposit,
           tx,
         });
       }
-      return commitMarkedFunding(args.ledgerCtx, { ...funding, paymentId: receipt.txHash }, tx);
+      return commitMarkedFunding(args.ledgerCtx, {
+        ...funding,
+        paymentId: receipt.txHash,
+        payerAddress: receipt.authorizer,
+      }, tx);
     },
   });
   if (accepted.outcome === "ambiguous") {

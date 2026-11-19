@@ -3,6 +3,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
+import unsignedReports from "../../../../protocol-fixtures/unsigned-caller-reports-v1.json";
 import { msatsToUsdc } from "../../../lib/currency";
 import type { LightningBackend } from "../../../lib/lightning-backend";
 import { encodePayment, X402_V1_VERSION } from "../../../lib/x402/spec";
@@ -25,6 +26,8 @@ import { PostgresProcessedPaymentStore } from "../processed-payment-store";
 import { RevenueReporter } from "../revenue-reporter";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
+import { X402ExactSettlementServer } from "../x402-exact-settlement";
+import { PostgresX402ExactSettlementStore } from "../x402-exact-settlement-store";
 
 vi.mock("../../../lib/x402", () => ({ verifyX402Payment: vi.fn() }));
 
@@ -42,28 +45,32 @@ const FUTURE_MS = Date.now() + 24 * 60 * 60 * 1000;
 const DVM_SCHEMA = `dvm_deposit_outbox_${process.pid}`;
 const AUTOWIRE_PRIVKEY = new Uint8Array(32).fill(13);
 const AUTOWIRE_CALLER = Buffer.from(schnorr.getPublicKey(AUTOWIRE_PRIVKEY)).toString("hex");
+const { payerAddress } = unsignedReports.x402_exact_deposit.body;
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
   network: "eip155:8453",
   payTo: "0x1111111111111111111111111111111111111111",
 };
-const ARTIFACT = encodePayment({
-  x402Version: X402_V1_VERSION,
-  scheme: "exact",
-  network: X402.network,
-  payload: {
-    signature: `0x${"44".repeat(65)}`,
-    authorization: {
-      from: "0x2222222222222222222222222222222222222222",
-      to: X402.payTo,
-      value: String(PRICE_MICRO),
-      validAfter: "0",
-      validBefore: "99999999999",
-      nonce: `0x${"55".repeat(32)}`,
+function exactArtifact(nonce: string, from = `0x${"aB".repeat(20)}`): string {
+  return encodePayment({
+    x402Version: X402_V1_VERSION,
+    scheme: "exact",
+    network: X402.network,
+    payload: {
+      signature: `0x${"44".repeat(65)}`,
+      authorization: {
+        from,
+        to: X402.payTo,
+        value: String(PRICE_MICRO),
+        validAfter: "0",
+        validBefore: "99999999999",
+        nonce: `0x${nonce.repeat(32)}`,
+      },
     },
-  },
-});
+  });
+}
+const ARTIFACT = exactArtifact("55");
 
 const signedSchema = z.object({
   pubkey: z.string().regex(/^[0-9a-f]{64}$/),
@@ -145,6 +152,7 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
       amountUsdcMicro: msatsToUsdc(paidMsats, RATE),
       txHash,
       settleResponseHeader: "header",
+      authorizer: payerAddress,
     });
   }
 
@@ -233,7 +241,8 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
       });
 
       expect(response.status).toBe(200);
-      expect(await pendingDeposits()).toEqual([
+      const deposits = await pendingDeposits();
+      expect(deposits).toEqual([
         {
           payload: expect.objectContaining({
             dvmId: DVM_ID,
@@ -244,6 +253,7 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
           }),
         },
       ]);
+      expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
       expect(
         await pool.query("SELECT 1 FROM pending_revenue_reports")
       ).toMatchObject({ rowCount: 0 });
@@ -252,8 +262,29 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
     }
   });
 
-  it("queues an upfront fund-and-draw before its rail transaction commits", async () => {
-    const result = await verifyUpfrontPayment(upfrontOpts("0xupfront"));
+  it.each(["durable", "fallback"] as const)("queues the verified authorizer with %s upfront funding", async (mode) => {
+    const opts = upfrontOpts("0xupfront");
+    const store = new PostgresX402ExactSettlementStore(pool);
+    const facilitatorPayer = `0x${"cd".repeat(20)}`;
+    vi.stubGlobal("fetch", vi.fn(async (input) => {
+      const url = String(input);
+      if (url === `${X402.facilitator}/verify`) return Response.json({ isValid: true });
+      if (url === `${X402.facilitator}/settle`) {
+        return Response.json({ success: true, transaction: "0xupfront", payer: facilitatorPayer });
+      }
+      throw new Error("unexpected facilitator request");
+    }));
+    if (mode === "durable") {
+      await store.init();
+    } else {
+      const actual = await vi.importActual<typeof import("../../../lib/x402")>("../../../lib/x402");
+      vi.mocked(verifyX402Payment).mockImplementationOnce(actual.verifyX402Payment);
+    }
+    const result = await verifyUpfrontPayment({
+      ...opts,
+      x402Payment: exactArtifact("56"),
+      ...(mode === "durable" && { x402ExactSettlement: new X402ExactSettlementServer({ store }) }),
+    });
 
     expect(result.error).toBeUndefined();
     expect(await pendingDeposits()).toEqual([
@@ -265,9 +296,30 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
           fundingId: "0xupfront",
           rail: "x402",
           amountMicro: PRICE_MICRO,
+          instrument: "x402_exact",
+          payerAddress,
         }),
       },
     ]);
+    const settleResponse = JSON.parse(Buffer.from(result.x402SettleResponseHeader!, "base64").toString());
+    expect(settleResponse).toMatchObject({ payer: facilitatorPayer });
+    expect(JSON.stringify(settleResponse).toLowerCase()).not.toContain(payerAddress);
+  });
+
+  it("omits the authorizer from explicit reusable credit funding", async () => {
+    const result = await verifyUpfrontPayment({
+      ...upfrontOpts("0xreusable"),
+      creditEnvelope: {
+        creditId: "reusable-credit",
+        drawId: "first-draw",
+        fund: { amountMicro: PRICE_MICRO, commitment: fundingCommitment(ARTIFACT) },
+      },
+    });
+    expect(result.error).toBeUndefined();
+    const deposits = await pendingDeposits();
+    expect(deposits).toHaveLength(1);
+    expect(deposits[0]?.payload).toMatchObject({ creditId: "reusable-credit", instrument: "x402_exact" });
+    expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
   });
 
   it("queues a fund-only top-up once across a retry", async () => {
@@ -300,7 +352,9 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
 
     const replay = await verifyUpfrontPayment(opts);
     expect(replay.error?.body.error).toBe("replay_rejected");
-    expect(await pendingDeposits()).toHaveLength(1);
+    const deposits = await pendingDeposits();
+    expect(deposits).toHaveLength(1);
+    expect(deposits[0]?.payload).not.toHaveProperty("payerAddress");
   });
 
   it("queues a mid-job top-up in the marker/fund/grow transaction", async () => {
