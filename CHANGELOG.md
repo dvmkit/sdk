@@ -28,6 +28,12 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - `JobRecord`, exported from `@dvmkit/sdk` and `@dvmkit/sdk/server`, drops `receivedProofs`. Payment results and `JobManager` job objects also drop the field. Remove it from custom job-store readers, writers, and record builders. The Cashu wallet accumulator owns inbound proofs, and caller change tokens follow the existing path.
 
+Every other signature change against `0.42.0` is additive, and needs no code change in a builder or custom store:
+
+- `PaymentRequestContent` gains optional `mandate_skipped` with a reason, and `CreditTerms` gains the optional `mandate_skipped: true` capability flag. Job records, stores, content retention helpers, and credit-menu helpers pick up these fields through their existing message or credit types.
+- `CreditFundingReport` and `CreditDepositPayload` gain optional `payerAddress` for settled one-request x402 exact payments and Tempo charges. Ledger, reporting, and DVM configuration types pick up the field through their existing report types.
+- `X402Receipt` gains optional `authorizer` for the verified x402 exact payer. Exact-settlement acceptance, server, and option types pick up the field through the receipt. Host, job manager, and credit-route signatures reflect the optional fields in the types they already use.
+
 ### Migrations
 
 - New Postgres job tables omit `received_proofs`. Existing columns can stay in place with their original empty-array default. Regular job reads and writes ignore the column, and the content sweep still erases historical values where the column exists.
