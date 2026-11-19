@@ -111,7 +111,8 @@ export async function verifyX402Payment(
       // Trust the EIP-3009 authorization's `value` for the rail-native amount —
       // the facilitator already cryptographically validated it against the
       // requirements, so re-deriving from msats would be a lossy round-trip.
-      const amountUsdcMicro = Number.parseInt(exactEvmAuthorization(payload).value, 10);
+      const authorization = exactEvmAuthorization(payload);
+      const amountUsdcMicro = Number.parseInt(authorization.value, 10);
       const amountMsats = btcUsdRate > 0 ? usdcToMsats(amountUsdcMicro / 1e6, btcUsdRate) : 0;
 
       callerLoggers.x402.info("x402.verify_payment.result", {
@@ -124,6 +125,7 @@ export async function verifyX402Payment(
         verified: true,
         amountMsats,
         amountUsdcMicro,
+        authorizer: authorization.from.toLowerCase(),
         txHash: settleRes.transaction,
         settleResponseHeader: encodeSettleResponseHeader(settleRes),
       };

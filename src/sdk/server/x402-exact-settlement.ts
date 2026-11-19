@@ -764,6 +764,7 @@ function receiptFromIntent(intent: X402ExactSettlementIntent, btcUsdRate: number
     verified: true,
     amountMsats: btcUsdRate > 0 ? usdcToMsats(amountUsdcMicro / 1e6, btcUsdRate) : 0,
     amountUsdcMicro,
+    authorizer: intent.from.toLowerCase(),
     txHash: intent.transaction,
     settleResponseHeader: encodeSettleResponseHeader(response),
   };

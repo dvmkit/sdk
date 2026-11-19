@@ -74,6 +74,8 @@ Upgrading adds `exhausted` and `unmatched` to the report-state constraint and th
 
 ### Settlement-report history
 
+Credit-deposit reports include an optional lowercase `payerAddress` for settled one-request x402 exact payments, including deferred settlement and repair. It comes from the verified EIP-3009 authorization. Settled one-request Tempo charges can also include `payerAddress`, derived from the verified transfer for a push or the signed transaction sender for a pull. This field is independent of `callerPubkey`. Proof-only charges, reusable credit, top-ups, and channel deposits omit it. See the [deposit examples](../protocol-fixtures/unsigned-caller-reports-v1.json).
+
 Every `createDVMHost` or `createDVMServer` boot with a PostgreSQL pool and a DVM ID creates `sdk_hosted_settlement_report_history`, `sdk_hosted_settlement_report_obligations`, and `sdk_hosted_settlement_report_identity` before any financial or report table, with no secret, scope, price, payment rail, or first payment. A host given its own `jobStore` still initializes them on the `pool`, `database`, or `DATABASE_URL` it was configured with when `DVMKIT_DVM_ID` is set.
 
 A server that delivers platform reports (a platform URL and token, without a custom `onJobCompleted`) reserves each report before its external effect: x402 batch claims, refunds and settles through the SDK's PostgreSQL channel storage, and Tempo session settles and closes through the host's session runtime. Those reservations are reconciled, queued and delivered, and a Tempo close is accepted only from the authenticated credit drain. The settlement callback and payout reports require the original reservation while history is complete.

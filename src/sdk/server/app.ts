@@ -956,6 +956,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
             await repairX402ExactSettlementEffect({
               effect,
               paymentId: receipt.txHash,
+              payerAddress: receipt.authorizer,
               ledger: creditLedger,
               processedPayments,
               enqueueCreditDeposit,
@@ -1240,6 +1241,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
               return repairX402ExactSettlementEffect({
                 effect,
                 paymentId: receipt.txHash,
+                payerAddress: receipt.authorizer,
                 ledger: this.creditLedger,
                 processedPayments: this.processedPayments,
                 enqueueCreditDeposit: opts.enqueueCreditDeposit,
@@ -4195,11 +4197,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!funding || !onCreditFunded || !this.opts.dvmId) return;
     // Built by the same function the reporter's outbox uses, so the override
     // cannot report a narrower deposit than the SDK-owned path.
-    Promise.resolve(onCreditFunded(creditDepositPayload(this.opts.dvmId, funding))).catch(
-      (err: unknown) => {
-        diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed:`, err);
-      }
-    );
+    const payload = creditDepositPayload(this.opts.dvmId, funding);
+    void Promise.resolve().then(() => onCreditFunded(payload)).catch(() => {
+      // A receiver's error can include the address from the report body.
+      diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed`);
+    });
   }
 
   /**

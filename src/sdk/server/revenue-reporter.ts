@@ -221,6 +221,8 @@ export interface CreditDepositPayload {
    * which have only one instrument each.
    */
   instrument?: "x402_exact" | "x402_channel" | "tempo_charge" | "tempo_session";
+  /** Lowercase verified payer for a settled one-request x402 exact payment or Tempo charge. */
+  payerAddress?: string;
   /**
    * Tempo session funding only: the TIP-1034 channel this deposit
    * arrived on, registered so the platform's close observer can route a
