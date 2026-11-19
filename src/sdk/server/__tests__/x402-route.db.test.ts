@@ -8,6 +8,7 @@ import { encodeEventTopics, encodeFunctionData, type Hex, parseAbi, parseAbiItem
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
+import unsignedReports from "../../../../protocol-fixtures/unsigned-caller-reports-v1.json";
 import { X402_PAYMENT_REQUIRED_MAX_BYTES, X402_SIZE_CHECK_ERROR } from "../../../lib/x402/bazaar";
 import { x402NetworkByCaip2 } from "../../../lib/x402/networks";
 import { diagnosticConsole } from "../../../observability/diagnostic-console";
@@ -21,11 +22,14 @@ import { MemoryKVStore } from "../../store";
 import type { SDKJobContext, X402Listing } from "../../types";
 import { createDVMServer } from "../app";
 import { CreditLedger } from "../credit-ledger";
+import { initLockPubkeyTable, seedLockPubkeyState } from "../lock-pubkey-store";
 import { PostgresJobStore } from "../postgres-job-store";
 import { PostgresProcessedPaymentStore } from "../processed-payment-store";
+import type { CreditDepositPayload } from "../revenue-reporter";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { PostgresX402ExactSettlementStore, type X402ExactSettlementIntent } from "../x402-exact-settlement-store";
 import { SETTLE_WINDOW_CLOSED_REASON, X402_ROUTE_COPY } from "../x402-route";
+import { adminHeader, ADMIN_KEY, ADMIN_SECRET } from "./__helpers__/content-fixtures";
 
 interface RouteFixtureRow {
   status: number;
@@ -46,6 +50,9 @@ const SCHEMA = "x402_route_test";
 const DVM_ID = "x402-route-test";
 const PRICE_MICRO = 16_000;
 const TRANSACTION = `0x${"77".repeat(32)}`;
+const PLATFORM_URL = "https://platform.example.com";
+const AUTHORIZER = `0x${"aB".repeat(20)}`;
+const { payerAddress, callerPubkey, instrument } = unsignedReports.x402_exact_deposit.body;
 const X402: X402Config = {
   facilitator: "https://facilitator.example.com",
   network: "eip155:8453",
@@ -78,7 +85,7 @@ function authorization(validFor: number | string, nonce = "33", amount = PRICE_M
     payload: {
       signature: `0x${"ab".repeat(65)}`,
       authorization: {
-        from: "0x2222222222222222222222222222222222222222",
+        from: AUTHORIZER,
         to: X402.payTo,
         value: String(amount),
         validAfter: "0",
@@ -225,6 +232,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     const realFetch = globalThis.fetch;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = typeof request === "string" ? request : request instanceof URL ? request.href : request.url;
+      if (url.startsWith(`${PLATFORM_URL}/`)) return new Response(null, { status: 503 });
       // The settlement server bookmarks a block before each submission; answer
       // it here so no test waits on, or depends on, a public chain RPC.
       if (!["localhost", "127.0.0.1"].includes(new URL(url).hostname) && !url.startsWith(`${X402.facilitator}/`)) {
@@ -262,6 +270,8 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       facilitatorTimeoutMs?: number;
       x402Only?: boolean;
       devMode?: boolean;
+      reportDeposits?: boolean;
+      lockPubkey?: string;
       /** Mount the server under this path, as a host does for `mount(..., { prefix })`. */
       prefix?: string;
       /** The listing `fetch` is offered with on x402. */
@@ -323,6 +333,8 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       jobStore: jobs,
       creditLedger: ledger,
       processedPayments: payments,
+      ...(opts.reportDeposits && { platformUrl: PLATFORM_URL, platformToken: "test-token" }),
+      ...(opts.lockPubkey && { lockPubkey: opts.lockPubkey }),
       x402,
       fxFetcher: {
         fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date().toISOString() }),
@@ -336,6 +348,13 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     });
     served = opts.prefix ? new Hono().route(opts.prefix, instance.app) : instance.app;
     return url;
+  }
+
+  async function pendingDeposits(): Promise<CreditDepositPayload[]> {
+    const { rows } = await pool.query<{ payload: CreditDepositPayload }>(
+      "SELECT payload FROM pending_dvm_reports WHERE kind = 'deposit'"
+    );
+    return rows.map((row) => row.payload);
   }
 
   function call(url: string, opts: { name?: string; body?: string; payment?: string; headers?: Record<string, string> } = {}) {
@@ -358,6 +377,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
 
   it("quotes an unpaid request and answers the paid retry with the result once a slow settlement lands", async () => {
     const url = await start({
+      reportDeposits: true,
       behaviour: async (ctx) => {
         ctx.artifact({ name: "page", data: "paid-for output" });
         ctx.complete("done");
@@ -365,7 +385,9 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     });
     settleAnswer = async () => {
       await new Promise((resolve) => setTimeout(resolve, 2500));
-      return Response.json({ success: true, transaction: TRANSACTION, network: X402.network });
+      return Response.json({
+        success: true, transaction: TRANSACTION, network: X402.network, payer: `0x${"cd".repeat(20)}`,
+      });
     };
     const quote = await call(url);
     expect(quote.status).toBe(402);
@@ -378,6 +400,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     expect(quote.headers.get("X-Cashu")).toBeNull();
     expect(decodePaymentRequiredHeader(quote.headers.get("PAYMENT-REQUIRED")!).accepts).toHaveLength(1);
     expect(handled).toBe(0);
+    expect(await pendingDeposits()).toEqual([]);
 
     const paid = await call(url, { payment: authorization(quoted.accepts[0]!.maxTimeoutSeconds) });
     expect(paid.status).toBe(fixture.charged.status);
@@ -389,11 +412,18 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     expect(JSON.stringify(body.messages)).toContain("paid-for output");
     expect(paid.headers.get(fixture.identityHeader)).toBe(body.job_id);
     expect(settleHeader(paid)).toMatchObject({ success: true, transaction: TRANSACTION });
+    expect(JSON.stringify(settleHeader(paid)).toLowerCase()).not.toContain(payerAddress);
+    expect(JSON.stringify(body).toLowerCase()).not.toContain(payerAddress);
+    expect(await pendingDeposits()).toEqual([
+      expect.objectContaining({
+        creditId: expect.stringMatching(/^x402d:/), callerPubkey, instrument, payerAddress,
+      }),
+    ]);
     expect(facilitatorCalls).toEqual(["/verify", "/settle"]);
   }, 20_000);
 
   it("answers a failed handler with 500, never settles, and releases the authorization", async () => {
-    const url = await start({ behaviour: async (ctx) => { ctx.fail("blocked"); } });
+    const url = await start({ reportDeposits: true, behaviour: async (ctx) => { ctx.fail("blocked"); } });
     const response = await call(url, { payment: authorization(60) });
     expect(response.status).toBe(fixture.handlerFailed.status);
     const body = await response.json() as { job_id: string };
@@ -402,6 +432,16 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     expect(response.headers.get("PAYMENT-RESPONSE")).toBeNull();
     expect(facilitatorCalls).toEqual(["/verify"]);
     expect(await intentStatus(body.job_id)).toMatchObject({ status: "released" });
+    expect(await pendingDeposits()).toEqual([]);
+  });
+
+  it("does not report a deposit when the facilitator rejects verification", async () => {
+    verifyAnswer = () => Response.json({ isValid: false });
+    const url = await start({ reportDeposits: true });
+    const response = await call(url, { payment: authorization(60) });
+    expect(response.status).toBe(402);
+    expect(facilitatorCalls).toEqual(["/verify"]);
+    expect(await pendingDeposits()).toEqual([]);
   });
 
   it("answers 422 to a failure the handler marks as the caller's, never settles, and keeps the mark on the stored job", async () => {
@@ -571,14 +611,76 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       const [intent] = await settlements.list({ dvmId: DVM_ID, limit: 1, includeResolved: true });
       return chainSettledAnswer(body, intent!);
     };
-    const url = await start();
-    const response = await call(url, { payment: authorization(60) });
+    const url = await start({ reportDeposits: true });
+    const payment = authorization(60);
+    const response = await call(url, { payment });
     expect(response.status).toBe(fixture.charged.status);
     expect(await response.json()).toMatchObject(fixture.charged.body);
     // The client paid with v1 requirements, which name the network by its v1 slug.
     const network = x402NetworkByCaip2(X402.network)!.slug;
     expect(settleHeader(response)).toMatchObject({ success: true, transaction: TRANSACTION, network });
+    expect(settleHeader(response)).not.toHaveProperty("payer");
+    await call(url, { payment });
+    expect(await pendingDeposits()).toEqual([
+      expect.objectContaining({ fundingId: TRANSACTION, callerPubkey, instrument, payerAddress }),
+    ]);
   }, 20_000);
+
+  it("reports the stored authorizer once when an operator repairs a settled intent", async () => {
+    const signingKey = ADMIN_KEY.slice(2);
+    const url = await start({ reportDeposits: true, lockPubkey: ADMIN_KEY });
+    await initLockPubkeyTable(pool);
+    await seedLockPubkeyState(pool, DVM_ID, ADMIN_KEY);
+    const intentId = "ab".repeat(32);
+    await settlements.prepare({
+      id: intentId,
+      dvmId: DVM_ID,
+      resource: `${url}/v1/job`,
+      network: X402.network,
+      asset: x402NetworkByCaip2(X402.network)!.usdc.toLowerCase(),
+      from: AUTHORIZER,
+      to: X402.payTo,
+      value: String(PRICE_MICRO),
+      validAfter: "0",
+      validBefore: String(Math.floor(Date.now() / 1000) + 60),
+      nonce: `0x${"33".repeat(32)}`,
+      fingerprint: "settled-authorization",
+      effect: {
+        dvmId: DVM_ID,
+        callerId: signingKey,
+        priceFiat: { currency: "usd", amountMicro: PRICE_MICRO },
+        drawBasis: false,
+        requiredMsats: PRICE_MICRO,
+        paidMsats: PRICE_MICRO,
+        fundedMicro: PRICE_MICRO,
+        nativeAmount: PRICE_MICRO,
+        ttlMs: 60_000,
+      },
+    });
+    await settlements.markSubmitting({ dvmId: DVM_ID, intentId });
+    await settlements.recordOutcome({
+      dvmId: DVM_ID, intentId, status: "settled", outcome: "success", transaction: TRANSACTION,
+    });
+    const path = "/admin/credit/reconcile-x402-exact-settlement";
+    for (const replayed of [false, true]) {
+      const response = await fetch(`${url}${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: adminHeader("POST", path, Date.now(), ADMIN_SECRET, DVM_ID),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ settlement_intent_id: intentId }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ status: "reconciled", replayed });
+      expect(JSON.stringify(body).toLowerCase()).not.toContain(payerAddress);
+    }
+    expect(facilitatorCalls).toEqual([]);
+    expect(await pendingDeposits()).toEqual([
+      expect.objectContaining({ fundingId: TRANSACTION, callerPubkey: signingKey, instrument, payerAddress }),
+    ]);
+  });
 
   it.each(["", "/feed"])("names the capability's own address under the mount %j as the resource, whatever query or encoding the request carried", async (prefix) => {
     const url = await start({ prefix });
@@ -622,7 +724,10 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
   });
 
   it("answers a refused settlement with 402 and the facilitator's refusal, and no result", async () => {
-    const url = await start({ behaviour: async (ctx) => { ctx.artifact({ name: "page", data: "paid-for output" }); ctx.complete("done"); } });
+    const url = await start({
+      reportDeposits: true,
+      behaviour: async (ctx) => { ctx.artifact({ name: "page", data: "paid-for output" }); ctx.complete("done"); },
+    });
     settleAnswer = async () => Response.json({ success: false, errorReason: "insufficient_funds", network: X402.network });
     const response = await call(url, { payment: authorization(60) });
     expect(response.status).toBe(fixture.settlementRefused.status);
@@ -633,6 +738,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     for (const field of fixture.settlementRefused.omittedFields) expect(body).not.toHaveProperty(field);
     expect(settleHeader(response)).toMatchObject({ success: false, errorReason: "insufficient_funds" });
     expect(response.headers.get(fixture.identityHeader)).toBe(body.job_id);
+    expect(await pendingDeposits()).toEqual([]);
   });
 
   it.each([

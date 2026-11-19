@@ -16,6 +16,8 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 ## Unreleased
 
+- Credit-deposit reports for settled one-request x402 exact payments can include the verified EIP-3009 authorizer as an optional lowercase `payerAddress`. The authenticated caller key remains separate.
+
 - A standing-mandate ask the provider will not pay now carries `content.mandate_skipped.reason` on its `payment-request`, so a caller can pay the open ask at once instead of waiting out settlement timing. Providers advertise it as `credit.mandate_skipped: true` on `/v1/info`. The portable shape is in `protocol-fixtures/standing-mandate-v1.json`.
 
 ## [0.42.0](https://github.com/dvmkit/sdk/compare/v0.41.0...v0.42.0) (2026-11-19)
