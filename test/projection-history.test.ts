@@ -82,6 +82,35 @@ describe("projection release history", () => {
     check(1, "release tags are incomplete after v0.1.0");
   });
 
+  it.each([true, false])("guards the first corpus release when its tag is missing (pins committed at rollover: %s)", (atRollover) => {
+    git("tag", "v0.1.0");
+    writeFileSync(join(root, ".release-please-manifest.json"), JSON.stringify({ ".": "0.2.0" }));
+    if (atRollover) writePins(batch);
+    commit();
+    if (!atRollover) {
+      writePins(batch);
+      commit();
+    }
+    git("tag", "v0.2.0");
+    git("tag", "-d", "v0.2.0");
+    check(0, "projection history ok:");
+
+    writePins(repinned);
+    commit();
+    check(1, "published projection batch initial changed or disappeared since v0.2.0");
+  });
+
+  it("checks uncommitted changes against the release tag at HEAD", () => {
+    git("tag", "v0.1.0");
+    writePins(batch);
+    commit();
+    git("tag", "-am", "first release with corpus pins", "v0.2.0");
+    check(0, "projection history ok:");
+
+    writePins(repinned);
+    check(1, "published projection batch initial changed or disappeared since v0.2.0");
+  });
+
   it("compares a new release tag to its predecessor", () => {
     writePins(batch);
     commit();
@@ -89,6 +118,7 @@ describe("projection release history", () => {
     writePins(repinned);
     commit();
     git("tag", "-am", "candidate release", "v0.2.0");
+    writePins(batch);
     check(1, "changed or disappeared since v0.1.0");
   });
 });

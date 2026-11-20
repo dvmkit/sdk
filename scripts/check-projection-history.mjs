@@ -17,44 +17,90 @@ function checkProjectionHistory(root) {
     throw new Error("fetch full history and release tags before checking the projection corpus");
   }
 
-  // A release build can run at the new tag itself. Compare against its predecessor.
+  /** @param {string} ref */
+  const committedPins = (ref) => git("ls-tree", ref, "--", manifest)
+    ? readPins(git("show", `${ref}:${manifest}`))
+    : undefined;
+
   const tagsAtHead = new Set(git("tag", "--points-at", "HEAD").split("\n"));
-  const tags = git("tag", "--merged", "HEAD", "--list", "v*").split("\n").filter(Boolean);
-  const candidates = tags.filter((tag) => releaseTag.test(tag) && !tagsAtHead.has(tag));
+  const tags = git("tag", "--merged", "HEAD", "--list", "v*").split("\n").filter((tag) => releaseTag.test(tag));
+  const headTag = tags.find((tag) => tagsAtHead.has(tag));
+  const candidates = tags.filter((tag) => !tagsAtHead.has(tag));
   if (candidates.length === 0) {
     throw new Error("no previous reachable release tag; fetch the release tags before checking the projection corpus");
   }
+
   const previous = git("describe", "--tags", "--abbrev=0", `--candidates=${candidates.length}`,
     ...candidates.flatMap((tag) => ["--match", tag]), "HEAD");
   const previousRef = `refs/tags/${previous}`;
   // The next release can be prepared before its tag exists. Two version
   // rollovers since the selected tag mean at least one preceding tag is absent.
-  const rollovers = git("log", "-2", "--first-parent", "--format=%H", `${previousRef}..HEAD`, "--", releaseVersionFile);
-  if (rollovers.includes("\n")) {
+  const rollover = git("log", "-2", "--first-parent", "--format=%H", `${previousRef}..HEAD`, "--", releaseVersionFile);
+  if (rollover.includes("\n")) {
     throw new Error(`release tags are incomplete after ${previous}; fetch the release tags`);
   }
+
   const current = readPins(readFileSync(resolve(root, manifest), "utf8"));
-  if (!git("ls-tree", previousRef, "--", manifest)) {
-    if (git("log", "-1", "--format=%H", previousRef, "--", manifest) ||
-      candidates.some((tag) => git("ls-tree", `refs/tags/${tag}`, "--", manifest))) {
-      throw new Error(`${previous} is missing its previously tracked projection corpus`);
-    }
-    return `first release of the projection corpus (predecessor ${previous})`;
+  const published = committedPins(previousRef);
+  if (!published && (git("log", "-1", "--format=%H", previousRef, "--", manifest) ||
+    candidates.some((tag) => git("ls-tree", `refs/tags/${tag}`, "--", manifest)))) {
+    throw new Error(`${previous} is missing its previously tracked projection corpus`);
   }
 
-  const published = readPins(git("show", `${previousRef}:${manifest}`));
+  if (headTag) {
+    const tagged = committedPins("HEAD");
+    if (published) {
+      if (!tagged) throw new Error(`${headTag} is missing its previously tracked projection corpus`);
+      checkPins(published, tagged, previous);
+    }
+    if (tagged) {
+      checkPins(tagged, current, headTag);
+      return `published projection batches checked against ${headTag} (predecessor ${previous})`;
+    }
+  }
+
+  if (published) checkPins(published, current, previous);
+
+  if (!headTag && rollover) {
+    // A prepared release and a release with a missing tag look alike locally.
+    // Use committed pins from that version, including fixes after preparation.
+    const changes = git("log", "--first-parent", "--format=%H", `${rollover}..HEAD`, "--", manifest);
+    const version = JSON.parse(git("show", `${rollover}:${releaseVersionFile}`))["."];
+    if (typeof version !== "string" || !releaseTag.test(`v${version}`)) {
+      throw new Error("invalid prepared release version");
+    }
+    let checked = false;
+    for (const ref of [rollover, ...changes.split("\n").filter(Boolean)]) {
+      const pins = committedPins(ref);
+      if (!pins) continue;
+      checkPins(pins, current, `v${version} (committed pins; fetch the release tag if published)`);
+      checked = true;
+    }
+    if (checked) return `committed projection pins for v${version} checked (predecessor ${previous})`;
+  }
+
+  return published
+    ? `published projection batches checked against ${previous}`
+    : `first release of the projection corpus (predecessor ${previous})`;
+}
+
+/**
+ * @param {ReturnType<typeof readPins>} published
+ * @param {ReturnType<typeof readPins>} current
+ * @param {string} release
+ */
+function checkPins(published, current, release) {
   const previousEpoch = Math.max(...published.map(({ epoch }) => epoch));
   const currentEpoch = Math.max(...current.map(({ epoch }) => epoch));
-  if (currentEpoch < previousEpoch) throw new Error(`projection epoch moved backwards from ${previous}`);
+  if (currentEpoch < previousEpoch) throw new Error(`projection epoch moved backwards from ${release}`);
 
   const currentById = new Map(current.map((batch) => [batch.id, batch]));
   for (const batch of published) {
     const next = currentById.get(batch.id);
     if (next?.epoch === batch.epoch && next.sha256 === batch.sha256) continue;
     if (currentEpoch > previousEpoch && batch.epoch < currentEpoch) continue;
-    throw new Error(`published projection batch ${batch.id} changed or disappeared since ${previous}`);
+    throw new Error(`published projection batch ${batch.id} changed or disappeared since ${release}`);
   }
-  return `published projection batches checked against ${previous}`;
 }
 
 /** @param {string} json @returns {{ id: string, epoch: number, sha256: string }[]} */

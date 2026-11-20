@@ -66,7 +66,7 @@ The offline tests recompute the SHA-256 pins in `src/observability/__tests__/fix
 
 For a narrowing, start the next epoch with the current catalogue and witnesses for surviving and new admissions. Reuse unchanged witnesses and keep historical batches and their pins. Review every grammar change for newly excluded values and add witnesses for code-held additions. The corpus samples admitted values and cannot prove that two grammars accept the same language.
 
-The outer verification gate runs `npm run check:projection-history` against the prior reachable release tag. Check out full history and release tags to run it. A tagged batch must retain its pin and epoch unless the projection advances past it. The first release of the corpus uses a preceding tag without the manifest and relies on review of the starting witnesses.
+The outer verification gate runs `npm run check:projection-history` against the prior reachable release tag. Check out full history and release tags to run it. A tagged batch must retain its pin and epoch unless the projection advances past it. On a tagged checkout, the gate checks the release against its predecessor and local pins against the release. If a version rollover has no reachable tag, the gate checks the pins committed for that version, including changes after release preparation. Bootstrap applies when the predecessor has no corpus and the new version has no committed pins yet.
 
 Use the Conventional Commit subject to say what narrowed and name the new epoch. Confirm that the generated changelog records both before approving the release pull request. A release containing several narrowings records them under the same new epoch.
 
