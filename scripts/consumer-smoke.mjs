@@ -256,6 +256,8 @@ function importThroughEntryPoints(consumer) {
       `const probes = ${JSON.stringify(runtimeProbes)};`,
       `const loaded = [${Object.keys(runtimeProbes).map((_, index) => `entry${index}`).join(", ")}];`,
       "const summary = [];",
+      "const { DIAGNOSTIC_PROJECTION_EPOCH: epoch } = loaded[Object.keys(probes).indexOf('./internal')];",
+      "if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error('missing positive diagnostic projection epoch');",
       "if (entry0.INLINE_RESULT_MESSAGES_MAX_BYTES !== 1_048_576) throw new Error('inline messages limit must be 1 MiB');",
       "for (const [index, entry] of Object.keys(probes).entries()) {",
       "  for (const name of probes[entry]) {",

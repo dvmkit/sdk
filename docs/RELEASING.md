@@ -56,6 +56,14 @@ To graduate a tested release candidate to stable, use `Release-As: X.Y.Z` on a n
 
 For the version in this checkout, read `package.json` with `npm pkg get version`; the release tag command also requires `.release-please-manifest.json` to agree. To inspect npm publication state, use `npm view @dvmkit/sdk versions --json` for published versions and `npm view @dvmkit/sdk dist-tags --json` for the versions selected by `latest` and `next`.
 
+### Diagnostic projection changes
+
+The diagnostic projection epoch starts at 1. Bump it once per release that makes previously projected span rows lose or change admitted data. Examples include removing an event, field, or code, adding a strip-list entry, or tightening a format or bound. Keep the epoch unchanged for additions that preserve existing rows. The catalogue version tracks the catalogue format independently.
+
+The offline tests use pinned catalogue lists and synthetic projected rows under `src/observability/__tests__/fixtures/projection/`. For an additive rule, append a fixture batch at the current epoch with its own SHA-256 digest in `projection-epoch.test.ts`. For a narrowing, keep the historical batches and digests, then add a batch at the next epoch with the current catalogue and witnesses for all surviving and new admissions. Reuse unchanged witnesses when building the new batch. Pin the digest of the batch object as serialized by `JSON.stringify`, including its epoch. Check the fixtures against the prior rules when adding a witness for an existing admission.
+
+Use the Conventional Commit subject to say what narrowed and name the new epoch. Confirm that the generated changelog records both before approving the release pull request. A release containing several narrowings records them under the same new epoch.
+
 ### First release on fresh history
 
 Seed the repository with one reviewed, signed snapshot whose `package.json`, root lockfile metadata, `api-surface.json`, and release-please manifest all say `0.8.0`. Build, verify and qualify its exact packed archive before publication. Leave the first `0.8.0` changelog entry to the genuine release-please pull request.

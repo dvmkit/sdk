@@ -63,6 +63,9 @@ const catalogue = DIAGNOSTIC_CATALOGUE;
 
 export const DIAGNOSTIC_CATALOGUE_VERSION = catalogue.version;
 
+// Advance only when previously projected rows can lose or change admitted data.
+export const DIAGNOSTIC_PROJECTION_EPOCH: number = 1;
+
 const PAYMENT_ENUMS: Record<string, ReadonlySet<string>> = {
   reason: new Set(catalogue.paymentSkipReasons),
   cause: new Set(catalogue.denominationCauses),
