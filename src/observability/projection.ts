@@ -616,7 +616,7 @@ function projectFacilitatorField(key: string, value: unknown): unknown {
   }
   if (key === "extension_rejected_reason" || key === "facilitator_message") {
     if (typeof value !== "string") return undefined;
-    const text = value.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, FACILITATOR_TEXT_MAX);
+    const text = value.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, FACILITATOR_TEXT_MAX).trimEnd();
     return text === "" ? undefined : text;
   }
   return undefined;

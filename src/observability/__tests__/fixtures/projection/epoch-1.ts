@@ -226,3 +226,17 @@ export const epoch1 = {
     ),
   },
 };
+
+// Whitespace-only normalisation at a truncation boundary does not bump the
+// epoch when it removes only characters the rule would trim on a second pass.
+// The corpus keeps the canonical projected form.
+export const facilitatorTruncation = {
+  rows: {
+    facilitatorTruncation: facilitatorEvents.map((name) =>
+      fields({
+        extension_rejected_reason: "a".repeat(255),
+        facilitator_message: "a".repeat(255),
+      }, { name, dataset: "x402" }),
+    ),
+  },
+};

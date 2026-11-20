@@ -60,6 +60,8 @@ For the version in this checkout, read `package.json` with `npm pkg get version`
 
 The diagnostic projection epoch starts at 1. Bump it once per release that makes previously projected span rows lose or change admitted data. Examples include removing an event, field, or code, adding a strip-list entry, or tightening a format or bound. Keep the epoch unchanged for additions that preserve existing rows. The catalogue version tracks the catalogue format independently.
 
+The epoch also stays unchanged for whitespace-only normalisation at a truncation boundary when the change removes only characters the rule's own trimming would remove on a second pass.
+
 The offline tests use pinned catalogue lists and synthetic projected rows under `src/observability/__tests__/fixtures/projection/`. For an additive rule, append a fixture batch at the current epoch with its own SHA-256 digest in `projection-epoch.test.ts`. For a narrowing, keep the historical batches and digests, then add a batch at the next epoch with the current catalogue and witnesses for all surviving and new admissions. Reuse unchanged witnesses when building the new batch. Pin the digest of the batch object as serialized by `JSON.stringify`, including its epoch. Check the fixtures against the prior rules when adding a witness for an existing admission.
 
 Use the Conventional Commit subject to say what narrowed and name the new epoch. Confirm that the generated changelog records both before approving the release pull request. A release containing several narrowings records them under the same new epoch.

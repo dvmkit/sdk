@@ -13,7 +13,7 @@ import {
   type DiagnosticIdentityAuthority,
 } from "../projection";
 import type { SpanRow } from "../types";
-import { epoch1 } from "./fixtures/projection/epoch-1";
+import { epoch1, facilitatorTruncation } from "./fixtures/projection/epoch-1";
 
 type CatalogueSnapshot = Omit<DiagnosticCatalogue, "version">;
 
@@ -25,11 +25,13 @@ interface CorpusBatch {
 
 const corpus = {
   initial: { epoch: 1, ...epoch1 },
+  facilitatorTruncation: { epoch: 1, ...facilitatorTruncation },
 } satisfies Record<string, CorpusBatch>;
 
 // A new batch extends an epoch without changing the pinned contents of any batch.
 const digests: Record<keyof typeof corpus, string> = {
   initial: "b8f096c23e9fd8d08304da2b63113c642e333a6fb204967814dca17faf5d4864",
+  facilitatorTruncation: "34842824211a9fa63d8340fbb9454330016bf5ab62de12edcbe6980436a9ac04",
 };
 
 function projectAdmittedRow(row: SpanRow) {
@@ -106,5 +108,16 @@ describe("diagnostic projection epoch", () => {
         }
       });
     }
+  }
+});
+
+it("keeps facilitator text idempotent when truncation lands on a space", () => {
+  for (const canonical of facilitatorTruncation.rows.facilitatorTruncation) {
+    const raw = "a".repeat(255) + " b";
+    const fields = { facilitator_message: raw, extension_rejected_reason: raw };
+    const first = projectSpanRow({ ...canonical, dimensions: fields, attributes: fields });
+    if (!first.ok) throw new Error(`rejected facilitator span: ${first.code}`);
+    expect(projectSpanRow(first.row)).toEqual(first);
+    expect(first.row).toEqual(canonical);
   }
 });
