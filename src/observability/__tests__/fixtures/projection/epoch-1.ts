@@ -38,11 +38,17 @@ const max = Number.MAX_SAFE_INTEGER;
 const uuid = "ab000000-0000-0000-0000-000000000001";
 const upperUuid = uuid.toUpperCase();
 const longSlug = `a${"-".repeat(61)}0`;
-const longId = "A0_.:-".repeat(85) + "a0";
+const diagnosticIds = ["a", "A", "0", "_", ".", ":", "-", "A0_.:-".repeat(85) + "a0"];
 const decimal = "9".repeat(78);
 const hex = "a0".repeat(32);
-const transactionHash = `0x${hex}`;
-const longVersion = "1".repeat(60) + ".0.0";
+const transactionHashes = [`0x${hex}`, `0x${hex.toUpperCase()}`, `0x${"0".repeat(64)}`];
+const [transactionHash] = transactionHashes;
+const nativeAmounts = ["0", "1", "1234567890", decimal];
+const reportEvents = ["tempo_session_close_report_written_off", "tempo_session_close_report_reopened"];
+const payerExit = { name: "tempo_session_close_exit_resolved", dataset: "tempo" } as const;
+const checkoutPrefixes = ["cs_", "cs_test_", "cs_live_"];
+const longVersionComponent = "1".repeat(60);
+const longVersions = [`${longVersionComponent}.0.0`, `0.${longVersionComponent}.0`, `0.0.${longVersionComponent}`];
 const shortCapability = "a";
 const longCapability = "a" + "0_-".repeat(15) + "_0";
 const shortOrigin = "http://a";
@@ -102,13 +108,17 @@ export const epoch1 = {
     ),
     levels: catalogue.levels.map((level) => ({ ...base, level: level as SpanRow["level"] })),
     statuses: catalogue.statuses.map((status) => ({ ...base, status: status as SpanRow["status"] })),
-    services: ["platform-api", "router", "admin", "unknown", "isolate-a", `isolate-${longSlug}`]
+    services: ["platform-api", "router", "admin", "unknown", "isolate-a", "isolate-0", "isolate-0a", `isolate-${longSlug}`]
       .map((service) => ({ ...base, service })),
-    releases: ["0.0.0", "v1.2.3", "1.2.3-rc.4", "v1.2.3-rc.4", "abcdef0", "a".repeat(40), longVersion, "dev", "test", "unknown"]
+    releases: ["0.0.0", "v1.2.3", "1.2.3-rc.4", "v1.2.3-rc.4", "abcdef0", "0".repeat(7), "a".repeat(40), ...longVersions, `v${"9".repeat(59)}.0.0`, `v1.2.3-rc.${"9".repeat(54)}`, "v01.02.03-rc.00", "dev", "test", "unknown"]
       .map((service_version) => ({ ...base, service_version })),
-    hosts: ["localhost", "a".repeat(12), "f".repeat(32)].map((host) => ({ ...base, host })),
+    hosts: ["localhost", "0".repeat(12), "a".repeat(12), "f".repeat(32), "a0".repeat(16)].map((host) => ({ ...base, host })),
     envelopeBounds: [
       { ...base, pid: 1, sample_rate: Number.MIN_VALUE },
+      { ...base, sample_rate: 0.75 },
+      { ...base, sample_rate: 1 - Number.EPSILON / 2 },
+      { ...base, span_id: "0123456789abcdef", trace_id: "0123456789abcdef".repeat(2),
+        parent_span_id: "abcdef0123456789", ended_at_ms: max },
       {
         ...base, span_id: "ffffffffffffffff", trace_id: "f".repeat(32),
         parent_span_id: "0000000000000001", pid: 2_147_483_647,
@@ -128,19 +138,19 @@ export const epoch1 = {
     booleans: [fields(booleanValues), fieldValues(catalogue.booleanFields, [true])[0]],
     integers: [fields(integerValues), fieldValues(catalogue.integerFields, [max])[0]],
     fieldCountLimit: [fields(Object.fromEntries(Object.entries(fullFields).slice(0, 64)))],
-    hashes: fieldValues(catalogue.hashFields, ["AB".repeat(8), hex]),
-    transactionHashes: fieldValues(catalogue.transactionHashFields, [transactionHash, `0x${hex.toUpperCase()}`]),
-    origins: fieldValues(catalogue.urlFields, [shortOrigin, longOrigin, "https://example.com"]),
+    hashes: fieldValues(catalogue.hashFields, ["AB".repeat(8), "a0".repeat(8), hex, "AB0f".repeat(16)]),
+    transactionHashes: fieldValues(catalogue.transactionHashFields, transactionHashes),
+    origins: fieldValues(catalogue.urlFields, [shortOrigin, longOrigin, "https://0.example.com", "http://0a-b2.example.com"]),
     identities: [
       fields({ dvm_id: uuid, builder_id: upperUuid, dvm_slug: "a" }),
       fields({ dvm_id: upperUuid, builder_id: uuid, dvm_slug: longSlug }),
-      fields({ dvm_resolution: "none" }),
+      fields({ dvm_resolution: "none", dvm_slug: "0" }),
     ],
     capabilities: [
       ...fieldValues(catalogue.capabilityFields, [shortCapability, longCapability]),
-      fields({ capabilities: Array(64).fill(longCapability) }, { name: "x402_rail_missing" }),
+      fields({ capabilities: [shortCapability, ...Array(63).fill(longCapability)] }, { name: "x402_rail_missing" }),
     ],
-    clientVersions: fieldValues(catalogue.clientVersionFields, ["0.0.0", "1.2.3-rc.0", longVersion]),
+    clientVersions: fieldValues(catalogue.clientVersionFields, ["0.0.0", "1.2.3-rc.0", "1.2.3-rc.12", `1.2.3-rc.${"9".repeat(55)}`, ...longVersions]),
     enumFields: [
       ...fieldValues(["client.protocol_version"], catalogue.clientProtocolVersions),
       ...fieldValues(["rail"], catalogue.rails),
@@ -161,9 +171,9 @@ export const epoch1 = {
     ],
     additionalFields: [
       ...fieldValues(["status_code", "http.status_code", "source_status"], [100, 599]),
-      ...fieldValues(["amount"], [0, 0.5, max]),
-      ...fieldValues(["forecast.refund_native", "drain.native"], [0, max, "0", decimal]),
-      ...fieldValues(["event_id"], ["evt_A", `evt_${"aB0".repeat(21)}z`]),
+      ...fieldValues(["amount"], [0, Number.MIN_VALUE, 0.5, 2 ** 52 - 0.5, max]),
+      ...fieldValues(["forecast.refund_native", "drain.native"], [0, max, ...nativeAmounts]),
+      ...fieldValues(["event_id"], ["evt_A", "evt_0", `evt_${"aB0".repeat(21)}z`]),
       fields({ reject_reason: "scanner_probe" }),
       ...fieldValues(
         ["report_kind"],
@@ -172,7 +182,7 @@ export const epoch1 = {
       ),
       ...fieldValues(["reason"], ["timeout", "failed", "lock_unavailable"], shutdownClaim),
       ...fieldValues(["unclaimed_channels"], [null, 0, max], shutdownClaim),
-      ...fieldValues(["unclaimed_amount_native"], [null, "0", decimal], shutdownClaim),
+      ...fieldValues(["unclaimed_amount_native"], [null, ...nativeAmounts], shutdownClaim),
       fields({
         override: "DVMKIT_NWC_RECEIVE_ALLOW_SPEND=true",
         excess_methods: [...catalogue.nwcExcessMethods, "unknown_method"],
@@ -184,19 +194,21 @@ export const epoch1 = {
       }, { name: "x402_env_ignored", dataset: "x402" }),
     ],
     cardCheckout: [
-      ...fieldsForEvents(checkoutEvents, { session_id: "cs_A", payment_intent: "pi_A", retry_after_ms: 0 }, "stripe"),
-      ...fieldsForEvents(checkoutEvents, {
-        session_id: `cs_test_${"z".repeat(128)}`,
-        payment_intent: `pi_${"A_0z".repeat(32)}`,
-        retry_after_ms: max,
-      }, "stripe"),
-      fields({ session_id: `cs_live_${"z".repeat(128)}` }, { name: checkoutEvents[0], dataset: "stripe" }),
+      ...fieldsForEvents(checkoutEvents, { payment_intent: "pi_0", retry_after_ms: 0 }, "stripe"),
+      ...fieldsForEvents(checkoutEvents, { payment_intent: "pi__" }, "stripe"),
+      ...fieldsForEvents(checkoutEvents, { payment_intent: `pi_${"A_0z".repeat(32)}`, retry_after_ms: max }, "stripe"),
+      ...checkoutPrefixes.flatMap((prefix) => [
+        ...["a", "Z", "0"].flatMap((suffix) =>
+          fieldsForEvents(checkoutEvents, { session_id: prefix + suffix }, "stripe"),
+        ),
+        ...fieldsForEvents(checkoutEvents, { session_id: `${prefix}${"aB0".repeat(42)}z9` }, "stripe"),
+      ]),
     ],
     cardRefund: refundEvents.flatMap((name) => {
       const context = { name, dataset: "stripe" } as const;
       return [
-        ...fieldValues(["credit_id", "drain_id", "challenge_id"], ["A", longId], context),
-        ...fieldValues(["payment_intent"], ["pi_A", `pi_${"z".repeat(64)}`], context),
+        ...fieldValues(["credit_id", "drain_id", "challenge_id"], diagnosticIds, context),
+        ...fieldValues(["payment_intent"], ["pi_a", "pi_A", "pi_A0", "pi_0", `pi_${"zA0".repeat(21)}9`], context),
         ...fieldValues(["stage"], ["plan", "refund", "disputes", "expiry", "retry", "stranded"], context),
         ...fieldValues(["refund_status"], ["planned", "pending", "requires_action", "succeeded", "failed", "canceled", "rejected"], context),
         ...fieldValues(["frozen", "unfrozen", "expiry_refunds", "completed", "pending", "stranded_refunds"], [0, max], context),
@@ -205,25 +217,32 @@ export const epoch1 = {
     facilitator: facilitatorEvents.flatMap((name) => {
       const context = { name, dataset: "x402" } as const;
       return [
-        ...fieldValues(["extension", "extension_status"], ["a", `Z${"0_.-".repeat(15)}0_-`], context),
-        ...fieldValues(["extension_rejected_reason", "facilitator_message"], ["!", `!${" ~".repeat(127)}!`], context),
+        ...fieldValues(["extension", "extension_status"], ["a", "Z", `Z${"aB0_.-".repeat(10)}0_-`], context),
+        ...fieldValues(["extension_rejected_reason", "facilitator_message"], ["!", `!${Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i)).join("").repeat(2)}${" ~".repeat(32)}!`], context),
       ];
     }),
     tempoDrains: ["tempo_drain_booked_as_refunded", "tempo_drain_released"].flatMap((name) => {
       const context = { name, dataset: "tempo" } as const;
       return [
-        fields({ drain_reference: `sha256:${hex}`, channel_id: transactionHash }, context),
-        ...fieldValues(["credit_id", "drain_id"], ["A", longId], context),
-        ...fieldValues(["amount_native"], [null, "0", decimal], context),
+        fields({ drain_reference: `sha256:${hex}` }, context),
+        ...fieldValues(["channel_id"], transactionHashes, context),
+        ...fieldValues(["credit_id", "drain_id"], diagnosticIds, context),
+        ...fieldValues(["amount_native"], [null, ...nativeAmounts], context),
       ];
     }),
-    tempoCloseReports: ["tempo_session_close_report_written_off", "tempo_session_close_report_reopened"].flatMap((name) => [
-      fields({ channel_id: transactionHash, obligation_id: uuid, amount_native: "0", amount_forgone_native: "0" }, { name, dataset: "tempo" }),
-      fields({ channel_id: `0x${hex.toUpperCase()}`, obligation_id: upperUuid, amount_native: decimal, amount_forgone_native: decimal }, { name, dataset: "tempo" }),
-    ]),
-    tempoPayerExit: ["0", decimal].map((amount_at_stake_native) =>
-      fields({ channel_id: transactionHash, obligation_id: uuid, amount_at_stake_native }, { name: "tempo_session_close_exit_resolved", dataset: "tempo" }),
-    ),
+    tempoCloseReports: reportEvents.flatMap((name) => {
+      const context = { name, dataset: "tempo" } as const;
+      return [
+        ...fieldValues(["channel_id"], transactionHashes, context),
+        ...fieldValues(["obligation_id"], [uuid, upperUuid], context),
+        ...fieldValues(["amount_native", "amount_forgone_native"], nativeAmounts, context),
+      ];
+    }),
+    tempoPayerExit: [
+      ...fieldValues(["channel_id"], transactionHashes, payerExit),
+      ...fieldValues(["obligation_id"], [uuid, upperUuid], payerExit),
+      ...fieldValues(["amount_at_stake_native"], nativeAmounts, payerExit),
+    ],
   },
 };
 

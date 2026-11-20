@@ -27,6 +27,7 @@ export function dispatchVerification(options) {
     { name: "toolchain", args: ["run", "check:toolchain"] },
     { name: "README quickstart", args: ["run", "check:readme-quickstart"] },
     { name: "repository safety", args: ["run", "check:public-safety", "--", "--skip-pack"] },
+    { name: "projection release history", args: ["run", "check:projection-history"] },
     { name: "clean source gate", args: ["run", "clean-install-smoke", ...(options.requireDatabase ? ["--", "--require-database"] : [])] },
     ...(options.requireDatabase ? [{ name: "Tempo close concurrency stress", args: ["run", "test:tempo-close-stress"] }] : []),
   ];
@@ -48,6 +49,7 @@ export function assertReleaseDispatch(dispatch) {
     ["run", "check:toolchain"],
     ["run", "check:readme-quickstart"],
     ["run", "check:public-safety", "--", "--skip-pack"],
+    ["run", "check:projection-history"],
     ["run", "clean-install-smoke", "--", "--require-database"],
     ["run", "test:tempo-close-stress"],
   ], "outer verification");

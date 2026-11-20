@@ -14,8 +14,9 @@ import {
 } from "../projection";
 import type { SpanRow } from "../types";
 import { epoch1, facilitatorTruncation } from "./fixtures/projection/epoch-1";
+import pins from "./fixtures/projection/batch-pins.json";
 
-type CatalogueSnapshot = Omit<DiagnosticCatalogue, "version">;
+type CatalogueSnapshot = DiagnosticCatalogue;
 
 interface CorpusBatch {
   epoch: number;
@@ -27,12 +28,6 @@ const corpus = {
   initial: { epoch: 1, ...epoch1 },
   facilitatorTruncation: { epoch: 1, ...facilitatorTruncation },
 } satisfies Record<string, CorpusBatch>;
-
-// A new batch extends an epoch without changing the pinned contents of any batch.
-const digests: Record<keyof typeof corpus, string> = {
-  initial: "b8f096c23e9fd8d08304da2b63113c642e333a6fb204967814dca17faf5d4864",
-  facilitatorTruncation: "34842824211a9fa63d8340fbb9454330016bf5ab62de12edcbe6980436a9ac04",
-};
 
 function projectAdmittedRow(row: SpanRow) {
   // Trusted context is process-local. Reconstitute it from the synthetic
@@ -54,12 +49,16 @@ function projectAdmittedRow(row: SpanRow) {
   return projectSpanRow(input);
 }
 
-function catalogueLosses(snapshot: CatalogueSnapshot): string[] {
+function catalogueLosses(previous: CatalogueSnapshot, next: CatalogueSnapshot): string[] {
   const losses: string[] = [];
-  for (const key of Object.keys(snapshot) as (keyof DiagnosticCatalogue)[]) {
+  for (const key of Object.keys(previous) as (keyof DiagnosticCatalogue)[]) {
     if (key === "version") continue;
-    const before = new Set<string | number>(snapshot[key]);
-    const after = new Set<string | number>(DIAGNOSTIC_CATALOGUE[key]);
+    if (!Object.hasOwn(next, key)) {
+      losses.push(key);
+      continue;
+    }
+    const before = new Set<string | number>(previous[key]);
+    const after = new Set<string | number>(next[key]);
     // tokenFields is a strip list: additions withdraw an admission.
     const [required, available] = key === "tokenFields" ? [after, before] : [before, after];
     for (const entry of required) {
@@ -71,15 +70,27 @@ function catalogueLosses(snapshot: CatalogueSnapshot): string[] {
 
 describe("diagnostic projection epoch", () => {
   const batches: Record<string, CorpusBatch> = corpus;
-  const active = Object.entries(batches).filter(([, batch]) => batch.epoch === DIAGNOSTIC_PROJECTION_EPOCH);
+  const active = pins
+    .filter(({ epoch }) => epoch === DIAGNOSTIC_PROJECTION_EPOCH)
+    .map(({ id }) => [id, batches[id]] as const);
+
+  it("records the live catalogue in the latest snapshot of the current epoch", () => {
+    const snapshots = active.flatMap(([id, batch]) => batch.catalogue ? [{ id, catalogue: batch.catalogue }] : []);
+    const latest = snapshots.at(-1);
+    expect(latest?.catalogue).toEqual(DIAGNOSTIC_CATALOGUE);
+    for (const [index, { id, catalogue }] of snapshots.slice(1).entries()) {
+      expect(catalogueLosses(snapshots[index].catalogue, catalogue), `catalogue snapshot ${id}`).toEqual([]);
+    }
+  });
 
   it("has a corpus for each epoch and keeps every published batch intact", () => {
     const epochs = [...new Set(Object.values(batches).map(({ epoch }) => epoch))].sort((a, b) => a - b);
     expect(epochs).toEqual(Array.from({ length: DIAGNOSTIC_PROJECTION_EPOCH }, (_, index) => index + 1));
-    expect(Object.keys(corpus)).toEqual(Object.keys(digests));
-    for (const key of Object.keys(digests) as (keyof typeof digests)[]) {
-      const digest = createHash("sha256").update(JSON.stringify(corpus[key])).digest("hex");
-      expect(digest, `published corpus batch ${key}`).toBe(digests[key]);
+    expect(pins.map(({ id }) => id).sort()).toEqual(Object.keys(corpus).sort());
+    for (const { id, epoch, sha256 } of pins) {
+      expect(batches[id].epoch, `epoch of corpus batch ${id}`).toBe(epoch);
+      const digest = createHash("sha256").update(JSON.stringify(batches[id])).digest("hex");
+      expect(digest, `published corpus batch ${id}`).toBe(sha256);
     }
     for (const epoch of epochs) {
       expect(Object.values(batches).some((batch) => batch.epoch === epoch && batch.catalogue !== undefined)).toBe(true);
@@ -87,12 +98,6 @@ describe("diagnostic projection epoch", () => {
   });
 
   for (const [key, batch] of active) {
-    if (batch.catalogue) {
-      const snapshot = batch.catalogue;
-      it(`keeps catalogue admissions from ${key}`, () => {
-        expect(catalogueLosses(snapshot)).toEqual([]);
-      });
-    }
     for (const [group, rows] of Object.entries(batch.rows)) {
       it(`preserves admitted rows in ${key}/${group}`, () => {
         for (const [index, row] of rows.entries()) {

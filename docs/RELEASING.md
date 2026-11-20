@@ -62,7 +62,11 @@ The diagnostic projection epoch starts at 1. Bump it once per release that makes
 
 The epoch also stays unchanged for whitespace-only normalisation at a truncation boundary when the change removes only characters the rule's own trimming would remove on a second pass.
 
-The offline tests use pinned catalogue lists and synthetic projected rows under `src/observability/__tests__/fixtures/projection/`. For an additive rule, append a fixture batch at the current epoch with its own SHA-256 digest in `projection-epoch.test.ts`. For a narrowing, keep the historical batches and digests, then add a batch at the next epoch with the current catalogue and witnesses for all surviving and new admissions. Reuse unchanged witnesses when building the new batch. Pin the digest of the batch object as serialized by `JSON.stringify`, including its epoch. Check the fixtures against the prior rules when adding a witness for an existing admission.
+The offline tests recompute the SHA-256 pins in `src/observability/__tests__/fixtures/projection/batch-pins.json` from the fixture batches. Hash the batch object as serialized by `JSON.stringify`, including its epoch. For additions, append a batch at the current epoch with witnesses for the new admissions. If the catalogue changed, include a complete new snapshot. The latest snapshot must equal the live catalogue, and each snapshot at that epoch must retain the previous admissions. Removing an entry from a strip list adds an admission. Adding an entry to a strip list withdraws one.
+
+For a narrowing, start the next epoch with the current catalogue and witnesses for surviving and new admissions. Reuse unchanged witnesses and keep historical batches and their pins. Review every grammar change for newly excluded values and add witnesses for code-held additions. The corpus samples admitted values and cannot prove that two grammars accept the same language.
+
+The outer verification gate runs `npm run check:projection-history` against the prior reachable release tag. Check out full history and release tags to run it. A tagged batch must retain its pin and epoch unless the projection advances past it. The first release of the corpus uses a preceding tag without the manifest and relies on review of the starting witnesses.
 
 Use the Conventional Commit subject to say what narrowed and name the new epoch. Confirm that the generated changelog records both before approving the release pull request. A release containing several narrowings records them under the same new epoch.
 
