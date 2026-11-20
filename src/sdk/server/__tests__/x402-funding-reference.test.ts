@@ -358,6 +358,63 @@ describe("x402 settle without a transaction reference", () => {
     ]);
   });
 
+  it("refuses a reserved standing-mandate draw before a zero-upfront handler runs", async () => {
+    const schema = z.object({
+      input: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string(),
+    });
+    const signer = createSignedRequestVerifier(schema);
+    const secret = new Uint8Array(32).fill(17);
+    const creditId = `imp:x402:${LEGACY_ID}`;
+    const ledger = new MemoryCreditLedger();
+    await ledger.fund({
+      creditId,
+      callerPubkey: signer.signRequest(secret, { input: "original" }).pubkey,
+      currency: "usd",
+      amountMicro: PRICE_FIAT.amountMicro,
+      expiryMs: Date.now() + 60_000,
+      basis: { rail: "x402", paidMsats: REQUIRED_MSATS, fundingRef: LEGACY_ID },
+    });
+    const onJob = vi.fn((ctx: { complete(message: string): void }) => ctx.complete("done"));
+    const auth = secp256k1Auth();
+    const recordReplay = vi.spyOn(auth, "recordReplay");
+    const server = await createDVMServer(configureDVM({
+      name: "x402-standing-mandate",
+      capabilities: { run: { input: schema, onJob } },
+      auth,
+    }), {
+      env: {}, devMode: true, store: new MemoryKVStore(), jobStore: new MemoryJobStore(),
+      dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger,
+    });
+    const submit = (drawId: string) => server.app.request("/v1/job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        capability: "run",
+        data: signer.signRequest(secret, {
+          input: "original",
+          credit_id: creditId,
+          draw_id: drawId,
+          mandate: { max_total_micro: 10_000, max_ask_micro: 10_000, expires_at_ms: Date.now() + 60_000 },
+        }),
+      }),
+    });
+    try {
+      const refused = await submit(`${LEGACY_REPORT_DRAW_ID}:1`);
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toMatchObject({ error: "invalid_mandate", message: expect.stringContaining("draw ID") });
+      expect(onJob).not.toHaveBeenCalled();
+      expect(recordReplay).not.toHaveBeenCalled();
+
+      // The digest is still a valid caller choice on the same historical credit.
+      const corrected = await submit(AUTHORIZATION_ID);
+      expect(corrected.status).toBe(200);
+      expect(onJob).toHaveBeenCalledTimes(1);
+      expect(recordReplay).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.shutdown();
+    }
+  });
+
   it("keeps distinct caller-chosen draw and Cashu revenue keys in the report outbox", async () => {
     const queued: { kind: string; payload: Record<string, unknown> }[] = [];
     const query = async (sql: string, values: string[]) => {

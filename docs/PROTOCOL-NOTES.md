@@ -200,7 +200,9 @@ The balance authorization is the only mid-job payment checked before money moves
 
 For reconciliation after an upgrade, the opaque funding and settlement reference is `eip3009:sha256:` followed by the lowercase hexadecimal SHA-256 digest of the entire legacy `eip3009:<from>:<nonce>` key. For SDK-created implicit x402 credits, keep the `imp:x402:` prefix and replace the funding ID after it. Payouts from those credits use the same mapped credit ID even when they pay out over another rail.
 
-The original draw proven by the payment marker uses `x402-report-draw:<opaque funding ID>` in reports. If that key is already occupied by a caller draw on the same credit, use the first unoccupied key by appending `:1`, `:2`, and so on. New draws on that legacy credit cannot use those reserved report keys. Existing caller draws and their replays keep their IDs. Apply the mapping consistently before resuming report delivery. The SDK uses the original ledger keys to look up draws and reissue receipts.
+The original draw proven by the payment marker uses `x402-report-draw:<opaque funding ID>` in reports. If that key is already occupied by a caller draw on the same credit, use the first unoccupied key by appending `:1`, `:2`, and so on. The SDK reserves those keys for reporting on that legacy credit. A zero-upfront submit with a standing mandate that names a reserved draw ID returns `invalid_mandate` before the handler runs. Existing caller draws and their replays keep their IDs. The SDK uses the original ledger keys to look up draws and reissue receipts.
+
+Pause new draws on legacy hashless x402 credits before assigning report keys. During a rollback to a build that lacks the reservation, keep those draw writes paused, including balance payments and standing mandates on running jobs. A new draw can otherwise occupy the assigned report key and change it on the next upgrade. Resume draw creation once all writers enforce the reservation again. Resume related report delivery after applying the mapping and with a build that emits the mapped IDs.
 
 ### Release compatibility
 

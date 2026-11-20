@@ -136,10 +136,12 @@ import {
   IMPLICIT_CREDIT_TTL_MS,
   implicitCreditId,
   isDerivedCreditId,
+  isReservedX402ReportDrawId,
   legacyX402FundingIdForReplay,
   opaqueX402CreditId,
   opaqueX402FundingId,
   priceFiatMicro,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
   resolvePriceFiat,
 } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
@@ -3824,6 +3826,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             drawId: creditEnvelope.drawId, jobId: existingDraw.jobId, fingerprint, callerPubkey: authPubkey });
           if (recovered) return recovered;
           return c.json({ error: "invalid_mandate", message: "The mandate draw_id already belongs to an existing draw. Choose a fresh draw_id." }, 400);
+        }
+        if (isReservedX402ReportDrawId(creditEnvelope.creditId, creditEnvelope.drawId)) {
+          return c.json({ error: "invalid_mandate", message: RESERVED_X402_REPORT_DRAW_MESSAGE }, 400);
         }
       }
 
