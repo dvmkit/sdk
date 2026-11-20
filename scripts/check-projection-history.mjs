@@ -1,14 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
 const manifest = "src/observability/__tests__/fixtures/projection/batch-pins.json";
 const releaseVersionFile = ".release-please-manifest.json";
 const releaseTag = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.(?:0|[1-9]\d*))?$/u;
 
 /** @param {string} root */
-export function checkProjectionHistory(root) {
+function checkProjectionHistory(root) {
   /** @param {...string} args */
   const git = (...args) => execFileSync("git", args, {
     cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
@@ -71,12 +70,14 @@ function readPins(json) {
   return pins;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  try {
-    const result = checkProjectionHistory(resolve(import.meta.dirname, ".."));
-    console.log(`projection history ok: ${result}`);
-  } catch (error) {
-    console.error(`projection history: ${error instanceof Error ? error.message : String(error)}`);
-    process.exitCode = 1;
+try {
+  const args = process.argv.slice(2);
+  if (args.length && !(args.length === 2 && args[0] === "--root" && args[1])) {
+    throw new Error("use no arguments, or --root directory");
   }
+  const root = args.length ? resolve(args[1]) : resolve(import.meta.dirname, "..");
+  console.log(`projection history ok: ${checkProjectionHistory(root)}`);
+} catch (error) {
+  console.error(`projection history: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
 }
