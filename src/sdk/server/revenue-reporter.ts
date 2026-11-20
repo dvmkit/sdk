@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 
 import type { X402SelfRelayRpcFailureReason } from "../../lib/x402/types";
+import { opaqueX402CreditReportIds } from "./funding";
 import { withSdkInitLock } from "./init-lock";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { PayoutPendingPayload, PayoutReportPayload } from "./payout-reporter";
@@ -754,7 +755,7 @@ export class RevenueReporter {
 
   /** Persist a revenue report and attempt immediate delivery. */
   async report(payload: RevenueReportPayload): Promise<void> {
-    return this.enqueue("revenue", payload, payload.jobId);
+    return this.enqueue("revenue", opaqueX402CreditReportIds(payload), payload.jobId);
   }
 
   /** The permanent deduplication claim and outbox insert commit together.
@@ -786,12 +787,12 @@ export class RevenueReporter {
    * rail transaction commits, including after a process restart.
    */
   async enqueueDeposit(tx: RevenueReporterQuerier, payload: CreditDepositPayload): Promise<void> {
-    await this.insertPending(tx, "deposit", payload);
+    await this.insertPending(tx, "deposit", opaqueX402CreditReportIds(payload));
   }
 
   /** Persist without network delivery before the refund accounting transaction commits. */
   async enqueueCreditDrawRefund(tx: RevenueReporterQuerier, payload: CreditDrawRefundPayload): Promise<void> {
-    await this.insertPending(tx, "refund", payload);
+    await this.insertPending(tx, "refund", opaqueX402CreditReportIds(payload));
   }
 
   /** Join a released draw to the transaction that made the hold terminal. */
@@ -799,7 +800,7 @@ export class RevenueReporter {
     tx: RevenueReporterQuerier,
     payload: CreditDrawReleasePayload
   ): Promise<void> {
-    await this.insertPending(tx, "release", payload);
+    await this.insertPending(tx, "release", opaqueX402CreditReportIds(payload));
   }
 
   /**
@@ -807,7 +808,7 @@ export class RevenueReporter {
    * report commit or roll back together; no network I/O here.
    */
   async enqueueCreditDrain(tx: RevenueReporterQuerier, payload: CreditDrainPayload): Promise<void> {
-    await this.insertPending(tx, "drain", payload);
+    await this.insertPending(tx, "drain", opaqueX402CreditReportIds(payload));
   }
 
   /**
@@ -911,7 +912,7 @@ export class RevenueReporter {
     tx: RevenueReporterQuerier,
     payload: CreditExpiryReleasePayload
   ): Promise<void> {
-    await this.insertPending(tx, "expiry_release", payload);
+    await this.insertPending(tx, "expiry_release", opaqueX402CreditReportIds(payload));
   }
 
   /**

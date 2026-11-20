@@ -13,6 +13,8 @@ import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
 import { creditDepositPayload, verifyUpfrontPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
+import { secp256k1Auth } from "../secp256k1-auth";
+import { createSignedRequestVerifier } from "../signed-request";
 
 /**
  * An x402 settle that returns no transaction hash still moved money, so the
@@ -174,15 +176,17 @@ describe("x402 settle without a transaction reference", () => {
     expect((await ledger.get(creditId))?.balanceMicro).toBe(PRICE_FIAT.amountMicro);
   });
 
-  it("recovers the original job under a historical payment reference", async () => {
+  it.each([false, true])("recovers the original hashless job (legacy IDs: %s)", async (legacy) => {
     const onJob = vi.fn((ctx: { complete(message: string): void }) => ctx.complete("done"));
+    const onJobCompleted = vi.fn();
     const ledger = new MemoryCreditLedger();
+    const jobStore = new MemoryJobStore();
     const server = await createDVMServer(configureDVM({
       name: "x402-funding-replay",
       capabilities: { run: { input: z.object({ input: z.string() }), price: "$0.01", onJob } },
     }), {
-      env: {}, devMode: true, store: new MemoryKVStore(), jobStore: new MemoryJobStore(),
-      dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger,
+      env: {}, devMode: true, store: new MemoryKVStore(), jobStore,
+      dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger, onJobCompleted,
     });
     const submit = (input: string) => server.app.request("/v1/job", {
       method: "POST",
@@ -190,15 +194,23 @@ describe("x402 settle without a transaction reference", () => {
       body: JSON.stringify({ capability: "run", data: { input } }),
     });
     try {
-      // Seed the marker, draw and job with the identifiers a historical recovery could have persisted.
-      vi.mocked(verifyX402Payment).mockResolvedValueOnce({
-        verified: true, amountMsats: REQUIRED_MSATS, amountUsdcMicro: PRICE_FIAT.amountMicro,
-        txHash: LEGACY_ID, settleResponseHeader: "hdr",
-      });
+      if (legacy) {
+        // Seed the historical marker and credit keys through the acceptance path.
+        vi.mocked(verifyX402Payment).mockResolvedValueOnce({
+          verified: true, amountMsats: REQUIRED_MSATS, amountUsdcMicro: PRICE_FIAT.amountMicro,
+          txHash: LEGACY_ID, settleResponseHeader: "hdr",
+        });
+      }
       const original = await submit("original");
-      const identity = await original.json();
+      const identity = await original.json() as { job_id: string };
       expect(original.status).toBe(200);
-      expect(identity).toHaveProperty("job_id");
+      const job = await jobStore.get(identity.job_id);
+      if (!job) throw new Error("expected an accepted job");
+      if (legacy) {
+        await jobStore.save({ ...job, paymentTxHash: undefined, paymentTransactionHash: undefined });
+      }
+      expect((await jobStore.get(identity.job_id))?.paymentTxHash).toBeUndefined();
+      expect(job.creditId).toBe(`imp:x402:${legacy ? LEGACY_ID : AUTHORIZATION_ID}`);
 
       const replay = await submit("original");
       expect(replay.status).toBe(200);
@@ -207,7 +219,83 @@ describe("x402 settle without a transaction reference", () => {
       expect(mismatch.status).toBe(409);
       expect(await mismatch.text()).not.toContain(FROM);
       expect(onJob).toHaveBeenCalledTimes(1);
-      expect(await ledger.get(`imp:x402:${AUTHORIZATION_ID}`)).toBeUndefined();
+      expect(await ledger.getDraw({ creditId: job.creditId!, drawId: job.drawId! })).toMatchObject({
+        status: "settled", amountMicro: PRICE_FIAT.amountMicro,
+      });
+      await vi.waitFor(() => expect(onJobCompleted).toHaveBeenCalledTimes(1));
+      expect(onJobCompleted.mock.calls[0]?.[0]).toMatchObject({
+        jobId: job.id, paymentTxHash: AUTHORIZATION_ID, fundingRef: AUTHORIZATION_ID,
+      });
+      if (legacy) expect(await ledger.get(`imp:x402:${AUTHORIZATION_ID}`)).toBeUndefined();
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("reports linked opaque identifiers when resuming a job funded under historical keys", async () => {
+    const schema = z.object({
+      input: z.string(), pubkey: z.string(), signature: z.string(),
+      timestamp: z.number(), nonce: z.string(),
+    });
+    const signer = createSignedRequestVerifier(schema);
+    const jobStore = new MemoryJobStore();
+    const save = jobStore.save.bind(jobStore);
+    vi.spyOn(jobStore, "save").mockRejectedValueOnce(new Error("initial job save failed")).mockImplementation(save);
+    const ledger = new MemoryCreditLedger();
+    const onCreditFunded = vi.fn();
+    const onJobCompleted = vi.fn();
+    const onJob = vi.fn((ctx: { complete(message: string): void }) => ctx.complete("done"));
+    const server = await createDVMServer(configureDVM({
+      name: "x402-funding-resume",
+      capabilities: { run: { input: schema, price: "$0.01", onJob } },
+      auth: secp256k1Auth(),
+    }), {
+      env: {}, devMode: true, store: new MemoryKVStore(), jobStore,
+      dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger,
+      onCreditFunded, onJobCompleted,
+    });
+    const submit = (path: string, payment?: string) => server.app.request(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(payment && { "X-PAYMENT": payment }) },
+      body: JSON.stringify({
+        capability: "run",
+        data: signer.signRequest(new Uint8Array(32).fill(17), { input: "original", request_id: "resume-payment" }),
+      }),
+    });
+    try {
+      vi.mocked(verifyX402Payment).mockResolvedValueOnce({
+        verified: true, amountMsats: REQUIRED_MSATS, amountUsdcMicro: PRICE_FIAT.amountMicro,
+        txHash: LEGACY_ID, settleResponseHeader: "hdr",
+      });
+      const first = await submit("/v1/job", paymentHeader());
+      expect(first.status, await first.clone().text()).toBe(500);
+      expect(onJob).not.toHaveBeenCalled();
+      const ledgerKeys = { creditId: `imp:x402:${LEGACY_ID}`, drawId: LEGACY_ID };
+      const original = await ledger.getDraw(ledgerKeys);
+      expect(original).toMatchObject({ status: "pending" });
+
+      const resumed = await submit("/v1/request-resume/resume-payment");
+      expect(resumed.status, await resumed.clone().text()).toBe(200);
+      expect(await resumed.json()).toMatchObject({ job_id: original?.jobId });
+      expect(verifyX402Payment).toHaveBeenCalledTimes(1);
+      expect(onJob).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(onJobCompleted).toHaveBeenCalledTimes(1));
+      expect(onCreditFunded).toHaveBeenCalledTimes(1);
+      const deposit = onCreditFunded.mock.calls[0]?.[0];
+      expect(deposit).toMatchObject({ fundingId: AUTHORIZATION_ID, creditId: `imp:x402:${AUTHORIZATION_ID}` });
+      expect(onJobCompleted.mock.calls[0]?.[0]).toMatchObject({
+        jobId: original?.jobId,
+        paymentTxHash: AUTHORIZATION_ID,
+        fundingRef: deposit.fundingId,
+        creditId: deposit.creditId,
+        drawId: AUTHORIZATION_ID,
+        drawAmountMicro: PRICE_FIAT.amountMicro,
+      });
+      expect(await ledger.getDraw(ledgerKeys)).toMatchObject({ status: "settled" });
+      expect(await ledger.get(deposit.creditId)).toBeUndefined();
+      expect(await jobStore.get(original!.jobId!)).toMatchObject({
+        ...ledgerKeys, paymentTxHash: AUTHORIZATION_ID,
+      });
     } finally {
       await server.shutdown();
     }

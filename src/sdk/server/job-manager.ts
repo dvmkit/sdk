@@ -51,7 +51,13 @@ import {
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
-import { deferredX402IntentId, legacyX402FundingIdForReplay } from "./funding";
+import {
+  deferredX402IntentId,
+  implicitCreditId,
+  isX402AuthorizationFundingId,
+  legacyX402FundingIdForReplay,
+  opaqueX402CreditReportIds,
+} from "./funding";
 import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
@@ -4046,11 +4052,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (!funding || !onCreditFunded || !this.opts.dvmId) return;
     // Same builder as the reporter's outbox, so the override cannot report a
     // narrower deposit than the SDK-owned path.
-    Promise.resolve(onCreditFunded(creditDepositPayload(this.opts.dvmId, funding))).catch(
-      (err: unknown) => {
-        diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed:`, err);
-      }
-    );
+    const payload = creditDepositPayload(this.opts.dvmId, funding);
+    Promise.resolve(onCreditFunded(payload)).catch(() => {
+      diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
+    });
   }
 
   /**
@@ -4872,14 +4877,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    *
    * Takes the fields rather than a `ServerJob` so the reconciler — a
    * background sweep that holds no in-process job — books through this exact
-   * path off the row it read. `paymentTxHash` is passed **verbatim**, never
-   * recomputed as a `drawSettlementRef`: it is the same column the in-line
-   * funnel reads, so the two bookings are byte-identical by construction and
-   * the platform's `UNIQUE (rail, tx_hash)` dedupes them. Deriving it instead
-   * would diverge on an implicit N=1 job (whose row carries the rail's own
-   * reference) and on any job whose column a mid-job top-up overwrote — the
-   * same rot `resolveDrawPool` documents as the reason not to read regime off
-   * this column.
+   * path off the row it read. Both bookings preserve the settlement identity
+   * in `paymentTxHash` for deduplication. An implicit hashless x402 draw
+   * can supply it when absent, and historical x402 IDs are projected to their
+   * opaque equivalents on both sides of the reporting join.
    *
    * Returns whether the report was handed to `onJobCompleted`, so a caller
    * that logs the booking says what actually happened rather than what it
@@ -4917,7 +4918,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const hasDraw = !!(job.creditId && job.drawId);
     if (!isTerminal(job.status) || (job.status !== "completed" && !hasDraw)) return SKIPPED;
     if (!hasDraw && !onJobCompleted && !onRevenueSkippedNoRail) return SKIPPED;
-    const drawFields = { jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId };
+    const drawFields = opaqueX402CreditReportIds({
+      jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId,
+    });
     if (job.status !== "completed" && deferredX402IntentId(job.creditId)) {
       // An unfinished deferred-x402 job abandons its authorization unspent; no ledger draw exists.
       diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "abandoned" });
@@ -4944,6 +4947,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let drawAmountMicro: number | undefined;
     let bookedMsats = job.paidMsats;
     let bookedNative = job.nativeAmount;
+    let paymentTxHash = job.paymentTxHash;
     if (job.creditId && job.drawId && this.opts.creditLedger) {
       const args = { creditId: job.creditId, drawId: job.drawId };
       let unreadable = false;
@@ -4979,6 +4983,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
+      if (!paymentTxHash && creditRail === "x402" &&
+          draw.creditId === implicitCreditId("x402", draw.drawId) &&
+          isX402AuthorizationFundingId(draw.drawId)) {
+        paymentTxHash = draw.drawId;
+      }
       // The settled draw, not the job's counters, says what the draw earned: a Bitcoin
       // settle re-prices it off the lots it consumed and a partial settle charges only part.
       ({ paidMsats: bookedMsats, nativeAmount: bookedNative } = settledDrawRevenue(job, draw));
@@ -5039,8 +5048,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             level: "warn",
             event: "revenue_skipped_no_rail",
             jobId: job.id,
-            creditId: job.creditId,
-            drawId: job.drawId,
+            creditId: drawFields.creditId,
+            drawId: drawFields.drawId,
             drawAmountMicro,
             creditCurrency,
             paidMsats: job.paidMsats,
@@ -5061,7 +5070,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         );
         if (onRevenueSkippedNoRail) {
           Promise.resolve(
-            onRevenueSkippedNoRail({
+            onRevenueSkippedNoRail(opaqueX402CreditReportIds({
               dvmId: this.opts.dvmId ?? "",
               jobId: job.id,
               creditId: job.creditId,
@@ -5071,7 +5080,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               creditCurrency,
               creditRail: creditRail ?? null,
               reason,
-            })
+            }))
           ).catch((err: unknown) => {
             diagnosticConsole.error(`[${job.id}] Revenue skip alert reporting failed:`, err);
           });
@@ -5092,7 +5101,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       (job.costAmountMicro !== undefined && job.costCurrency !== undefined ? 0 : undefined);
     let handed: Promise<void>;
     try {
-      handed = Promise.resolve(onJobCompleted({
+      handed = Promise.resolve(onJobCompleted(opaqueX402CreditReportIds({
         dvmId: this.opts.dvmId ?? "",
         jobId: job.id,
         // Legacy Postgres rows surface a missing capability as `""`. Keep
@@ -5102,7 +5111,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         paidMsats: bookedMsats,
         paymentMint: job.paymentMint,
         rail: job.paymentRail,
-        paymentTxHash: job.paymentTxHash,
+        paymentTxHash,
         nativeAmount: bookedNative,
         nativeAsset: job.nativeAsset,
         cashuFlow: job.cashuFlow,
@@ -5114,7 +5123,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           ? { cost: { amountMicro: job.costAmountMicro, currency: job.costCurrency } }
           : {}),
         ...credit,
-      }));
+      })));
     } catch (err) {
       handed = Promise.reject(err);
     }

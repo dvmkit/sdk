@@ -295,6 +295,7 @@ export function x402SettledShare(
 
 const X402_FUNDING_DIGEST_PREFIX = "eip3009:sha256:";
 const LEGACY_X402_FUNDING_ID = /^eip3009:0x[0-9a-f]{40}:0x[0-9a-f]{64}$/;
+const X402_FUNDING_DIGEST = /^eip3009:sha256:[0-9a-f]{64}$/;
 
 export interface X402FundingReference {
   paymentId: string;
@@ -323,11 +324,28 @@ export function legacyX402FundingIdForReplay(
   }
 }
 
-/** Historical credit and draw IDs remain valid lookup keys but can carry a wallet address. */
-export function x402FundingIdForDiagnostics(id: string): string {
+export function isX402AuthorizationFundingId(id: string): boolean {
+  return LEGACY_X402_FUNDING_ID.test(id) || X402_FUNDING_DIGEST.test(id);
+}
+
+/** Map a historical lookup key to the same opaque identifier used by new x402 funding. */
+export function opaqueX402FundingId(id: string): string {
   const prefix = id.startsWith("imp:x402:") ? "imp:x402:" : "";
   const fundingId = id.slice(prefix.length);
   return LEGACY_X402_FUNDING_ID.test(fundingId) ? prefix + digestX402FundingId(fundingId) : id;
+}
+
+const CREDIT_REPORT_IDS = ["creditId", "drawId", "fundingId", "fundingRef", "paymentTxHash"] as const;
+
+/** Project both sides of reporting joins without changing local ledger keys or previously queued reports. */
+export function opaqueX402CreditReportIds<T extends object>(payload: T): T {
+  const projected = { ...payload };
+  const ids: Partial<Record<(typeof CREDIT_REPORT_IDS)[number], unknown>> = projected;
+  for (const field of CREDIT_REPORT_IDS) {
+    const id = ids[field];
+    if (typeof id === "string") ids[field] = opaqueX402FundingId(id);
+  }
+  return projected;
 }
 
 function digestX402FundingId(legacyPaymentId: string): string {

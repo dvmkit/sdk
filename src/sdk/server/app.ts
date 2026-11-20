@@ -136,9 +136,9 @@ import {
   IMPLICIT_CREDIT_TTL_MS,
   isDerivedCreditId,
   legacyX402FundingIdForReplay,
+  opaqueX402FundingId,
   priceFiatMicro,
   resolvePriceFiat,
-  x402FundingIdForDiagnostics,
 } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
 import { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
@@ -4208,7 +4208,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const payload = creditDepositPayload(this.opts.dvmId, funding);
     void Promise.resolve().then(() => onCreditFunded(payload)).catch(() => {
       // A receiver's error can include the address from the report body.
-      diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed`);
+      diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
     });
   }
 
@@ -4255,8 +4255,15 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   ): Promise<Response | undefined> {
     if (!opts.requestId) return undefined;
     const store = this.jobManager.store;
-    const prior = await store.findJobByPaymentTxHash(opts.requestId) ??
-      (opts.legacyPaymentId ? await store.findJobByPaymentTxHash(opts.legacyPaymentId) : undefined);
+    const marker = opts.legacyPaymentId
+      ? await this.findProcessedPayment("x402", opts.requestId, opts.legacyPaymentId)
+      : undefined;
+    // An implicit hashless payment never wrote a transaction reference on the job.
+    // The marker was committed with the original draw and identifies the job directly.
+    const prior = marker?.jobId
+      ? await store.get(marker.jobId)
+      : await store.findJobByPaymentTxHash(opts.requestId) ??
+        (opts.legacyPaymentId ? await store.findJobByPaymentTxHash(opts.legacyPaymentId) : undefined);
     if (!prior) return undefined;
 
     const bodyMatches =
@@ -4289,6 +4296,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return undefined;
     }
     return await this.submitResponse(c, prior, prior.requesterToken);
+  }
+
+  private async findProcessedPayment(
+    rail: "x402" | "tempo",
+    paymentId: string,
+    legacyPaymentId?: string
+  ) {
+    const dvmId = this.opts.dvmId ?? "";
+    return await this.processedPayments.get({ dvmId, rail, paymentId }) ??
+      (rail === "x402" && legacyPaymentId
+        ? this.processedPayments.get({ dvmId, rail, paymentId: legacyPaymentId })
+        : undefined);
   }
 
   /**
@@ -4365,13 +4384,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   }): Promise<PaymentInfo | undefined> {
     if (!this.opts.dvmId) return undefined;
     for (const rail of ["x402", "tempo"] as const) {
-      const marker = await this.processedPayments.get({
-        dvmId: this.opts.dvmId,
-        rail,
-        paymentId: opts.paymentId,
-      }) ?? (rail === "x402" && opts.legacyPaymentId
-        ? await this.processedPayments.get({ dvmId: this.opts.dvmId, rail, paymentId: opts.legacyPaymentId })
-        : undefined);
+      const marker = await this.findProcessedPayment(rail, opts.paymentId, opts.legacyPaymentId);
       if (!marker) continue;
       if (marker.jobId !== opts.jobId) {
         diagnosticConsole.warn(
@@ -4391,7 +4404,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         drawId: marker.drawId,
         expectedJobId: opts.jobId,
         requiredMsats: opts.requiredMsats,
-        paymentId: marker.paymentId,
+        paymentId: opts.paymentId,
         expectedRail: rail,
       });
     }
@@ -4429,8 +4442,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         {
           level: "request_acceptance_recovered",
           jobId: opts.expectedJobId,
-          creditId: x402FundingIdForDiagnostics(opts.creditId),
-          drawId: x402FundingIdForDiagnostics(opts.drawId),
+          creditId: opaqueX402FundingId(opts.creditId),
+          drawId: opaqueX402FundingId(opts.drawId),
           rail: payment.paymentRail,
         }
       );
@@ -5745,7 +5758,9 @@ function recordedDrawPayment(
   const rail = fundingMethodFromStored(draw.railValue.rail);
   if (!rail) return undefined;
   const nativeAsset = nativeAssetFromStored(draw.railValue.nativeAsset);
-  const paymentTxHash = opts.paymentId ?? drawSettlementRef(opts.dvmId, draw.creditId, draw.drawId);
+  const paymentTxHash = opts.paymentId === undefined
+    ? drawSettlementRef(opts.dvmId, draw.creditId, draw.drawId)
+    : opaqueX402FundingId(opts.paymentId);
   return {
     paidMsats: draw.railValue.drawMsats > 0 ? draw.railValue.drawMsats : (opts.requiredMsats ?? 0),
     paymentRail: rail,

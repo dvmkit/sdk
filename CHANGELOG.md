@@ -3,7 +3,8 @@
 ## Upgrade details
 
 - New x402 fallback funding IDs use an opaque authorization digest if the facilitator confirms payment without a transaction hash. Existing funding IDs remain valid for replay and receipt recovery. Payer-limit errors omit the wallet address. The caller-facing settlement headers retain the optional `payer` for x402 compatibility.
-- Hosts that share a processed-payment store across fallback settlement workers should upgrade those workers together. Older workers only recognize the previous fallback IDs.
+- Pause fallback x402 funding and stop all older writers sharing the payment store before enabling the upgrade. Overlapping versions can credit the same authorization once under each ID format. After any digest-keyed payment commits, keep fallback x402 funding disabled on rollback unless the rollback build also recognizes digest markers. Once receiver keys are migrated, keep related report delivery paused on rollback unless the rollback build emits the same opaque IDs.
+- If a report receiver already holds legacy x402 IDs, reconcile pending deliveries before cutover and map the receiver's related credit, draw, funding, and settlement keys to the same opaque IDs before releasing new reports. This keeps the original accounting joins and retry keys together. Queued reports retain the identifiers under which they may already have been delivered.
 
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
 

@@ -198,6 +198,8 @@ No payment is accepted without a ledger row. A payment is valued in the credit's
 
 The balance authorization is the only mid-job payment checked before money moves (a pre-flight): there is no separate payment-request refresh, job quote or challenge endpoint, since x402 and Tempo challenges ride inside the ask. It alone answers HTTP 409 `ask_expired` after the deadline; rail payments land as balance instead.
 
+For reconciliation after an upgrade, the opaque report ID is `eip3009:sha256:` followed by the lowercase hexadecimal SHA-256 digest of the entire legacy `eip3009:<from>:<nonce>` key. For implicit credit IDs, keep the `imp:x402:` prefix and replace the funding ID after it. Apply the same mapping to credit, draw, funding, and settlement identifiers in related receiver records before resuming report delivery. The SDK still uses the stored ledger keys to look up historical draws and reissue existing receipts.
+
 ### Release compatibility
 
 - **Breaking behavior changes:** an ask now expires 30 seconds after `expires_at_ms`. A rail payment on an ended job, after its ask expired, with no ask open, or on a rail the job's credit cannot take is accepted as balance with a `credit` block instead of refused or applied to the job's counters; it no longer resumes the handler. An ask on a job bound to a credit offers only that credit's rail when it can. A cancel held by a payment in flight can answer 409 `payment_in_progress`. A mid-job payment on a host without a credit ledger is refused. `ask_expired` is a new balance-payment refusal. The internal `processIncomingPayment` now runs the ledger leg and requires `creditLedger`.
