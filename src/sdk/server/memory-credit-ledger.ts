@@ -60,6 +60,7 @@ import {
   x402SettlementPending,
 } from "./credit-ledger";
 import { assertSettleMicro, type DrawSettleRequest, planDrawResolution, settledShare } from "./credit-draw-resolution";
+import { isReservedX402ReportDrawId, RESERVED_X402_REPORT_DRAW_MESSAGE } from "./funding";
 import {
   depleteLots,
   DRAIN_DELIVERY_RESERVE_SATS,
@@ -814,6 +815,9 @@ export class MemoryCreditLedger implements CreditLedgerLike {
         );
       }
       return { ...drawResult(existing, credit), replayed: true };
+    }
+    if (isReservedX402ReportDrawId(args.creditId, args.drawId)) {
+      throw new CreditLedgerError("draw_conflict", RESERVED_X402_REPORT_DRAW_MESSAGE);
     }
     if (credit.status !== "active") throw terminalCreditError(args.creditId);
     if (x402Refund) throw x402SettlementPending(args.creditId, x402Refund);

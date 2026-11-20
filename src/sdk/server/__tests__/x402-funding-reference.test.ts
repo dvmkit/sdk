@@ -38,6 +38,7 @@ const DVM_ID = "dvm-1";
 const LEGACY_ID = `eip3009:${FROM}:${NONCE}`;
 // Digest of the normalized legacy identity, computed independently.
 const AUTHORIZATION_ID = "eip3009:sha256:4c71c1dccd5fff3d021b506b75057c7e9b68838c55a71b70716be79f93faf7d4";
+const LEGACY_REPORT_DRAW_ID = `x402-report-draw:${AUTHORIZATION_ID}`;
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
@@ -233,12 +234,13 @@ describe("x402 settle without a transaction reference", () => {
     }
   });
 
-  it("reports linked opaque identifiers when resuming a job funded under historical keys", async () => {
+  it("reports a recovered historical draw separately from a caller draw on the same credit", async () => {
     const schema = z.object({
       input: z.string(), pubkey: z.string(), signature: z.string(),
       timestamp: z.number(), nonce: z.string(),
     });
     const signer = createSignedRequestVerifier(schema);
+    const secret = new Uint8Array(32).fill(17);
     const jobStore = new MemoryJobStore();
     const save = jobStore.save.bind(jobStore);
     vi.spyOn(jobStore, "save").mockRejectedValueOnce(new Error("initial job save failed")).mockImplementation(save);
@@ -255,12 +257,16 @@ describe("x402 settle without a transaction reference", () => {
       dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger,
       onCreditFunded, onJobCompleted,
     });
-    const submit = (path: string, payment?: string) => server.app.request(path, {
+    const submit = (
+      path: string,
+      payment?: string,
+      envelope: Record<string, unknown> = { request_id: "resume-payment" }
+    ) => server.app.request(path, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(payment && { "X-PAYMENT": payment }) },
       body: JSON.stringify({
         capability: "run",
-        data: signer.signRequest(new Uint8Array(32).fill(17), { input: "original", request_id: "resume-payment" }),
+        data: signer.signRequest(secret, { input: "original", ...envelope }),
       }),
     });
     try {
@@ -289,7 +295,6 @@ describe("x402 settle without a transaction reference", () => {
         paymentTxHash: AUTHORIZATION_ID,
         fundingRef: deposit.fundingId,
         creditId: deposit.creditId,
-        drawId: AUTHORIZATION_ID,
         drawAmountMicro: PRICE_FIAT.amountMicro,
       });
       expect(await ledger.getDraw(ledgerKeys)).toMatchObject({ status: "settled" });
@@ -297,9 +302,60 @@ describe("x402 settle without a transaction reference", () => {
       expect(await jobStore.get(original!.jobId!)).toMatchObject({
         ...ledgerKeys, paymentTxHash: AUTHORIZATION_ID,
       });
+
+      await ledger.fund({
+        creditId: ledgerKeys.creditId,
+        callerPubkey: signer.signRequest(secret, { input: "original" }).pubkey,
+        currency: "usd",
+        amountMicro: PRICE_FIAT.amountMicro,
+        expiryMs: Date.now() + 60_000,
+        basis: { rail: "x402", paidMsats: REQUIRED_MSATS, nativeAmount: PRICE_FIAT.amountMicro, nativeAsset: "usdc" },
+      });
+      const namedDraw = await submit("/v1/job", undefined, { credit_id: ledgerKeys.creditId, draw_id: AUTHORIZATION_ID });
+      expect(namedDraw.status, await namedDraw.clone().text()).toBe(200);
+      await vi.waitFor(() => expect(onJobCompleted).toHaveBeenCalledTimes(2));
+      expect(onJobCompleted.mock.calls.map(([report]) => [report.creditId, report.drawId])).toEqual([
+        [deposit.creditId, LEGACY_REPORT_DRAW_ID],
+        [deposit.creditId, AUTHORIZATION_ID],
+      ]);
+
+      const reserved = await submit("/v1/job", paymentHeader(), {
+        credit_id: ledgerKeys.creditId,
+        draw_id: LEGACY_REPORT_DRAW_ID,
+        fund: { amount_micro: PRICE_FIAT.amountMicro, commitment: fundingCommitment(paymentHeader()) },
+      });
+      expect(reserved.status).toBe(409);
+      expect(await reserved.json()).toMatchObject({ error: "draw_conflict" });
+      expect(verifyX402Payment).toHaveBeenCalledTimes(1);
+      expect(await ledger.getDraw({ creditId: ledgerKeys.creditId, drawId: LEGACY_REPORT_DRAW_ID })).toBeUndefined();
     } finally {
       await server.shutdown();
     }
+  });
+
+  it("joins a Cashu drain on a historical x402 credit to the opaque deposit key", async () => {
+    const queued: object[] = [];
+    const db = {
+      query: async (_sql: string, values: string[]) => {
+        queued.push(JSON.parse(values[1]));
+        return { rows: [], rowCount: 1 };
+      },
+    } as unknown as RevenueReporterQuerier & ConstructorParameters<typeof RevenueReporter>[0];
+    const reporter = new RevenueReporter(db, "https://example.com", "test-token");
+    const creditId = `imp:x402:${LEGACY_ID}`;
+    const deposit = creditDepositPayload(DVM_ID, {
+      creditId, callerPubkey: CALLER, fundingId: LEGACY_ID,
+      rail: "x402", paidMsats: 10_000, amountMicro: 10_000, currency: "usd", fundedAt: 100, expiryMs: 1000,
+    });
+    await reporter.enqueueDeposit(db, deposit);
+    await reporter.enqueueCreditDrain(db, {
+      dvmId: DVM_ID, creditId, callerPubkey: CALLER, drainId: "cashu-drain",
+      method: "cashu", status: "picked_up", creditCurrency: "usd", amountMicro: 10_000, drainedAt: 200,
+    });
+    expect(queued).toMatchObject([
+      { creditId: `imp:x402:${AUTHORIZATION_ID}`, fundingId: AUTHORIZATION_ID },
+      { creditId: `imp:x402:${AUTHORIZATION_ID}`, drainId: "cashu-drain", method: "cashu" },
+    ]);
   });
 
   it("keeps distinct caller-chosen draw and Cashu revenue keys in the report outbox", async () => {

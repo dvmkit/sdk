@@ -59,6 +59,7 @@ import {
   matchesX402ImplicitDraw,
   opaqueX402CreditId,
   opaqueX402FundingId,
+  x402ImplicitDrawReportId,
 } from "./funding";
 import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
@@ -4915,6 +4916,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async revenueOutcome(job: RevenueBookableJob, warnUnsettled: boolean): Promise<RevenueOutcome> {
     const onJobCompleted = this.opts.onJobCompleted;
     const onRevenueSkippedNoRail = this.opts.onRevenueSkippedNoRail;
+    const ledger = this.opts.creditLedger;
     // A draw that settled is revenue however its job ended: a job that did not complete can
     // still have been charged for the part it finished. Without a draw only completion earns.
     const hasDraw = !!(job.creditId && job.drawId);
@@ -4928,7 +4930,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "abandoned" });
       return SKIPPED;
     }
-    if (job.status !== "completed" && !this.opts.creditLedger) {
+    if (job.status !== "completed" && !ledger) {
       // Only a ledger can say whether this job's draw settled for its finished part.
       diagnosticConsole.warn({ level: "warn", event: "revenue_skipped_no_ledger", ...drawFields });
       return SKIPPED;
@@ -4950,14 +4952,14 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let bookedMsats = job.paidMsats;
     let bookedNative = job.nativeAmount;
     let paymentTxHash = job.paymentTxHash;
-    if (job.creditId && job.drawId && this.opts.creditLedger) {
+    if (job.creditId && job.drawId && ledger) {
       const args = { creditId: job.creditId, drawId: job.drawId };
       let unreadable = false;
-      const draw = await this.opts.creditLedger.getDraw(args).catch(() => {
+      const draw = await ledger.getDraw(args).catch(() => {
         unreadable = true;
         return undefined;
       });
-      let implicitX402 = false;
+      let implicitX402PaymentId: string | undefined;
       if (draw?.railValue.rail === "x402") {
         drawFields.creditId = opaqueX402CreditId(draw.creditId);
         if (draw.jobId === job.id && draw.creditId === implicitCreditId("x402", draw.drawId) &&
@@ -4966,12 +4968,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             const marker = await this.opts.processedPayments?.get({
               dvmId: this.opts.dvmId ?? "", rail: "x402", paymentId: draw.drawId,
             });
-            implicitX402 = matchesX402ImplicitDraw(marker, draw);
+            if (matchesX402ImplicitDraw(marker, draw)) {
+              implicitX402PaymentId = opaqueX402FundingId(draw.drawId);
+              drawFields.drawId = await x402ImplicitDrawReportId(draw.creditId, draw.drawId, async (candidate) =>
+                Boolean(await ledger.getDraw({ creditId: draw.creditId, drawId: candidate })));
+            }
           } catch {
             diagnosticConsole.warn({ event: "revenue_payment_marker_unreadable", jobId: job.id });
             return DEFERRED;
           }
-          if (implicitX402) drawFields.drawId = opaqueX402FundingId(draw.drawId);
         }
       }
       if (draw?.status === "released" && job.status !== "completed") {
@@ -5002,7 +5007,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
-      if (!paymentTxHash && implicitX402) paymentTxHash = drawFields.drawId;
+      if (!paymentTxHash) paymentTxHash = implicitX402PaymentId;
       // The settled draw, not the job's counters, says what the draw earned: a Bitcoin
       // settle re-prices it off the lots it consumed and a partial settle charges only part.
       ({ paidMsats: bookedMsats, nativeAmount: bookedNative } = settledDrawRevenue(job, draw));

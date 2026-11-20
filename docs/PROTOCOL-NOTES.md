@@ -198,7 +198,9 @@ No payment is accepted without a ledger row. A payment is valued in the credit's
 
 The balance authorization is the only mid-job payment checked before money moves (a pre-flight): there is no separate payment-request refresh, job quote or challenge endpoint, since x402 and Tempo challenges ride inside the ask. It alone answers HTTP 409 `ask_expired` after the deadline; rail payments land as balance instead.
 
-For reconciliation after an upgrade, the opaque report ID is `eip3009:sha256:` followed by the lowercase hexadecimal SHA-256 digest of the entire legacy `eip3009:<from>:<nonce>` key. For SDK-created implicit x402 credits, keep the `imp:x402:` prefix and replace the funding ID after it. Map x402 funding and settlement references and the original draw proven by the payment marker. Check that the mapped keys are still unique before resuming report delivery. Caller-chosen identifiers retain their original values. The SDK uses the stored ledger keys to look up historical draws and reissue existing receipts.
+For reconciliation after an upgrade, the opaque funding and settlement reference is `eip3009:sha256:` followed by the lowercase hexadecimal SHA-256 digest of the entire legacy `eip3009:<from>:<nonce>` key. For SDK-created implicit x402 credits, keep the `imp:x402:` prefix and replace the funding ID after it. Payouts from those credits use the same mapped credit ID even when they pay out over another rail.
+
+The original draw proven by the payment marker uses `x402-report-draw:<opaque funding ID>` in reports. If that key is already occupied by a caller draw on the same credit, use the first unoccupied key by appending `:1`, `:2`, and so on. New draws on that legacy credit cannot use those reserved report keys. Existing caller draws and their replays keep their IDs. Apply the mapping consistently before resuming report delivery. The SDK uses the original ledger keys to look up draws and reissue receipts.
 
 ### Release compatibility
 

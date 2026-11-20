@@ -63,10 +63,12 @@ import {
   IMPLICIT_CREDIT_TTL_MS,
   implicitCreditId,
   isDerivedCreditId,
+  isReservedX402ReportDrawId,
   msatsToFiatMicro,
   opaqueX402CreditId,
   opaqueX402FundingId,
   type PriceFiat,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
   type X402FundingReference,
   x402FundingReference,
   x402RequiredUsdcMicro,
@@ -1190,6 +1192,20 @@ async function verifyUpfrontPaymentInScope(
           creditId: creditEnv.creditId,
           drawId: creditEnv.drawId,
           jobId: existingDraw.jobId,
+        },
+      };
+    }
+    if (isReservedX402ReportDrawId(creditEnv.creditId, creditEnv.drawId)) {
+      return {
+        paidMsats: 0,
+        error: {
+          status: 409,
+          body: paymentErrorBody("draw_conflict", {
+            message: RESERVED_X402_REPORT_DRAW_MESSAGE,
+            display: "This draw ID is reserved. No payment was taken.",
+            hint: RESERVED_X402_REPORT_DRAW_MESSAGE,
+            retryable: true,
+          }),
         },
       };
     }

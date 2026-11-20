@@ -37,7 +37,15 @@ import type {
   CreditExpiryReleaseEnqueue,
   CreditExpiryReleasePayload,
 } from "./revenue-reporter";
-import { implicitCreditId, matchesX402ImplicitDraw, opaqueX402CreditId, opaqueX402FundingId } from "./funding";
+import {
+  implicitCreditId,
+  isReservedX402ReportDrawId,
+  matchesX402ImplicitDraw,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
+  x402ImplicitDrawReportId,
+} from "./funding";
 import { readProcessedPayment } from "./processed-payment-store";
 import {
   X402_SPEND_BLOCKING_SETTLEMENT_STATUSES,
@@ -1077,6 +1085,9 @@ export class CreditLedger {
           );
         }
         return { ...drawResultFromRow(existing, credit), replayed: true };
+      }
+      if (isReservedX402ReportDrawId(args.creditId, args.drawId)) {
+        throw new CreditLedgerError("draw_conflict", RESERVED_X402_REPORT_DRAW_MESSAGE);
       }
       if (credit.status !== "active") throw terminalCreditError(args.creditId, credit.status);
       if (tempoLifecycle && (tempoLifecycle.finalized || tempoLifecycle.closeRequestedAt !== 0n)) {
@@ -3791,8 +3802,9 @@ export class CreditLedger {
     const { credit_id: creditId, draw_id: drawId, job_id: jobId } = draw;
     if (rail !== "x402") return { creditId, drawId };
     const report = { creditId: opaqueX402CreditId(creditId), drawId };
-    const opaqueDrawId = opaqueX402FundingId(drawId);
-    if (opaqueDrawId === drawId || creditId !== implicitCreditId("x402", drawId) || jobId === null) return report;
+    if (opaqueX402FundingId(drawId) === drawId || creditId !== implicitCreditId("x402", drawId) || jobId === null) {
+      return report;
+    }
     // Standalone ledgers may have no SDK payment markers. Use this transaction's
     // connection so a release can prove provenance while holding the ledger lock.
     const { rows } = await q.query<{ markers: boolean }>(
@@ -3800,9 +3812,11 @@ export class CreditLedger {
     );
     if (!rows[0]?.markers) return report;
     const marker = await readProcessedPayment(q, { dvmId, rail: "x402", paymentId: drawId });
-    return matchesX402ImplicitDraw(marker, { creditId, drawId, jobId })
-      ? { ...report, drawId: opaqueDrawId }
-      : report;
+    if (matchesX402ImplicitDraw(marker, { creditId, drawId, jobId })) {
+      report.drawId = await x402ImplicitDrawReportId(creditId, drawId, async (candidate) =>
+        Boolean(await this.readDraw(q, creditId, candidate)));
+    }
+    return report;
   }
 
   /**

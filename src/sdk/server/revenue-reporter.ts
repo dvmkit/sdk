@@ -808,9 +808,7 @@ export class RevenueReporter {
    * report commit or roll back together; no network I/O here.
    */
   async enqueueCreditDrain(tx: RevenueReporterQuerier, payload: CreditDrainPayload): Promise<void> {
-    await this.insertPending(tx, "drain", payload.method === "x402"
-      ? { ...payload, creditId: opaqueX402CreditId(payload.creditId) }
-      : payload);
+    await this.insertPending(tx, "drain", { ...payload, creditId: opaqueX402CreditId(payload.creditId) });
   }
 
   /**

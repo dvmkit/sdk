@@ -297,6 +297,8 @@ export function x402SettledShare(
 const X402_FUNDING_DIGEST_PREFIX = "eip3009:sha256:";
 const LEGACY_X402_FUNDING_ID = /^eip3009:0x[0-9a-f]{40}:0x[0-9a-f]{64}$/;
 const X402_FUNDING_DIGEST = /^eip3009:sha256:[0-9a-f]{64}$/;
+const IMPLICIT_X402_CREDIT_PREFIX = "imp:x402:";
+const X402_REPORT_DRAW_PREFIX = "x402-report-draw:";
 
 export interface X402FundingReference {
   paymentId: string;
@@ -336,8 +338,39 @@ export function opaqueX402FundingId(id: string): string {
 
 /** The implicit x402 credit namespace is reserved for SDK-created credits. */
 export function opaqueX402CreditId(id: string): string {
-  const prefix = id.startsWith("imp:x402:") ? "imp:x402:" : "";
-  return prefix ? prefix + opaqueX402FundingId(id.slice(prefix.length)) : id;
+  return id.startsWith(IMPLICIT_X402_CREDIT_PREFIX)
+    ? IMPLICIT_X402_CREDIT_PREFIX + opaqueX402FundingId(id.slice(IMPLICIT_X402_CREDIT_PREFIX.length))
+    : id;
+}
+
+function legacyX402DrawReportBase(creditId: string): string | undefined {
+  if (!creditId.startsWith(IMPLICIT_X402_CREDIT_PREFIX)) return undefined;
+  const legacyId = creditId.slice(IMPLICIT_X402_CREDIT_PREFIX.length);
+  return LEGACY_X402_FUNDING_ID.test(legacyId)
+    ? X402_REPORT_DRAW_PREFIX + digestX402FundingId(legacyId)
+    : undefined;
+}
+
+export const RESERVED_X402_REPORT_DRAW_MESSAGE = "Choose a draw ID outside this credit's reserved reporting namespace.";
+
+export function isReservedX402ReportDrawId(creditId: string, drawId: string): boolean {
+  if (!drawId.startsWith(X402_REPORT_DRAW_PREFIX)) return false;
+  const base = legacyX402DrawReportBase(creditId);
+  return base !== undefined && (drawId === base ||
+    (drawId.startsWith(`${base}:`) && /^[1-9][0-9]*$/.test(drawId.slice(base.length + 1))));
+}
+
+/** Call for a marker-bound draw. Existing ledger keys occupy slots permanently, and new draws cannot take them. */
+export async function x402ImplicitDrawReportId(
+  creditId: string,
+  drawId: string,
+  exists: (candidate: string) => Promise<boolean>
+): Promise<string> {
+  const base = legacyX402DrawReportBase(creditId);
+  if (!base) return drawId;
+  let candidate = base;
+  for (let suffix = 1; await exists(candidate); suffix++) candidate = `${base}:${suffix}`;
+  return candidate;
 }
 
 /** A caller can choose a draw ID. The processed payment must bind the same credit, draw, and job. */
