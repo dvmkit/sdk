@@ -56,7 +56,9 @@ import {
   implicitCreditId,
   isX402AuthorizationFundingId,
   legacyX402FundingIdForReplay,
-  opaqueX402CreditReportIds,
+  matchesX402ImplicitDraw,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
 } from "./funding";
 import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
@@ -4918,9 +4920,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const hasDraw = !!(job.creditId && job.drawId);
     if (!isTerminal(job.status) || (job.status !== "completed" && !hasDraw)) return SKIPPED;
     if (!hasDraw && !onJobCompleted && !onRevenueSkippedNoRail) return SKIPPED;
-    const drawFields = opaqueX402CreditReportIds({
+    const drawFields = {
       jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId,
-    });
+    };
     if (job.status !== "completed" && deferredX402IntentId(job.creditId)) {
       // An unfinished deferred-x402 job abandons its authorization unspent; no ledger draw exists.
       diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "abandoned" });
@@ -4955,6 +4957,23 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         unreadable = true;
         return undefined;
       });
+      let implicitX402 = false;
+      if (draw?.railValue.rail === "x402") {
+        drawFields.creditId = opaqueX402CreditId(draw.creditId);
+        if (draw.jobId === job.id && draw.creditId === implicitCreditId("x402", draw.drawId) &&
+            isX402AuthorizationFundingId(draw.drawId)) {
+          try {
+            const marker = await this.opts.processedPayments?.get({
+              dvmId: this.opts.dvmId ?? "", rail: "x402", paymentId: draw.drawId,
+            });
+            implicitX402 = matchesX402ImplicitDraw(marker, draw);
+          } catch {
+            diagnosticConsole.warn({ event: "revenue_payment_marker_unreadable", jobId: job.id });
+            return DEFERRED;
+          }
+          if (implicitX402) drawFields.drawId = opaqueX402FundingId(draw.drawId);
+        }
+      }
       if (draw?.status === "released" && job.status !== "completed") {
         // A released draw on a job that did not complete charged nothing: nothing was earned.
         diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "released" });
@@ -4983,20 +5002,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
-      if (!paymentTxHash && creditRail === "x402" &&
-          draw.creditId === implicitCreditId("x402", draw.drawId) &&
-          isX402AuthorizationFundingId(draw.drawId)) {
-        paymentTxHash = draw.drawId;
-      }
+      if (!paymentTxHash && implicitX402) paymentTxHash = drawFields.drawId;
       // The settled draw, not the job's counters, says what the draw earned: a Bitcoin
       // settle re-prices it off the lots it consumed and a partial settle charges only part.
       ({ paidMsats: bookedMsats, nativeAmount: bookedNative } = settledDrawRevenue(job, draw));
       credit = {
-        creditId: draw.creditId,
-        drawId: draw.drawId,
+        creditId: drawFields.creditId,
+        drawId: drawFields.drawId,
         drawAmountMicro: draw.amountMicro,
         creditCurrency: draw.railValue.creditCurrency ?? undefined,
-        fundingRef: draw.railValue.fundingRef ?? undefined,
+        fundingRef: creditRail === "x402" && draw.railValue.fundingRef !== null
+          ? opaqueX402FundingId(draw.railValue.fundingRef)
+          : draw.railValue.fundingRef ?? undefined,
         settledAt: draw.resolvedAt ?? undefined,
       };
     }
@@ -5070,17 +5087,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         );
         if (onRevenueSkippedNoRail) {
           Promise.resolve(
-            onRevenueSkippedNoRail(opaqueX402CreditReportIds({
+            onRevenueSkippedNoRail({
               dvmId: this.opts.dvmId ?? "",
               jobId: job.id,
-              creditId: job.creditId,
-              drawId: job.drawId,
+              creditId: drawFields.creditId ?? job.creditId,
+              drawId: drawFields.drawId ?? job.drawId,
               paidMsats: job.paidMsats,
               drawAmountMicro,
               creditCurrency,
               creditRail: creditRail ?? null,
               reason,
-            }))
+            })
           ).catch((err: unknown) => {
             diagnosticConsole.error(`[${job.id}] Revenue skip alert reporting failed:`, err);
           });
@@ -5101,7 +5118,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       (job.costAmountMicro !== undefined && job.costCurrency !== undefined ? 0 : undefined);
     let handed: Promise<void>;
     try {
-      handed = Promise.resolve(onJobCompleted(opaqueX402CreditReportIds({
+      handed = Promise.resolve(onJobCompleted({
         dvmId: this.opts.dvmId ?? "",
         jobId: job.id,
         // Legacy Postgres rows surface a missing capability as `""`. Keep
@@ -5111,7 +5128,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         paidMsats: bookedMsats,
         paymentMint: job.paymentMint,
         rail: job.paymentRail,
-        paymentTxHash,
+        paymentTxHash: job.paymentRail === "x402" && paymentTxHash !== undefined
+          ? opaqueX402FundingId(paymentTxHash)
+          : paymentTxHash,
         nativeAmount: bookedNative,
         nativeAsset: job.nativeAsset,
         cashuFlow: job.cashuFlow,
@@ -5123,7 +5142,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           ? { cost: { amountMicro: job.costAmountMicro, currency: job.costCurrency } }
           : {}),
         ...credit,
-      })));
+      }));
     } catch (err) {
       handed = Promise.reject(err);
     }

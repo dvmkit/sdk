@@ -134,8 +134,10 @@ import {
   deferredX402IntentId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
+  implicitCreditId,
   isDerivedCreditId,
   legacyX402FundingIdForReplay,
+  opaqueX402CreditId,
   opaqueX402FundingId,
   priceFiatMicro,
   resolvePriceFiat,
@@ -4438,12 +4440,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       paymentId: opts.paymentId,
     });
     if (payment) {
+      const opaqueDrawId = opaqueX402FundingId(draw.drawId);
+      const drawId = draw.railValue.rail === "x402" &&
+        draw.creditId === implicitCreditId("x402", draw.drawId) && opaqueDrawId === payment.paymentTxHash
+        ? opaqueDrawId
+        : draw.drawId;
       diagnosticConsole.warn(
         {
           level: "request_acceptance_recovered",
           jobId: opts.expectedJobId,
-          creditId: opaqueX402FundingId(opts.creditId),
-          drawId: opaqueX402FundingId(opts.drawId),
+          creditId: opaqueX402CreditId(opts.creditId),
+          drawId,
           rail: payment.paymentRail,
         }
       );
@@ -5760,7 +5767,7 @@ function recordedDrawPayment(
   const nativeAsset = nativeAssetFromStored(draw.railValue.nativeAsset);
   const paymentTxHash = opts.paymentId === undefined
     ? drawSettlementRef(opts.dvmId, draw.creditId, draw.drawId)
-    : opaqueX402FundingId(opts.paymentId);
+    : rail === "x402" ? opaqueX402FundingId(opts.paymentId) : opts.paymentId;
   return {
     paidMsats: draw.railValue.drawMsats > 0 ? draw.railValue.drawMsats : (opts.requiredMsats ?? 0),
     paymentRail: rail,

@@ -5,6 +5,7 @@ import { decodePayment, exactEvmAuthorization } from "../../lib/x402/spec";
 import type { FxFetcher, FxRateSnapshot, FxSourceFailure } from "../pricing/fx";
 import { FxRateUnavailableError, readFxSourceFailure } from "../pricing/fx";
 import { fxRateFor, parseUsdPrice, satsToFiat } from "../pricing/index";
+import type { ProcessedPaymentRecord } from "./processed-payment-store";
 
 /**
  * Fiat denomination of the job price, pinned per request.
@@ -328,24 +329,26 @@ export function isX402AuthorizationFundingId(id: string): boolean {
   return LEGACY_X402_FUNDING_ID.test(id) || X402_FUNDING_DIGEST.test(id);
 }
 
-/** Map a historical lookup key to the same opaque identifier used by new x402 funding. */
+/** Map a known x402 funding reference to the opaque form used by new funding. */
 export function opaqueX402FundingId(id: string): string {
-  const prefix = id.startsWith("imp:x402:") ? "imp:x402:" : "";
-  const fundingId = id.slice(prefix.length);
-  return LEGACY_X402_FUNDING_ID.test(fundingId) ? prefix + digestX402FundingId(fundingId) : id;
+  return LEGACY_X402_FUNDING_ID.test(id) ? digestX402FundingId(id) : id;
 }
 
-const CREDIT_REPORT_IDS = ["creditId", "drawId", "fundingId", "fundingRef", "paymentTxHash"] as const;
+/** The implicit x402 credit namespace is reserved for SDK-created credits. */
+export function opaqueX402CreditId(id: string): string {
+  const prefix = id.startsWith("imp:x402:") ? "imp:x402:" : "";
+  return prefix ? prefix + opaqueX402FundingId(id.slice(prefix.length)) : id;
+}
 
-/** Project both sides of reporting joins without changing local ledger keys or previously queued reports. */
-export function opaqueX402CreditReportIds<T extends object>(payload: T): T {
-  const projected = { ...payload };
-  const ids: Partial<Record<(typeof CREDIT_REPORT_IDS)[number], unknown>> = projected;
-  for (const field of CREDIT_REPORT_IDS) {
-    const id = ids[field];
-    if (typeof id === "string") ids[field] = opaqueX402FundingId(id);
-  }
-  return projected;
+/** A caller can choose a draw ID. The processed payment must bind the same credit, draw, and job. */
+export function matchesX402ImplicitDraw(
+  marker: ProcessedPaymentRecord | undefined,
+  draw: { creditId: string; drawId: string; jobId: string | null }
+): boolean {
+  return marker?.rail === "x402" && draw.jobId !== null &&
+    marker.jobId === draw.jobId && marker.creditId === draw.creditId &&
+    marker.drawId === draw.drawId && marker.paymentId === draw.drawId &&
+    draw.creditId === implicitCreditId("x402", draw.drawId);
 }
 
 function digestX402FundingId(legacyPaymentId: string): string {

@@ -13,6 +13,7 @@ import { MemoryCreditLedger } from "../memory-credit-ledger";
 import { MemoryJobStore } from "../memory-job-store";
 import { creditDepositPayload, verifyUpfrontPayment } from "../payment";
 import { MemoryProcessedPaymentStore } from "../processed-payment-store";
+import { RevenueReporter, type RevenueReporterQuerier } from "../revenue-reporter";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
 
@@ -296,6 +297,91 @@ describe("x402 settle without a transaction reference", () => {
       expect(await jobStore.get(original!.jobId!)).toMatchObject({
         ...ledgerKeys, paymentTxHash: AUTHORIZATION_ID,
       });
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("keeps distinct caller-chosen draw and Cashu revenue keys in the report outbox", async () => {
+    const queued: { kind: string; payload: Record<string, unknown> }[] = [];
+    const query = async (sql: string, values: string[]) => {
+      if (sql.includes("INSERT INTO pending_dvm_reports")) {
+        queued.push({ kind: values[3], payload: JSON.parse(values[1]) });
+      }
+      return { rows: [], rowCount: 1 };
+    };
+    const db = { query } as unknown as RevenueReporterQuerier & ConstructorParameters<typeof RevenueReporter>[0];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const reporter = new RevenueReporter(db, "https://example.com", "test-token");
+    for (const [i, id] of [LEGACY_ID, AUTHORIZATION_ID].entries()) {
+      await reporter.enqueueCreditDrawRelease(db, {
+        dvmId: DVM_ID,
+        creditId: "named-credit",
+        drawId: id,
+        amountMicro: 10_000,
+        creditCurrency: "usd",
+        ledgerSeq: i + 1,
+        releasedAt: 1_000,
+      });
+      await reporter.report({
+        dvmId: DVM_ID,
+        jobId: `cashu-job-${i}`,
+        paidMsats: 10_000,
+        rail: "cashu",
+        paymentTxHash: id,
+      });
+    }
+
+    expect(queued.filter(({ kind }) => kind === "release").map(({ payload }) => payload.drawId))
+      .toEqual([LEGACY_ID, AUTHORIZATION_ID]);
+    expect(queued.filter(({ kind }) => kind === "revenue").map(({ payload }) => payload.paymentTxHash))
+      .toEqual([LEGACY_ID, AUTHORIZATION_ID]);
+  });
+
+  it("preserves two caller-chosen draws on the same x402 credit in revenue reports", async () => {
+    const schema = z.object({
+      input: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string(),
+    });
+    const signer = createSignedRequestVerifier(schema);
+    const secret = new Uint8Array(32).fill(17);
+    const ledger = new MemoryCreditLedger();
+    await ledger.fund({
+      creditId: LEGACY_ID,
+      callerPubkey: signer.signRequest(secret, { input: "original" }).pubkey,
+      currency: "usd",
+      amountMicro: 2 * PRICE_FIAT.amountMicro,
+      expiryMs: Date.now() + 60_000,
+      basis: { rail: "x402", paidMsats: 2 * REQUIRED_MSATS, nativeAsset: "usdc",
+        nativeAmount: 2 * PRICE_FIAT.amountMicro, fundingRef: `0x${"56".repeat(32)}` },
+    });
+    const onJobCompleted = vi.fn();
+    const server = await createDVMServer(configureDVM({
+      name: "x402-explicit-draw",
+      capabilities: { run: { input: schema, price: "$0.01", onJob: (ctx) => { ctx.complete("done"); } } },
+      auth: secp256k1Auth(),
+    }), {
+      env: {}, devMode: true, store: new MemoryKVStore(), jobStore: new MemoryJobStore(),
+      dvmId: DVM_ID, x402: X402, fxFetcher: warmFetcher(), creditLedger: ledger, onJobCompleted,
+    });
+    try {
+      for (const [idx, drawId] of [LEGACY_ID, AUTHORIZATION_ID].entries()) {
+        const response = await server.app.request("/v1/job", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            capability: "run",
+            data: signer.signRequest(secret, { input: "original", credit_id: LEGACY_ID, draw_id: drawId }),
+          }),
+        });
+        expect(response.status, await response.text()).toBe(200);
+        await vi.waitFor(() => expect(onJobCompleted).toHaveBeenCalledTimes(idx + 1));
+      }
+      expect(onJobCompleted.mock.calls.map(([report]) => ({ creditId: report.creditId, drawId: report.drawId })))
+        .toEqual([
+          { creditId: LEGACY_ID, drawId: LEGACY_ID },
+          { creditId: LEGACY_ID, drawId: AUTHORIZATION_ID },
+        ]);
+      expect((await ledger.get(LEGACY_ID))?.balanceMicro).toBe(0);
     } finally {
       await server.shutdown();
     }

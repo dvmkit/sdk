@@ -64,7 +64,8 @@ import {
   implicitCreditId,
   isDerivedCreditId,
   msatsToFiatMicro,
-  opaqueX402CreditReportIds,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
   type PriceFiat,
   type X402FundingReference,
   x402FundingReference,
@@ -5240,11 +5241,11 @@ export function creditDepositPayload(
   dvmId: string,
   funding: CreditFundingReport
 ): CreditDepositPayload {
-  return opaqueX402CreditReportIds({
+  return {
     dvmId,
-    creditId: funding.creditId,
+    creditId: funding.rail === "x402" ? opaqueX402CreditId(funding.creditId) : funding.creditId,
     callerPubkey: funding.callerPubkey,
-    fundingId: funding.fundingId,
+    fundingId: funding.rail === "x402" ? opaqueX402FundingId(funding.fundingId) : funding.fundingId,
     rail: funding.rail,
     paidMsats: funding.paidMsats,
     grossPaidMsats: funding.grossPaidMsats,
@@ -5280,7 +5281,7 @@ export function creditDepositPayload(
           }),
         },
       }),
-  });
+  };
 }
 
 /** Finish the local ledger effect retained by a durable exact-settlement intent. */

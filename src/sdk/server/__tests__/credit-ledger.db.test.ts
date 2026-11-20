@@ -8,6 +8,7 @@ import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { CreditLedger, CreditLedgerError } from "../credit-ledger";
+import { PostgresProcessedPaymentStore } from "../processed-payment-store";
 import { fundCredit } from "./__helpers__/credit-fixtures";
 import { describeCreditLedgerConformance } from "./__helpers__/credit-ledger-conformance";
 
@@ -440,6 +441,43 @@ describe.skipIf(!RUN)("credit ledger (Postgres)", () => {
       },
     });
     expect(enqueueCalls).toHaveLength(1);
+  });
+
+  it.each([true, false])("projects a historical x402 draw only when its payment marker names that job (%s)", async (bound) => {
+    const legacyId = `eip3009:0x${"ab".repeat(20)}:0x${"cd".repeat(32)}`;
+    const opaqueId = "eip3009:sha256:4c71c1dccd5fff3d021b506b75057c7e9b68838c55a71b70716be79f93faf7d4";
+    const creditId = `imp:x402:${legacyId}`;
+    const draw = { creditId, drawId: legacyId, jobId: "using-draw" };
+    const dvmId = "legacy-x402-release-test";
+    const payments = new PostgresProcessedPaymentStore(poolA);
+    await payments.init();
+    await ledger.fund({
+      creditId, callerPubkey: CALLER, currency: "usd", amountMicro: 10_000, expiryMs: FUTURE_MS,
+      basis: { rail: "x402", paidMsats: 10_000, fundingRef: legacyId },
+    });
+    await ledger.draw({ ...draw, amountMicro: 10_000 });
+    try {
+      await payments.record({
+        ...draw, dvmId, rail: "x402", paymentId: legacyId,
+        jobId: bound ? draw.jobId : "balance-only-funding",
+      });
+      const reports: { creditId: string; drawId: string }[] = [];
+      const released = await ledger.release({
+        ...draw,
+        releaseOutbox: {
+          dvmId,
+          enqueue: async (_tx, payload) => {
+            reports.push({ creditId: payload.creditId, drawId: payload.drawId });
+          },
+        },
+      });
+      expect(released).toMatchObject({ creditId, drawId: legacyId, status: "released", availableMicro: 10_000 });
+      expect(reports).toEqual([{
+        creditId: `imp:x402:${opaqueId}`, drawId: bound ? opaqueId : legacyId,
+      }]);
+    } finally {
+      await poolA.query("DELETE FROM processed_payments WHERE dvm_id = $1", [dvmId]);
+    }
   });
 
   it("settle and release are idempotent; cross-state transitions are refused", async () => {
