@@ -16,7 +16,8 @@ import type { SpanRow } from "../types";
 import { epoch1, facilitatorTruncation } from "./fixtures/projection/epoch-1";
 import pins from "./fixtures/projection/batch-pins.json";
 
-type CatalogueSnapshot = DiagnosticCatalogue;
+// Older snapshots predate lists that a later release may add.
+type CatalogueSnapshot = Pick<DiagnosticCatalogue, "version"> & Partial<Omit<DiagnosticCatalogue, "version">>;
 
 interface CorpusBatch {
   epoch: number;
