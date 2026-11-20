@@ -14,6 +14,18 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.44.0](https://github.com/dvmkit/sdk/compare/v0.43.0...v0.44.0) (2026-11-20)
+
+
+### Features
+
+* export a diagnostic projection epoch that moves only on narrowing ([#211](https://github.com/dvmkit/sdk/issues/211)) ([75cbb39](https://github.com/dvmkit/sdk/commit/75cbb39fe1015181ed990b05ad8a1136fa4c8ddd))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.43.0 ([#213](https://github.com/dvmkit/sdk/issues/213)) ([7507ae3](https://github.com/dvmkit/sdk/commit/7507ae383c264206cc19953c0396e5f72066d884))
+
 ## [0.43.0](https://github.com/dvmkit/sdk/compare/v0.42.0...v0.43.0) (2026-11-19)
 
 - A resent x402 channel deposit whose payment terms changed after the DVM already took it is answered from its stored attempt (settled, reconciled on chain, or already complete) instead of `requirements_mismatch`; a stored deposit that never left is refused with `requirements_mismatch` and is never settled under the old terms. A caller that re-signs under the changed terms replaces an expired `prepared` deposit for the same credit effect instead of failing on an identity conflict.
