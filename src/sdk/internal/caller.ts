@@ -867,6 +867,7 @@ export {
 export {
   DIAGNOSTIC_CATALOGUE,
   DIAGNOSTIC_CATALOGUE_VERSION,
+  DIAGNOSTIC_PROJECTION_EPOCH,
   bindDiagnosticCapabilityAuthority,
   bindDiagnosticIdentityAuthority,
   createDiagnosticCapabilityAuthority,

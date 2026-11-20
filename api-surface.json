@@ -1956,6 +1956,7 @@
         "DEFAULT_LOCK_PUBKEY_GRACE_SECONDS",
         "DIAGNOSTIC_CATALOGUE",
         "DIAGNOSTIC_CATALOGUE_VERSION",
+        "DIAGNOSTIC_PROJECTION_EPOCH",
         "DbTransport",
         "DeliveredResult",
         "DescribeOptions",

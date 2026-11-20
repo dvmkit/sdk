@@ -56,6 +56,20 @@ To graduate a tested release candidate to stable, use `Release-As: X.Y.Z` on a n
 
 For the version in this checkout, read `package.json` with `npm pkg get version`; the release tag command also requires `.release-please-manifest.json` to agree. To inspect npm publication state, use `npm view @dvmkit/sdk versions --json` for published versions and `npm view @dvmkit/sdk dist-tags --json` for the versions selected by `latest` and `next`.
 
+### Diagnostic projection changes
+
+The diagnostic projection epoch starts at 1. Bump it once per release that makes previously projected span rows lose or change admitted data. Examples include removing an event, field, or code, adding a strip-list entry, or tightening a format or bound. Keep the epoch unchanged for additions that preserve existing rows. The catalogue version tracks the catalogue format independently.
+
+The epoch also stays unchanged for whitespace-only normalisation at a truncation boundary when the change removes only characters the rule's own trimming would remove on a second pass.
+
+The offline tests recompute the SHA-256 pins in `src/observability/__tests__/fixtures/projection/batch-pins.json` from the fixture batches. Hash the batch object as serialized by `JSON.stringify`, including its epoch. For additions, append a batch at the current epoch with witnesses for the new admissions. If the catalogue changed, include a complete new snapshot. The latest snapshot must equal the live catalogue, and each snapshot at that epoch must retain the previous admissions. Removing an entry from a strip list adds an admission. Adding an entry to a strip list withdraws one.
+
+For a narrowing, start the next epoch with the current catalogue and witnesses for surviving and new admissions. Reuse unchanged witnesses and keep historical batches and their pins. Review every grammar change for newly excluded values and add witnesses for code-held additions. The corpus samples admitted values and cannot prove that two grammars accept the same language.
+
+The outer verification gate runs `npm run check:projection-history` against the prior reachable release tag. Check out full history and release tags to run it. A tagged batch must retain its pin and epoch unless the projection advances past it. On a tagged checkout, the gate checks the release against its predecessor and local pins against the release. If a version rollover has no reachable tag, the gate checks the pins committed for that version, including changes after release preparation. Bootstrap applies when the predecessor has no corpus and the new version has no committed pins yet.
+
+Use the Conventional Commit subject to say what narrowed and name the new epoch. Confirm that the generated changelog records both before approving the release pull request. A release containing several narrowings records them under the same new epoch.
+
 ### First release on fresh history
 
 Seed the repository with one reviewed, signed snapshot whose `package.json`, root lockfile metadata, `api-surface.json`, and release-please manifest all say `0.8.0`. Build, verify and qualify its exact packed archive before publication. Leave the first `0.8.0` changelog entry to the genuine release-please pull request.

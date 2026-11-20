@@ -63,6 +63,9 @@ const catalogue = DIAGNOSTIC_CATALOGUE;
 
 export const DIAGNOSTIC_CATALOGUE_VERSION = catalogue.version;
 
+// Advance only when previously projected rows can lose or change admitted data.
+export const DIAGNOSTIC_PROJECTION_EPOCH: number = 1;
+
 const PAYMENT_ENUMS: Record<string, ReadonlySet<string>> = {
   reason: new Set(catalogue.paymentSkipReasons),
   cause: new Set(catalogue.denominationCauses),
@@ -613,7 +616,7 @@ function projectFacilitatorField(key: string, value: unknown): unknown {
   }
   if (key === "extension_rejected_reason" || key === "facilitator_message") {
     if (typeof value !== "string") return undefined;
-    const text = value.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, FACILITATOR_TEXT_MAX);
+    const text = value.replace(/[^\x20-\x7e]+/g, " ").trim().slice(0, FACILITATOR_TEXT_MAX).trimEnd();
     return text === "" ? undefined : text;
   }
   return undefined;

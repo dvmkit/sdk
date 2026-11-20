@@ -1,0 +1,12 @@
+[
+  {
+    "id": "initial",
+    "epoch": 1,
+    "sha256": "f695cfd4da88812ca4074aaf2caa0d79d776747c75665f80a943d562e40417dd"
+  },
+  {
+    "id": "facilitatorTruncation",
+    "epoch": 1,
+    "sha256": "34842824211a9fa63d8340fbb9454330016bf5ab62de12edcbe6980436a9ac04"
+  }
+]

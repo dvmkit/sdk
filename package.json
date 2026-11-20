@@ -62,6 +62,7 @@
     "check:consumer": "node scripts/consumer-smoke.mjs",
     "install-published-release": "node scripts/install-published-release.mjs",
     "check:package": "node scripts/package-smoke.mjs",
+    "check:projection-history": "node scripts/check-projection-history.mjs",
     "check:public-safety": "node scripts/public-safety.mjs",
     "check:release": "node scripts/check-release.mjs",
     "check:toolchain": "node scripts/check-toolchain.mjs",

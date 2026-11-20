@@ -31,6 +31,8 @@ The one case this would otherwise lose is the environment bug we cannot see: a p
 
 A failing test case is welcome, as a snippet in the issue or a link to a small standalone repository. Attach it to the issue rather than opening a pull request with it. `npm test` runs offline, `npm run test:server` needs free local ports, `npm run test:db` needs Postgres, and `npm run verify` runs all of them.
 
+For changes to the diagnostic allowlist or span projection, follow the [diagnostic projection release procedure](docs/RELEASING.md#diagnostic-projection-changes).
+
 ### What makes a report reproducible here
 
 This is a server framework, so a report that names only a symptom usually cannot be acted on. Include the SDK version, the Node.js version, the deployment shape (container image, long-running host process, managed platform, local development), the entry point involved (`@dvmkit/sdk`, `@dvmkit/sdk/server`, or `@dvmkit/sdk/testing`), and the smallest handler or configuration that shows the problem. Where money is involved, name the payment rail and use test-mode or synthetic values throughout.
