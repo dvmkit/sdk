@@ -1,3 +1,4 @@
+import { inspect } from "node:util";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -228,7 +229,9 @@ describe.skipIf(!RUN)("exact x402 settlement store (Postgres)", () => {
       expect(admitted).toHaveLength(1);
       expect(refused).toHaveLength(7);
       for (const o of refused) {
-        expect((o as PromiseRejectedResult).reason).toBeInstanceOf(X402ExactPayerLimitError);
+        const error: unknown = (o as PromiseRejectedResult).reason;
+        expect(error).toBeInstanceOf(X402ExactPayerLimitError);
+        expect(inspect(error, { showHidden: true })).not.toContain(PAYER_A);
       }
       const { rows } = await pool.query(
         "SELECT count(*)::int AS n FROM x402_exact_settlement_intents WHERE dvm_id = $1",

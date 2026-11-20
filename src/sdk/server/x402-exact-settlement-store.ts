@@ -253,7 +253,7 @@ export class PostgresX402ExactSettlementStore implements X402ExactSettlementStor
                         THEN valid_before::numeric > $3 ELSE false END))`,
           [intent.dvmId, intent.from, Math.floor(now / 1000)]
         );
-        if (Number(rows[0]?.n ?? 0) >= limit) throw new X402ExactPayerLimitError(intent.from);
+        if (Number(rows[0]?.n ?? 0) >= limit) throw new X402ExactPayerLimitError();
       }
       const authFingerprint = intent.effect?.jobAdmission?.authFingerprint;
       if (authFingerprint) {
@@ -603,7 +603,7 @@ export class MemoryX402ExactSettlementStore implements X402ExactSettlementStore 
           outstanding++;
         }
       }
-      if (outstanding >= opts.maxOutstandingPerPayer) throw new X402ExactPayerLimitError(intent.from);
+      if (outstanding >= opts.maxOutstandingPerPayer) throw new X402ExactPayerLimitError();
     }
     const authFingerprint = intent.effect?.jobAdmission?.authFingerprint;
     if (authFingerprint) {
@@ -839,8 +839,8 @@ export class X402ExactIntentConflictError extends Error {
 
 /** Raised when a payer already has the most outstanding authorizations a DVM admits. */
 export class X402ExactPayerLimitError extends Error {
-  constructor(readonly payer: string) {
-    super(`x402 payer ${payer} has too many outstanding authorizations`);
+  constructor() {
+    super("x402 payer has too many outstanding authorizations");
     this.name = "X402ExactPayerLimitError";
   }
 }

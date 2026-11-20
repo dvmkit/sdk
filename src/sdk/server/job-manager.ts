@@ -51,7 +51,7 @@ import {
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
-import { deferredX402IntentId } from "./funding";
+import { deferredX402IntentId, legacyX402FundingIdForReplay } from "./funding";
 import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
@@ -3505,7 +3505,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // A replayed mid-job payment is the retry after a lost acknowledgement.
       // The money moved once; hand back the original funding evidence so the
       // caller can reconcile without paying again.
-      const replayed = await this.replayedDrawFundingReceipt(job, verifyResult.error.replayPaymentId);
+      const replayed = await this.replayedDrawFundingReceipt(
+        job,
+        verifyResult.error.replayPaymentId,
+        body.content.x402_payment
+      );
       return {
         error: {
           body: { ...verifyResult.error.body, ...(replayed && { draw_funding_receipt: replayed }) },
@@ -3784,15 +3788,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   /** The stored evidence for a replayed mid-job payment, looked up by the payment id the marker collided on. */
   private async replayedDrawFundingReceipt(
     job: ServerJob,
-    replayPaymentId: string | undefined
+    replayPaymentId: string | undefined,
+    x402Payment: unknown
   ): Promise<DrawFundingReceipt | undefined> {
     const ledger = this.opts.creditLedger;
     if (!replayPaymentId || !ledger || !job.creditId) return undefined;
     try {
-      const [credit, funding] = await Promise.all([
+      const [credit, currentFunding] = await Promise.all([
         ledger.get(job.creditId),
         ledger.getFunding({ creditId: job.creditId, fundId: replayPaymentId }),
       ]);
+      const legacyPaymentId = currentFunding ? undefined : legacyX402FundingIdForReplay(replayPaymentId, x402Payment);
+      const funding = currentFunding ?? (legacyPaymentId
+        ? await ledger.getFunding({ creditId: job.creditId, fundId: legacyPaymentId })
+        : undefined);
       if (!credit || !funding || funding.jobId !== job.id) return undefined;
       return await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, credit.currency);
     } catch (err) {

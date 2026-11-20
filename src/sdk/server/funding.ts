@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { IMPLICIT_CREDIT_TTL_MS } from "../../lib/credit-implicit";
+import { decodePayment, exactEvmAuthorization } from "../../lib/x402/spec";
 import type { FxFetcher, FxRateSnapshot, FxSourceFailure } from "../pricing/fx";
 import { FxRateUnavailableError, readFxSourceFailure } from "../pricing/fx";
 import { fxRateFor, parseUsdPrice, satsToFiat } from "../pricing/index";
@@ -290,6 +291,47 @@ export function x402SettledShare(
 ): number {
   if (requiredUsdcMicro <= 0 || settledUsdcMicro === requiredUsdcMicro) return quoted;
   return Math.round((quoted * settledUsdcMicro) / requiredUsdcMicro);
+}
+
+const X402_FUNDING_DIGEST_PREFIX = "eip3009:sha256:";
+const LEGACY_X402_FUNDING_ID = /^eip3009:0x[0-9a-f]{40}:0x[0-9a-f]{64}$/;
+
+export interface X402FundingReference {
+  paymentId: string;
+  legacyPaymentId?: string;
+}
+
+/** An authorizer's nonce is single-use. Hash the original identity so its replay semantics survive the format change. */
+export function x402FundingReference(txHash: string | undefined, paymentHeader: string): X402FundingReference {
+  if (txHash) return { paymentId: txHash };
+  const { from, nonce } = exactEvmAuthorization(decodePayment(paymentHeader));
+  const legacyPaymentId = `eip3009:${from.toLowerCase()}:${nonce.toLowerCase()}`;
+  return { paymentId: digestX402FundingId(legacyPaymentId), legacyPaymentId };
+}
+
+/** Recover historical evidence only from the credential corresponding to a verified replay. */
+export function legacyX402FundingIdForReplay(
+  paymentId: string | undefined,
+  paymentHeader: unknown,
+): string | undefined {
+  if (!paymentId?.startsWith(X402_FUNDING_DIGEST_PREFIX) || typeof paymentHeader !== "string") return undefined;
+  try {
+    const ref = x402FundingReference(undefined, paymentHeader);
+    return ref.paymentId === paymentId ? ref.legacyPaymentId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Historical credit and draw IDs remain valid lookup keys but can carry a wallet address. */
+export function x402FundingIdForDiagnostics(id: string): string {
+  const prefix = id.startsWith("imp:x402:") ? "imp:x402:" : "";
+  const fundingId = id.slice(prefix.length);
+  return LEGACY_X402_FUNDING_ID.test(fundingId) ? prefix + digestX402FundingId(fundingId) : id;
+}
+
+function digestX402FundingId(legacyPaymentId: string): string {
+  return X402_FUNDING_DIGEST_PREFIX + createHash("sha256").update(legacyPaymentId).digest("hex");
 }
 
 /**

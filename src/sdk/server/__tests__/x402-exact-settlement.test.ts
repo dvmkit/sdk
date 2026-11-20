@@ -1,3 +1,4 @@
+import { inspect } from "node:util";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { encodePayment, X402_V1_VERSION } from "../../../lib/x402/spec";
@@ -9,6 +10,7 @@ import {
 import {
   MemoryX402ExactSettlementStore,
   X402ExactIntentConflictError,
+  X402ExactPayerLimitError,
   type X402ExactSettlementEffect,
 } from "../x402-exact-settlement-store";
 
@@ -97,6 +99,33 @@ beforeEach(() => {
 });
 
 describe("durable exact x402 settlement", () => {
+  it("refuses a second live authorization without exposing the payer in the error", async () => {
+    const store = new MemoryX402ExactSettlementStore();
+    const from = `0x${"66".repeat(20)}`;
+    const intent = {
+      id: "first",
+      dvmId: "dvm-1",
+      resource: "/v1/x402/run",
+      network: CONFIG.network,
+      asset: CONFIG.asset!,
+      from,
+      to: CONFIG.payTo,
+      value: "1000",
+      validAfter: "0",
+      validBefore: "9999999999",
+      nonce: `0x${"44".repeat(32)}`,
+      fingerprint: "first-authorization",
+    };
+    const options = { maxOutstandingPerPayer: 1 };
+    await store.claim(intent, options);
+    const refused = store.claim({
+      ...intent, id: "second", nonce: `0x${"45".repeat(32)}`, fingerprint: "second-authorization",
+    }, options);
+    await expect(refused).rejects.toBeInstanceOf(X402ExactPayerLimitError);
+    const error: unknown = await refused.catch((err: unknown) => err);
+    expect(inspect(error, { showHidden: true })).not.toContain(from);
+  });
+
   it("lets concurrent presentations submit and finalize the authorization once", async () => {
     const store = new MemoryX402ExactSettlementStore();
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {

@@ -46,12 +46,22 @@ const TOPUP_MICRO = 50_000;
 const TOPUP_MSATS = 50_000;
 const TOPUP_USDC = 50_000;
 const TOPUP_TX = "0xmidjobsettlement";
+const HASHLESS_FROM = `0x${"22".repeat(20)}`;
+const HASHLESS_NONCE = `0x${"34".repeat(32)}`;
+const LEGACY_TOPUP_ID = `eip3009:${HASHLESS_FROM}:${HASHLESS_NONCE}`;
+const HASHLESS_TOPUP_ID = "eip3009:sha256:5619babd725d93efd699bc1f9a19d259fe42a0895c07e60791417da66845985d";
 
 const X402: X402Config = {
   facilitator: "https://x402.test/facilitator",
   network: "eip155:8453",
   payTo: "0x1111111111111111111111111111111111111111"
 };
+
+function hashlessPaymentHeader(): string {
+  return encodePayment({ x402Version: 1, scheme: "exact", network: X402.network, payload: {
+    signature: "0xdeadbeef", authorization: { from: HASHLESS_FROM, to: X402.payTo, value: String(TOPUP_USDC),
+      validAfter: "0", validBefore: "9999999999", nonce: HASHLESS_NONCE } } });
+}
 
 function warmFetcher(): FxFetcher {
   return {
@@ -538,6 +548,44 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         }
       });
 
+      it("reissues the original signed receipt on replay of a legacy hashless payment", async () => {
+        const h = harness();
+        await upfrontDraw(h);
+        const key = { creditId: "c1", drawId: "d1", fundId: LEGACY_TOPUP_ID };
+        await h.processedPayments.record({
+          ...key, dvmId: DVM_ID, rail: "x402", paymentId: LEGACY_TOPUP_ID, jobId: JOB_ID,
+        });
+        await h.ledger.recordFunding({ ...key, rail: "x402", amountMicro: TOPUP_MICRO, jobId: JOB_ID });
+        await h.ledger.fund({
+          creditId: key.creditId, callerPubkey: CALLER, currency: "usd", amountMicro: TOPUP_MICRO,
+          expiryMs: FUTURE_MS, basis: { rail: "x402", paidMsats: TOPUP_MSATS, fundingRef: LEGACY_TOPUP_ID },
+        });
+        const grown = await h.ledger.growDraw({ ...key, addAmountMicro: TOPUP_MICRO });
+        await h.ledger.completeFunding({
+          ...key, callerPubkey: CALLER, balanceAfterMicro: grown.balanceAfterMicro, ledgerSeq: grown.ledgerSeq,
+        });
+        vi.mocked(verifyX402Payment).mockResolvedValueOnce({
+          verified: true, amountMsats: TOPUP_MSATS, amountUsdcMicro: TOPUP_USDC,
+        });
+
+        const jm = manager(h);
+        try {
+          const [receipt] = await jm.drawFundingReceipts({ id: JOB_ID, ...key });
+          expect(receipt).toMatchObject({ fund_id: LEGACY_TOPUP_ID });
+          expect(verifyDrawFundingReceipt(receipt)).toBe(true);
+
+          const body = { type: "payment" as const, content: { x402_payment: hashlessPaymentHeader() } };
+          const replay = await jm.processPayment(boundJob(), body, null);
+          expect(replay.error).toMatchObject({ status: 409, body: { error: "replay_rejected", draw_funding_receipt: receipt } });
+          expect(replay.error?.body.message).not.toContain(HASHLESS_FROM);
+          expect(await h.ledger.listDrawFundings(key)).toHaveLength(1);
+          expect(await h.ledger.getDraw(key)).toMatchObject({ amountMicro: UPFRONT_MICRO + TOPUP_MICRO });
+          expect(await h.processedPayments.get({ dvmId: DVM_ID, rail: "x402", paymentId: HASHLESS_TOPUP_ID })).toBeUndefined();
+        } finally {
+          jm.shutdown();
+        }
+      });
+
       it("issues nothing without a receipt key and lists nothing for a job that holds no draw", async () => {
         const h = harness();
         await upfrontDraw(h);
@@ -849,20 +897,14 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
       vi.mocked(verifyX402Payment).mockResolvedValueOnce({
         verified: true, amountMsats: TOPUP_MSATS, amountUsdcMicro: TOPUP_USDC, txHash: undefined,
       } as Awaited<ReturnType<typeof verifyX402Payment>>);
-      const nonce = `0x${"34".repeat(32)}`;
-      const from = "0x2222222222222222222222222222222222222222";
-      const header = encodePayment({ x402Version: 1, scheme: "exact", network: "eip155:8453", payload: {
-        signature: "0xdeadbeef", authorization: { from, to: X402.payTo, value: String(TOPUP_USDC),
-          validAfter: "0", validBefore: "9999999999", nonce } } });
-
       const { verified, error } = await verifyIncomingPayment(
-        { type: "payment", content: { x402_payment: header } },
+        { type: "payment", content: { x402_payment: hashlessPaymentHeader() } },
         { x402Config: X402, dvmId: DVM_ID, jobId: JOB_ID, fxFetcher: warmFetcher(),
           creditLedger: h.ledger, processedPayments: h.processedPayments },
         explicitJob()
       );
       expect(error).toBeUndefined();
-      expect(verified?.funding?.fundingId).toBe(`eip3009:${from}:${nonce}`);
+      expect(verified?.funding?.fundingId).toBe(HASHLESS_TOPUP_ID);
       expect((await h.ledger.getDraw({ creditId: "c1", drawId: "d1" }))?.amountMicro).toBe(UPFRONT_MICRO + TOPUP_MICRO);
     });
 

@@ -135,8 +135,10 @@ import {
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
   isDerivedCreditId,
+  legacyX402FundingIdForReplay,
   priceFiatMicro,
   resolvePriceFiat,
+  x402FundingIdForDiagnostics,
 } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
 import { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
@@ -3951,8 +3953,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             // draw keys remain a separate regime; try the draw key when the
             // payment reference cannot resolve an explicitly funded job.
             if (!route && err.detail.body.error === "replay_rejected") {
+              const replayPaymentId = err.detail.replayPaymentId;
+              const legacyPaymentId = railOpts.cashuToken
+                ? undefined
+                : legacyX402FundingIdForReplay(replayPaymentId, railOpts.x402Payment);
               const recovered = await this.recoverReplayedJob(c, {
-                requestId: err.detail.replayPaymentId,
+                requestId: replayPaymentId,
+                legacyPaymentId,
                 fingerprint,
                 callerPubkey: authPubkey,
               });
@@ -3967,9 +3974,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 });
                 if (drawRecovered) return drawRecovered;
               }
-              if (publicRequestClaimResult && err.detail.replayPaymentId) {
+              if (publicRequestClaimResult && replayPaymentId) {
                 const recoveredPayment = await this.recoverProcessedPaymentAcceptance({
-                  paymentId: err.detail.replayPaymentId,
+                  paymentId: replayPaymentId,
+                  legacyPaymentId,
                   jobId: publicRequestClaimResult.jobId,
                   requiredMsats: priceMsats,
                 });
@@ -4243,10 +4251,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async recoverReplayedJob(
     c: Context<AppEnv>,
-    opts: { requestId?: string; fingerprint: string; callerPubkey?: string }
+    opts: { requestId?: string; legacyPaymentId?: string; fingerprint: string; callerPubkey?: string }
   ): Promise<Response | undefined> {
     if (!opts.requestId) return undefined;
-    const prior = await this.jobManager.store.findJobByPaymentTxHash(opts.requestId);
+    const store = this.jobManager.store;
+    const prior = await store.findJobByPaymentTxHash(opts.requestId) ??
+      (opts.legacyPaymentId ? await store.findJobByPaymentTxHash(opts.legacyPaymentId) : undefined);
     if (!prior) return undefined;
 
     const bodyMatches =
@@ -4349,6 +4359,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async recoverProcessedPaymentAcceptance(opts: {
     paymentId: string;
+    legacyPaymentId?: string;
     jobId: string;
     requiredMsats?: number;
   }): Promise<PaymentInfo | undefined> {
@@ -4358,7 +4369,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         dvmId: this.opts.dvmId,
         rail,
         paymentId: opts.paymentId,
-      });
+      }) ?? (rail === "x402" && opts.legacyPaymentId
+        ? await this.processedPayments.get({ dvmId: this.opts.dvmId, rail, paymentId: opts.legacyPaymentId })
+        : undefined);
       if (!marker) continue;
       if (marker.jobId !== opts.jobId) {
         diagnosticConsole.warn(
@@ -4416,8 +4429,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         {
           level: "request_acceptance_recovered",
           jobId: opts.expectedJobId,
-          creditId: opts.creditId,
-          drawId: opts.drawId,
+          creditId: x402FundingIdForDiagnostics(opts.creditId),
+          drawId: x402FundingIdForDiagnostics(opts.drawId),
           rail: payment.paymentRail,
         }
       );

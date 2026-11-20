@@ -2,6 +2,9 @@
 
 ## Upgrade details
 
+- New x402 fallback funding IDs use an opaque authorization digest if the facilitator confirms payment without a transaction hash. Existing funding IDs remain valid for replay and receipt recovery. Payer-limit errors omit the wallet address. The caller-facing settlement headers retain the optional `payer` for x402 compatibility.
+- Hosts that share a processed-payment store across fallback settlement workers should upgrade those workers together. Older workers only recognize the previous fallback IDs.
+
 The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refund changes are included in `0.11.0-rc.1`.
 
 - Add authenticated admin routes to list, retry, and write off hosted Tempo close reports, with exact native amounts and explicit refusal codes. New wire examples are in `protocol-fixtures/tempo-close-reports.json`. Existing direct write-off calls retain their boolean result; `includeDetails: true` additionally returns the amount forgone. The default list is an action queue; `all=1` exposes terminal history with per-row action flags and write-off details. Successful retries emit a catalogued audit event. Initialization adds a nullable write-off timestamp column; existing decision times remain unknown.
