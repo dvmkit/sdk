@@ -237,6 +237,8 @@ interface ChannelRecord {
    * same stamp until one lands.
    */
   unreconciledBalanceAt?: number;
+  /** A retained refund probe needs a fresh signing cursor before funding. */
+  refundProbeNeedsRefresh?: true;
   context?: BatchSettlementClientContext;
   metadata?: StoredX402ChannelMetadata;
 }
@@ -275,7 +277,9 @@ export async function withX402ChannelLock<T>(operation: () => Promise<T>): Promi
 /** File-backed implementation of upstream's `ClientChannelStorage` contract. */
 export class DvmX402ChannelStorage implements ClientChannelStorage {
   private nextBalanceProvenance: { provenance: X402UnobservedBalanceProvenance } | undefined;
-  private refundResidual: { id: string; residual: BatchSettlementClientContext } | undefined;
+  private refundResidual:
+    | { id: string; residual: BatchSettlementClientContext; source: "answer" | "probe" }
+    | undefined;
 
   get(key: string): Promise<BatchSettlementClientContext | undefined> {
     return fromSynchronousStore(() => loadFile().channels[canonicalChannelId(key)]?.context);
@@ -345,16 +349,24 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
   }
 
   /**
-   * Seed upstream's cooperative-refund probe without changing the acknowledged
-   * base. Records written before have only the upstream context, so
-   * `hold` adopts its acknowledged value rather than losing that base to the
-   * chain floor this seeds. The seed itself is a `channels()` read, so it is
-   * `observed` and settles the unreconciled question like any other.
+   * Set the signing cursor at the observed chain floor for a refund probe or
+   * its funding refresh. Keep the signed voucher evidence because the refund
+   * can leave escrow that the voucher can still claim. Preserve the separate
+   * acknowledged amount, including the legacy value in the previous context.
    */
-  setRefundProbe(key: string, context: BatchSettlementClientContext): Promise<void> {
+  setRefundProbe(key: string, amounts: BatchSettlementClientContext): Promise<void> {
     return fromSynchronousStore(() => {
-      writeContext(key, context, "observed", "hold");
+      const file = loadFile();
+      const id = canonicalChannelId(key);
+      const { refundProbeNeedsRefresh: _refresh, ...record } = file.channels[id] ?? {};
+      const context = { ...record.context, ...amounts };
+      file.channels[id] = channelRecordWithContext(record, context, "observed", "hold");
+      saveFile(file);
     });
+  }
+
+  refundProbeNeedsRefresh(key: string): boolean {
+    return loadFile().channels[canonicalChannelId(key)]?.refundProbeNeedsRefresh === true;
   }
 
   /**
@@ -383,15 +395,16 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
   }
 
   /**
-   * Turn upstream's next delete of `key` into a write of the escrow the DVM
-   * reported left after a cooperative refund. Upstream treats every refund it
-   * did not size itself as full and deletes the record, but a drain bounded by
-   * an outstanding voucher leaves money in the channel, and the record is what
-   * reports it. The figure is the DVM's, so the write is stamped unreconciled.
-   * Returns a cleanup for answers upstream rejects instead.
+   * Turn upstream's next delete of `key` into an unreconciled write. The
+   * figure can be a valid DVM residual or the pre-refund chain probe. The
+   * probe holds the acknowledged base and needs a refresh before funding.
    */
-  stageRefundResidual(key: string, residual: BatchSettlementClientContext): () => void {
-    const staged = { id: canonicalChannelId(key), residual };
+  stageRefundResidual(
+    key: string,
+    residual: BatchSettlementClientContext,
+    source: "answer" | "probe" = "answer"
+  ): () => void {
+    const staged = { id: canonicalChannelId(key), residual, source };
     this.refundResidual = staged;
     return () => {
       if (this.refundResidual === staged) this.refundResidual = undefined;
@@ -402,14 +415,23 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
     return fromSynchronousStore(() => {
       const file = loadFile();
       const id = canonicalChannelId(key);
-      const residual = this.refundResidual?.id === id ? this.refundResidual.residual : undefined;
+      const staged = this.refundResidual?.id === id ? this.refundResidual : undefined;
       this.refundResidual = undefined;
-      if (residual) {
-        const context = { ...(file.channels[id]?.context ?? {}), ...residual };
-        writeContext(key, context, "unreconciled", "advance");
+      const record = file.channels[id];
+      if (staged) {
+        const context = { ...record?.context, ...staged.residual };
+        const fromProbe = staged.source === "probe";
+        const next = channelRecordWithContext(
+          record ?? {},
+          context,
+          "unreconciled",
+          fromProbe ? "hold" : "advance"
+        );
+        if (fromProbe) next.refundProbeNeedsRefresh = true;
+        file.channels[id] = next;
+        saveFile(file);
         return;
       }
-      const record = file.channels[id];
       if (!record) return;
       if (record.metadata) file.channels[id] = { metadata: record.metadata };
       else {

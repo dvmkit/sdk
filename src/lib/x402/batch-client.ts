@@ -9,6 +9,7 @@ import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402
 import { BATCH_SETTLEMENT_ADDRESS, type ClientEvmSigner, toClientEvmSigner } from "@x402/evm";
 import {
   BatchSettlementEvmScheme,
+  type BatchSettlementClientContext,
   computeChannelId,
   processPaymentResponse,
   readChannelBalanceAndTotalClaimed,
@@ -64,7 +65,7 @@ export async function createX402BatchPayment(args: {
   depositMicro: number;
 }): Promise<X402BatchPayment> {
   const accepted = selectBatchRequirement(args.paymentRequired, args.wallet.network);
-  const { scheme } = createScheme(args.wallet, args.depositMicro);
+  const { scheme, signer } = createScheme(args.wallet, args.depositMicro);
   const config = scheme.buildChannelConfig(accepted) as StoredX402ChannelConfig;
   const channelId = computeChannelId(config, accepted.network);
   assertNoRivalVoucher(channelId, args.creditId);
@@ -72,6 +73,7 @@ export async function createX402BatchPayment(args: {
   // or a voucher, and how large — a projection inflated by a refusal sizes the
   // top-up short.
   await reconcileLapsedRefusals(args.wallet, channelId);
+  await refreshRetainedRefundProbe(storageForScheme(scheme), signer, channelId);
   const created = await scheme.createPaymentPayload(2, accepted, {
     extensions: args.paymentRequired.extensions,
   });
@@ -474,6 +476,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
   assertRecordedChannel(recorded, channelId);
   const journalled = listPendingX402FundingsForChannel(channelId);
   let atRiskMicro: bigint;
+  let refundProbe: BatchSettlementClientContext;
   // Only the chain read in this block can be broken by the endpoint; what
   // follows it is arithmetic and a local write, where naming the RPC scoping
   // would read as an explanation for a failure it had no part in.
@@ -502,9 +505,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
     // USDC amount. An unreadable authorization puts the whole balance at risk.
     atRiskMicro = (reserved > balance ? balance : reserved) - totalClaimed;
     const storage = new DvmX402ChannelStorage();
-    const previous = (await storage.get(channelId)) ?? {};
-    await storage.setRefundProbe(channelId, {
-      ...previous,
+    refundProbe = {
       balance: balance.toString(),
       totalClaimed: totalClaimed.toString(),
       // Seed the first voucher at the contract's floor purely so upstream's
@@ -519,7 +520,8 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       // the very hazard the report exists to expose. It is information for the
       // caller, never a larger signature or a gate on the drain.
       chargedCumulativeAmount: totalClaimed.toString(),
-    });
+    };
+    await storage.setRefundProbe(channelId, refundProbe);
   } catch (err) {
     throw x402RefundError(err, { network, rpc, endpointInPath: readingChain });
   }
@@ -538,7 +540,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
   // retries the refund once after a recoverable 402.
   let dvmRefusal: DvmError | undefined;
   const responseStorage = storageForScheme(scheme);
-  let clearResponseProvenance: (() => void) | undefined;
+  let clearRefundAnswer: (() => void) | undefined;
   let probePending = true;
   const adaptedFetch: typeof fetch = async (_input, init) => {
     const payment = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? undefined;
@@ -557,11 +559,15 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       // superseded refusal as the reason would name a state the DVM has since
       // moved past.
       dvmRefusal = undefined;
-      responseHeader = boundHeaderToChannel(result.x402PaymentResponse, channelId);
-      clearResponseProvenance?.();
-      clearResponseProvenance = responseHeader
-        ? stageRefundAnswer(responseStorage, channelId, responseHeader)
-        : undefined;
+      clearRefundAnswer?.();
+      const answer = stageRefundAnswer(
+        responseStorage,
+        channelId,
+        result.x402PaymentResponse,
+        refundProbe
+      );
+      responseHeader = answer.header;
+      clearRefundAnswer = answer.clear;
       return new Response(JSON.stringify(result), {
         status: 200,
         headers: {
@@ -611,7 +617,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       throw dvmRefusal ?? x402RefundError(err, { network, rpc, endpointInPath: true });
     }
   } finally {
-    clearResponseProvenance?.();
+    clearRefundAnswer?.();
   }
   // Not a live branch: upstream resolves only after a post the DVM answered,
   // and the catch above rethrows when there wasn't one. It stays as the
@@ -701,8 +707,9 @@ async function applyX402BatchResponse(
   // An answer whose channel state is for another channel, or out of bounds,
   // acknowledges nothing this payment can stand on: upstream would still add
   // the deposit, so it is not handed over at all.
-  if (settleChannelState(decoded.extra, signed.channelId).kind === "dropped") return;
-  const response = withSignedCharge(boundToChannel(decoded, signed.channelId), signed);
+  const bound = settleChannelState(decoded.extra, signed.channelId);
+  if (bound.kind === "dropped") return;
+  const response = withSignedCharge(withBoundChannelState(decoded, bound), signed);
   // Upstream adds a deposit to the stored balance on its own arithmetic and
   // leaves a voucher's balance alone; neither is a chain observation.
   const clearProvenance = storage.stageNextUnobservedBalanceProvenance(
@@ -764,72 +771,58 @@ function withSignedCharge<T extends { extra?: Record<string, unknown> }>(
 }
 
 /**
- * Keep an answer's channel state only when it is for `channelId` and within
- * bounds. Upstream keys channel records by the answer's own `channelId`, so a
- * DVM naming another channel, or sending an amount past uint256, would
- * otherwise rewrite or delete that channel's record. With no expected channel
- * the state is dropped.
+ * Forward only validated channel state. Any accompanying charge belongs to
+ * the same state and upstream validates it against the request amount.
  */
-function boundToChannel<T extends { extra?: Record<string, unknown> }>(response: T, channelId: string | undefined): T {
-  const bound =
-    channelId === undefined
-      ? isRecord(response.extra) && response.extra.channelState !== undefined
-        ? ({ kind: "dropped" } as const)
-        : ({ kind: "absent" } as const)
-      : settleChannelState(response.extra, channelId);
+function withBoundChannelState(
+  response: ReturnType<typeof decodePaymentResponseHeader>,
+  bound: ReturnType<typeof settleChannelState>
+): ReturnType<typeof decodePaymentResponseHeader> {
   if (bound.kind === "absent") return response;
   const { extra: _dropped, ...rest } = response;
-  if (bound.kind === "dropped") return rest as T;
-  // Upstream validates the charge against the request amount itself.
+  if (bound.kind === "dropped") return rest;
   const charged = response.extra?.chargedAmount;
   return {
     ...rest,
     extra: { channelState: bound.state, ...(charged !== undefined ? { chargedAmount: charged } : {}) },
-  } as unknown as T;
+  };
 }
 
-function boundHeaderToChannel(header: string | undefined, channelId: string): string | undefined {
-  if (header === undefined) return undefined;
+/**
+ * A successful refund can only leave a projection. Use a valid positive
+ * residual when supplied, or retain the pre-refund chain probe if the DVM's
+ * state failed validation. An absent state or zero balance allows retirement.
+ */
+function stageRefundAnswer(
+  storage: DvmX402ChannelStorage,
+  channelId: string,
+  header: string | undefined,
+  refundProbe: BatchSettlementClientContext
+): { header?: string; clear?: () => void } {
+  if (header === undefined) return {};
   let response: ReturnType<typeof decodePaymentResponseHeader>;
   try {
     response = decodePaymentResponseHeader(header);
   } catch {
     // Upstream refuses an undecodable header itself, with its own error.
-    return header;
+    return { header };
   }
-  return encodePaymentResponseHeader(boundToChannel(response, channelId));
-}
-
-/**
- * What a refund answer leaves on record: the DVM's figures, as an older x402
- * client applied them. A positive remaining balance keeps the record; none, or
- * no channel state, lets upstream delete it.
- */
-function stageRefundAnswer(
-  storage: DvmX402ChannelStorage,
-  channelId: string,
-  responseHeader: string
-): () => void {
+  const bound = settleChannelState(response.extra, channelId);
+  const sanitizedHeader = encodePaymentResponseHeader(withBoundChannelState(response, bound));
   const clearProvenance = storage.stageNextUnobservedBalanceProvenance("unreconciled");
-  let state: Record<string, unknown> | undefined;
-  try {
-    const extra = decodePaymentResponseHeader(responseHeader).extra;
-    state = isRecord(extra?.channelState) ? extra.channelState : undefined;
-  } catch {
-    // Upstream refuses an undecodable header itself, with its own error.
+  let clearResidual: (() => void) | undefined;
+  if (bound.kind === "dropped") {
+    clearResidual = storage.stageRefundResidual(channelId, refundProbe, "probe");
+  } else if (bound.kind === "kept" && BigInt(bound.state.balance ?? "0") > 0n) {
+    const { channelId: _channelId, ...residual } = bound.state;
+    clearResidual = storage.stageRefundResidual(channelId, residual);
   }
-  const balance = typeof state?.balance === "string" ? state.balance : undefined;
-  if (!state || balance === undefined || BigInt(balance) <= 0n) return clearProvenance;
-  const clearResidual = storage.stageRefundResidual(channelId, {
-    balance,
-    ...(typeof state.chargedCumulativeAmount === "string"
-      ? { chargedCumulativeAmount: state.chargedCumulativeAmount }
-      : {}),
-    ...(typeof state.totalClaimed === "string" ? { totalClaimed: state.totalClaimed } : {}),
-  });
-  return () => {
-    clearProvenance();
-    clearResidual();
+  return {
+    header: sanitizedHeader,
+    clear: () => {
+      clearProvenance();
+      clearResidual?.();
+    },
   };
 }
 
@@ -837,6 +830,31 @@ function storageForScheme(scheme: BatchSettlementEvmScheme): DvmX402ChannelStora
   const storage = schemeStorage.get(scheme);
   if (!storage) throw new Error("x402 batch scheme has no dvmkit channel storage");
   return storage;
+}
+
+async function refreshRetainedRefundProbe(
+  storage: DvmX402ChannelStorage,
+  signer: ClientEvmSigner,
+  channelId: `0x${string}`
+): Promise<void> {
+  // A balance report can reconcile the balance alone. Funding also needs the
+  // signing cursor refreshed because upstream only recovers missing contexts.
+  if (!storage.refundProbeNeedsRefresh(channelId)) return;
+  const [balance, totalClaimed] = await readChannelBalanceAndTotalClaimed(signer, channelId).catch((err) => {
+    const cause = redactUrlsInText(err instanceof Error ? err.message : String(err));
+    throw new DvmError(
+      "x402_rpc_error",
+      `Reading the x402 channel after a cooperative refund failed: ${cause}`,
+      "Restore access to the channel's RPC endpoint and retry funding.",
+      { channel_id: channelId }
+    );
+  });
+  const claimed = totalClaimed.toString();
+  await storage.setRefundProbe(channelId, {
+    balance: balance.toString(),
+    totalClaimed: claimed,
+    chargedCumulativeAmount: claimed,
+  });
 }
 
 /**

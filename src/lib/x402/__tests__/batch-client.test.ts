@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  decodePaymentResponseHeader,
   decodePaymentSignatureHeader,
   encodePaymentResponseHeader,
   encodePaymentSignatureHeader,
@@ -1002,6 +1003,8 @@ describe("x402 batch client", () => {
       type: "refund",
       voucher: { channelId, maxClaimableAmount: "120000" },
     });
+    await expect(new store.DvmX402ChannelStorage().get(channelId)).resolves.toBeUndefined();
+    expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeUndefined();
   });
 
   // viem writes its own `URL:` line into the message, and
@@ -1375,7 +1378,7 @@ describe("x402 batch client", () => {
   // The outstanding voucher is already signed and never expires, so
   // refusing revokes nothing. Proceed at the acknowledged base and report the
   // whole ordinary stuck-funding exposure instead.
-  it("drains when an outstanding voucher puts the whole channel balance at risk", async () => {
+  it("retires a zero-balance channel after refunding with the whole balance at risk", async () => {
     const { channelId, network, key, account, required, journal } = await refundFixture();
     journal({ maxClaimableMicro: "200000" });
     viemClientMock.create.mockReturnValue({
@@ -1414,16 +1417,182 @@ describe("x402 batch client", () => {
       type: "refund",
       voucher: { channelId, maxClaimableAmount: "0" },
     });
+    const store = await import("../channel-store");
+    await expect(new store.DvmX402ChannelStorage().get(channelId)).resolves.toBeUndefined();
+    expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeUndefined();
   });
 
-  it("leaves another channel's record alone when a refund answer names that channel", async () => {
-    const { network, key, account, required } = await refundFixture();
+  it.each(["balance", "totalClaimed", "chargedCumulativeAmount"] as const)(
+    "keeps the refund probe as unreconciled when the answer's %s exceeds uint256",
+    async (field) => {
+      const { channelId, network, key, account, required, record } = await refundFixture();
+      record();
+      const store = await import("../channel-store");
+      const storage = new store.DvmX402ChannelStorage();
+      await storage.set(channelId, { balance: "250000", chargedCumulativeAmount: "5000" });
+      viemClientMock.create.mockReturnValue({
+        readContract: vi.fn().mockResolvedValue([200_000n, 10_000n]),
+      });
+      const { DvmError } = await import("../../errors");
+      const post = vi
+        .fn()
+        .mockRejectedValueOnce(
+          new DvmError("payment_required", "Refund approval required.", undefined, {
+            x402_payment_required: required,
+          })
+        )
+        .mockResolvedValueOnce(
+          refundResponse({
+            channelId,
+            network,
+            payer: account.address,
+            amount: "190000",
+            channelAmounts: { [field]: (2n ** 256n).toString() },
+          })
+        );
+      const batch = await import("../batch-client");
+
+      const outcome = await batch.refundX402BatchChannel({
+        wallet: { privateKey: key, address: account.address, network },
+        endpoint: "https://dvm.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        depositMicro: 200_000,
+        post,
+      });
+
+      expect(decodePaymentResponseHeader(outcome.paymentResponse).extra?.channelState).toBeUndefined();
+      await expect(storage.get(channelId)).resolves.toMatchObject({
+        balance: "200000",
+        totalClaimed: "10000",
+        chargedCumulativeAmount: "10000",
+      });
+      expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeGreaterThan(0);
+      await expect(storage.getAcknowledgedCumulativeAmount(channelId)).resolves.toBe("5000");
+    }
+  );
+
+  it("signs a fresh deposit after a full refund with rejected channel state", async () => {
+    const { channelId, network, key, account, required, record } = await refundFixture();
+    record();
+    const readContract = vi.fn().mockResolvedValue([200_000n, 10_000n]);
+    viemClientMock.create.mockReturnValue({ readContract });
+    const { DvmError } = await import("../../errors");
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: required,
+        })
+      )
+      .mockResolvedValueOnce(
+        refundResponse({
+          channelId,
+          network,
+          payer: account.address,
+          amount: "190000",
+          channelAmounts: { balance: (2n ** 256n).toString() },
+        })
+      );
+    const batch = await import("../batch-client");
+    const store = await import("../channel-store");
+    const storage = new store.DvmX402ChannelStorage();
+    const args = {
+      wallet: { privateKey: key, address: account.address, network },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+    };
+    await batch.refundX402BatchChannel({ ...args, post });
+    const paymentRequired = { ...required, accepts: [{ ...required.accepts[0], amount: "5000" }] };
+
+    readContract.mockRejectedValueOnce(new Error("RPC unavailable"));
+    await expect(batch.createX402BatchPayment({ ...args, paymentRequired })).rejects.toMatchObject({
+      code: "x402_rpc_error",
+    });
+    await expect(storage.get(channelId)).resolves.toMatchObject({ balance: "200000" });
+    expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeGreaterThan(0);
+
+    readContract.mockResolvedValue([0n, 0n]);
+    const signed = await batch.createX402BatchPayment({ ...args, paymentRequired });
+    expect(decodePaymentSignatureHeader(signed.paymentHeader).payload).toMatchObject({
+      type: "deposit",
+      deposit: { amount: "200000" },
+      voucher: { channelId, maxClaimableAmount: "5000" },
+    });
+    expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeUndefined();
+  });
+
+  it("preserves signed claim authority when funding refreshes a partial refund", async () => {
+    const { channelId, network, key, account, required, record } = await refundFixture();
+    record();
+    const { signVoucher } = await import("@x402/evm/batch-settlement/client");
+    const voucher = await signVoucher(account, channelId, "200000", network);
+    const store = await import("../channel-store");
+    const storage = new store.DvmX402ChannelStorage();
+    await storage.set(channelId, {
+      balance: "500000",
+      totalClaimed: "10000",
+      chargedCumulativeAmount: "160000",
+      signedMaxClaimable: "200000",
+      signature: voucher.signature,
+    });
+    const readContract = vi.fn().mockResolvedValue([500_000n, 10_000n]);
+    viemClientMock.create.mockReturnValue({ readContract });
+    const { DvmError } = await import("../../errors");
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: required,
+        })
+      )
+      .mockResolvedValueOnce(
+        refundResponse({
+          channelId,
+          network,
+          payer: account.address,
+          amount: "300000",
+          channelAmounts: { balance: (2n ** 256n).toString() },
+        })
+      );
+    const batch = await import("../batch-client");
+    const args = {
+      wallet: { privateKey: key, address: account.address, network },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+    };
+    await batch.refundX402BatchChannel({ ...args, post });
+
+    readContract.mockResolvedValue([200_000n, 20_000n]);
+    const paymentRequired = { ...required, accepts: [{ ...required.accepts[0], amount: "5000" }] };
+    const signed = await batch.createX402BatchPayment({ ...args, paymentRequired });
+    expect(decodePaymentSignatureHeader(signed.paymentHeader).payload).toMatchObject({
+      type: "voucher",
+      voucher: { channelId, maxClaimableAmount: "25000" },
+    });
+    await expect(storage.get(channelId)).resolves.toMatchObject({
+      balance: "200000",
+      totalClaimed: "20000",
+      chargedCumulativeAmount: "20000",
+      signedMaxClaimable: "200000",
+      signature: voucher.signature,
+    });
+    await expect(storage.getAcknowledgedCumulativeAmount(channelId)).resolves.toBe("160000");
+  });
+
+  it("keeps both records when a refund answer names another channel", async () => {
+    const { channelId, network, key, account, required } = await refundFixture();
     viemClientMock.create.mockReturnValue({
       readContract: vi.fn().mockResolvedValue([200_000n, 0n]),
     });
     const other = `0x${"ee".repeat(32)}` as const;
     const store = await import("../channel-store");
-    await new store.DvmX402ChannelStorage().set(other, { balance: "9000", chargedCumulativeAmount: "100" });
+    const storage = new store.DvmX402ChannelStorage();
+    await storage.set(other, { balance: "9000", chargedCumulativeAmount: "100" });
     const { DvmError } = await import("../../errors");
     const post = vi
       .fn()
@@ -1446,11 +1615,17 @@ describe("x402 batch client", () => {
       post,
     });
 
-    // A zero balance after refund deletes the named channel's record upstream.
-    await expect(new store.DvmX402ChannelStorage().get(other)).resolves.toMatchObject({
+    await expect(storage.get(other)).resolves.toMatchObject({
       balance: "9000",
       chargedCumulativeAmount: "100",
     });
+    expect(store.x402ChannelBalanceUnreconciledAt(other)).toBeUndefined();
+    await expect(storage.get(channelId)).resolves.toMatchObject({
+      balance: "200000",
+      totalClaimed: "0",
+      chargedCumulativeAmount: "0",
+    });
+    expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeGreaterThan(0);
   });
 
   // The mirror of the timed exit's rule: an authorization nobody can read is
@@ -1556,6 +1731,11 @@ describe("x402 batch client", () => {
     expect(outcome).toMatchObject({ result: drained, atRiskMicro: 200_000n });
     expect(outcome.pendingFundings).toHaveLength(1);
     const store = await import("../channel-store");
+    await expect(new store.DvmX402ChannelStorage().get(channelId)).resolves.toMatchObject({
+      balance: "200000",
+      totalClaimed: "0",
+      chargedCumulativeAmount: "0",
+    });
     expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeGreaterThan(0);
     // The exposure is reported but deliberately does not raise the voucher
     // signed here, which would mint the DVM fresh claim authority up to a cap
@@ -2241,6 +2421,7 @@ function refundResponse(args: {
   network: `${string}:${string}`;
   payer: `0x${string}`;
   amount: string;
+  channelAmounts?: { balance?: string; totalClaimed?: string; chargedCumulativeAmount?: string };
 }) {
   return {
     op: "drain" as const,
@@ -2269,6 +2450,7 @@ function refundResponse(args: {
           chargedCumulativeAmount: "0",
           withdrawRequestedAt: 0,
           refundNonce: "1",
+          ...args.channelAmounts,
         },
       },
     }),
