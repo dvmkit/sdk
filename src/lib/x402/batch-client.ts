@@ -65,7 +65,7 @@ export async function createX402BatchPayment(args: {
   depositMicro: number;
 }): Promise<X402BatchPayment> {
   const accepted = selectBatchRequirement(args.paymentRequired, args.wallet.network);
-  const { scheme } = createScheme(args.wallet, args.depositMicro);
+  const { scheme, signer } = createScheme(args.wallet, args.depositMicro);
   const config = scheme.buildChannelConfig(accepted) as StoredX402ChannelConfig;
   const channelId = computeChannelId(config, accepted.network);
   assertNoRivalVoucher(channelId, args.creditId);
@@ -73,6 +73,7 @@ export async function createX402BatchPayment(args: {
   // or a voucher, and how large — a projection inflated by a refusal sizes the
   // top-up short.
   await reconcileLapsedRefusals(args.wallet, channelId);
+  await refreshRetainedRefundProbe(storageForScheme(scheme), signer, channelId);
   const created = await scheme.createPaymentPayload(2, accepted, {
     extensions: args.paymentRequired.extensions,
   });
@@ -812,7 +813,7 @@ function stageRefundAnswer(
   const clearProvenance = storage.stageNextUnobservedBalanceProvenance("unreconciled");
   let clearResidual: (() => void) | undefined;
   if (bound.kind === "dropped") {
-    clearResidual = storage.stageRefundResidual(channelId, refundProbe, "hold");
+    clearResidual = storage.stageRefundResidual(channelId, refundProbe, "probe");
   } else if (bound.kind === "kept" && BigInt(bound.state.balance ?? "0") > 0n) {
     const { channelId: _channelId, ...residual } = bound.state;
     clearResidual = storage.stageRefundResidual(channelId, residual);
@@ -830,6 +831,31 @@ function storageForScheme(scheme: BatchSettlementEvmScheme): DvmX402ChannelStora
   const storage = schemeStorage.get(scheme);
   if (!storage) throw new Error("x402 batch scheme has no dvmkit channel storage");
   return storage;
+}
+
+async function refreshRetainedRefundProbe(
+  storage: DvmX402ChannelStorage,
+  signer: ClientEvmSigner,
+  channelId: `0x${string}`
+): Promise<void> {
+  // A balance report can reconcile the balance alone. Funding also needs the
+  // signing cursor refreshed because upstream only recovers missing contexts.
+  if (!storage.refundProbeNeedsRefresh(channelId)) return;
+  const [balance, totalClaimed] = await readChannelBalanceAndTotalClaimed(signer, channelId).catch((err) => {
+    const cause = redactUrlsInText(err instanceof Error ? err.message : String(err));
+    throw new DvmError(
+      "x402_rpc_error",
+      `Reading the x402 channel after a cooperative refund failed: ${cause}`,
+      "Restore access to the channel's RPC endpoint and retry funding.",
+      { channel_id: channelId }
+    );
+  });
+  const claimed = totalClaimed.toString();
+  await storage.setRefundProbe(channelId, {
+    balance: balance.toString(),
+    totalClaimed: claimed,
+    chargedCumulativeAmount: claimed,
+  });
 }
 
 /**

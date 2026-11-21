@@ -237,6 +237,8 @@ interface ChannelRecord {
    * same stamp until one lands.
    */
   unreconciledBalanceAt?: number;
+  /** A retained refund probe needs a fresh signing cursor before funding. */
+  refundProbeNeedsRefresh?: true;
   context?: BatchSettlementClientContext;
   metadata?: StoredX402ChannelMetadata;
 }
@@ -276,7 +278,7 @@ export async function withX402ChannelLock<T>(operation: () => Promise<T>): Promi
 export class DvmX402ChannelStorage implements ClientChannelStorage {
   private nextBalanceProvenance: { provenance: X402UnobservedBalanceProvenance } | undefined;
   private refundResidual:
-    | { id: string; residual: BatchSettlementClientContext; base: X402AcknowledgedBase }
+    | { id: string; residual: BatchSettlementClientContext; source: "answer" | "probe" }
     | undefined;
 
   get(key: string): Promise<BatchSettlementClientContext | undefined> {
@@ -347,16 +349,22 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
   }
 
   /**
-   * Seed upstream's cooperative-refund probe without changing the acknowledged
-   * base. Records written before have only the upstream context, so
-   * `hold` adopts its acknowledged value rather than losing that base to the
-   * chain floor this seeds. The seed itself is a `channels()` read, so it is
-   * `observed` and settles the unreconciled question like any other.
+   * Set the signing cursor at the observed chain floor for a refund probe or
+   * its funding refresh. Preserve the separate acknowledged amount, including
+   * the legacy value stored only in the previous context.
    */
   setRefundProbe(key: string, context: BatchSettlementClientContext): Promise<void> {
     return fromSynchronousStore(() => {
-      writeContext(key, context, "observed", "hold");
+      const file = loadFile();
+      const id = canonicalChannelId(key);
+      const { refundProbeNeedsRefresh: _refresh, ...record } = file.channels[id] ?? {};
+      file.channels[id] = channelRecordWithContext(record, context, "observed", "hold");
+      saveFile(file);
     });
+  }
+
+  refundProbeNeedsRefresh(key: string): boolean {
+    return loadFile().channels[canonicalChannelId(key)]?.refundProbeNeedsRefresh === true;
   }
 
   /**
@@ -386,16 +394,15 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
 
   /**
    * Turn upstream's next delete of `key` into an unreconciled write. The
-   * figure can be a valid DVM residual or the pre-refund chain probe. Pass
-   * `hold` for the probe, whose cumulative amount is only the chain floor.
-   * Clean up the staged write if upstream rejects the answer.
+   * figure can be a valid DVM residual or the pre-refund chain probe. The
+   * probe holds the acknowledged base and needs a refresh before funding.
    */
   stageRefundResidual(
     key: string,
     residual: BatchSettlementClientContext,
-    base: X402AcknowledgedBase = "advance"
+    source: "answer" | "probe" = "answer"
   ): () => void {
-    const staged = { id: canonicalChannelId(key), residual, base };
+    const staged = { id: canonicalChannelId(key), residual, source };
     this.refundResidual = staged;
     return () => {
       if (this.refundResidual === staged) this.refundResidual = undefined;
@@ -411,7 +418,15 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
       const record = file.channels[id];
       if (staged) {
         const context = { ...record?.context, ...staged.residual };
-        file.channels[id] = channelRecordWithContext(record ?? {}, context, "unreconciled", staged.base);
+        const fromProbe = staged.source === "probe";
+        const next = channelRecordWithContext(
+          record ?? {},
+          context,
+          "unreconciled",
+          fromProbe ? "hold" : "advance"
+        );
+        if (fromProbe) next.refundProbeNeedsRefresh = true;
+        file.channels[id] = next;
         saveFile(file);
         return;
       }
