@@ -13,5 +13,10 @@
     "id": "settlementUnconfirmed",
     "epoch": 1,
     "sha256": "24d5d1057e7eab28dc53b5f5f25c7984c21bf341f61dd84b4fc72e425cd42290"
+  },
+  {
+    "id": "chargeSettledOnRetry",
+    "epoch": 1,
+    "sha256": "345f19c67fa5588e8e7a90c17c6c3a1bb9241fd6d8f3abb28bfe920f2313c89f"
   }
 ]

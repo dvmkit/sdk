@@ -44,7 +44,10 @@ export interface PostgresTempoChargeStoreOpts {
  * `Date.now()`. Values here are deliberately opaque JSON: mppx writes a number
  * for a replay marker and a `SponsorBudget.State` object for the fee-sponsor
  * budget, which shares this store unprefixed so aggregate in-flight fee
- * exposure is sponsor-wide rather than per-process.
+ * exposure is sponsor-wide rather than per-process. The SDK adds a third kind
+ * of row under `dvmkit:tempo-charge:pending:`: an object describing a charge
+ * whose broadcast ended unconfirmed, which a later presentation of the same
+ * credential claims with one `update` before booking the payment.
  *
  * **Retention is ours — mppx has no TTL at any layer of `Store`.** Every row
  * carries an `expires_at` refreshed on each write, swept by a sampled in-line
@@ -55,7 +58,10 @@ export interface PostgresTempoChargeStoreOpts {
  * nonce (plus a thirty-second lease while it is `prepared`), so an hour-idle
  * budget row holds only reservations `SponsorBudget.reconcile` would release on
  * sight. Sweeping such a row is equivalent to reconciling it, and the next
- * reservation recreates it.
+ * reservation recreates it. A pending-charge row is only reachable while its
+ * challenge is unexpired, because mppx refuses an expired credential before
+ * the row is read; sweeping it later returns that charge to the plain
+ * already-used refusal.
  *
  * `expires_at` is a GC marker only: reads do not filter on it, so protection
  * lapses when a row is swept and never before.

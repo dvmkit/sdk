@@ -13,7 +13,7 @@ import {
   type DiagnosticIdentityAuthority,
 } from "../projection";
 import type { SpanRow } from "../types";
-import { epoch1, facilitatorTruncation, settlementUnconfirmed } from "./fixtures/projection/epoch-1";
+import { chargeSettledOnRetry, epoch1, facilitatorTruncation, settlementUnconfirmed } from "./fixtures/projection/epoch-1";
 import pins from "./fixtures/projection/batch-pins.json";
 
 // Older snapshots predate lists that a later release may add.
@@ -29,6 +29,7 @@ const corpus = {
   initial: { epoch: 1, ...epoch1 },
   facilitatorTruncation: { epoch: 1, ...facilitatorTruncation },
   settlementUnconfirmed: { epoch: 1, ...settlementUnconfirmed },
+  chargeSettledOnRetry: { epoch: 1, ...chargeSettledOnRetry },
 } satisfies Record<string, CorpusBatch>;
 
 function projectAdmittedRow(row: SpanRow) {

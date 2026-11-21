@@ -104,12 +104,19 @@ function originalHold(job: JobRecord): UpfrontPayment | undefined {
 
 ## Tempo charges whose broadcast is not confirmed
 
-A Tempo charge credential carries a signed transaction that the DVM broadcasts. When the broadcast call fails after the transaction was sent, the DVM reads the chain for up to five seconds. A transfer the chain proves is accepted as usual. Otherwise the request is refused with `402 payment_invalid`, `rail: "tempo"`, and one of two `reason` values a client should branch on before reading the fresh challenge the response also carries:
+A Tempo charge credential carries a signed transaction that the DVM broadcasts. When the broadcast call fails after the transaction was sent, the DVM reads the chain for up to five seconds. A transfer the chain proves is accepted as usual. Otherwise the request is refused with `402 payment_invalid`, `rail: "tempo"`, and one of two `reason` values a client should branch on before reading the fresh challenge the response also carries. `retryable` then says whether resending the same credential can still settle the payment:
 
 - `reason: "not_broadcast"`, `retryable: true`: the node reported the transaction neither mined nor pooled, and the DVM released its hash. Resend the same request with the same credential. Do not build a new payment: the signed transaction is still valid, so a second one could settle alongside it. The release needs the DVM's charge replay store; a DVM without one answers `settlement_unconfirmed` instead.
-- `reason: "settlement_unconfirmed"`, `retryable: false`: the chain gave no verdict in time. The transfer may still settle, and its hash stays consumed, so resending the credential is refused. Do not pay again; the payment needs reconciliation by the service operator.
+- `reason: "settlement_unconfirmed"`, `retryable: true`, with `retry_after_ms`: the chain gave no verdict in time, and the DVM recorded the charge as pending. Wait `retry_after_ms` milliseconds, then resend the same request with the same credential. Do not pay again and do not answer the fresh challenge. The DVM does not send the transaction again. It reads the chain and answers one of:
+  - the payment is accepted, once, when the receipt proves the transfer. A second resend, or one racing the first, is refused as already used.
+  - the same `settlement_unconfirmed` body while the outcome is still unknown. Keep retrying until the challenge expires.
+  - `not_broadcast` when the node no longer knows the transaction and it could still be included. The hash is released, so the next resend broadcasts it.
+  - the ordinary `payment_invalid` refusal with no `reason` when the transaction was included but is not this payment, or when it was never included and the chain is past its `validBefore`. In the second case nothing was paid and none can be, so pay the fresh challenge.
+- `reason: "settlement_unconfirmed"`, `retryable: false`: as above, but no pending record exists, because the DVM has no charge replay store or could not write to it. Resending the credential is refused. Do not pay again; the payment needs reconciliation by the service operator.
 
-Mid-job Tempo payments return the same two bodies. A transaction the chain shows as reverted, or as paying another recipient, amount, token or challenge, keeps the ordinary `payment_invalid` refusal with no `reason`.
+The pending record lives in the DVM's charge replay store for that store's retention, one hour by default. A credential resent after its challenge expires is refused as expired before the record is read.
+
+Mid-job Tempo payments return the same bodies. A transaction the chain shows as reverted, or as paying another recipient, amount, token or challenge, keeps the ordinary `payment_invalid` refusal with no `reason`.
 
 ## Cashu lock requirements
 

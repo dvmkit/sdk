@@ -79,7 +79,9 @@ import type { TopUpCapUnenforcedReason } from "./job-store";
 import { UNCAPPABLE_ASK_TOTAL } from "./job-store";
 import type { ArrivalBalanceReason, BalanceLanding as LedgerBalanceLanding } from "./payment-arrival";
 import type { MintHealthTracker } from "./mint-health-tracker";
-import { challengeMeta, type MppxServer, readTempoChargePayer, TempoChargeSettlementError } from "./mpp-setup";
+import {
+  challengeMeta, type MppxServer, readTempoChargePayer, TEMPO_CHARGE_RETRY_AFTER_MS, TempoChargeSettlementError,
+} from "./mpp-setup";
 import {
   fiatMicroToMethodAmount,
   methodNativeAmountFromDecimal,
@@ -6283,6 +6285,15 @@ function x402NotOfferedResult(currency?: string): PaymentResult {
  */
 function tempoCredentialRefusalBody(err: unknown): Record<string, unknown> {
   const outcome = err instanceof TempoChargeSettlementError ? err.outcome : undefined;
+  if (outcome === "unconfirmed" && err instanceof TempoChargeSettlementError && err.resumable) {
+    return paymentErrorBody("payment_invalid", {
+      message: "Tempo payment is not confirmed yet",
+      display: "The payment was sent but isn't confirmed yet, so the request wasn't accepted. The payment may still settle.",
+      hint: "Wait retry_after_ms, then resend this exact request with the same payment credential. Do not pay again, and do not answer the new challenge in this response.",
+      retryable: true,
+      extra: { rail: "tempo", reason: "settlement_unconfirmed", retry_after_ms: TEMPO_CHARGE_RETRY_AFTER_MS },
+    });
+  }
   if (outcome === "unconfirmed") {
     return paymentErrorBody("payment_invalid", {
       message: "Tempo payment could not be confirmed",
