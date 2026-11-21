@@ -1206,7 +1206,8 @@
     "ledger_refused",
     "settlement_failed",
     "unsupported_version",
-    "unknown"
+    "unknown",
+    "settlement_unconfirmed"
   ],
   "paymentFailureStages": [
     "verifier",

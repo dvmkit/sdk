@@ -79,7 +79,7 @@ import type { TopUpCapUnenforcedReason } from "./job-store";
 import { UNCAPPABLE_ASK_TOTAL } from "./job-store";
 import type { ArrivalBalanceReason, BalanceLanding as LedgerBalanceLanding } from "./payment-arrival";
 import type { MintHealthTracker } from "./mint-health-tracker";
-import { challengeMeta, type MppxServer, readTempoChargePayer } from "./mpp-setup";
+import { challengeMeta, type MppxServer, readTempoChargePayer, TempoChargeSettlementError } from "./mpp-setup";
 import {
   fiatMicroToMethodAmount,
   methodNativeAmountFromDecimal,
@@ -1963,9 +1963,7 @@ async function verifyUpfrontPaymentInScope(
       return {
         paidMsats: 0,
         error: {
-          body: paymentErrorBody("payment_invalid", {
-            message: "MPP credential verification failed",
-          }),
+          body: tempoCredentialRefusalBody(err),
           status: 402,
           mppChallenges,
           ...(x402Requirements && { x402Requirements }),
@@ -3412,14 +3410,7 @@ async function verifyIncomingPaymentInScope(
       };
     } catch (err) {
       logCredentialRejected("tempo", "mid-job", err);
-      return {
-        error: {
-          body: paymentErrorBody("payment_invalid", {
-            message: "MPP credential verification failed",
-          }),
-          status: 402,
-        },
-      };
+      return { error: { body: tempoCredentialRefusalBody(err), status: 402 } };
     }
   }
 
@@ -6284,6 +6275,32 @@ function x402NotOfferedResult(currency?: string): PaymentResult {
     paidMsats: 0,
     error: x402NotOfferedPaymentError(currency),
   };
+}
+
+/**
+ * The stock `payment_invalid` copy says nothing was charged and to pay again.
+ * Neither holds once a charge transaction may have reached the chain.
+ */
+function tempoCredentialRefusalBody(err: unknown): Record<string, unknown> {
+  const outcome = err instanceof TempoChargeSettlementError ? err.outcome : undefined;
+  if (outcome === "unconfirmed") {
+    return paymentErrorBody("payment_invalid", {
+      message: "Tempo payment could not be confirmed",
+      display: "The payment was sent but couldn't be confirmed, so the request wasn't accepted. The payment may still settle.",
+      hint: "Do not pay again, and do not answer the new challenge in this response. Ask the service operator to reconcile this payment.",
+      extra: { rail: "tempo", reason: "settlement_unconfirmed" },
+    });
+  }
+  if (outcome === "not_broadcast") {
+    return paymentErrorBody("payment_invalid", {
+      message: "Tempo payment was not broadcast",
+      display: "The payment wasn't accepted by the network when it was sent, so the request wasn't accepted.",
+      hint: "Resend this exact request with the same payment credential. Do not build a new payment from the new challenge in this response: the transaction already signed is still valid and could settle as well.",
+      retryable: true,
+      extra: { rail: "tempo", reason: "not_broadcast" },
+    });
+  }
+  return paymentErrorBody("payment_invalid", { message: "MPP credential verification failed" });
 }
 
 // Fixed categories identify failures without reflecting upstream exception text.

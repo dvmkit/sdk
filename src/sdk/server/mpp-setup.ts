@@ -7,7 +7,7 @@ import { Credential as MppCredential, Errors as MppxErrors, PaymentRequest } fro
 import { Mppx, tempo } from "mppx/server";
 import { Session as TempoSession } from "mppx/tempo";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
-import { parseEventLogs, type Account, type Client, type Hex, type RpcTransactionReceipt } from "viem";
+import { keccak256, parseEventLogs, type Account, type Client, type Hex, type RpcTransactionReceipt } from "viem";
 import { Abis } from "viem/tempo";
 
 import { loggers } from "../../observability/loggers";
@@ -486,6 +486,87 @@ export function challengeMeta(challenge: Challenge.Challenge): Record<string, st
   return challenge.meta;
 }
 
+// --- Settling a charge from the chain after its broadcast call failed ---
+// A node can include a transaction and still fail the synchronous send, so a
+// thrown broadcast says nothing about whether the caller paid.
+
+/** Total time one failed broadcast may spend asking the chain what happened. */
+export const TEMPO_CHARGE_RECOVERY_BUDGET_MS = 5_000;
+const POLL_INTERVAL_MS = 500;
+/** Held back from polling so the final not-broadcast check still fits the budget. */
+const ABSENCE_CHECK_RESERVE_MS = 1_000;
+
+/**
+ * - `unconfirmed`: the chain gave no verdict in time. The transaction may still
+ *   settle, so its hash stays consumed.
+ * - `not_broadcast`: the node reports the transaction neither mined nor pooled,
+ *   and its hash was released for a retry of the same credential.
+ * - `rejected_on_chain`: the transaction was included but is not this payment.
+ */
+export type TempoChargeSettlementOutcome = "unconfirmed" | "not_broadcast" | "rejected_on_chain";
+
+export class TempoChargeSettlementError extends Error {
+  override readonly name = "TempoChargeSettlementError";
+
+  constructor(readonly outcome: TempoChargeSettlementOutcome, cause: unknown) {
+    super(`Tempo charge broadcast failed: ${outcome}`, { cause });
+  }
+}
+
+/**
+ * - `settled`: the receipt passed every payment assertion.
+ * - `rejected`: a receipt exists and failed them.
+ * - `missing`: the node answered that it has no receipt.
+ * - `unavailable`: the node gave no usable answer.
+ */
+type TempoChargeProbe = "settled" | "rejected" | "missing" | "unavailable";
+
+interface TempoChargeRecovery {
+  /** The broadcast failure, kept as the cause of any refusal. */
+  cause: unknown;
+  probe(): Promise<TempoChargeProbe>;
+  /** Resolves `true` only when the node knows the transaction neither as mined nor as pooled. */
+  isUnknownToNode(): Promise<boolean>;
+  /** Frees the consumed transaction hash. Absent when the replay store is out of reach. */
+  release?: () => Promise<void>;
+}
+
+/** Resolves once the payment is proven on chain; otherwise throws a {@link TempoChargeSettlementError}. */
+async function settleFailedTempoBroadcast(recovery: TempoChargeRecovery): Promise<void> {
+  const deadline = Date.now() + TEMPO_CHARGE_RECOVERY_BUDGET_MS;
+  const pollUntil = deadline - ABSENCE_CHECK_RESERVE_MS;
+  let last: TempoChargeProbe = "unavailable";
+  for (;;) {
+    last = await before(pollUntil, recovery.probe()) ?? "unavailable";
+    if (last === "settled") return;
+    if (last === "rejected") throw new TempoChargeSettlementError("rejected_on_chain", recovery.cause);
+    if (Date.now() + POLL_INTERVAL_MS >= pollUntil) break;
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+  if (last === "missing" && recovery.release &&
+      await before(deadline, recovery.isUnknownToNode()) === true) {
+    // A delete that finishes after the deadline only frees a hash the caller was told is consumed.
+    const released = await before(deadline, recovery.release().then(() => true));
+    throw new TempoChargeSettlementError(released === true ? "not_broadcast" : "unconfirmed", recovery.cause);
+  }
+  throw new TempoChargeSettlementError("unconfirmed", recovery.cause);
+}
+
+/** The settled value, or `undefined` when the work fails or outlives the deadline. */
+async function before<T>(deadline: number, work: Promise<T>): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const tempoChargePayers = new WeakMap<Receipt.Receipt, () => string | undefined>();
 
 export function readTempoChargePayer(receipt: Receipt.Receipt): string | undefined {
@@ -498,8 +579,14 @@ export function readTempoChargePayer(receipt: Receipt.Receipt): string | undefin
 }
 
 function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
-  type ReceiptCapture = { receipt?: RpcTransactionReceipt };
-  const pushReceipts = new AsyncLocalStorage<ReceiptCapture>();
+  type RpcCapture = {
+    /** `null` is the node's own answer that it holds no receipt. */
+    receipt?: RpcTransactionReceipt | null;
+    /** Raw transaction handed to the node, recorded before the send can fail. */
+    sent?: Hex;
+    client?: Client;
+  };
+  const captures = new AsyncLocalStorage<RpcCapture>();
   const charge = tempo.charge({
     ...options,
     async getClient({ chainId }) {
@@ -509,14 +596,20 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
       const chain = chainId === TEMPO_MODERATO_CHAIN_ID ? tempoModerato : mainnet;
       if (chainId && chainId !== chain.id) throw new Error("Unsupported Tempo charge chain");
       const client = createClient({ chain, transport: http() });
-      const push = pushReceipts.getStore();
-      if (!push) return client;
+      const capture = captures.getStore();
+      if (!capture) return client;
+      capture.client = client;
       // Capture the receipts mppx already reads during validation and broadcast.
       const request = new Proxy(client.request, {
         async apply(target, receiver, args) {
+          const call = args[0] as { method?: unknown; params?: unknown } | undefined;
+          const raw = Array.isArray(call?.params) ? call.params[0] as unknown : undefined;
+          if (call?.method === "eth_sendRawTransactionSync" && typeof raw === "string") {
+            capture.sent = raw as Hex;
+          }
           const result: unknown = await Reflect.apply(target, receiver, args);
-          if (args[0]?.method === "eth_getTransactionReceipt") {
-            push.receipt = result as RpcTransactionReceipt;
+          if (call?.method === "eth_getTransactionReceipt") {
+            capture.receipt = result as RpcTransactionReceipt | null;
           }
           return result;
         },
@@ -526,24 +619,96 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
   });
   const validate = charge.validate!;
   const broadcast = charge.broadcast!;
-  const preflights = new WeakMap<object, ReceiptCapture & { validation: Awaited<ReturnType<typeof validate>> }>();
+  type Validation = Awaited<ReturnType<typeof validate>>;
+  type BroadcastInput = Parameters<typeof broadcast>[0];
+  const preflights = new WeakMap<object, { validation: Validation; receipt?: RpcTransactionReceipt | null }>();
+
+  /**
+   * Asks the chain whether a transaction whose send threw was included anyway.
+   * Returns nothing when the failure happened before any send, where mppx has
+   * already released the hash itself.
+   */
+  const recoverFromChain = (
+    input: BroadcastInput, validation: Validation | undefined, failed: RpcCapture, cause: unknown
+  ): TempoChargeRecovery | undefined => {
+    const { payload } = input.credential;
+    const details = validation?.details as { mode?: unknown; sender?: unknown } | undefined;
+    const chainId = (validation?.request as { methodDetails?: { chainId?: unknown } } | undefined)
+      ?.methodDetails?.chainId;
+    if (payload.type !== "transaction" || !failed.sent || !failed.client || details?.mode !== "pull" ||
+        typeof details.sender !== "string" || !HEX_ADDRESS_RE.test(details.sender) ||
+        typeof chainId !== "number") return undefined;
+    const { client } = failed;
+    // A fee payer's co-signature changes the hash, so the chain knows the
+    // transaction by the bytes that were sent, not the bytes the caller signed.
+    const hash = keccak256(failed.sent);
+    // mppx's hash-credential validation applies the same token, recipient,
+    // amount, sender and memo assertions as its own confirmed-broadcast path.
+    const proof = {
+      ...input,
+      credential: {
+        ...input.credential,
+        payload: { type: "hash" as const, hash },
+        source: `did:pkh:eip155:${chainId}:${details.sender}`,
+      },
+    } as BroadcastInput;
+    const store = options?.store;
+    return {
+      cause,
+      probe: async () => {
+        const read: RpcCapture = {};
+        try {
+          await captures.run(read, () => validate(proof));
+        } catch {
+          if (read.receipt === undefined) return "unavailable";
+          return read.receipt === null ? "missing" : "rejected";
+        }
+        // mppx trusts the node to answer for the hash it was asked about.
+        return read.receipt?.status === "0x1" && read.receipt.transactionHash?.toLowerCase() === hash
+          ? "settled" : "unavailable";
+      },
+      isUnknownToNode: async () => await client.request(
+        { method: "eth_getTransactionByHash", params: [hash] }, { retryCount: 0 }
+      ) === null,
+      // mppx keeps its default in-memory replay store private, so only a
+      // configured store can give the hash back.
+      ...(store && { release: async () => {
+        const hashes = new Set([hash, keccak256(payload.signature as Hex)]);
+        await Promise.all([...hashes].map((used) => store.delete(`mppx:charge:${used}`)));
+      } }),
+    };
+  };
+
   return {
     ...charge,
     validate: async (input: Parameters<typeof validate>[0]) => {
-      const capture: ReceiptCapture = {};
+      const capture: RpcCapture = {};
       const validation = input.credential.payload.type === "hash"
-        ? await pushReceipts.run(capture, () => validate(input))
+        ? await captures.run(capture, () => validate(input))
         : await validate(input);
       preflights.set(input.credential, { validation, receipt: capture.receipt });
       return validation;
     },
-    broadcast: async (input: Parameters<typeof broadcast>[0]) => {
+    broadcast: async (input: BroadcastInput) => {
       const preflight = preflights.get(input.credential);
       preflights.delete(input.credential);
-      const push: ReceiptCapture = {};
-      const receipt = input.credential.payload.type === "hash"
-        ? await pushReceipts.run(push, () => broadcast(input))
-        : await broadcast(input);
+      const push: RpcCapture = {};
+      let receipt: Awaited<ReturnType<typeof broadcast>>;
+      try {
+        receipt = input.credential.payload.type === "proof"
+          ? await broadcast(input)
+          : await captures.run(push, () => broadcast(input));
+      } catch (error) {
+        const recovery = recoverFromChain(input, preflight?.validation, push, error);
+        if (!recovery) throw error;
+        await settleFailedTempoBroadcast(recovery);
+        receipt = {
+          method: "tempo",
+          status: "success",
+          timestamp: new Date().toISOString(),
+          reference: keccak256(push.sent!),
+        };
+      }
       if (preflight && receipt && typeof receipt === "object") {
         tempoChargePayers.set(receipt, () => {
           const { validation } = preflight;
