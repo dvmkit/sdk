@@ -42,7 +42,12 @@ import type { LockPubkeyState, LockPubkeyStateLoader } from "./lock-pubkey-store
 import { toLockPubkey } from "./lock-pubkey-store";
 import type { TempoCloseReconciled, TransactionalPayoutHook } from "./payout-reporter";
 import type { ReceiptIssuer } from "./receipt-issuer";
-import type { CreditDepositEnqueue, CreditDrainEnqueue, CreditDrawRefundEnqueue } from "./revenue-reporter";
+import type {
+  CreditDepositEnqueue,
+  CreditDepositPayload,
+  CreditDrainEnqueue,
+  CreditDrawRefundEnqueue,
+} from "./revenue-reporter";
 import type { TempoCloseEvidence, TempoDrainRail } from "./tempo-drain-leg";
 import { classifyTempoCloseEvidence, completeTempoChannelDrain } from "./tempo-drain-leg";
 import {
@@ -87,6 +92,12 @@ export interface InstallAdminCreditRoutesOpts {
   creditCurrency: () => string;
   /** Reporter-owned deposit outbox write, run inside the reconcile transaction. */
   enqueueCreditDeposit?: CreditDepositEnqueue;
+  /**
+   * Builder-owned deposit report for a reconcile when the hosted outbox is absent. Called once
+   * after the ledger commit for a newly credited invoice, never for a replay or a refusal.
+   * Delivery is best-effort: the implementation owns error handling and retries.
+   */
+  reportCreditDeposit?: (payload: CreditDepositPayload) => void;
   /** Reporter-owned drain outbox write, run inside the mark-sent transaction. */
   enqueueCreditDrain?: CreditDrainEnqueue;
   /** A configured hosted platform requires an actual transactional drain reporter for new bookings. */
@@ -1102,6 +1113,22 @@ async function handleReconcileInvoice(
   };
   // Preserve the longer life in the report as well as on the target credit.
   const expiryMs = Math.max(nowMs + opts.creditTtlMs(), existing?.expiryMs ?? 0);
+  const deposit: CreditDepositPayload = {
+    dvmId: opts.dvmId,
+    creditId: targetCreditId,
+    callerPubkey: invoice.callerPubkey,
+    // The payment hash keys the deposit, as it does on the ordinary
+    // settlement path — so a redelivered report collides rather
+    // than double-counts.
+    fundingId: invoice.paymentHash,
+    rail: "lightning",
+    paidMsats: invoice.amountMsats,
+    amountMicro: invoice.amountMicro,
+    creditCurrency: invoice.currency,
+    fundedAt: settledAtMs ?? invoice.settledAt ?? nowMs,
+    expiryMs,
+    repaired: true,
+  };
   try {
     const result = await opts.ledger.reconcileBlockedInvoice({
       paymentHash,
@@ -1110,30 +1137,19 @@ async function handleReconcileInvoice(
       basis,
       ...(settledAtMs === undefined ? {} : { settledAtMs }),
       ...(opts.enqueueCreditDeposit
-        ? {
-            depositOutbox: {
-              enqueue: opts.enqueueCreditDeposit,
-              payload: {
-                dvmId: opts.dvmId,
-                creditId: targetCreditId,
-                callerPubkey: invoice.callerPubkey,
-                // The payment hash keys the deposit, as it does on the ordinary
-                // settlement path — so a redelivered report collides rather
-                // than double-counts.
-                fundingId: invoice.paymentHash,
-                rail: "lightning",
-                paidMsats: invoice.amountMsats,
-                amountMicro: invoice.amountMicro,
-                creditCurrency: invoice.currency,
-                fundedAt: settledAtMs ?? invoice.settledAt ?? nowMs,
-                expiryMs,
-                repaired: true,
-              },
-            },
-          }
+        ? { depositOutbox: { enqueue: opts.enqueueCreditDeposit, payload: deposit } }
         : {}),
       nowMs,
     });
+    // The hosted outbox, when present, already carries the report inside the transaction.
+    // The override runs only after commit, and a replay never reaches it again.
+    if (!opts.enqueueCreditDeposit && opts.reportCreditDeposit && !result.replayed) {
+      try {
+        opts.reportCreditDeposit({ ...deposit, expiryMs: result.credit?.expiryMs ?? expiryMs });
+      } catch {
+        diagnosticConsole.error(`[${targetCreditId}] Deposit reporting failed`);
+      }
+    }
     return c.json({
       status: "reconciled",
       payment_hash: paymentHash,
