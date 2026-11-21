@@ -271,6 +271,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       x402Only?: boolean;
       devMode?: boolean;
       reportDeposits?: boolean;
+      onCreditFunded?: (payload: CreditDepositPayload) => void | Promise<void>;
       lockPubkey?: string;
       /** Mount the server under this path, as a host does for `mount(..., { prefix })`. */
       prefix?: string;
@@ -334,6 +335,7 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       creditLedger: ledger,
       processedPayments: payments,
       ...(opts.reportDeposits && { platformUrl: PLATFORM_URL, platformToken: "test-token" }),
+      onCreditFunded: opts.onCreditFunded,
       ...(opts.lockPubkey && { lockPubkey: opts.lockPubkey }),
       x402,
       fxFetcher: {
@@ -420,6 +422,37 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
       }),
     ]);
     expect(facilitatorCalls).toEqual(["/verify", "/settle"]);
+  }, 20_000);
+
+  it("delivers a deferred deposit through the override once its credit is visible", async () => {
+    const creditReads: ReturnType<CreditLedger["get"]>[] = [];
+    const onCreditFunded = vi.fn((payload: CreditDepositPayload) => {
+      creditReads.push(ledger.get(payload.creditId));
+    });
+    let attemptsBeforeCompletion: number | undefined;
+    const url = await start({
+      reportDeposits: true,
+      onCreditFunded,
+      behaviour: async (ctx) => {
+        attemptsBeforeCompletion = onCreditFunded.mock.calls.length;
+        ctx.complete("done");
+      },
+    });
+    const payment = authorization(60);
+    const response = await call(url, { payment });
+    expect(response.status).toBe(fixture.charged.status);
+    const { job_id: jobId } = await response.json() as { job_id: string };
+    expect(attemptsBeforeCompletion).toBe(0);
+    expect(await intentStatus(jobId)).toMatchObject({ status: "complete" });
+    await call(url, { payment });
+    expect(onCreditFunded.mock.calls).toEqual([[
+      expect.objectContaining({
+        dvmId: DVM_ID, creditId: expect.stringMatching(/^x402d:/), fundingId: TRANSACTION,
+        rail: "x402", amountMicro: PRICE_MICRO, callerPubkey, instrument, payerAddress,
+      }),
+    ]]);
+    expect(await creditReads[0]).toMatchObject({ callerPubkey, currency: "usd" });
+    expect(await pendingDeposits()).toEqual([]);
   }, 20_000);
 
   it("answers a failed handler with 500, never settles, and releases the authorization", async () => {
@@ -626,9 +659,8 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     ]);
   }, 20_000);
 
-  it("reports the stored authorizer once when an operator repairs a settled intent", async () => {
+  async function seedSettledIntent(url: string): Promise<string> {
     const signingKey = ADMIN_KEY.slice(2);
-    const url = await start({ reportDeposits: true, lockPubkey: ADMIN_KEY });
     await initLockPubkeyTable(pool);
     await seedLockPubkeyState(pool, DVM_ID, ADMIN_KEY);
     const intentId = "ab".repeat(32);
@@ -661,16 +693,26 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     await settlements.recordOutcome({
       dvmId: DVM_ID, intentId, status: "settled", outcome: "success", transaction: TRANSACTION,
     });
+    return intentId;
+  }
+
+  function reconcile(url: string, intentId: string): Promise<Response> {
     const path = "/admin/credit/reconcile-x402-exact-settlement";
+    return fetch(`${url}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: adminHeader("POST", path, Date.now(), ADMIN_SECRET, DVM_ID),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ settlement_intent_id: intentId }),
+    });
+  }
+
+  it("reports the stored authorizer once when an operator repairs a settled intent", async () => {
+    const url = await start({ reportDeposits: true, lockPubkey: ADMIN_KEY });
+    const intentId = await seedSettledIntent(url);
     for (const replayed of [false, true]) {
-      const response = await fetch(`${url}${path}`, {
-        method: "POST",
-        headers: {
-          Authorization: adminHeader("POST", path, Date.now(), ADMIN_SECRET, DVM_ID),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ settlement_intent_id: intentId }),
-      });
+      const response = await reconcile(url, intentId);
       expect(response.status).toBe(200);
       const body = await response.json();
       expect(body).toMatchObject({ status: "reconciled", replayed });
@@ -678,8 +720,42 @@ describe.skipIf(!RUN)("x402 route (Postgres)", () => {
     }
     expect(facilitatorCalls).toEqual([]);
     expect(await pendingDeposits()).toEqual([
-      expect.objectContaining({ fundingId: TRANSACTION, callerPubkey: signingKey, instrument, payerAddress }),
+      expect.objectContaining({ fundingId: TRANSACTION, callerPubkey: ADMIN_KEY.slice(2), instrument, payerAddress }),
     ]);
+  });
+
+  it("dispatches a repaired deposit after commit and skips delivery on replay after rejection", async () => {
+    const creditReads: ReturnType<CreditLedger["get"]>[] = [];
+    const onCreditFunded = vi.fn((payload: CreditDepositPayload) => {
+      creditReads.push(ledger.get(payload.creditId));
+      return Promise.reject(new Error("deposit receiver unavailable"));
+    });
+    const url = await start({ reportDeposits: true, lockPubkey: ADMIN_KEY, onCreditFunded });
+    const intentId = await seedSettledIntent(url);
+    const creditId = `imp:x402:${TRANSACTION}`;
+
+    // Fail the final state update after the ledger leg has staged its deposit.
+    await pool.query(`ALTER TABLE x402_exact_settlement_intents
+      ADD CONSTRAINT block_completion CHECK (status <> 'complete')`);
+    expect((await reconcile(url, intentId)).status).toBe(500);
+    expect(onCreditFunded).not.toHaveBeenCalled();
+    expect(await ledger.get(creditId)).toBeUndefined();
+    expect(await settlements.get(DVM_ID, intentId)).toMatchObject({ status: "settled" });
+    await pool.query("ALTER TABLE x402_exact_settlement_intents DROP CONSTRAINT block_completion");
+
+    for (const replayed of [false, true]) {
+      const response = await reconcile(url, intentId);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ status: "reconciled", settlement_status: "complete", replayed });
+    }
+    expect(onCreditFunded.mock.calls).toEqual([[
+      expect.objectContaining({
+        dvmId: DVM_ID, creditId, fundingId: TRANSACTION, rail: "x402", amountMicro: PRICE_MICRO,
+        callerPubkey: ADMIN_KEY.slice(2), instrument, payerAddress,
+      }),
+    ]]);
+    expect(await creditReads[0]).toMatchObject({ callerPubkey: ADMIN_KEY.slice(2), currency: "usd" });
+    expect(await pendingDeposits()).toEqual([]);
   });
 
   it.each(["", "/feed"])("names the capability's own address under the mount %j as the resource, whatever query or encoding the request carried", async (prefix) => {
