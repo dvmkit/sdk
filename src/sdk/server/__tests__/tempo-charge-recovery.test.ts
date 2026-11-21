@@ -230,6 +230,17 @@ describe("a Tempo charge whose broadcast call fails", () => {
     expect(calls.eth_sendRawTransactionSync).toBe(2);
   });
 
+  it("ends unconfirmed at the budget when the replay store never finishes releasing the hash", async () => {
+    const store = Store.memory();
+    const mpp = tempoServer({ ...store, delete: () => new Promise<never>(() => undefined) });
+    const charge = await signedCharge(mpp);
+    fakeRpc({ send: "throws", receipt: "none", pooled: false }, charge);
+
+    const refused = await outcomeOf(broadcast(mpp, charge));
+
+    expect(refused).toEqual({ error: expect.objectContaining({ outcome: "unconfirmed" }) });
+  });
+
   it("keeps the hash consumed when no replay store is configured to release it from", async () => {
     const mpp = tempoServer(null);
     const charge = await signedCharge(mpp);
@@ -289,9 +300,10 @@ describe("a Tempo charge whose broadcast call fails", () => {
 
       expect(refused).toEqual({ value: expect.objectContaining({ paidMsats: 0 }) });
       if (!("value" in refused)) return;
-      expect(refused.value.error).toMatchObject({ status: 402, body: { error: "payment_invalid", retryable: false } });
-      expect(String(refused.value.error?.body.hint)).toMatch(/^Do not pay again/);
-      expect(String(refused.value.error?.body.display)).not.toMatch(/Nothing was charged/);
+      expect(refused.value.error).toMatchObject({
+        status: 402,
+        body: { error: "payment_invalid", retryable: false, rail: "tempo", reason: "settlement_unconfirmed" },
+      });
       expect(warn.mock.calls.map(([row]) => JSON.parse(String(row)) as unknown)).toContainEqual(
         expect.objectContaining({
           event: "tempo_credential_rejected",
@@ -310,7 +322,10 @@ describe("a Tempo charge whose broadcast call fails", () => {
 
       const refused = await outcomeOf(upfront(mpp, charge.credential));
       expect(refused).toEqual({ value: expect.objectContaining({
-        paidMsats: 0, error: expect.objectContaining({ body: expect.objectContaining({ retryable: true }) }),
+        paidMsats: 0,
+        error: expect.objectContaining({
+          body: expect.objectContaining({ retryable: true, rail: "tempo", reason: "not_broadcast" }),
+        }),
       }) });
 
       chain.send = "confirms";

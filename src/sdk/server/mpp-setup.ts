@@ -545,12 +545,9 @@ async function settleFailedTempoBroadcast(recovery: TempoChargeRecovery): Promis
   }
   if (last === "missing" && recovery.release &&
       await before(deadline, recovery.isUnknownToNode()) === true) {
-    try {
-      await recovery.release();
-    } catch {
-      throw new TempoChargeSettlementError("unconfirmed", recovery.cause);
-    }
-    throw new TempoChargeSettlementError("not_broadcast", recovery.cause);
+    // A delete that finishes after the deadline only frees a hash the caller was told is consumed.
+    const released = await before(deadline, recovery.release().then(() => true));
+    throw new TempoChargeSettlementError(released === true ? "not_broadcast" : "unconfirmed", recovery.cause);
   }
   throw new TempoChargeSettlementError("unconfirmed", recovery.cause);
 }

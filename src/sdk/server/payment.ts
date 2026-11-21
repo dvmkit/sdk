@@ -6287,15 +6287,17 @@ function tempoCredentialRefusalBody(err: unknown): Record<string, unknown> {
     return paymentErrorBody("payment_invalid", {
       message: "Tempo payment could not be confirmed",
       display: "The payment was sent but couldn't be confirmed, so the request wasn't accepted. The payment may still settle.",
-      hint: "Do not pay again. Ask the service operator to reconcile this payment.",
+      hint: "Do not pay again, and do not answer the new challenge in this response. Ask the service operator to reconcile this payment.",
+      extra: { rail: "tempo", reason: "settlement_unconfirmed" },
     });
   }
   if (outcome === "not_broadcast") {
     return paymentErrorBody("payment_invalid", {
       message: "Tempo payment was not broadcast",
-      display: "The payment didn't reach the network, so the request wasn't accepted. Nothing was charged.",
-      hint: "Retry with the same payment — it has not been used.",
+      display: "The payment wasn't accepted by the network when it was sent, so the request wasn't accepted.",
+      hint: "Resend this exact request with the same payment credential. Do not build a new payment from the new challenge in this response: the transaction already signed is still valid and could settle as well.",
       retryable: true,
+      extra: { rail: "tempo", reason: "not_broadcast" },
     });
   }
   return paymentErrorBody("payment_invalid", { message: "MPP credential verification failed" });
