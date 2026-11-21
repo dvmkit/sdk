@@ -385,8 +385,11 @@ describe("a Tempo charge presented again after its broadcast ended unconfirmed",
   });
 
   /** A first presentation whose send failed and whose receipt lookup gave no verdict. */
-  async function unconfirmedCharge(options: Parameters<typeof signedCharge>[1] = {}, fault: Partial<Chain> = {}) {
-    const mpp = tempoServer();
+  async function unconfirmedCharge(
+    options: Parameters<typeof signedCharge>[1] = {}, fault: Partial<Chain> = {},
+    store: Store.AtomicStore = Store.memory()
+  ) {
+    const mpp = tempoServer(store);
     const charge = await signedCharge(mpp, options);
     const chain: Chain = { send: "throws", receipt: "error", pooled: true, ...fault };
     const calls = fakeRpc(chain, charge);
@@ -527,6 +530,55 @@ describe("a Tempo charge presented again after its broadcast ended unconfirmed",
       error: expect.objectContaining({ outcome: "rejected_on_chain" }),
     });
     expect(await outcomeOf(broadcast(mpp, charge))).toHaveProperty("value");
+  });
+
+  it.each([
+    ["claim", "update"],
+    ["pending-record read", "get"],
+  ] as const)("stays resumable when the store fails the %s once, then settles on the next presentation", async (_, op) => {
+    const memory = Store.memory();
+    let failing = false;
+    const store: Store.AtomicStore = {
+      ...memory,
+      [op]: (...args: unknown[]) => failing
+        ? Promise.reject(new Error("connection reset"))
+        : (memory[op] as (...all: unknown[]) => Promise<unknown>)(...args),
+    };
+    const { mpp, charge, chain, calls } = await unconfirmedCharge({}, {}, store);
+
+    chain.receipt = "found";
+    failing = true;
+    expect(await outcomeOf(broadcast(mpp, charge))).toEqual({
+      error: expect.objectContaining({ outcome: "unconfirmed", resumable: true }),
+    });
+
+    failing = false;
+    expect(await outcomeOf(broadcast(mpp, charge))).toEqual({
+      value: expect.objectContaining({ status: "success", reference: charge.hash }),
+    });
+    expect(calls.eth_sendRawTransactionSync).toBe(1);
+  });
+
+  it("asks a first presentation to come back when the pending-record read never answers", async () => {
+    const memory = Store.memory();
+    let stalled = true;
+    const mpp = tempoServer({
+      ...memory,
+      get: (key: string) => stalled ? new Promise<never>(() => undefined) : memory.get(key),
+    } as Store.AtomicStore);
+    const charge = await signedCharge(mpp);
+    const chain: Chain = { send: "confirms", receipt: "found", pooled: true };
+    const calls = fakeRpc(chain, charge);
+
+    expect(await outcomeOf(broadcast(mpp, charge))).toEqual({
+      error: expect.objectContaining({ outcome: "unconfirmed", resumable: true }),
+    });
+    expect(calls.eth_sendRawTransactionSync ?? 0).toBe(0);
+
+    stalled = false;
+    expect(await outcomeOf(broadcast(mpp, charge))).toEqual({
+      value: expect.objectContaining({ status: "success", reference: charge.hash }),
+    });
   });
 
   it("answers the non-resumable refusal when the pending record cannot be written in time", async () => {

@@ -114,7 +114,7 @@ A Tempo charge credential carries a signed transaction that the DVM broadcasts. 
   - the ordinary `payment_invalid` refusal with no `reason` when the transaction was included but is not this payment, or when it was never included and the chain is past its `validBefore`. In the second case nothing was paid and none can be, so pay the fresh challenge.
 - `reason: "settlement_unconfirmed"`, `retryable: false`: as above, but no pending record exists, because the DVM has no charge replay store or could not write to it. Resending the credential is refused. Do not pay again; the payment needs reconciliation by the service operator.
 
-The pending record lives in the DVM's charge replay store for that store's retention, one hour by default. A credential resent after its challenge expires is refused as expired before the record is read.
+The pending record lives in the DVM's charge replay store for that store's retention, one hour by default. A credential resent after its challenge expires is refused as expired before the record is read. If the store cannot be read, or fails while the settled charge is being claimed, the DVM answers the retryable `settlement_unconfirmed` refusal, so a store fault never tells the caller to pay again.
 
 Mid-job Tempo payments return the same bodies. A transaction the chain shows as reverted, or as paying another recipient, amount, token or challenge, keeps the ordinary `payment_invalid` refusal with no `reason`.
 

@@ -810,7 +810,16 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
       const capture: RpcCapture = {};
       const { payload } = input.credential;
       const pendingKey = store && payload.type === "transaction" ? pendingTempoChargeKey(payload.signature) : undefined;
-      const pending = store && pendingKey ? readPendingTempoCharge(await store.get(pendingKey)) : undefined;
+      let pending: PendingTempoCharge | undefined;
+      if (store && pendingKey) {
+        const stored = await before(
+          Date.now() + TEMPO_CHARGE_RECOVERY_BUDGET_MS, store.get(pendingKey).then((value: unknown) => ({ value }))
+        );
+        // A failed read cannot rule out a pending record, and the stock
+        // refusal would tell a caller whose transfer landed to pay again.
+        if (!stored) throw new TempoChargeSettlementError("unconfirmed", undefined, true);
+        pending = readPendingTempoCharge(stored.value);
+      }
       let validation: Validation;
       if (store && pendingKey && pending) {
         validation = await resumePending(input as BroadcastInput, store, pendingKey, pending);
@@ -833,7 +842,14 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
         // One atomic claim, so concurrent presentations cannot both book. A
         // crash between this claim and the booking strands the payment, and
         // the log line is what reconciles it.
-        if (!await takePending(store, resumed.key, resumed.pending)) {
+        // The claim is not raced against a timer: giving up on an update that
+        // then commits would remove the record with nothing booked.
+        const claimed = await takePending(store, resumed.key, resumed.pending).catch((cause: unknown) => {
+          // The receipt is proven and a failed update leaves the record
+          // claimable, so the caller is asked to present the credential again.
+          throw new TempoChargeSettlementError("unconfirmed", cause, true);
+        });
+        if (!claimed) {
           throw new MppxErrors.VerificationFailedError({ reason: "Transaction hash has already been used" });
         }
         diagnosticConsole.info({
