@@ -490,12 +490,16 @@ export interface SDKServerOpts {
   /** Advanced clear-on-recovery callback for clean job-retention passes. */
   onJobRetentionSweepRecovered?: JobManagerOpts["onJobRetentionSweepRecovered"];
   /**
-   * Advanced override for the hosted deposit reporter. With a DVM ID, the
-   * callback runs after funding commits, including deferred exact x402
-   * settlement and operator repair. The SDK makes one best-effort attempt per
-   * new deposit. A callback failure leaves the funding committed, and settlement
-   * retries skip delivery once the funding has committed. The integration owns
-   * durable delivery and recovery from process exits.
+   * Advanced override for the hosted deposit reporter.
+   *
+   * With a DVM ID, deferred exact x402 settlement and exact x402 operator
+   * repair make one best-effort callback attempt after each new deposit commits.
+   * A callback failure leaves the funding committed. Replaying a committed
+   * settlement skips delivery. The integration owns retries and recovery from
+   * process exits.
+   *
+   * Lightning invoice repair reports through the hosted outbox. Setting
+   * this override disables that report.
    */
   onCreditFunded?: (info: CreditDepositPayload) => void | Promise<void>;
   /**
