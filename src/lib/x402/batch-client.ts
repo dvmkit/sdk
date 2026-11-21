@@ -505,7 +505,6 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
     // USDC amount. An unreadable authorization puts the whole balance at risk.
     atRiskMicro = (reserved > balance ? balance : reserved) - totalClaimed;
     const storage = new DvmX402ChannelStorage();
-    const previous = (await storage.get(channelId)) ?? {};
     refundProbe = {
       balance: balance.toString(),
       totalClaimed: totalClaimed.toString(),
@@ -522,7 +521,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       // caller, never a larger signature or a gate on the drain.
       chargedCumulativeAmount: totalClaimed.toString(),
     };
-    await storage.setRefundProbe(channelId, { ...previous, ...refundProbe });
+    await storage.setRefundProbe(channelId, refundProbe);
   } catch (err) {
     throw x402RefundError(err, { network, rpc, endpointInPath: readingChain });
   }

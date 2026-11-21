@@ -1524,6 +1524,66 @@ describe("x402 batch client", () => {
     expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeUndefined();
   });
 
+  it("preserves signed claim authority when funding refreshes a partial refund", async () => {
+    const { channelId, network, key, account, required, record } = await refundFixture();
+    record();
+    const { signVoucher } = await import("@x402/evm/batch-settlement/client");
+    const voucher = await signVoucher(account, channelId, "200000", network);
+    const store = await import("../channel-store");
+    const storage = new store.DvmX402ChannelStorage();
+    await storage.set(channelId, {
+      balance: "500000",
+      totalClaimed: "10000",
+      chargedCumulativeAmount: "160000",
+      signedMaxClaimable: "200000",
+      signature: voucher.signature,
+    });
+    const readContract = vi.fn().mockResolvedValue([500_000n, 10_000n]);
+    viemClientMock.create.mockReturnValue({ readContract });
+    const { DvmError } = await import("../../errors");
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: required,
+        })
+      )
+      .mockResolvedValueOnce(
+        refundResponse({
+          channelId,
+          network,
+          payer: account.address,
+          amount: "300000",
+          channelAmounts: { balance: (2n ** 256n).toString() },
+        })
+      );
+    const batch = await import("../batch-client");
+    const args = {
+      wallet: { privateKey: key, address: account.address, network },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+    };
+    await batch.refundX402BatchChannel({ ...args, post });
+
+    readContract.mockResolvedValue([200_000n, 20_000n]);
+    const paymentRequired = { ...required, accepts: [{ ...required.accepts[0], amount: "5000" }] };
+    const signed = await batch.createX402BatchPayment({ ...args, paymentRequired });
+    expect(decodePaymentSignatureHeader(signed.paymentHeader).payload).toMatchObject({
+      type: "voucher",
+      voucher: { channelId, maxClaimableAmount: "25000" },
+    });
+    await expect(storage.get(channelId)).resolves.toMatchObject({
+      balance: "200000",
+      totalClaimed: "20000",
+      chargedCumulativeAmount: "20000",
+      signedMaxClaimable: "200000",
+      signature: voucher.signature,
+    });
+    await expect(storage.getAcknowledgedCumulativeAmount(channelId)).resolves.toBe("160000");
+  });
+
   it("keeps both records when a refund answer names another channel", async () => {
     const { channelId, network, key, account, required } = await refundFixture();
     viemClientMock.create.mockReturnValue({

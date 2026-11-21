@@ -350,14 +350,16 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
 
   /**
    * Set the signing cursor at the observed chain floor for a refund probe or
-   * its funding refresh. Preserve the separate acknowledged amount, including
-   * the legacy value stored only in the previous context.
+   * its funding refresh. Keep the signed voucher evidence because the refund
+   * can leave escrow that the voucher can still claim. Preserve the separate
+   * acknowledged amount, including the legacy value in the previous context.
    */
-  setRefundProbe(key: string, context: BatchSettlementClientContext): Promise<void> {
+  setRefundProbe(key: string, amounts: BatchSettlementClientContext): Promise<void> {
     return fromSynchronousStore(() => {
       const file = loadFile();
       const id = canonicalChannelId(key);
       const { refundProbeNeedsRefresh: _refresh, ...record } = file.channels[id] ?? {};
+      const context = { ...record.context, ...amounts };
       file.channels[id] = channelRecordWithContext(record, context, "observed", "hold");
       saveFile(file);
     });
