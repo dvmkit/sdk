@@ -492,14 +492,16 @@ export interface SDKServerOpts {
   /**
    * Advanced override for the hosted deposit reporter.
    *
-   * With a DVM ID, deferred exact x402 settlement and exact x402 operator
-   * repair make one best-effort callback attempt after each new deposit commits.
-   * A callback failure leaves the funding committed. Replaying a committed
-   * settlement skips delivery. The integration owns retries and recovery from
-   * process exits.
+   * With a DVM ID, deferred exact x402 settlement, exact x402 operator repair
+   * and Lightning invoice operator repair make one best-effort callback attempt
+   * after each new deposit commits. A callback failure leaves the funding
+   * committed. Replaying a committed settlement or repair skips delivery, even
+   * after a failed attempt. A refused repair delivers nothing. The integration
+   * owns retries and recovery from process exits.
    *
-   * Lightning invoice repair reports through the hosted outbox. Setting
-   * this override disables that report.
+   * Without this override, the hosted deposit outbox reports each deposit in
+   * the same transaction as the ledger write. Setting the override replaces
+   * that outbox report.
    */
   onCreditFunded?: (info: CreditDepositPayload) => void | Promise<void>;
   /**
@@ -1604,6 +1606,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         dvmId, store: this.jobManager.store, retentionDays: this.descriptor.jobRetentionDays,
         getLockPubkeyState: () => this.loadActiveLockPubkeyState(db, dvmId), nonceStore: this.adminCashuNonceStore,
       });
+      const onCreditFunded = this.opts.onCreditFunded;
       installAdminCreditRoutes(this.app, {
         db,
         dvmId,
@@ -1617,6 +1620,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         creditCurrency: () => this.creditCurrency(),
         enqueueCreditDrawRefund: this.opts.enqueueCreditDrawRefund,
         enqueueCreditDeposit: this.opts.enqueueCreditDeposit,
+        ...(onCreditFunded
+          ? {
+              reportCreditDeposit: (payload: CreditDepositPayload) =>
+                deliverCreditDeposit(onCreditFunded, payload),
+            }
+          : {}),
         enqueueCreditDrain: this.opts.enqueueCreditDrain,
         requireDrainReport: !!this.opts.platformUrl,
         lightningReceive: this.opts.lightningReceive,

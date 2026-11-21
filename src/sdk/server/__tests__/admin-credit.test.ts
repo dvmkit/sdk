@@ -153,6 +153,8 @@ function makeHarness(
 
     noLightning?: boolean;
     creditCurrency?: string;
+    /** Mirrors a server with `onCreditFunded`: no hosted outbox, post-commit hook instead. */
+    reportCreditDeposit?: Parameters<typeof installAdminCreditRoutes>[1]["reportCreditDeposit"];
 
     noX402?: boolean;
 
@@ -221,7 +223,9 @@ function makeHarness(
     receiptIssuer: new ReceiptIssuer({ secret: "77".repeat(32), dvm: "test", dvmId: DVM_ID }),
     creditTtlMs: () => CREDIT_TTL_MS,
     creditCurrency: () => opts.creditCurrency ?? "usd",
-    enqueueCreditDeposit: deposits as never,
+    ...(opts.reportCreditDeposit
+      ? { reportCreditDeposit: opts.reportCreditDeposit }
+      : { enqueueCreditDeposit: deposits as never }),
     enqueueCreditDrain: drains as never,
     ...(opts.noLightning ? {} : { lightningReceive: { lookupSettlement } as never }),
     ...(opts.noX402
@@ -1507,6 +1511,67 @@ describe("POST /admin/credit/reconcile-invoice", () => {
       settledAt: SETTLED_AT,
 
       blockedReason: "funding_replayed_on_cashu",
+    });
+  });
+
+  describe("with an onCreditFunded override", () => {
+    const body = { payment_hash: PAYMENT_HASH, credit_id: "c-target" };
+
+    it("reports a new repair once after the commit, and not through the outbox", async () => {
+      const reportCreditDeposit = vi.fn();
+      const { app, ledger, deposits } = makeHarness({ reportCreditDeposit });
+      await seedBlocked(ledger);
+      // The hook must run after the ledger commit: the credit already exists when it fires.
+      reportCreditDeposit.mockImplementation(async () => {
+        expect((await ledger.get("c-target"))?.balanceMicro).toBe(500_000);
+      });
+      const res = await call(app, "POST", "/admin/credit/reconcile-invoice", body);
+      expect(res.status).toBe(200);
+      expect(reportCreditDeposit).toHaveBeenCalledTimes(1);
+      expect(reportCreditDeposit.mock.calls[0]?.[0]).toMatchObject({
+        dvmId: DVM_ID,
+        creditId: "c-target",
+        callerPubkey: CALLER,
+        fundingId: PAYMENT_HASH,
+        rail: "lightning",
+        paidMsats: 500_000,
+        amountMicro: 500_000,
+        creditCurrency: "usd",
+        fundedAt: SETTLED_AT,
+        repaired: true,
+      });
+      const expiryMs = (reportCreditDeposit.mock.calls[0]?.[0] as { expiryMs: number }).expiryMs;
+      expect(expiryMs).toBe((await ledger.get("c-target"))?.expiryMs);
+      expect(deposits).not.toHaveBeenCalled();
+    });
+
+    it("makes no further attempt on a replay, even when the first attempt threw", async () => {
+      const reportCreditDeposit = vi.fn(() => {
+        throw new Error("receiver down");
+      });
+      const { app, ledger } = makeHarness({ reportCreditDeposit });
+      await seedBlocked(ledger);
+      const first = await call(app, "POST", "/admin/credit/reconcile-invoice", body);
+      const second = await call(app, "POST", "/admin/credit/reconcile-invoice", body);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect((await second.json()) as Record<string, unknown>).toMatchObject({ replayed: true });
+      expect(reportCreditDeposit).toHaveBeenCalledTimes(1);
+      expect((await ledger.get("c-target"))?.balanceMicro).toBe(500_000);
+    });
+
+    it("makes no attempt when reconciliation fails", async () => {
+      const reportCreditDeposit = vi.fn();
+      const { app, ledger } = makeHarness({ reportCreditDeposit, creditCurrency: "eur" });
+      await seedBlocked(ledger);
+      const refused = await call(app, "POST", "/admin/credit/reconcile-invoice", body);
+      expect(refused.status).toBe(422);
+      const { app: app2, ledger: ledger2 } = makeHarness({ reportCreditDeposit });
+      await seedBlocked(ledger2);
+      vi.spyOn(ledger2, "reconcileBlockedInvoice").mockRejectedValueOnce(new Error("db down"));
+      const failed = await call(app2, "POST", "/admin/credit/reconcile-invoice", body);
+      expect(failed.status).toBe(500);
+      expect(reportCreditDeposit).not.toHaveBeenCalled();
     });
   });
 
