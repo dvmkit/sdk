@@ -8,8 +8,9 @@ import { Mppx, tempo } from "mppx/server";
 import { Session as TempoSession } from "mppx/tempo";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import { keccak256, parseEventLogs, type Account, type Client, type Hex, type RpcTransactionReceipt } from "viem";
-import { Abis } from "viem/tempo";
+import { Abis, Transaction as TempoTransaction } from "viem/tempo";
 
+import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { loggers } from "../../observability/loggers";
 import type { CreditDrainRecord, CreditLedgerLike, CreditLedgerQuerier, TempoCreditLoss } from "./credit-ledger";
 import type { MppSecretState } from "./mpp-secret-state";
@@ -495,6 +496,10 @@ export const TEMPO_CHARGE_RECOVERY_BUDGET_MS = 5_000;
 const POLL_INTERVAL_MS = 500;
 /** Held back from polling so the final not-broadcast check still fits the budget. */
 const ABSENCE_CHECK_RESERVE_MS = 1_000;
+/** Spent after the lookup budget, so a slow store cannot shorten the chain lookup. */
+const PENDING_WRITE_BUDGET_MS = 2_000;
+/** How long a caller is asked to wait before presenting an unconfirmed charge again. */
+export const TEMPO_CHARGE_RETRY_AFTER_MS = 2_000;
 
 /**
  * - `unconfirmed`: the chain gave no verdict in time. The transaction may still
@@ -502,14 +507,57 @@ const ABSENCE_CHECK_RESERVE_MS = 1_000;
  * - `not_broadcast`: the node reports the transaction neither mined nor pooled,
  *   and its hash was released for a retry of the same credential.
  * - `rejected_on_chain`: the transaction was included but is not this payment.
+ * - `expired`: the transaction was never included and the chain is past its
+ *   validity window, so it never will be.
  */
-export type TempoChargeSettlementOutcome = "unconfirmed" | "not_broadcast" | "rejected_on_chain";
+export type TempoChargeSettlementOutcome = "unconfirmed" | "not_broadcast" | "rejected_on_chain" | "expired";
 
 export class TempoChargeSettlementError extends Error {
   override readonly name = "TempoChargeSettlementError";
 
-  constructor(readonly outcome: TempoChargeSettlementOutcome, cause: unknown) {
+  /**
+   * @param resumable A pending record exists, so presenting the same
+   *   credential again settles the charge from the chain.
+   */
+  constructor(readonly outcome: TempoChargeSettlementOutcome, cause: unknown, readonly resumable = false) {
     super(`Tempo charge broadcast failed: ${outcome}`, { cause });
+  }
+}
+
+/**
+ * A charge whose first presentation ended unconfirmed. It carries what a
+ * later presentation needs to read the chain, possibly on another machine.
+ */
+interface PendingTempoCharge {
+  /** Identifies this write, so a claim cannot take a record written after it was read. */
+  id: string;
+  /** Hash of the bytes sent to the node. */
+  hash: Hex;
+  sender: string;
+  chainId: number;
+  /** Unix seconds after which the chain no longer includes the transaction. */
+  validBefore?: number;
+}
+
+function pendingTempoChargeKey(signature: string): string {
+  return `dvmkit:tempo-charge:pending:${keccak256(signature as Hex)}`;
+}
+
+function readPendingTempoCharge(value: unknown): PendingTempoCharge | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { id, hash, sender, chainId, validBefore } = value as Record<string, unknown>;
+  if (typeof id !== "string" || typeof hash !== "string" || !/^0x[0-9a-f]{64}$/.test(hash) ||
+      typeof sender !== "string" || !HEX_ADDRESS_RE.test(sender) || typeof chainId !== "number" ||
+      (validBefore !== undefined && typeof validBefore !== "number")) return undefined;
+  return { id, hash: hash as Hex, sender, chainId, ...(validBefore !== undefined && { validBefore }) };
+}
+
+function tempoValidBefore(signature: string): number | undefined {
+  try {
+    const { validBefore } = TempoTransaction.deserialize(signature as never) as { validBefore?: unknown };
+    return typeof validBefore === "number" && Number.isSafeInteger(validBefore) ? validBefore : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -529,6 +577,8 @@ interface TempoChargeRecovery {
   isUnknownToNode(): Promise<boolean>;
   /** Frees the consumed transaction hash. Absent when the replay store is out of reach. */
   release?: () => Promise<void>;
+  /** Records the charge as pending so a later presentation can settle it. */
+  markPending?: () => Promise<void>;
 }
 
 /** Resolves once the payment is proven on chain; otherwise throws a {@link TempoChargeSettlementError}. */
@@ -547,9 +597,12 @@ async function settleFailedTempoBroadcast(recovery: TempoChargeRecovery): Promis
       await before(deadline, recovery.isUnknownToNode()) === true) {
     // A delete that finishes after the deadline only frees a hash the caller was told is consumed.
     const released = await before(deadline, recovery.release().then(() => true));
-    throw new TempoChargeSettlementError(released === true ? "not_broadcast" : "unconfirmed", recovery.cause);
+    if (released === true) throw new TempoChargeSettlementError("not_broadcast", recovery.cause);
   }
-  throw new TempoChargeSettlementError("unconfirmed", recovery.cause);
+  const recorded = recovery.markPending !== undefined && await before(
+    Date.now() + PENDING_WRITE_BUDGET_MS, recovery.markPending().then(() => true)
+  ) === true;
+  throw new TempoChargeSettlementError("unconfirmed", recovery.cause, recorded);
 }
 
 /** The settled value, or `undefined` when the work fails or outlives the deadline. */
@@ -622,6 +675,97 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
   type Validation = Awaited<ReturnType<typeof validate>>;
   type BroadcastInput = Parameters<typeof broadcast>[0];
   const preflights = new WeakMap<object, { validation: Validation; receipt?: RpcTransactionReceipt | null }>();
+  const store = options?.store as Store.AtomicStore | undefined;
+  /** Pending charges the chain proved during validation, awaiting their claim. */
+  const proven = new WeakMap<object, { key: string; pending: PendingTempoCharge }>();
+
+  /**
+   * Reads the receipt through mppx's hash-credential validation, which applies
+   * the same token, recipient, amount, sender and memo assertions as its own
+   * confirmed-broadcast path, against the challenge being presented.
+   */
+  const proveOnChain = async (
+    input: BroadcastInput, sent: Pick<PendingTempoCharge, "hash" | "sender" | "chainId">
+  ): Promise<{ probe: TempoChargeProbe; validation?: Validation; client?: Client }> => {
+    const proof = {
+      ...input,
+      credential: {
+        ...input.credential,
+        payload: { type: "hash" as const, hash: sent.hash },
+        source: `did:pkh:eip155:${sent.chainId}:${sent.sender}`,
+      },
+    } as BroadcastInput;
+    const read: RpcCapture = {};
+    try {
+      const validation = await captures.run(read, () => validate(proof));
+      // mppx trusts the node to answer for the hash it was asked about.
+      return read.receipt?.status === "0x1" && read.receipt.transactionHash?.toLowerCase() === sent.hash
+        ? { probe: "settled", validation, client: read.client }
+        : { probe: "unavailable", client: read.client };
+    } catch {
+      const probe = read.receipt === undefined ? "unavailable" : read.receipt === null ? "missing" : "rejected";
+      return { probe, client: read.client };
+    }
+  };
+
+  const isUnknownToNode = async (client: Client, hash: Hex): Promise<boolean> => await client.request(
+    { method: "eth_getTransactionByHash", params: [hash] }, { retryCount: 0 }
+  ) === null;
+
+  const releaseHashes = async (replays: Store.AtomicStore, hash: Hex, signature: string): Promise<void> => {
+    const hashes = new Set([hash, keccak256(signature as Hex)]);
+    await Promise.all([...hashes].map((used) => replays.delete(`mppx:charge:${used}`)));
+  };
+
+  /** Removes the record only if it is still the one that was read. */
+  const takePending = (replays: Store.AtomicStore, key: string, pending: PendingTempoCharge): Promise<boolean> =>
+    replays.update(key, (current) => readPendingTempoCharge(current)?.id === pending.id
+      ? { op: "delete", result: true }
+      : { op: "noop", result: false });
+
+  /**
+   * Settles a charge whose earlier presentation ended unconfirmed. mppx would
+   * refuse this credential before sending: at simulation once the transaction
+   * has landed, otherwise at its consumed-hash check.
+   */
+  const resumePending = async (
+    input: BroadcastInput, replays: Store.AtomicStore, key: string, pending: PendingTempoCharge
+  ): Promise<Validation> => {
+    const deadline = Date.now() + TEMPO_CHARGE_RECOVERY_BUDGET_MS;
+    const refusal = (outcome: TempoChargeSettlementOutcome, resumable = false) =>
+      new TempoChargeSettlementError(outcome, undefined, resumable);
+    let read = await before(deadline, proveOnChain(input, pending));
+    if (read?.probe === "missing" && read.client) {
+      const { client } = read;
+      const chainTime = pending.validBefore === undefined ? undefined : await before(deadline, client.request(
+        { method: "eth_getBlockByNumber", params: ["latest", false] }, { retryCount: 0 }
+      ).then((block) => Number(BigInt((block as { timestamp: Hex }).timestamp))));
+      if (pending.validBefore !== undefined && chainTime !== undefined && chainTime > pending.validBefore) {
+        // The first read may predate the block that proved expiry.
+        read = await before(deadline, proveOnChain(input, pending));
+        if (read?.probe === "missing") {
+          const dropped = await before(deadline, takePending(replays, key, pending));
+          throw refusal(dropped === true ? "expired" : "unconfirmed", dropped !== true);
+        }
+      } else if (await before(deadline, isUnknownToNode(client, pending.hash)) === true) {
+        // Taking the record first keeps a slow presentation from releasing a
+        // hash that a resend has consumed again in the meantime.
+        if (await before(deadline, takePending(replays, key, pending)) !== true) throw refusal("unconfirmed", true);
+        const { signature } = input.credential.payload as { signature: string };
+        const released = await before(deadline, releaseHashes(replays, pending.hash, signature).then(() => true));
+        throw refusal(released === true ? "not_broadcast" : "unconfirmed");
+      }
+    }
+    if (read?.probe === "rejected") throw refusal("rejected_on_chain");
+    if (read?.probe !== "settled" || !read.validation) throw refusal("unconfirmed", true);
+    proven.set(input.credential, { key, pending });
+    return {
+      ...read.validation,
+      credential: input.credential,
+      source: input.credential.source,
+      details: { mode: "pull", sender: pending.sender },
+    } as Validation;
+  };
 
   /**
    * Asks the chain whether a transaction whose send threw was included anyway.
@@ -642,40 +786,21 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
     // A fee payer's co-signature changes the hash, so the chain knows the
     // transaction by the bytes that were sent, not the bytes the caller signed.
     const hash = keccak256(failed.sent);
-    // mppx's hash-credential validation applies the same token, recipient,
-    // amount, sender and memo assertions as its own confirmed-broadcast path.
-    const proof = {
-      ...input,
-      credential: {
-        ...input.credential,
-        payload: { type: "hash" as const, hash },
-        source: `did:pkh:eip155:${chainId}:${details.sender}`,
-      },
-    } as BroadcastInput;
-    const store = options?.store;
+    const sent = { hash, sender: details.sender, chainId };
+    const { signature } = payload;
+    const validBefore = tempoValidBefore(signature);
     return {
       cause,
-      probe: async () => {
-        const read: RpcCapture = {};
-        try {
-          await captures.run(read, () => validate(proof));
-        } catch {
-          if (read.receipt === undefined) return "unavailable";
-          return read.receipt === null ? "missing" : "rejected";
-        }
-        // mppx trusts the node to answer for the hash it was asked about.
-        return read.receipt?.status === "0x1" && read.receipt.transactionHash?.toLowerCase() === hash
-          ? "settled" : "unavailable";
-      },
-      isUnknownToNode: async () => await client.request(
-        { method: "eth_getTransactionByHash", params: [hash] }, { retryCount: 0 }
-      ) === null,
+      probe: async () => (await proveOnChain(input, sent)).probe,
+      isUnknownToNode: () => isUnknownToNode(client, hash),
       // mppx keeps its default in-memory replay store private, so only a
-      // configured store can give the hash back.
-      ...(store && { release: async () => {
-        const hashes = new Set([hash, keccak256(payload.signature as Hex)]);
-        await Promise.all([...hashes].map((used) => store.delete(`mppx:charge:${used}`)));
-      } }),
+      // configured store can give the hash back or hold a pending record.
+      ...(store && {
+        release: () => releaseHashes(store, hash, signature),
+        markPending: () => store.put(pendingTempoChargeKey(signature), {
+          id: randomUUID(), ...sent, ...(validBefore !== undefined && { validBefore }),
+        } satisfies PendingTempoCharge),
+      }),
     };
   };
 
@@ -683,31 +808,78 @@ function tempoChargeWithPayer(options: Parameters<typeof tempo.charge>[0]) {
     ...charge,
     validate: async (input: Parameters<typeof validate>[0]) => {
       const capture: RpcCapture = {};
-      const validation = input.credential.payload.type === "hash"
-        ? await captures.run(capture, () => validate(input))
-        : await validate(input);
+      const { payload } = input.credential;
+      const pendingKey = store && payload.type === "transaction" ? pendingTempoChargeKey(payload.signature) : undefined;
+      let pending: PendingTempoCharge | undefined;
+      if (store && pendingKey) {
+        const stored = await before(
+          Date.now() + TEMPO_CHARGE_RECOVERY_BUDGET_MS, store.get(pendingKey).then((value: unknown) => ({ value }))
+        );
+        // A failed read cannot rule out a pending record, and the stock
+        // refusal would tell a caller whose transfer landed to pay again.
+        if (!stored) throw new TempoChargeSettlementError("unconfirmed", undefined, true);
+        pending = readPendingTempoCharge(stored.value);
+      }
+      let validation: Validation;
+      if (store && pendingKey && pending) {
+        validation = await resumePending(input as BroadcastInput, store, pendingKey, pending);
+      } else {
+        validation = payload.type === "hash"
+          ? await captures.run(capture, () => validate(input))
+          : await validate(input);
+      }
       preflights.set(input.credential, { validation, receipt: capture.receipt });
       return validation;
     },
     broadcast: async (input: BroadcastInput) => {
       const preflight = preflights.get(input.credential);
       preflights.delete(input.credential);
+      const resumed = proven.get(input.credential);
+      proven.delete(input.credential);
       const push: RpcCapture = {};
       let receipt: Awaited<ReturnType<typeof broadcast>>;
-      try {
-        receipt = input.credential.payload.type === "proof"
-          ? await broadcast(input)
-          : await captures.run(push, () => broadcast(input));
-      } catch (error) {
-        const recovery = recoverFromChain(input, preflight?.validation, push, error);
-        if (!recovery) throw error;
-        await settleFailedTempoBroadcast(recovery);
+      if (resumed && store) {
+        // One atomic claim, so concurrent presentations cannot both book. A
+        // crash between this claim and the booking strands the payment, and
+        // the log line is what reconciles it.
+        // The claim is not raced against a timer: giving up on an update that
+        // then commits would remove the record with nothing booked.
+        const claimed = await takePending(store, resumed.key, resumed.pending).catch((cause: unknown) => {
+          // The receipt is proven and a failed update leaves the record
+          // claimable, so the caller is asked to present the credential again.
+          throw new TempoChargeSettlementError("unconfirmed", cause, true);
+        });
+        if (!claimed) {
+          throw new MppxErrors.VerificationFailedError({ reason: "Transaction hash has already been used" });
+        }
+        diagnosticConsole.info({
+          level: "info",
+          event: "tempo_charge_settled_on_retry",
+          rail: "tempo",
+          transaction_hash: resumed.pending.hash,
+        });
         receipt = {
           method: "tempo",
           status: "success",
           timestamp: new Date().toISOString(),
-          reference: keccak256(push.sent!),
+          reference: resumed.pending.hash,
         };
+      } else {
+        try {
+          receipt = input.credential.payload.type === "proof"
+            ? await broadcast(input)
+            : await captures.run(push, () => broadcast(input));
+        } catch (error) {
+          const recovery = recoverFromChain(input, preflight?.validation, push, error);
+          if (!recovery) throw error;
+          await settleFailedTempoBroadcast(recovery);
+          receipt = {
+            method: "tempo",
+            status: "success",
+            timestamp: new Date().toISOString(),
+            reference: keccak256(push.sent!),
+          };
+        }
       }
       if (preflight && receipt && typeof receipt === "object") {
         tempoChargePayers.set(receipt, () => {

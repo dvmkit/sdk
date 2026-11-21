@@ -542,7 +542,8 @@
     "card_refund_sweep",
     "card_refund_expiry_failed",
     "card_refund_sweep_failed",
-    "card_refund_sweep_step_failed"
+    "card_refund_sweep_step_failed",
+    "tempo_charge_settled_on_retry"
   ],
   "routeTemplates": [
     "/",

@@ -269,3 +269,15 @@ export const settlementUnconfirmed = {
     failureCategory: fieldValues(["failure_category"], ["settlement_unconfirmed"]),
   },
 };
+
+export const chargeSettledOnRetry = {
+  catalogue: {
+    ...settlementUnconfirmed.catalogue,
+    events: [...catalogue.events, "tempo_charge_settled_on_retry"],
+  },
+  rows: {
+    claim: fieldValues(["transaction_hash"], transactionHashes, {
+      name: "tempo_charge_settled_on_retry", dataset: "tempo",
+    }),
+  },
+};
