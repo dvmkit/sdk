@@ -558,6 +558,165 @@ describe.skipIf(!RUN)("— transactional deposit outbox", () => {
     }
   });
 
+  /**
+   * A signed charge transaction and a node that includes it, fails the
+   * synchronous send, and serves its receipt afterwards.
+   */
+  async function chargeWithLostConfirmation(
+    mpp: ReturnType<typeof tempoServer>, amount: string, amountMicro: number, path: string
+  ) {
+    const challenge = await mpp.issueChallenge("tempo", "charge", {
+      amount, meta: { path, nonce: "lost-confirmation" },
+    });
+    const memo = paymentMemo(challenge);
+    const signature = await TEMPO_PAYER.signTransaction({
+      type: "tempo",
+      chainId: 4217,
+      nonce: 1,
+      gas: 200_000n,
+      maxFeePerGas: 20_000_000_000n,
+      maxPriorityFeePerGas: 1n,
+      calls: [{
+        to: TEMPO_TOKEN,
+        data: encodeFunctionData({
+          abi: Abis.tip20, functionName: "transferWithMemo", args: [TEMPO_RECIPIENT, BigInt(amountMicro), memo],
+        }),
+      }],
+    }, { serializer: Transaction.serialize });
+    const hash = keccak256(signature);
+    const credential = Credential.from({
+      challenge,
+      payload: { type: "transaction", signature },
+      source: `did:pkh:eip155:4217:${TEMPO_PAYER.address}`,
+    });
+    const node = { sends: 0 };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rpc = JSON.parse(input instanceof Request ? await input.text() : String(init?.body));
+      if (rpc.method === "eth_call") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: "0x" });
+      if (rpc.method === "eth_sendRawTransactionSync") {
+        node.sends++;
+        return new Response("upstream timed out", { status: 504 });
+      }
+      if (rpc.method !== "eth_getTransactionReceipt") throw new Error(`Unexpected test RPC method: ${rpc.method}`);
+      expect(rpc.params).toEqual([hash]);
+      return Response.json({ jsonrpc: "2.0", id: rpc.id, result: {
+        status: "0x1",
+        transactionHash: hash,
+        from: TEMPO_PAYER.address,
+        to: TEMPO_TOKEN,
+        logs: [{
+          address: TEMPO_TOKEN,
+          topics: encodeEventTopics({
+            abi: Abis.tip20, eventName: "TransferWithMemo",
+            args: { from: TEMPO_PAYER.address, to: TEMPO_RECIPIENT, memo },
+          }),
+          data: encodeAbiParameters([{ type: "uint256" }], [BigInt(amountMicro)]),
+          logIndex: "0x0",
+        }],
+      } });
+    }));
+    return { challenge, credential, node };
+  }
+
+  it.each(["/v1/job", "/v1/credit"] as const)(
+    "books one Tempo deposit on %s when only the receipt confirms a charge whose send failed",
+    async (resourcePath) => {
+      const mpp = tempoServer();
+      const { credential, node } = await chargeWithLostConfirmation(mpp, "0.10", PRICE_MICRO, resourcePath);
+      const mppCredential = Credential.serialize(credential);
+      const topUp = resourcePath === "/v1/credit";
+      const { x402Payment: _, x402Config: __, ...opts } = upfrontOpts("tempo-lost-confirmation");
+      const pay = () => verifyUpfrontPayment({
+        ...opts,
+        mpp,
+        mppCredential,
+        resourcePath,
+        fxFetcher: stubFx,
+        ...(topUp && { fundOnly: {
+          creditId: "tempo-lost-confirmation",
+          fundId: "first-funding",
+          commitment: fundingCommitment(mppCredential),
+          allowOneShotStablecoin: true,
+        } }),
+      });
+
+      const result = await pay();
+
+      expect(result.error).toBeUndefined();
+      const booked = await pendingDeposits();
+      expect(booked).toEqual([{ payload: expect.objectContaining({
+        rail: tempoDeposit.rail,
+        instrument: tempoDeposit.instrument,
+        callerPubkey: CALLER,
+        amountMicro: PRICE_MICRO,
+      }) }]);
+      if (topUp) expect(booked[0]?.payload).not.toHaveProperty("payerAddress");
+      else expect(booked[0]?.payload).toHaveProperty("payerAddress", tempoDeposit.payerAddress);
+
+      await pay();
+      expect(await pendingDeposits()).toEqual(booked);
+      expect(node.sends).toBe(1);
+    }
+  );
+
+  it("books a mid-job Tempo charge once when only the receipt confirms its failed send", async () => {
+    const creditId = "credit-mid-job-tempo";
+    const drawId = "draw-mid-job-tempo";
+    const jobId = "job-mid-job-tempo";
+    await ledger.fund({
+      creditId,
+      callerPubkey: CALLER,
+      currency: "usd",
+      amountMicro: PRICE_MICRO,
+      expiryMs: FUTURE_MS,
+      basis: {
+        rail: "tempo",
+        paidMsats: PRICE_MSATS,
+        nativeAmount: PRICE_MICRO,
+        nativeAsset: "usdc",
+        fundingRef: "0xoriginal-tempo",
+      },
+    });
+    await ledger.draw({ creditId, drawId, amountMicro: PRICE_MICRO, jobId });
+    const mpp = tempoServer();
+    const { challenge, credential, node } = await chargeWithLostConfirmation(
+      mpp, "0.05", 50_000, `/v1/job/${jobId}/messages`
+    );
+    const snapshot: VerifyIncomingSnapshot = {
+      pendingPaymentMsats: 50_000,
+      pendingPaymentFiatMicro: 50_000,
+      pendingPaymentFiatCurrency: "usd",
+      pendingMppChallengeIds: [challenge.id],
+      paymentRail: "tempo",
+      creditId,
+      drawId,
+      paymentTxHash: drawSettlementRef(DVM_ID, creditId, drawId),
+      requesterPubkey: CALLER,
+    };
+
+    const result = await verifyIncomingPayment(
+      { type: "payment", content: { tempo_credential: credential } },
+      {
+        mpp,
+        fxFetcher: stubFx,
+        resourcePath: `/v1/job/${jobId}/messages`,
+        dvmId: DVM_ID,
+        jobId,
+        creditLedger: ledger,
+        processedPayments: processed,
+        enqueueCreditDeposit: reporter.enqueueDeposit.bind(reporter),
+      },
+      snapshot
+    );
+
+    expect(result.error).toBeUndefined();
+    expect((await ledger.getDraw({ creditId, drawId }))?.amountMicro).toBe(150_000);
+    expect(await pendingDeposits()).toEqual([
+      { payload: expect.objectContaining({ creditId, callerPubkey: CALLER, rail: "tempo", amountMicro: 50_000 }) },
+    ]);
+    expect(node.sends).toBe(1);
+  });
+
   it("does not attribute a verified zero-amount Tempo proof to a transfer payer", async () => {
     const mpp = tempoServer();
     const challenge = await mpp.challenge.tempo.charge({ amount: "0" });

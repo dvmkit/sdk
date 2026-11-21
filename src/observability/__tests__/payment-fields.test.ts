@@ -48,7 +48,7 @@ describe("payment diagnostic catalogue", () => {
     ["reason", ["credit_or_draw_missing", "draw_not_pending", "draw_job_mismatch", "rail_mismatch", "channel_binding_mismatch", "denomination_unavailable", "topup_cap_unavailable", "topup_cap_currency_mismatch", "unknown"]],
     ["cause", ["no_msats", "sub_micro", "unsupported_currency", "rate_unavailable", "rate_stale_refused", "unknown"]],
     ["source_failure", ["network_error", "http_error", "invalid_body", "no_usable_rate", "missing_currency", "unknown"]],
-    ["failure_category", ["invalid_challenge", "malformed_credential", "payment_expired", "verification_failed", "insufficient_funds", "invalid_signature", "unsupported_method", "replay_detected", "ledger_refused", "settlement_failed", "unsupported_version", "unknown"]],
+    ["failure_category", ["invalid_challenge", "malformed_credential", "payment_expired", "verification_failed", "insufficient_funds", "invalid_signature", "unsupported_method", "replay_detected", "ledger_refused", "settlement_failed", "settlement_unconfirmed", "unsupported_version", "unknown"]],
     ["failure_stage", ["verifier", "broadcast", "verifier_broadcast", "replay_store", "funding_ledger", "unknown"]],
     ["phase", ["upfront", "mid-job"]],
   ] as const)("retains the independently documented %s values", (field, values) => {

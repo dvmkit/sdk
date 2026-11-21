@@ -2,6 +2,7 @@ import { Errors } from "mppx";
 
 import { paymentFailureStage } from "../../observability/payment-diagnostics";
 import { CreditLedgerError } from "./credit-ledger";
+import { TempoChargeSettlementError } from "./mpp-setup";
 import { ProcessedPaymentReplayError } from "./processed-payment-store";
 
 /** Class identity is evidence; exception names, prose, details and nested causes are not. */
@@ -9,6 +10,9 @@ export function paymentFailureFields(error: unknown): Record<string, unknown> {
   let category = "unknown";
   try {
     if (error instanceof ProcessedPaymentReplayError) category = "replay_detected";
+    else if (error instanceof TempoChargeSettlementError) {
+      category = error.outcome === "unconfirmed" ? "settlement_unconfirmed" : "settlement_failed";
+    }
     else if (error instanceof CreditLedgerError) category = "ledger_refused";
     else if (error instanceof Errors.InvalidChallengeError) category = "invalid_challenge";
     else if (error instanceof Errors.MalformedCredentialError || error instanceof Errors.InvalidPayloadError) category = "malformed_credential";

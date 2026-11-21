@@ -259,3 +259,13 @@ export const facilitatorTruncation = {
     ),
   },
 };
+
+export const settlementUnconfirmed = {
+  catalogue: {
+    ...catalogue,
+    paymentFailureCategories: [...catalogue.paymentFailureCategories, "settlement_unconfirmed"],
+  },
+  rows: {
+    failureCategory: fieldValues(["failure_category"], ["settlement_unconfirmed"]),
+  },
+};

@@ -8,5 +8,10 @@
     "id": "facilitatorTruncation",
     "epoch": 1,
     "sha256": "34842824211a9fa63d8340fbb9454330016bf5ab62de12edcbe6980436a9ac04"
+  },
+  {
+    "id": "settlementUnconfirmed",
+    "epoch": 1,
+    "sha256": "24d5d1057e7eab28dc53b5f5f25c7984c21bf341f61dd84b4fc72e425cd42290"
   }
 ]
