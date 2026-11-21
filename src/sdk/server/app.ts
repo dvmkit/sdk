@@ -250,9 +250,11 @@ import {
 import { PostgresX402ChannelStorage } from "./x402-channel-store";
 import { x402ShutdownClaimEnvironment } from "./x402-shutdown-claim";
 import {
+  AfterExactSettlementCommit,
   DEFERRED_X402_SETTLE_WINDOW_CLOSED,
   InProcessDeferredX402Settler,
   X402ExactSettlementServer,
+  type X402ExactSettlementServerOpts,
 } from "./x402-exact-settlement";
 import {
   assertX402RoutesServable,
@@ -488,11 +490,16 @@ export interface SDKServerOpts {
   /** Advanced clear-on-recovery callback for clean job-retention passes. */
   onJobRetentionSweepRecovered?: JobManagerOpts["onJobRetentionSweepRecovered"];
   /**
-   * Advanced override: callback fired when a payment funds a credit.
-   * Auto-wired to the `RevenueReporter`'s deposit report alongside
-   * `onJobCompleted`; set explicitly only for tests / advanced integrations
-   * that own their own reporting. Fundings are deposits — a liability until
-   * drawn — reported separately from the draws that become revenue (the deposit-accounting rule).
+   * Advanced override for the hosted deposit reporter.
+   *
+   * With a DVM ID, deferred exact x402 settlement and exact x402 operator
+   * repair make one best-effort callback attempt after each new deposit commits.
+   * A callback failure leaves the funding committed. Replaying a committed
+   * settlement skips delivery. The integration owns retries and recovery from
+   * process exits.
+   *
+   * Lightning invoice repair reports through the hosted outbox. Setting
+   * this override disables that report.
    */
   onCreditFunded?: (info: CreditDepositPayload) => void | Promise<void>;
   /**
@@ -570,8 +577,19 @@ interface InternalSDKServerOpts extends SDKServerOpts {
   x402BatchSettlement?: X402BatchSettlementServer;
   x402BatchSettlementFactory?: () => Promise<X402BatchSettlementServer>;
   x402ExactSettlement?: X402ExactSettlementServer;
+  deferredX402?: InProcessDeferredX402Settler;
   /** The payout reporter, present exactly when the revenue reporter is. */
   payoutReporter?: PayoutReporter;
+}
+
+function deliverCreditDeposit(
+  callback: NonNullable<SDKServerOpts["onCreditFunded"]>,
+  payload: CreditDepositPayload
+): void {
+  void Promise.resolve().then(() => callback(payload)).catch(() => {
+    // A receiver's error can include the address from the report body.
+    diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
+  });
 }
 
 export async function createDVMServer<State, InputSchema extends ZodLike | undefined>(
@@ -952,25 +970,45 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
           ...(x402BatchConfig?.rpcUrl ? { rpcUrl: x402BatchConfig.rpcUrl } : {}),
         })
       : undefined;
+  const onCreditFunded = dvmId ? opts.onCreditFunded : undefined;
+  const commitExactFunding: NonNullable<X402ExactSettlementServerOpts["repair"]> = async (effect, receipt, tx) => {
+    if (!receipt.txHash) throw new Error("settled exact x402 intent has no transaction");
+    let deposit: CreditDepositPayload | undefined;
+    await repairX402ExactSettlementEffect({
+      effect,
+      paymentId: receipt.txHash,
+      payerAddress: receipt.authorizer,
+      ledger: creditLedger,
+      processedPayments,
+      // Stage only deposits eligible for the hosted outbox. The override runs after commit.
+      enqueueCreditDeposit: onCreditFunded
+        ? (_tx, payload) => {
+            deposit = payload;
+            return Promise.resolve();
+          }
+        : enqueueCreditDeposit,
+      tx,
+    });
+    if (onCreditFunded && deposit) {
+      const payload = deposit;
+      return new AfterExactSettlementCommit(() => deliverCreditDeposit(onCreditFunded, payload));
+    }
+  };
   const x402ExactSettlement =
     x402Config && x402ExactStore
       ? new X402ExactSettlementServer({
           store: x402ExactStore,
           evidence: x402ExactEvidence,
-          repair: async (effect, receipt, tx) => {
-            if (!receipt.txHash) throw new Error("settled exact x402 intent has no transaction");
-            await repairX402ExactSettlementEffect({
-              effect,
-              paymentId: receipt.txHash,
-              payerAddress: receipt.authorizer,
-              ledger: creditLedger,
-              processedPayments,
-              enqueueCreditDeposit,
-              tx,
-            });
-          },
+          repair: commitExactFunding,
         })
       : undefined;
+  const deferredX402 = x402ExactSettlement
+    ? new InProcessDeferredX402Settler({
+        settlement: x402ExactSettlement,
+        dvmId: dvmId ?? "",
+        commit: (receipt, tx, effect) => commitExactFunding(effect, receipt, tx),
+      })
+    : undefined;
 
   // The credit drain refuses a hosted close without this guard.
   if (opts.mpp && hostedTempoReports) installHostedTempoCloseGuard(opts.mpp, hostedTempoReports);
@@ -994,6 +1032,7 @@ export async function createDVMServer<State, InputSchema extends ZodLike | undef
     x402BatchSettlement,
     x402BatchSettlementFactory,
     x402ExactSettlement,
+    deferredX402,
     payoutReporter,
   });
   // Close the terminal-row-to-cost-outbox crash window before boot returns.
@@ -1237,25 +1276,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return !completed.replayed;
     });
     this.processedPayments = opts.processedPayments ?? new MemoryProcessedPaymentStore();
-    this.deferredX402 =
-      this.x402ExactSettlement && opts.x402
-        ? new InProcessDeferredX402Settler({
-            settlement: this.x402ExactSettlement,
-            dvmId: opts.dvmId ?? "",
-            commit: (receipt, tx, effect) => {
-              if (!receipt.txHash) throw new Error("settled exact x402 intent has no transaction");
-              return repairX402ExactSettlementEffect({
-                effect,
-                paymentId: receipt.txHash,
-                payerAddress: receipt.authorizer,
-                ledger: this.creditLedger,
-                processedPayments: this.processedPayments,
-                enqueueCreditDeposit: opts.enqueueCreditDeposit,
-                tx,
-              });
-            },
-          })
-        : undefined;
+    this.deferredX402 = opts.deferredX402;
     for (const reason of x402RouteUnpayableReasons(descriptor, {
       durableSettlement: this.deferredX402 !== undefined,
       pricingCurrency: this.pricingCurrency,
@@ -4201,22 +4222,12 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }
   }
 
-  /**
-   * Book a committed funding as a deposit (the deposit-accounting rule). Fire-and-forget
-   * onto the reporter's durable queue: a funding is a liability the platform
-   * must show, but a reporting hiccup must never fail the paid request that
-   * just succeeded.
-   */
   private reportCreditDeposit(funding: PaymentInfo["funding"]): void {
     const onCreditFunded = this.opts.onCreditFunded;
     if (!funding || !onCreditFunded || !this.opts.dvmId) return;
     // Built by the same function the reporter's outbox uses, so the override
     // cannot report a narrower deposit than the SDK-owned path.
-    const payload = creditDepositPayload(this.opts.dvmId, funding);
-    void Promise.resolve().then(() => onCreditFunded(payload)).catch(() => {
-      // A receiver's error can include the address from the report body.
-      diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
-    });
+    deliverCreditDeposit(onCreditFunded, creditDepositPayload(this.opts.dvmId, funding));
   }
 
   /**

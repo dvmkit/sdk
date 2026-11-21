@@ -75,6 +75,11 @@ export interface X402ExactSettlementServerOpts {
   ) => Promise<unknown>;
 }
 
+/** Internal result for callers that stage work during the local effect. */
+export class AfterExactSettlementCommit {
+  constructor(readonly run: () => void) {}
+}
+
 /** Durable coordinator for irreversible exact x402 settlement. */
 export class X402ExactSettlementServer {
   private readonly activeSubmissions = new Set<string>();
@@ -585,8 +590,8 @@ export class X402ExactSettlementServer {
     }
     const repair = this.opts.repair;
     if (!repair) throw new Error("x402 exact settlement repair is not configured");
-    const result = await this.opts.store.finalize(dvmId, intentId, (locked, tx) =>
-      repair(locked.effect, receiptFromIntent(locked, 0), tx)
+    const result = await this.finalizeEffect(dvmId, intentId, 0, (receipt, tx, effect) =>
+      repair(effect, receipt, tx)
     );
     return { intent: result.intent, replayed: result.replayed };
   }
@@ -605,9 +610,7 @@ export class X402ExactSettlementServer {
       effect?: X402ExactSettlementEffect
     ) => Promise<T>
   ): Promise<X402ExactAcceptance<T>> {
-    const result = await this.opts.store.finalize(intent.dvmId, intent.id, (locked, tx) =>
-      commit(receiptFromIntent(locked, btcUsdRate), tx, locked.effect)
-    );
+    const result = await this.finalizeEffect(intent.dvmId, intent.id, btcUsdRate, commit);
     return {
       outcome: "accepted",
       intentId: intent.id,
@@ -617,6 +620,23 @@ export class X402ExactSettlementServer {
       admissionPending: result.intent.status === "local_committed",
       effect: result.intent.effect,
     };
+  }
+
+  private async finalizeEffect<T>(
+    dvmId: string,
+    intentId: string,
+    btcUsdRate: number,
+    commit: (
+      receipt: X402Receipt,
+      tx?: ProcessedPaymentQuerier,
+      effect?: X402ExactSettlementEffect
+    ) => Promise<T>
+  ) {
+    const result = await this.opts.store.finalize(dvmId, intentId, (locked, tx) =>
+      commit(receiptFromIntent(locked, btcUsdRate), tx, locked.effect)
+    );
+    if (!result.replayed && result.value instanceof AfterExactSettlementCommit) result.value.run();
+    return result;
   }
 
   private async recoverEvidence(
