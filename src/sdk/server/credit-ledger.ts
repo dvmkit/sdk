@@ -38,6 +38,16 @@ import type {
   CreditExpiryReleasePayload,
 } from "./revenue-reporter";
 import {
+  implicitCreditId,
+  isReservedX402ReportDrawId,
+  matchesX402ImplicitDraw,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
+  x402ImplicitDrawReportId,
+} from "./funding";
+import { readProcessedPayment } from "./processed-payment-store";
+import {
   X402_SPEND_BLOCKING_SETTLEMENT_STATUSES,
   X402_WEDGED_SETTLEMENT_STATUSES,
   type X402RefundSettlementGate,
@@ -1076,6 +1086,9 @@ export class CreditLedger {
         }
         return { ...drawResultFromRow(existing, credit), replayed: true };
       }
+      if (isReservedX402ReportDrawId(args.creditId, args.drawId)) {
+        throw new CreditLedgerError("draw_conflict", RESERVED_X402_REPORT_DRAW_MESSAGE);
+      }
       if (credit.status !== "active") throw terminalCreditError(args.creditId, credit.status);
       if (tempoLifecycle && (tempoLifecycle.finalized || tempoLifecycle.closeRequestedAt !== 0n)) {
         throw new CreditLedgerError(
@@ -1527,8 +1540,9 @@ export class CreditLedger {
         (refund_id, credit_id, draw_id, request, amount_micro, restored_sats, result)
         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [args.refundId, creditId, drawId, request, amountMicro, restoredSats, JSON.stringify(result)]);
+      const reportIds = await this.drawReportIds(client, args.outbox.dvmId, draw, credit.rail);
       await args.outbox.enqueue(client, {
-        dvmId: args.outbox.dvmId, creditId, drawId, jobId: draw.job_id, refundId: args.refundId,
+        dvmId: args.outbox.dvmId, ...reportIds, jobId: draw.job_id, refundId: args.refundId,
         amountMicro, creditCurrency: credit.currency, ledgerSeq, refundedAt: nowMs,
         ...(args.reason === undefined ? {} : { reason: args.reason }),
       });
@@ -3766,10 +3780,10 @@ export class CreditLedger {
     // A whole release reports its hold. The remainder a partial settle releases is not
     // reported: the release report is keyed by draw, and this draw is also settled revenue.
     if (!plan.replay && plan.status === "released" && resolution.amountMicro > 0 && args.releaseOutbox) {
+      const reportIds = await this.drawReportIds(client, args.releaseOutbox.dvmId, draw, credit.rail);
       await args.releaseOutbox.enqueue(client, {
         dvmId: args.releaseOutbox.dvmId,
-        creditId: resolution.creditId,
-        drawId: resolution.drawId,
+        ...reportIds,
         amountMicro: resolution.amountMicro,
         creditCurrency: credit.currency,
         ledgerSeq: resolution.ledgerSeq,
@@ -3777,6 +3791,32 @@ export class CreditLedger {
       });
     }
     return resolution;
+  }
+
+  private async drawReportIds(
+    q: CreditLedgerQuerier,
+    dvmId: string,
+    draw: Pick<DrawRow, "credit_id" | "draw_id" | "job_id">,
+    rail: string | null
+  ): Promise<{ creditId: string; drawId: string }> {
+    const { credit_id: creditId, draw_id: drawId, job_id: jobId } = draw;
+    if (rail !== "x402") return { creditId, drawId };
+    const report = { creditId: opaqueX402CreditId(creditId), drawId };
+    if (opaqueX402FundingId(drawId) === drawId || creditId !== implicitCreditId("x402", drawId) || jobId === null) {
+      return report;
+    }
+    // Standalone ledgers may have no SDK payment markers. Use this transaction's
+    // connection so a release can prove provenance while holding the ledger lock.
+    const { rows } = await q.query<{ markers: boolean }>(
+      "SELECT to_regclass('processed_payments') IS NOT NULL AS markers"
+    );
+    if (!rows[0]?.markers) return report;
+    const marker = await readProcessedPayment(q, { dvmId, rail: "x402", paymentId: drawId });
+    if (matchesX402ImplicitDraw(marker, { creditId, drawId, jobId })) {
+      report.drawId = await x402ImplicitDrawReportId(creditId, drawId, async (candidate) =>
+        Boolean(await this.readDraw(q, creditId, candidate)));
+    }
+    return report;
   }
 
   /**

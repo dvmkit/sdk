@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 
 import type { X402SelfRelayRpcFailureReason } from "../../lib/x402/types";
+import { opaqueX402CreditId } from "./funding";
 import { withSdkInitLock } from "./init-lock";
 import type { HostedSettlementReportObligations } from "./hosting-settlement-report-obligations";
 import type { PayoutPendingPayload, PayoutReportPayload } from "./payout-reporter";
@@ -807,7 +808,7 @@ export class RevenueReporter {
    * report commit or roll back together; no network I/O here.
    */
   async enqueueCreditDrain(tx: RevenueReporterQuerier, payload: CreditDrainPayload): Promise<void> {
-    await this.insertPending(tx, "drain", payload);
+    await this.insertPending(tx, "drain", { ...payload, creditId: opaqueX402CreditId(payload.creditId) });
   }
 
   /**
@@ -911,7 +912,9 @@ export class RevenueReporter {
     tx: RevenueReporterQuerier,
     payload: CreditExpiryReleasePayload
   ): Promise<void> {
-    await this.insertPending(tx, "expiry_release", payload);
+    await this.insertPending(tx, "expiry_release", payload.rail === "x402"
+      ? { ...payload, creditId: opaqueX402CreditId(payload.creditId) }
+      : payload);
   }
 
   /**

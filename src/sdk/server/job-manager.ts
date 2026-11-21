@@ -51,7 +51,16 @@ import {
   isFundingRail,
   type StalePendingDrawCursor,
 } from "./credit-ledger";
-import { deferredX402IntentId } from "./funding";
+import {
+  deferredX402IntentId,
+  implicitCreditId,
+  isX402AuthorizationFundingId,
+  legacyX402FundingIdForReplay,
+  matchesX402ImplicitDraw,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
+  x402ImplicitDrawReportId,
+} from "./funding";
 import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
@@ -3505,7 +3514,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // A replayed mid-job payment is the retry after a lost acknowledgement.
       // The money moved once; hand back the original funding evidence so the
       // caller can reconcile without paying again.
-      const replayed = await this.replayedDrawFundingReceipt(job, verifyResult.error.replayPaymentId);
+      const replayed = await this.replayedDrawFundingReceipt(
+        job,
+        verifyResult.error.replayPaymentId,
+        body.content.x402_payment
+      );
       return {
         error: {
           body: { ...verifyResult.error.body, ...(replayed && { draw_funding_receipt: replayed }) },
@@ -3784,15 +3797,20 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   /** The stored evidence for a replayed mid-job payment, looked up by the payment id the marker collided on. */
   private async replayedDrawFundingReceipt(
     job: ServerJob,
-    replayPaymentId: string | undefined
+    replayPaymentId: string | undefined,
+    x402Payment: unknown
   ): Promise<DrawFundingReceipt | undefined> {
     const ledger = this.opts.creditLedger;
     if (!replayPaymentId || !ledger || !job.creditId) return undefined;
     try {
-      const [credit, funding] = await Promise.all([
+      const [credit, currentFunding] = await Promise.all([
         ledger.get(job.creditId),
         ledger.getFunding({ creditId: job.creditId, fundId: replayPaymentId }),
       ]);
+      const legacyPaymentId = currentFunding ? undefined : legacyX402FundingIdForReplay(replayPaymentId, x402Payment);
+      const funding = currentFunding ?? (legacyPaymentId
+        ? await ledger.getFunding({ creditId: job.creditId, fundId: legacyPaymentId })
+        : undefined);
       if (!credit || !funding || funding.jobId !== job.id) return undefined;
       return await drawFundingReceiptFor(ledger, this.opts.receiptIssuer, funding, credit.currency);
     } catch (err) {
@@ -4037,11 +4055,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (!funding || !onCreditFunded || !this.opts.dvmId) return;
     // Same builder as the reporter's outbox, so the override cannot report a
     // narrower deposit than the SDK-owned path.
-    Promise.resolve(onCreditFunded(creditDepositPayload(this.opts.dvmId, funding))).catch(
-      (err: unknown) => {
-        diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed:`, err);
-      }
-    );
+    const payload = creditDepositPayload(this.opts.dvmId, funding);
+    Promise.resolve(onCreditFunded(payload)).catch(() => {
+      diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
+    });
   }
 
   /**
@@ -4863,14 +4880,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    *
    * Takes the fields rather than a `ServerJob` so the reconciler — a
    * background sweep that holds no in-process job — books through this exact
-   * path off the row it read. `paymentTxHash` is passed **verbatim**, never
-   * recomputed as a `drawSettlementRef`: it is the same column the in-line
-   * funnel reads, so the two bookings are byte-identical by construction and
-   * the platform's `UNIQUE (rail, tx_hash)` dedupes them. Deriving it instead
-   * would diverge on an implicit N=1 job (whose row carries the rail's own
-   * reference) and on any job whose column a mid-job top-up overwrote — the
-   * same rot `resolveDrawPool` documents as the reason not to read regime off
-   * this column.
+   * path off the row it read. Both bookings preserve the settlement identity
+   * in `paymentTxHash` for deduplication. An implicit hashless x402 draw
+   * can supply it when absent, and historical x402 IDs are projected to their
+   * opaque equivalents on both sides of the reporting join.
    *
    * Returns whether the report was handed to `onJobCompleted`, so a caller
    * that logs the booking says what actually happened rather than what it
@@ -4903,18 +4916,21 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   private async revenueOutcome(job: RevenueBookableJob, warnUnsettled: boolean): Promise<RevenueOutcome> {
     const onJobCompleted = this.opts.onJobCompleted;
     const onRevenueSkippedNoRail = this.opts.onRevenueSkippedNoRail;
+    const ledger = this.opts.creditLedger;
     // A draw that settled is revenue however its job ended: a job that did not complete can
     // still have been charged for the part it finished. Without a draw only completion earns.
     const hasDraw = !!(job.creditId && job.drawId);
     if (!isTerminal(job.status) || (job.status !== "completed" && !hasDraw)) return SKIPPED;
     if (!hasDraw && !onJobCompleted && !onRevenueSkippedNoRail) return SKIPPED;
-    const drawFields = { jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId };
+    const drawFields = {
+      jobId: job.id, jobStatus: job.status, creditId: job.creditId, drawId: job.drawId,
+    };
     if (job.status !== "completed" && deferredX402IntentId(job.creditId)) {
       // An unfinished deferred-x402 job abandons its authorization unspent; no ledger draw exists.
       diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "abandoned" });
       return SKIPPED;
     }
-    if (job.status !== "completed" && !this.opts.creditLedger) {
+    if (job.status !== "completed" && !ledger) {
       // Only a ledger can say whether this job's draw settled for its finished part.
       diagnosticConsole.warn({ level: "warn", event: "revenue_skipped_no_ledger", ...drawFields });
       return SKIPPED;
@@ -4935,13 +4951,34 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let drawAmountMicro: number | undefined;
     let bookedMsats = job.paidMsats;
     let bookedNative = job.nativeAmount;
-    if (job.creditId && job.drawId && this.opts.creditLedger) {
+    let paymentTxHash = job.paymentTxHash;
+    if (job.creditId && job.drawId && ledger) {
       const args = { creditId: job.creditId, drawId: job.drawId };
       let unreadable = false;
-      const draw = await this.opts.creditLedger.getDraw(args).catch(() => {
+      const draw = await ledger.getDraw(args).catch(() => {
         unreadable = true;
         return undefined;
       });
+      let implicitX402PaymentId: string | undefined;
+      if (draw?.railValue.rail === "x402") {
+        drawFields.creditId = opaqueX402CreditId(draw.creditId);
+        if (draw.jobId === job.id && draw.creditId === implicitCreditId("x402", draw.drawId) &&
+            isX402AuthorizationFundingId(draw.drawId)) {
+          try {
+            const marker = await this.opts.processedPayments?.get({
+              dvmId: this.opts.dvmId ?? "", rail: "x402", paymentId: draw.drawId,
+            });
+            if (matchesX402ImplicitDraw(marker, draw)) {
+              implicitX402PaymentId = opaqueX402FundingId(draw.drawId);
+              drawFields.drawId = await x402ImplicitDrawReportId(draw.creditId, draw.drawId, async (candidate) =>
+                Boolean(await ledger.getDraw({ creditId: draw.creditId, drawId: candidate })));
+            }
+          } catch {
+            diagnosticConsole.warn({ event: "revenue_payment_marker_unreadable", jobId: job.id });
+            return DEFERRED;
+          }
+        }
+      }
       if (draw?.status === "released" && job.status !== "completed") {
         // A released draw on a job that did not complete charged nothing: nothing was earned.
         diagnosticConsole.log({ level: "info", event: "revenue_skipped_released_draw", ...drawFields, drawStatus: "released" });
@@ -4970,15 +5007,18 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
       creditRail = draw.railValue.rail;
       drawAmountMicro = draw.amountMicro;
+      if (!paymentTxHash) paymentTxHash = implicitX402PaymentId;
       // The settled draw, not the job's counters, says what the draw earned: a Bitcoin
       // settle re-prices it off the lots it consumed and a partial settle charges only part.
       ({ paidMsats: bookedMsats, nativeAmount: bookedNative } = settledDrawRevenue(job, draw));
       credit = {
-        creditId: draw.creditId,
-        drawId: draw.drawId,
+        creditId: drawFields.creditId,
+        drawId: drawFields.drawId,
         drawAmountMicro: draw.amountMicro,
         creditCurrency: draw.railValue.creditCurrency ?? undefined,
-        fundingRef: draw.railValue.fundingRef ?? undefined,
+        fundingRef: creditRail === "x402" && draw.railValue.fundingRef !== null
+          ? opaqueX402FundingId(draw.railValue.fundingRef)
+          : draw.railValue.fundingRef ?? undefined,
         settledAt: draw.resolvedAt ?? undefined,
       };
     }
@@ -5030,8 +5070,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             level: "warn",
             event: "revenue_skipped_no_rail",
             jobId: job.id,
-            creditId: job.creditId,
-            drawId: job.drawId,
+            creditId: drawFields.creditId,
+            drawId: drawFields.drawId,
             drawAmountMicro,
             creditCurrency,
             paidMsats: job.paidMsats,
@@ -5055,8 +5095,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             onRevenueSkippedNoRail({
               dvmId: this.opts.dvmId ?? "",
               jobId: job.id,
-              creditId: job.creditId,
-              drawId: job.drawId,
+              creditId: drawFields.creditId ?? job.creditId,
+              drawId: drawFields.drawId ?? job.drawId,
               paidMsats: job.paidMsats,
               drawAmountMicro,
               creditCurrency,
@@ -5093,7 +5133,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         paidMsats: bookedMsats,
         paymentMint: job.paymentMint,
         rail: job.paymentRail,
-        paymentTxHash: job.paymentTxHash,
+        paymentTxHash: job.paymentRail === "x402" && paymentTxHash !== undefined
+          ? opaqueX402FundingId(paymentTxHash)
+          : paymentTxHash,
         nativeAmount: bookedNative,
         nativeAsset: job.nativeAsset,
         cashuFlow: job.cashuFlow,

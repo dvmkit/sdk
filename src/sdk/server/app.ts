@@ -134,8 +134,14 @@ import {
   deferredX402IntentId,
   drawSettlementRef,
   IMPLICIT_CREDIT_TTL_MS,
+  implicitCreditId,
   isDerivedCreditId,
+  isReservedX402ReportDrawId,
+  legacyX402FundingIdForReplay,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
   priceFiatMicro,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
   resolvePriceFiat,
 } from "./funding";
 import { fundingReceiptFor } from "./funding-receipt";
@@ -3821,6 +3827,9 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           if (recovered) return recovered;
           return c.json({ error: "invalid_mandate", message: "The mandate draw_id already belongs to an existing draw. Choose a fresh draw_id." }, 400);
         }
+        if (isReservedX402ReportDrawId(creditEnvelope.creditId, creditEnvelope.drawId)) {
+          return c.json({ error: "invalid_mandate", message: RESERVED_X402_REPORT_DRAW_MESSAGE }, 400);
+        }
       }
 
       // Unsigned admission is for per-call payment only: a request that needs
@@ -3951,8 +3960,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             // draw keys remain a separate regime; try the draw key when the
             // payment reference cannot resolve an explicitly funded job.
             if (!route && err.detail.body.error === "replay_rejected") {
+              const replayPaymentId = err.detail.replayPaymentId;
+              const legacyPaymentId = railOpts.cashuToken
+                ? undefined
+                : legacyX402FundingIdForReplay(replayPaymentId, railOpts.x402Payment);
               const recovered = await this.recoverReplayedJob(c, {
-                requestId: err.detail.replayPaymentId,
+                requestId: replayPaymentId,
+                legacyPaymentId,
                 fingerprint,
                 callerPubkey: authPubkey,
               });
@@ -3967,9 +3981,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
                 });
                 if (drawRecovered) return drawRecovered;
               }
-              if (publicRequestClaimResult && err.detail.replayPaymentId) {
+              if (publicRequestClaimResult && replayPaymentId) {
                 const recoveredPayment = await this.recoverProcessedPaymentAcceptance({
-                  paymentId: err.detail.replayPaymentId,
+                  paymentId: replayPaymentId,
+                  legacyPaymentId,
                   jobId: publicRequestClaimResult.jobId,
                   requiredMsats: priceMsats,
                 });
@@ -4200,7 +4215,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const payload = creditDepositPayload(this.opts.dvmId, funding);
     void Promise.resolve().then(() => onCreditFunded(payload)).catch(() => {
       // A receiver's error can include the address from the report body.
-      diagnosticConsole.error(`[${funding.creditId}] Deposit reporting failed`);
+      diagnosticConsole.error(`[${payload.creditId}] Deposit reporting failed`);
     });
   }
 
@@ -4243,10 +4258,19 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async recoverReplayedJob(
     c: Context<AppEnv>,
-    opts: { requestId?: string; fingerprint: string; callerPubkey?: string }
+    opts: { requestId?: string; legacyPaymentId?: string; fingerprint: string; callerPubkey?: string }
   ): Promise<Response | undefined> {
     if (!opts.requestId) return undefined;
-    const prior = await this.jobManager.store.findJobByPaymentTxHash(opts.requestId);
+    const store = this.jobManager.store;
+    const marker = opts.legacyPaymentId
+      ? await this.findProcessedPayment("x402", opts.requestId, opts.legacyPaymentId)
+      : undefined;
+    // An implicit hashless payment never wrote a transaction reference on the job.
+    // The marker was committed with the original draw and identifies the job directly.
+    const prior = marker?.jobId
+      ? await store.get(marker.jobId)
+      : await store.findJobByPaymentTxHash(opts.requestId) ??
+        (opts.legacyPaymentId ? await store.findJobByPaymentTxHash(opts.legacyPaymentId) : undefined);
     if (!prior) return undefined;
 
     const bodyMatches =
@@ -4279,6 +4303,18 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return undefined;
     }
     return await this.submitResponse(c, prior, prior.requesterToken);
+  }
+
+  private async findProcessedPayment(
+    rail: "x402" | "tempo",
+    paymentId: string,
+    legacyPaymentId?: string
+  ) {
+    const dvmId = this.opts.dvmId ?? "";
+    return await this.processedPayments.get({ dvmId, rail, paymentId }) ??
+      (rail === "x402" && legacyPaymentId
+        ? this.processedPayments.get({ dvmId, rail, paymentId: legacyPaymentId })
+        : undefined);
   }
 
   /**
@@ -4349,16 +4385,13 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
    */
   private async recoverProcessedPaymentAcceptance(opts: {
     paymentId: string;
+    legacyPaymentId?: string;
     jobId: string;
     requiredMsats?: number;
   }): Promise<PaymentInfo | undefined> {
     if (!this.opts.dvmId) return undefined;
     for (const rail of ["x402", "tempo"] as const) {
-      const marker = await this.processedPayments.get({
-        dvmId: this.opts.dvmId,
-        rail,
-        paymentId: opts.paymentId,
-      });
+      const marker = await this.findProcessedPayment(rail, opts.paymentId, opts.legacyPaymentId);
       if (!marker) continue;
       if (marker.jobId !== opts.jobId) {
         diagnosticConsole.warn(
@@ -4378,7 +4411,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         drawId: marker.drawId,
         expectedJobId: opts.jobId,
         requiredMsats: opts.requiredMsats,
-        paymentId: marker.paymentId,
+        paymentId: opts.paymentId,
         expectedRail: rail,
       });
     }
@@ -4412,12 +4445,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       paymentId: opts.paymentId,
     });
     if (payment) {
+      const opaqueDrawId = opaqueX402FundingId(draw.drawId);
+      const drawId = draw.railValue.rail === "x402" &&
+        draw.creditId === implicitCreditId("x402", draw.drawId) && opaqueDrawId === payment.paymentTxHash
+        ? opaqueDrawId
+        : draw.drawId;
       diagnosticConsole.warn(
         {
           level: "request_acceptance_recovered",
           jobId: opts.expectedJobId,
-          creditId: opts.creditId,
-          drawId: opts.drawId,
+          creditId: opaqueX402CreditId(opts.creditId),
+          drawId,
           rail: payment.paymentRail,
         }
       );
@@ -5732,7 +5770,9 @@ function recordedDrawPayment(
   const rail = fundingMethodFromStored(draw.railValue.rail);
   if (!rail) return undefined;
   const nativeAsset = nativeAssetFromStored(draw.railValue.nativeAsset);
-  const paymentTxHash = opts.paymentId ?? drawSettlementRef(opts.dvmId, draw.creditId, draw.drawId);
+  const paymentTxHash = opts.paymentId === undefined
+    ? drawSettlementRef(opts.dvmId, draw.creditId, draw.drawId)
+    : rail === "x402" ? opaqueX402FundingId(opts.paymentId) : opts.paymentId;
   return {
     paidMsats: draw.railValue.drawMsats > 0 ? draw.railValue.drawMsats : (opts.requiredMsats ?? 0),
     paymentRail: rail,

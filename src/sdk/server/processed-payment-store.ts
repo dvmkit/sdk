@@ -152,22 +152,29 @@ export class PostgresProcessedPaymentStore implements ProcessedPaymentStore {
     rail: ProcessedPaymentRail;
     paymentId: string;
   }): Promise<ProcessedPaymentRecord | undefined> {
-    const { rows } = await this.pool.query<ProcessedPaymentRow>(
-      `SELECT * FROM processed_payments WHERE dvm_id = $1 AND rail = $2 AND payment_id = $3`,
-      [args.dvmId, args.rail, args.paymentId]
-    );
-    if (rows.length === 0) return undefined;
-    const row = rows[0];
-    return {
-      dvmId: row.dvm_id,
-      rail: row.rail,
-      paymentId: row.payment_id,
-      creditId: row.credit_id,
-      drawId: row.draw_id,
-      jobId: row.job_id,
-      createdAt: Number(row.created_at),
-    };
+    return readProcessedPayment(this.pool, args);
   }
+}
+
+export async function readProcessedPayment(
+  q: ProcessedPaymentQuerier,
+  args: { dvmId: string; rail: ProcessedPaymentRail; paymentId: string }
+): Promise<ProcessedPaymentRecord | undefined> {
+  const { rows } = await q.query<ProcessedPaymentRow>(
+    `SELECT * FROM processed_payments WHERE dvm_id = $1 AND rail = $2 AND payment_id = $3`,
+    [args.dvmId, args.rail, args.paymentId]
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    dvmId: row.dvm_id,
+    rail: row.rail,
+    paymentId: row.payment_id,
+    creditId: row.credit_id,
+    drawId: row.draw_id,
+    jobId: row.job_id,
+    createdAt: Number(row.created_at),
+  };
 }
 
 /** In-memory {@link ProcessedPaymentStore} for pool-less setups. Per-process. */

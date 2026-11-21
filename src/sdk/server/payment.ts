@@ -63,8 +63,14 @@ import {
   IMPLICIT_CREDIT_TTL_MS,
   implicitCreditId,
   isDerivedCreditId,
+  isReservedX402ReportDrawId,
   msatsToFiatMicro,
+  opaqueX402CreditId,
+  opaqueX402FundingId,
   type PriceFiat,
+  RESERVED_X402_REPORT_DRAW_MESSAGE,
+  type X402FundingReference,
+  x402FundingReference,
   x402RequiredUsdcMicro,
   x402SettledShare,
 } from "./funding";
@@ -1189,6 +1195,20 @@ async function verifyUpfrontPaymentInScope(
         },
       };
     }
+    if (isReservedX402ReportDrawId(creditEnv.creditId, creditEnv.drawId)) {
+      return {
+        paidMsats: 0,
+        error: {
+          status: 409,
+          body: paymentErrorBody("draw_conflict", {
+            message: RESERVED_X402_REPORT_DRAW_MESSAGE,
+            display: "This draw ID is reserved. No payment was taken.",
+            hint: RESERVED_X402_REPORT_DRAW_MESSAGE,
+            retryable: true,
+          }),
+        },
+      };
+    }
     if (credit && credit.currency !== ledgerCtx.priceFiat.currency) {
       logCreditRejected("currency_mismatch", creditEnv.creditId);
       return creditRefusal(
@@ -1487,11 +1507,11 @@ async function verifyUpfrontPaymentInScope(
         // Ledger leg (spec condition 3): the money moved at the
         // facilitator's /settle, so the durable commit dvmkit owns is the
         // processed-payment marker + fund + draw, all in one transaction
-        // keyed on the settlement tx hash. A marker collision means this
+        // keyed on the settlement reference. A marker collision means this
         // payment already funded — route to the recovery gates.
         let credited: CommittedFunding | undefined;
-        const paymentId = x402FundingId(receipt.txHash, x402Payment);
         if (ledgerCtx) {
+          const reference = x402FundingReference(receipt.txHash, x402Payment);
           // The fiat half of the same valuation — one rounding, in USDC.
           // Threaded to the commit below rather than left to `fundAndDraw`'s
           // own `fundedMicroFor`: a gate that accepted `price_micro` while the
@@ -1517,9 +1537,9 @@ async function verifyUpfrontPaymentInScope(
             //
             // The facilitator has already settled — money moved. Fail closed
             // (no job, no credit) like every post-commit refusal;
-            // the mismatch is a malformed client, and the tx hash is in the
+            // the mismatch is a malformed client, and the payment reference is in the
             // log for reconciliation.
-            logCreditRejected("fund_amount_mismatch", creditEnv.creditId, { paymentId });
+            logCreditRejected("fund_amount_mismatch", creditEnv.creditId, { paymentId: reference.paymentId });
             return creditRefusal(
               "funding_commitment_mismatch",
               `fund.amount_micro (${creditEnv.fund.amountMicro}) does not match the settled payment's value at the quoted price (${fundedMicro}).`,
@@ -1530,9 +1550,7 @@ async function verifyUpfrontPaymentInScope(
             );
           }
           try {
-            credited = await commitMarkedFunding(ledgerCtx, {
-              rail: "x402",
-              paymentId,
+            credited = await commitFallbackX402Funding(ledgerCtx, reference, {
               paidMsats,
               fundedMicro,
               nativeAmount: receipt.amountUsdcMicro,
@@ -3211,11 +3229,9 @@ async function verifyIncomingPaymentInScope(
       // same shape the upfront path uses, and the first crash-replay protection
       // this leg has ever had (the per-job nonce above is cleared on accept).
       let credited: CommittedFunding | undefined;
-      const paymentId = x402FundingId(receipt.txHash, body.content.x402_payment as string);
+      const reference = x402FundingReference(receipt.txHash, body.content.x402_payment as string);
       try {
-        credited = await commitMarkedFunding(ledgerCtx, {
-          rail: "x402",
-          paymentId,
+        credited = await commitFallbackX402Funding(ledgerCtx, reference, {
           paidMsats: midJobFundedMsats(snapshot, receipt.amountMsats),
           nativeAmount: receipt.amountUsdcMicro,
           nativeAsset: "usdc",
@@ -3410,18 +3426,6 @@ async function verifyIncomingPaymentInScope(
   return { error: { status: 402, body: paymentErrorBody("payment_invalid", {
     message: "Payment method is not configured",
   }) } };
-}
-
-/**
- * The funding id an x402 settlement is keyed on: its transaction hash, or the
- * EIP-3009 authorization when a facilitator reported success without one. An
- * authorizer's nonce is single-use on chain, so it identifies the transfer as
- * uniquely, and money that moved is never left without a ledger row.
- */
-function x402FundingId(txHash: string | undefined, paymentHeader: string): string {
-  if (txHash) return txHash;
-  const { from, nonce } = decodePayment(paymentHeader).payload.authorization;
-  return `eip3009:${from.toLowerCase()}:${nonce.toLowerCase()}`;
 }
 
 /**
@@ -5255,9 +5259,9 @@ export function creditDepositPayload(
 ): CreditDepositPayload {
   return {
     dvmId,
-    creditId: funding.creditId,
+    creditId: funding.rail === "x402" ? opaqueX402CreditId(funding.creditId) : funding.creditId,
     callerPubkey: funding.callerPubkey,
-    fundingId: funding.fundingId,
+    fundingId: funding.rail === "x402" ? opaqueX402FundingId(funding.fundingId) : funding.fundingId,
     rail: funding.rail,
     paidMsats: funding.paidMsats,
     grossPaidMsats: funding.grossPaidMsats,
@@ -5631,6 +5635,30 @@ function exactSettlementEffect(
     ttlMs: ctx.ttlMs,
     ...funding,
   };
+}
+
+async function commitFallbackX402Funding(
+  ctx: LedgerContext,
+  { paymentId, legacyPaymentId }: X402FundingReference,
+  funding: Omit<RailFunding, "rail" | "paymentId">,
+): Promise<CommittedFunding> {
+  if (legacyPaymentId) {
+    // The legacy key is read-only. The digest marker still arbitrates concurrent
+    // commits, and only that marker may be included in a replay error.
+    const legacy = await withPaymentStage("replay_store", async () => {
+      if (ctx.processedPayments) {
+        return ctx.processedPayments.get({ dvmId: ctx.dvmId, rail: "x402", paymentId: legacyPaymentId });
+      }
+      // A fund-only request already deduplicates by its caller-supplied fund ID.
+      if (ctx.fundOnly) return undefined;
+      const creditId = ctx.topUp?.creditId ?? ctx.creditEnvelope?.creditId;
+      return creditId !== undefined
+        ? ctx.ledger.getFunding({ creditId, fundId: legacyPaymentId })
+        : ctx.ledger.get(implicitCreditId("x402", legacyPaymentId));
+    });
+    if (legacy) throw new ProcessedPaymentReplayError("x402", paymentId);
+  }
+  return commitMarkedFunding(ctx, { ...funding, rail: "x402", paymentId });
 }
 
 /**

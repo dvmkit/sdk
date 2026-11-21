@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 
 import { IMPLICIT_CREDIT_TTL_MS } from "../../lib/credit-implicit";
+import { decodePayment, exactEvmAuthorization } from "../../lib/x402/spec";
 import type { FxFetcher, FxRateSnapshot, FxSourceFailure } from "../pricing/fx";
 import { FxRateUnavailableError, readFxSourceFailure } from "../pricing/fx";
 import { fxRateFor, parseUsdPrice, satsToFiat } from "../pricing/index";
+import type { ProcessedPaymentRecord } from "./processed-payment-store";
 
 /**
  * Fiat denomination of the job price, pinned per request.
@@ -290,6 +292,100 @@ export function x402SettledShare(
 ): number {
   if (requiredUsdcMicro <= 0 || settledUsdcMicro === requiredUsdcMicro) return quoted;
   return Math.round((quoted * settledUsdcMicro) / requiredUsdcMicro);
+}
+
+const X402_FUNDING_DIGEST_PREFIX = "eip3009:sha256:";
+const LEGACY_X402_FUNDING_ID = /^eip3009:0x[0-9a-f]{40}:0x[0-9a-f]{64}$/;
+const X402_FUNDING_DIGEST = /^eip3009:sha256:[0-9a-f]{64}$/;
+const IMPLICIT_X402_CREDIT_PREFIX = "imp:x402:";
+const X402_REPORT_DRAW_PREFIX = "x402-report-draw:";
+
+export interface X402FundingReference {
+  paymentId: string;
+  legacyPaymentId?: string;
+}
+
+/** An authorizer's nonce is single-use. Hash the original identity so its replay semantics survive the format change. */
+export function x402FundingReference(txHash: string | undefined, paymentHeader: string): X402FundingReference {
+  if (txHash) return { paymentId: txHash };
+  const { from, nonce } = exactEvmAuthorization(decodePayment(paymentHeader));
+  const legacyPaymentId = `eip3009:${from.toLowerCase()}:${nonce.toLowerCase()}`;
+  return { paymentId: digestX402FundingId(legacyPaymentId), legacyPaymentId };
+}
+
+/** Recover historical evidence only from the credential corresponding to a verified replay. */
+export function legacyX402FundingIdForReplay(
+  paymentId: string | undefined,
+  paymentHeader: unknown,
+): string | undefined {
+  if (!paymentId?.startsWith(X402_FUNDING_DIGEST_PREFIX) || typeof paymentHeader !== "string") return undefined;
+  try {
+    const ref = x402FundingReference(undefined, paymentHeader);
+    return ref.paymentId === paymentId ? ref.legacyPaymentId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function isX402AuthorizationFundingId(id: string): boolean {
+  return LEGACY_X402_FUNDING_ID.test(id) || X402_FUNDING_DIGEST.test(id);
+}
+
+/** Map a known x402 funding reference to the opaque form used by new funding. */
+export function opaqueX402FundingId(id: string): string {
+  return LEGACY_X402_FUNDING_ID.test(id) ? digestX402FundingId(id) : id;
+}
+
+/** The implicit x402 credit namespace is reserved for SDK-created credits. */
+export function opaqueX402CreditId(id: string): string {
+  return id.startsWith(IMPLICIT_X402_CREDIT_PREFIX)
+    ? IMPLICIT_X402_CREDIT_PREFIX + opaqueX402FundingId(id.slice(IMPLICIT_X402_CREDIT_PREFIX.length))
+    : id;
+}
+
+function legacyX402DrawReportBase(creditId: string): string | undefined {
+  if (!creditId.startsWith(IMPLICIT_X402_CREDIT_PREFIX)) return undefined;
+  const legacyId = creditId.slice(IMPLICIT_X402_CREDIT_PREFIX.length);
+  return LEGACY_X402_FUNDING_ID.test(legacyId)
+    ? X402_REPORT_DRAW_PREFIX + digestX402FundingId(legacyId)
+    : undefined;
+}
+
+export const RESERVED_X402_REPORT_DRAW_MESSAGE = "Choose a draw ID outside this credit's reserved reporting namespace.";
+
+export function isReservedX402ReportDrawId(creditId: string, drawId: string): boolean {
+  if (!drawId.startsWith(X402_REPORT_DRAW_PREFIX)) return false;
+  const base = legacyX402DrawReportBase(creditId);
+  return base !== undefined && (drawId === base ||
+    (drawId.startsWith(`${base}:`) && /^[1-9][0-9]*$/.test(drawId.slice(base.length + 1))));
+}
+
+/** Call for a marker-bound draw. Existing ledger keys occupy slots permanently, and new draws cannot take them. */
+export async function x402ImplicitDrawReportId(
+  creditId: string,
+  drawId: string,
+  exists: (candidate: string) => Promise<boolean>
+): Promise<string> {
+  const base = legacyX402DrawReportBase(creditId);
+  if (!base) return drawId;
+  let candidate = base;
+  for (let suffix = 1; await exists(candidate); suffix++) candidate = `${base}:${suffix}`;
+  return candidate;
+}
+
+/** A caller can choose a draw ID. The processed payment must bind the same credit, draw, and job. */
+export function matchesX402ImplicitDraw(
+  marker: ProcessedPaymentRecord | undefined,
+  draw: { creditId: string; drawId: string; jobId: string | null }
+): boolean {
+  return marker?.rail === "x402" && draw.jobId !== null &&
+    marker.jobId === draw.jobId && marker.creditId === draw.creditId &&
+    marker.drawId === draw.drawId && marker.paymentId === draw.drawId &&
+    draw.creditId === implicitCreditId("x402", draw.drawId);
+}
+
+function digestX402FundingId(legacyPaymentId: string): string {
+  return X402_FUNDING_DIGEST_PREFIX + createHash("sha256").update(legacyPaymentId).digest("hex");
 }
 
 /**
