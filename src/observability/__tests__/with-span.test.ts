@@ -35,7 +35,6 @@ describe("withSpan", () => {
     expect(span.span_id).toHaveLength(16);
     expect(span.trace_id).toHaveLength(32);
     expect(span.service_version).toBeDefined();
-    expect(span.host === null || span.host === "localhost").toBe(true);
     expect(span.pid).toBe(process.pid);
   });
 
@@ -478,5 +477,38 @@ describe("withSpan", () => {
         .mock.calls.map(([line]) => String(line))
         .join(""),
     ).not.toContain("SENTINEL");
+  });
+});
+
+describe("withSpan hostname projection", () => {
+  it.each([
+    { hostname: "abcdef012345", expectedHost: "abcdef012345" },
+    { hostname: "builder.example.com", expectedHost: null },
+  ])("emits the projected host for $hostname", async ({ hostname, expectedHost }) => {
+    const emitted: SpanRow[] = [];
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    let freshModule: typeof import("../with-span") | undefined;
+
+    try {
+      // withSpan reads the hostname when the module loads.
+      vi.resetModules();
+      vi.doMock("node:os", async () => ({
+        ...(await vi.importActual<typeof import("node:os")>("node:os")),
+        hostname: () => hostname,
+      }));
+
+      freshModule = await import("../with-span");
+      freshModule.setEmitter((row) => emitted.push(row));
+
+      await freshModule.withSpan({ dataset: "platform", name: "message" }, () => 42);
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0].host).toBe(expectedHost);
+    } finally {
+      freshModule?.setEmitter(null);
+      vi.doUnmock("node:os");
+      vi.resetModules();
+      writeSpy.mockRestore();
+    }
   });
 });
