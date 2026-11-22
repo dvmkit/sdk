@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,12 +10,14 @@ import {
 } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import { BatchSettlementEvmScheme, computeChannelId } from "@x402/evm/batch-settlement/client";
-import { encodeAbiParameters, keccak256, toBytes } from "viem";
+import { encodeAbiParameters, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import * as chains from "viem/chains";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DvmError } from "../../errors";
+import type { AttestedDvmIdentity } from "../../receipt-verify";
+import { deriveLegacyX402ChannelSalt, deriveX402ChannelSalt } from "../channel-salt";
 import type { PendingX402Funding, StoredX402ChannelMetadata } from "../channel-store";
 import { x402NetworkByCaip2 } from "../networks";
 
@@ -91,13 +93,419 @@ describe("x402 batch client", () => {
     });
   });
 
+  it.each([
+    { dvmId: "dvm-2", builderPubkey: "ab".repeat(32) },
+    { dvmId: "dvm-1", builderPubkey: "cd".repeat(32) },
+  ])("separates attested identities with identical terms at the same origin (%j)", async (other) => {
+    const { key, account, network, required } = await refundFixture();
+    viemClientMock.create.mockReturnValue({ readContract: vi.fn().mockResolvedValue([0n, 0n]) });
+    const batch = await import("../batch-client");
+    const args = {
+      wallet: { privateKey: key, address: account.address, network },
+      paymentRequired: { ...required, accepts: [{ ...required.accepts[0], amount: "200000" }] },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      depositMicro: 200_000,
+    };
+
+    const first = await batch.createX402BatchPayment({
+      ...args,
+      creditId: CREDIT_ID,
+      identity: { dvmId: "dvm-1", builderPubkey: "ab".repeat(32) },
+    });
+    const second = await batch.createX402BatchPayment({
+      ...args,
+      creditId: "credit-2",
+      identity: other,
+    });
+
+    expect(second.channelId).not.toBe(first.channelId);
+  });
+
+  it("signs for one channel across origins with the same attested identity", async () => {
+    const { key, account, network, required } = await refundFixture();
+    viemClientMock.create.mockReturnValue({ readContract: vi.fn().mockResolvedValue([0n, 0n]) });
+    const batch = await import("../batch-client");
+    const args = {
+      wallet: { privateKey: key, address: account.address, network },
+      paymentRequired: { ...required, accepts: [{ ...required.accepts[0], amount: "200000" }] },
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+      identity: { dvmId: "dvm-1", builderPubkey: "ab".repeat(32) },
+    };
+
+    const first = await batch.createX402BatchPayment({ ...args, endpoint: "https://dvm.example" });
+    await recordChannelCredit({ ...args, endpoint: "https://dvm.example" });
+    const second = await batch.createX402BatchPayment({ ...args, endpoint: "https://alias.example" });
+
+    expect(decodePaymentSignatureHeader(second.paymentHeader).payload).toMatchObject({
+      voucher: { channelId: first.channelId },
+    });
+  });
+
+  it("tops up and acknowledges a recorded legacy channel after restart", async () => {
+    const { batch, store, wallet, payment, channelId } = await signedDepositPayment({
+      fundedMicro: "300000",
+      chargedMicro: "250000",
+      depositMicro: 10_000,
+    });
+    expect(decodePaymentSignatureHeader(payment.paymentHeader).payload).toMatchObject({
+      type: "deposit",
+      deposit: { amount: "150000" },
+      voucher: { channelId, maxClaimableAmount: "450000" },
+    });
+
+    await batch.processX402BatchResponseForWallet({
+      wallet,
+      depositMicro: 200_000,
+      channelId,
+      paymentHeader: payment.paymentHeader,
+      paymentResponse: encodePaymentResponseHeader({
+        success: true,
+        transaction: "0xsettled",
+        network: wallet.network,
+        payer: wallet.address,
+        extra: { chargedAmount: "200000" },
+      }),
+    });
+
+    await expect(new store.DvmX402ChannelStorage().get(channelId)).resolves.toMatchObject({
+      balance: "450000",
+      chargedCumulativeAmount: "450000",
+    });
+  });
+
+  it("ignores a non-corrective 402 without terms for the recorded network", async () => {
+    const { key, account, channelId, network, required, record } = await refundFixture();
+    record();
+    const batch = await import("../batch-client");
+    const readContract = vi.fn();
+    viemClientMock.create.mockReturnValue({ readContract });
+
+    await expect(batch.processX402BatchCorrection({
+      wallet: { privateKey: key, address: account.address, network },
+      depositMicro: 200_000,
+      channelId,
+      paymentRequired: { ...required, error: "payment_required", accepts: [] },
+    })).resolves.toBe(false);
+    expect(readContract).not.toHaveBeenCalled();
+  });
+
+  it("corrects the recorded legacy channel using its on-chain claim", async () => {
+    const { key, account, channelId, network, required, record } = await refundFixture(
+      undefined,
+      true
+    );
+    record();
+    const batch = await import("../batch-client");
+    const { DvmX402ChannelStorage } = await import("../channel-store");
+    const readContract = vi.fn().mockResolvedValue([500_000n, 12_000n]);
+    viemClientMock.create.mockReturnValue({ readContract });
+
+    await expect(batch.processX402BatchCorrection({
+      wallet: { privateKey: key, address: account.address, network },
+      depositMicro: 200_000,
+      channelId,
+      paymentRequired: { ...required, error: "invalid_batch_settlement_evm_cumulative_below_claimed" },
+    })).resolves.toBe(true);
+
+    expect(readContract).toHaveBeenCalledWith(expect.objectContaining({ args: [channelId] }));
+    await expect(new DvmX402ChannelStorage().get(channelId)).resolves.toMatchObject({
+      chargedCumulativeAmount: "12000",
+    });
+  });
+
+  type Channel = "legacy" | "origin" | "attested" | "otherAttested" | "baseLegacy" | "baseOrigin";
+  type Owner = "exact" | "exactDifferent" | "same" | "different" | "unknown" | "alias" | "aliasUnknown";
+  type Refusal = "x402_refund_failed" | "x402_channel_ambiguous" | "x402_batch_not_offered" |
+    "x402_channel_owner_mismatch";
+  interface SelectionCase {
+    name: string;
+    records?: [Channel, Owner][];
+    unattested?: true;
+    baseOnly?: true;
+    requestedAlias?: true;
+    escrow?: [Channel, "funded" | "claimed"][];
+    zeroProjection?: Channel;
+    lateLegacyAck?: true;
+    transientRead?: true;
+    fund: Channel | Refusal;
+    fundReads: Channel[];
+    drain: Channel | Refusal;
+    drainReads: Channel[];
+  }
+  const selectionCases: SelectionCase[] = [
+    {
+      name: "an unrecorded funded attested channel precedes funded origin and legacy channels",
+      escrow: [["attested", "funded"], ["origin", "funded"], ["legacy", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "attested", drainReads: ["attested"],
+    },
+    {
+      name: "without an identity, unrecorded origin precedes legacy",
+      unattested: true, escrow: [["origin", "funded"], ["legacy", "funded"]],
+      fund: "origin", fundReads: ["origin"], drain: "origin", drainReads: ["origin"],
+    },
+    {
+      name: "unrecorded legacy escrow is adopted after both v2 probes are empty",
+      escrow: [["legacy", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "legacy", drainReads: ["attested", "origin", "legacy"],
+    },
+    {
+      name: "fully claimed balance is skipped before adopting origin escrow",
+      escrow: [["attested", "claimed"], ["origin", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "origin", drainReads: ["attested", "origin"],
+    },
+    {
+      name: "empty probes refuse without creating a record",
+      fund: "attested", fundReads: ["attested"], drain: "x402_refund_failed",
+      drainReads: ["attested", "origin", "legacy"],
+    },
+    {
+      name: "a different attested credit's origin channel cannot be selected or adopted",
+      records: [["origin", "different"]], escrow: [["origin", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "x402_refund_failed", drainReads: ["attested", "legacy"],
+    },
+    {
+      name: "a different attested credit's legacy channel cannot be selected or adopted",
+      records: [["legacy", "different"]], escrow: [["legacy", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "x402_refund_failed", drainReads: ["attested", "origin"],
+    },
+    {
+      name: "a different attested channel does not hide funded unrecorded escrow for the requested DVM",
+      records: [["otherAttested", "different"]], escrow: [["otherAttested", "funded"], ["attested", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "attested", drainReads: ["attested"],
+    },
+    {
+      name: "no requested identity cannot use an attested owner's origin channel",
+      records: [["origin", "different"]], unattested: true, escrow: [["origin", "funded"]],
+      fund: "x402_channel_owner_mismatch", fundReads: [], drain: "x402_refund_failed", drainReads: ["legacy"],
+    },
+    {
+      name: "a same-origin legacy record with no attestation outranks funded unrecorded v2",
+      records: [["legacy", "unknown"]], escrow: [["legacy", "funded"], ["attested", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "legacy", drainReads: ["legacy"],
+    },
+    {
+      name: "a fresh credit uses v2 while a recorded legacy drain with empty escrow refuses",
+      records: [["legacy", "unknown"]], escrow: [["attested", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "x402_refund_failed", drainReads: ["legacy"],
+    },
+    {
+      name: "a stale legacy record is followed to Base when the wallet is pinned to Base Sepolia",
+      records: [["baseLegacy", "unknown"]], baseOnly: true, escrow: [["baseLegacy", "funded"]],
+      fund: "x402_batch_not_offered", fundReads: [], drain: "baseLegacy", drainReads: ["baseLegacy"],
+    },
+    {
+      name: "an exact v2 record uses its other offered network even without the original identity",
+      records: [["baseOrigin", "exact"]], unattested: true, escrow: [["baseOrigin", "funded"]],
+      fund: "baseOrigin", fundReads: ["baseOrigin"], drain: "baseOrigin", drainReads: ["baseOrigin"],
+    },
+    {
+      name: "same attested identity permits a recorded channel across origins",
+      records: [["attested", "alias"]], escrow: [["attested", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "attested", drainReads: ["attested"],
+    },
+    {
+      name: "verified alias drains a channel salted at its recorded origin on another offered network",
+      records: [["baseOrigin", "same"]], requestedAlias: true, escrow: [["baseOrigin", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "baseOrigin", drainReads: ["baseOrigin"],
+    },
+    {
+      name: "another origin without stored attestation cannot be selected or adopted",
+      records: [["attested", "aliasUnknown"]], escrow: [["attested", "funded"]],
+      fund: "x402_channel_owner_mismatch", fundReads: [], drain: "x402_refund_failed", drainReads: ["origin", "legacy"],
+    },
+    {
+      name: "multiple derived records refuse before any drain RPC",
+      records: [["attested", "same"], ["legacy", "unknown"]],
+      escrow: [["attested", "funded"], ["legacy", "funded"]],
+      fund: "attested", fundReads: ["attested"], drain: "x402_channel_ambiguous", drainReads: [],
+    },
+    {
+      name: "exact v1 takes precedence over another record despite a reconciled zero projection",
+      records: [["legacy", "exactDifferent"], ["attested", "same"]], zeroProjection: "legacy",
+      escrow: [["attested", "funded"]],
+      fund: "legacy", fundReads: [], drain: "x402_refund_failed", drainReads: ["legacy"],
+    },
+    {
+      name: "an exact metadata-only v1 record has one funding read and remains v1 after retry",
+      records: [["legacy", "exact"]], transientRead: true,
+      fund: "legacy", fundReads: ["legacy"], drain: "x402_refund_failed", drainReads: ["legacy"],
+    },
+    {
+      name: "a metadata-only v2 record is reused at its exact credit",
+      records: [["origin", "exact"]],
+      fund: "origin", fundReads: ["origin"], drain: "x402_refund_failed", drainReads: ["origin"],
+    },
+    {
+      name: "duplicate exact records refuse even when a delayed legacy acknowledgement is newer",
+      records: [["origin", "exact"], ["legacy", "exact"]], zeroProjection: "legacy", lateLegacyAck: true,
+      fund: "x402_channel_ambiguous", fundReads: [], drain: "x402_channel_ambiguous", drainReads: [],
+    },
+  ];
+
+  it.each(selectionCases.map((row) => [row.name, row] as const))(
+    "selects funding and drain channels when %s",
+    async (_name, row) => {
+      const { key, account, config, network, required, record } = await refundFixture();
+      const base = await refundFixture("eip155:8453");
+      const endpoint = "https://dvm.example";
+      const identity = { dvmId: "dvm-b", builderPubkey: "ab".repeat(32) };
+      const other = { dvmId: "dvm-a", builderPubkey: identity.builderPubkey };
+      const wallet = { privateKey: key, address: account.address, network };
+      const saltInputs = { network, endpoint, payer: account.address };
+      const channels = {
+        origin: { config, network },
+        legacy: { config: { ...config, salt: deriveLegacyX402ChannelSalt(saltInputs) }, network },
+        attested: { config: { ...config, salt: deriveX402ChannelSalt({ ...saltInputs, identity }) }, network },
+        otherAttested: {
+          config: { ...config, salt: deriveX402ChannelSalt({ ...saltInputs, identity: other }) }, network,
+        },
+        baseOrigin: { config: base.config, network: base.network },
+        baseLegacy: {
+          config: { ...base.config, salt: deriveLegacyX402ChannelSalt({ ...saltInputs, network: base.network }) },
+          network: base.network,
+        },
+      };
+      const channelId = (name: Channel) => computeChannelId(channels[name].config, channels[name].network);
+      const store = await import("../channel-store");
+      const batch = await import("../batch-client");
+      for (const [name, owner] of row.records ?? []) {
+        const recorded = record({
+          ...channels[name],
+          channelId: channelId(name),
+          endpoint: owner === "alias" || owner === "aliasUnknown" ? "https://alias.example" : endpoint,
+          creditId: owner === "exact" || owner === "exactDifferent" ? CREDIT_ID : `credit-${name}`,
+          updatedAt: 100,
+        });
+        if (owner === "same" || owner === "alias" || owner === "different" || owner === "exactDifferent") {
+          await recordChannelCredit({
+            ...recorded, identity: owner === "same" || owner === "alias" ? identity : other,
+          });
+        }
+      }
+      if (row.zeroProjection) {
+        await new store.DvmX402ChannelStorage().reconcileChainState(channelId(row.zeroProjection), {
+          balance: "0", totalClaimed: "0",
+        });
+      }
+      if (row.lateLegacyAck) {
+        store.acknowledgeX402ChannelOwner({
+          channelId: channelId("legacy"), endpoint, callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID,
+        });
+      }
+      const journal = join(dir, "x402-channels.json");
+      const snapshot = existsSync(journal) ? readFileSync(journal) : undefined;
+      const originalMetadata = store.listX402Channels();
+      const assertMetadataPreserved = () => {
+        for (const original of originalMetadata) {
+          expect(store.findX402Channel({ channelId: original.channelId })).toEqual(original);
+        }
+      };
+
+      const readContract = vi.fn<({ args }: { args: [string] }) => Promise<[bigint, bigint]>>()
+        .mockResolvedValue([0n, 0n]);
+      viemClientMock.create.mockReturnValue({ readContract });
+      const args = {
+        wallet,
+        endpoint: `${row.requestedAlias ? "https://alias.example" : endpoint}/v1/credit`,
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        identity: row.unattested ? undefined : identity,
+        depositMicro: 200_000,
+      };
+      const offers = row.baseOnly ? base.required.accepts : [...required.accepts, ...base.required.accepts];
+      const fund = () => batch.createX402BatchPayment({
+        ...args,
+        paymentRequired: { ...required, accepts: offers.map((term) => ({ ...term, amount: "5000" })) },
+      });
+      const observed = () => readContract.mock.calls.map(([read]) => read.args[0]);
+      if (row.transientRead) {
+        readContract.mockRejectedValueOnce(new Error("temporary RPC failure"));
+        await expect(fund()).rejects.toThrow("temporary RPC failure");
+        expect(observed()).toEqual(row.fundReads.map(channelId));
+        readContract.mockClear();
+      }
+      if (row.fund in channels) {
+        const payment = await fund();
+        expect(decodePaymentSignatureHeader(payment.paymentHeader).payload).toMatchObject({
+          voucher: { channelId: channelId(row.fund as Channel) },
+        });
+      } else {
+        await expect(fund()).rejects.toMatchObject({ code: row.fund });
+      }
+      expect(observed()).toEqual(row.fundReads.map(channelId));
+      assertMetadataPreserved();
+
+      // Both operations start from the stipulated records. Funding can create new metadata.
+      if (snapshot) writeFileSync(journal, snapshot);
+      else rmSync(journal, { force: true });
+      const escrow = new Map(row.escrow?.map(([name, balance]) => [channelId(name), balance]));
+      readContract.mockClear().mockImplementation(({ args: [id] }) => {
+        const balance = escrow.get(id as `0x${string}`);
+        return Promise.resolve(balance === "funded" ? [200_000n, 0n]
+          : balance === "claimed" ? [200_000n, 200_000n] : [0n, 0n]);
+      });
+      const { DvmError } = await import("../../errors");
+      const post = vi.fn<(header?: string) => Promise<ReturnType<typeof refundResponse>>>()
+        .mockRejectedValueOnce(new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: { ...required, accepts: offers },
+        }));
+      if (row.drain in channels) {
+        const expected = row.drain as Channel;
+        const id = channelId(expected);
+        post.mockResolvedValueOnce(refundResponse({
+          channelId: id, network: channels[expected].network, payer: account.address, amount: "200000",
+        }));
+        await expect(batch.refundX402BatchChannel({ ...args, post })).resolves.toMatchObject({ atRiskMicro: 0n });
+        expect(post).toHaveBeenCalledTimes(2);
+        const signed = decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "");
+        expect(signed.payload).toMatchObject({ type: "refund", voucher: { channelId: id } });
+        expect(signed.accepted.network).toBe(channels[expected].network);
+        if (!originalMetadata.some((record) => record.channelId === id)) {
+          expect(store.findX402Channel({ channelId: id })).toMatchObject({
+            creditId: CREDIT_ID, endpoint, callerPubkey: CALLER_PUBKEY, network: channels[expected].network,
+          });
+        }
+      } else {
+        await expect(batch.refundX402BatchChannel({ ...args, post })).rejects.toMatchObject({
+          code: row.drain,
+          ...(row.drain === "x402_channel_ambiguous" ? {
+            data: { channel_ids: originalMetadata.map(({ channelId }) => channelId).sort() },
+            hint: row.lateLegacyAck
+              ? "Use the channel ID for a timed on-chain withdrawal."
+              : "Drain using the credit ID at its recorded origin, or use the channel ID for a timed on-chain withdrawal.",
+          } : {}),
+        });
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(store.listX402Channels()).toEqual(originalMetadata);
+      }
+      expect(observed()).toEqual(row.drainReads.map(channelId));
+      assertMetadataPreserved();
+    }
+  );
+
   it("keeps the acknowledged association while another scope constructs a voucher", async () => {
-    const { key, account, network, channelId, required, record } = await refundFixture();
+    const identity = { builderPubkey: "ab".repeat(32), dvmId: "dvm-owner" };
+    const { key, account, network, config, required, record } = await refundFixture();
+    const salt = deriveX402ChannelSalt({
+      network,
+      payer: account.address,
+      endpoint: "https://owner.example",
+      identity,
+    });
+    const channelId = computeChannelId({ ...config, salt }, network);
     const ownerCaller = "aa".repeat(32);
     record({
+      channelId,
+      config: { ...config, salt },
       endpoint: "https://owner.example",
       callerPubkey: ownerCaller,
       creditId: "credit-a",
+    });
+    await recordChannelCredit({
+      endpoint: "https://owner.example", callerPubkey: ownerCaller, creditId: "credit-a", identity,
     });
     const batch = await import("../batch-client");
     const store = await import("../channel-store");
@@ -115,6 +523,7 @@ describe("x402 batch client", () => {
       wallet: { privateKey: key, address: account.address, network },
       paymentRequired: fundingRequired,
       endpoint: "https://attempt.example",
+      identity,
       callerPubkey: CALLER_PUBKEY,
       creditId: "credit-b",
       depositMicro: 200_000,
@@ -165,7 +574,7 @@ describe("x402 batch client", () => {
       receiverAuthorizer,
       token,
       withdrawDelay: 86_400,
-      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+      salt: deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
     };
     const channelId = computeChannelId(config, network);
     const store = await import("../channel-store");
@@ -332,9 +741,7 @@ describe("x402 batch client", () => {
     const receiver = `0x${"22".repeat(20)}` as `0x${string}`;
     const receiverAuthorizer = `0x${"33".repeat(20)}` as `0x${string}`;
     const token = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const;
-    const salt = keccak256(
-      toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)
-    );
+    const salt = deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" });
     const config = {
       payer: account.address,
       payerAuthorizer: account.address,
@@ -459,7 +866,7 @@ describe("x402 batch client", () => {
         receiverAuthorizer,
         token,
         withdrawDelay: 86_400,
-        salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+        salt: deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
       },
       network
     );
@@ -488,7 +895,7 @@ describe("x402 batch client", () => {
     });
 
     await batch.processX402BatchResponse(payment.scheme, response);
-    // A resumed acknowledgement builds a fresh scheme, so it names the pending channel.
+    // A resumed acknowledgement uses the pending channel.
     await batch.processX402BatchResponseForWallet({
       wallet,
       depositMicro: 200_000,
@@ -644,7 +1051,7 @@ describe("x402 batch client", () => {
       receiverAuthorizer,
       token,
       withdrawDelay: 86_400,
-      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+      salt: deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
     };
     const channelId = computeChannelId(config, network);
     const required: PaymentRequired = {
@@ -718,7 +1125,8 @@ describe("x402 batch client", () => {
   });
 
   it("refuses a live rival before chain reconciliation or signing another deposit", async () => {
-    const { key, account, network, channelId, required } = await refundFixture();
+    const { key, account, network, channelId, required, record } = await refundFixture();
+    record();
     const wallet = { privateKey: key, address: account.address, network };
     const { pending } = await refusedDeposit(channelId, wallet);
     const store = await import("../channel-store");
@@ -737,7 +1145,7 @@ describe("x402 batch client", () => {
     const before = readFileSync(join(dir, "x402-channels.json"), "utf8");
 
     await expect(batch.createX402BatchPayment({
-      wallet, paymentRequired: required, endpoint: "https://example.com",
+      wallet, paymentRequired: required, endpoint: "https://dvm.example",
       callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID, depositMicro: 200_000,
     })).rejects.toMatchObject({
       code: "x402_voucher_pending",
@@ -762,7 +1170,7 @@ describe("x402 batch client", () => {
       receiverAuthorizer,
       token,
       withdrawDelay: 86_400,
-      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+      salt: deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
     };
     const channelId = computeChannelId(config, network);
     const required: PaymentRequired = {
@@ -882,7 +1290,7 @@ describe("x402 batch client", () => {
       receiverAuthorizer,
       token,
       withdrawDelay: 86_400,
-      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+      salt: deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
     };
     const channelId = computeChannelId(config, network);
     const accepts = (extra: Record<string, unknown>) => [
@@ -1942,7 +2350,7 @@ describe("x402 batch client", () => {
       const { key, account, network, config, required, record } = await refundFixture();
       // A channel opened under an older salt formula. Nothing in the config
       // reproduces it; only the record knows which channel holds the money.
-      const salt = keccak256(toBytes("dvmkit:x402-batch:legacy-formula"));
+      const salt = `0x${"bb".repeat(32)}` as const;
       const legacyConfig = { ...config, salt };
       const legacyChannelId = computeChannelId(legacyConfig, network);
       record({ channelId: legacyChannelId, config: legacyConfig });
@@ -1983,39 +2391,35 @@ describe("x402 batch client", () => {
       });
     });
 
-    it("finds the channel of a credit in a legacy wrong-owner record", async () => {
-      const { network, required, record } = await refundFixture();
-      // Older CLIs relabelled the single channel row before the DVM accepted a
-      // second credit. The drain still has to find that channel — and here,
-      // still has to refuse for the stranger's key.
+    it.each([false, true])("finds a matching derived channel under a stale credit association (legacy=%s)", async (legacy) => {
+      const { key, account, channelId, network, required, record } = await refundFixture(undefined, legacy);
       const recorded = record({ creditId: "credit-2" });
-      const stranger = `0x${"77".repeat(32)}` as `0x${string}`;
+      const readContract = vi.fn(({ args: [id] }) =>
+        Promise.resolve(id === channelId ? [200_000n, 0n] : [0n, 0n])
+      );
+      viemClientMock.create.mockReturnValue({ readContract });
       const { DvmError } = await import("../../errors");
       const batch = await import("../batch-client");
+      const store = await import("../channel-store");
+      const post = vi.fn<(header?: string) => Promise<ReturnType<typeof refundResponse>>>()
+        .mockRejectedValueOnce(new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: required,
+        }))
+        .mockResolvedValueOnce(refundResponse({ channelId, network, payer: account.address, amount: "200000" }));
 
-      const failure = await catchRefusal(
-        batch.refundX402BatchChannel({
-          wallet: {
-            privateKey: stranger,
-            address: privateKeyToAccount(stranger).address,
-            network,
-          },
-          endpoint: "https://dvm.example",
-          callerPubkey: CALLER_PUBKEY,
-          creditId: CREDIT_ID,
-          depositMicro: 200_000,
-          post: vi.fn().mockRejectedValue(
-            new DvmError("payment_required", "Refund approval required.", undefined, {
-              x402_payment_required: required,
-            })
-          ),
-        })
-      );
-
-      expect(failure).toMatchObject({
-        code: "x402_wallet_mismatch",
-        data: { channel_id: recorded.channelId },
+      await batch.refundX402BatchChannel({
+        wallet: { privateKey: key, address: account.address, network },
+        endpoint: "https://dvm.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        depositMicro: 200_000,
+        post,
       });
+
+      expect(decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "").payload).toMatchObject({
+        voucher: { channelId },
+      });
+      expect(store.findX402Channel({ channelId })).toEqual(recorded);
     });
 
     it("refuses when the DVM's current terms describe a different channel", async () => {
@@ -2464,7 +2868,10 @@ function refundResponse(args: {
  * separately at the call, so a test can open the two apart and drain across
  * them.
  */
-async function refundFixture(network: `${string}:${string}` = "eip155:84532") {
+async function refundFixture(
+  network: `${string}:${string}` = "eip155:84532",
+  legacy = false
+) {
   const key = `0x${"11".repeat(32)}` as `0x${string}`;
   const account = privateKeyToAccount(key);
   const receiver = `0x${"22".repeat(20)}` as const;
@@ -2477,7 +2884,9 @@ async function refundFixture(network: `${string}:${string}` = "eip155:84532") {
     receiverAuthorizer,
     token,
     withdrawDelay: 86_400,
-    salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
+    salt: legacy
+      ? deriveLegacyX402ChannelSalt({ network, payer: account.address })
+      : deriveX402ChannelSalt({ network, payer: account.address, endpoint: "https://dvm.example" }),
   };
   const channelId = computeChannelId(config, network);
   const required: PaymentRequired = {
@@ -2542,66 +2951,53 @@ async function refundFixture(network: `${string}:${string}` = "eip155:84532") {
   };
 }
 
+async function recordChannelCredit(args: {
+  endpoint: string;
+  callerPubkey: string;
+  creditId: string;
+  identity: AttestedDvmIdentity;
+}) {
+  const { recordFundResponse } = await import("../../credit-store");
+  recordFundResponse({
+    ...args,
+    targetMicro: 200_000,
+    credit: {
+      credit_id: args.creditId, currency: "USD", balance_micro: 200_000,
+      remaining_micro: 200_000, expiry_ms: Date.now() + 60_000,
+      expired: false, drainable: true, ledger_seq: 1,
+    },
+  });
+}
+
 /**
  * A payment `createX402BatchPayment` signed for a 200000 request on a channel
  * this machine already knows, holding `fundedMicro` (a deposit when it cannot
  * cover the request, a voucher when it can).
  */
-async function signedDepositPayment(opts: { fundedMicro?: string } = {}) {
-  const key = `0x${"11".repeat(32)}` as `0x${string}`;
-  const account = privateKeyToAccount(key);
-  const network = "eip155:84532" as const;
-  const receiver = `0x${"22".repeat(20)}` as `0x${string}`;
-  const receiverAuthorizer = `0x${"33".repeat(20)}` as `0x${string}`;
-  const token = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as const;
-  const channelId = computeChannelId(
-    {
-      payer: account.address,
-      payerAuthorizer: account.address,
-      receiver,
-      receiverAuthorizer,
-      token,
-      withdrawDelay: 86_400,
-      salt: keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`)),
-    },
-    network
-  );
+async function signedDepositPayment(
+  opts: { fundedMicro?: string; chargedMicro?: string; depositMicro?: number } = {}
+) {
+  const { key, account, network, channelId, required, record } = await refundFixture(undefined, true);
+  record({ callerPubkey: "aa".repeat(32) });
   const store = await import("../channel-store");
   // A known channel keeps upstream from reading the chain before it signs.
   await new store.DvmX402ChannelStorage().set(channelId, {
     balance: opts.fundedMicro ?? "0",
     totalClaimed: "0",
-    chargedCumulativeAmount: "0",
+    chargedCumulativeAmount: opts.chargedMicro ?? "0",
   });
   const batch = await import("../batch-client");
   const wallet = { privateKey: key, address: account.address, network };
   const payment = await batch.createX402BatchPayment({
     wallet,
     paymentRequired: {
-      x402Version: 2,
-      resource: { url: "https://dvm.example/v1/credit" },
-      accepts: [
-        {
-          scheme: "batch-settlement",
-          network,
-          asset: token,
-          amount: "200000",
-          payTo: receiver,
-          maxTimeoutSeconds: 60,
-          extra: {
-            receiverAuthorizer,
-            withdrawDelay: 86_400,
-            name: "x402 Batch Settlement",
-            version: "1",
-            assetTransferMethod: "eip3009",
-          },
-        },
-      ],
+      ...required,
+      accepts: required.accepts.map((accepted) => ({ ...accepted, amount: "200000" })),
     },
     endpoint: "https://dvm.example",
     callerPubkey: "aa".repeat(32),
     creditId: "credit-1",
-    depositMicro: 200_000,
+    depositMicro: opts.depositMicro ?? 200_000,
   });
-  return { batch, store, wallet, payment };
+  return { batch, store, wallet, payment, channelId };
 }

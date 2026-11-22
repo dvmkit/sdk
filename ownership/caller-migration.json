@@ -13253,10 +13253,16 @@
       ],
       "dependencies": [
         {
+          "module": "src/lib/credit-store.ts"
+        },
+        {
           "module": "src/lib/errors.ts"
         },
         {
           "module": "src/lib/payment-rails/rpc.ts"
+        },
+        {
+          "module": "src/lib/receipt-verify.ts"
         },
         {
           "module": "src/lib/transport/types.ts"
@@ -13269,6 +13275,9 @@
         },
         {
           "module": "src/lib/x402/channel-rpc.ts"
+        },
+        {
+          "module": "src/lib/x402/channel-salt.ts"
         },
         {
           "module": "src/lib/x402/channel-store.ts"
@@ -13374,6 +13383,32 @@
       "dependencies": [
         {
           "module": "src/lib/payment-rails/rpc.ts"
+        }
+      ]
+    },
+    {
+      "module": "src/lib/x402/channel-salt.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "The caller SDK derives salts for new x402 batch channels and probes legacy channels during drain.",
+          "symbols": [
+            "deriveLegacyX402ChannelSalt",
+            "deriveX402ChannelSalt"
+          ],
+          "consumerEvidence": [
+            "caller:./internal#deriveLegacyX402ChannelSalt",
+            "caller:./internal#deriveX402ChannelSalt"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/lib/receipt-verify.ts"
+        },
+        {
+          "module": "src/lib/x402/channel-store.ts"
         }
       ]
     },

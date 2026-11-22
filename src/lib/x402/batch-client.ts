@@ -14,20 +14,30 @@ import {
   processPaymentResponse,
   readChannelBalanceAndTotalClaimed,
 } from "@x402/evm/batch-settlement/client";
-import { createPublicClient, encodeAbiParameters, http, keccak256, toBytes } from "viem";
+import { createPublicClient, encodeAbiParameters, http, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import * as chains from "viem/chains";
 
+import {
+  dvmLocationIdentity,
+  dvmLocationOrigins,
+  listCredits,
+  type StoredCredit,
+} from "../credit-store";
 import { DvmError } from "../errors";
 import { resolveRpcHttpTransportOptions } from "../payment-rails/rpc";
+import type { AttestedDvmIdentity } from "../receipt-verify";
 import type { CreditOpResult } from "../transport/types";
 import { redactUrlsInText } from "../url-redact";
 import { X402_BATCH_CHANNEL_ABI } from "./batch-abi";
 import { resolveX402ChannelRpc, type X402ChannelRpc } from "./channel-rpc";
+import { deriveLegacyX402ChannelSalt, deriveX402ChannelSalt } from "./channel-salt";
 import {
   DvmX402ChannelStorage,
   findX402Channel,
   listPendingX402FundingsForChannel,
+  listX402Channels,
+  normalizeEndpoint,
   type PendingX402Funding,
   recordX402ChannelMetadata,
   type StoredX402ChannelConfig,
@@ -59,15 +69,32 @@ export async function createX402BatchPayment(args: {
   wallet: X402Wallet;
   paymentRequired: PaymentRequired;
   endpoint: string;
+  identity?: AttestedDvmIdentity;
   callerPubkey: string;
   creditId: string;
   /** Deposit policy in token micro-units, raised to upstream's required minimum. */
   depositMicro: number;
 }): Promise<X402BatchPayment> {
-  const accepted = selectBatchRequirement(args.paymentRequired, args.wallet.network);
-  const { scheme, signer } = createScheme(args.wallet, args.depositMicro);
+  const origin = normalizeEndpoint(args.endpoint);
+  const recorded = exactChannelRecord(listX402Channels(), { ...args, origin });
+  const network = recorded?.network ?? args.wallet.network;
+  const payer = privateKeyToAccount(args.wallet.privateKey as `0x${string}`).address;
+  if (recorded) assertX402ChannelPayer(recorded, payer);
+  const accepted = selectBatchRequirement(args.paymentRequired, network, recorded);
+  const salt = recorded?.config.salt ?? deriveX402ChannelSalt({ ...args, network, payer });
+  const { scheme, signer } = createScheme(args.wallet, args.depositMicro, network, salt);
   const config = scheme.buildChannelConfig(accepted) as StoredX402ChannelConfig;
   const channelId = computeChannelId(config, accepted.network);
+  assertRecordedChannel(recorded, channelId);
+  const owner = recorded ?? findX402Channel({ channelId });
+  if (!recorded && owner && !channelOwnerMatches(owner, { ...args, origin }, listCredits())) {
+    throw new DvmError(
+      "x402_channel_owner_mismatch",
+      `Recorded x402 channel ${channelId} does not belong to the requested DVM.`,
+      undefined,
+      { channel_id: channelId }
+    );
+  }
   assertNoRivalVoucher(channelId, args.creditId);
   // Before upstream reads `balance` to decide whether this payload is a deposit
   // or a voucher, and how large — a projection inflated by a refusal sizes the
@@ -77,15 +104,17 @@ export async function createX402BatchPayment(args: {
   const created = await scheme.createPaymentPayload(2, accepted, {
     extensions: args.paymentRequired.extensions,
   });
-  recordX402ChannelMetadata({
-    channelId,
-    endpoint: normalizeEndpoint(args.endpoint),
-    callerPubkey: args.callerPubkey,
-    creditId: args.creditId,
-    network: accepted.network,
-    config,
-    updatedAt: Date.now(),
-  });
+  if (!owner) {
+    recordX402ChannelMetadata({
+      channelId,
+      endpoint: origin,
+      callerPubkey: args.callerPubkey,
+      creditId: args.creditId,
+      network: accepted.network,
+      config,
+      updatedAt: Date.now(),
+    });
+  }
   const payload: PaymentPayload = {
     ...created,
     resource: args.paymentRequired.resource,
@@ -168,9 +197,9 @@ export async function processX402BatchResponseForWallet(args: {
   /** The pending funding's channel, the only one the answer may update. */
   channelId: string;
 }): Promise<void> {
-  const { scheme } = createScheme(args.wallet, args.depositMicro);
+  // The journalled signature already binds the channel, including its salt.
   await applyX402BatchResponse(
-    storageForScheme(scheme),
+    new DvmX402ChannelStorage(),
     args.paymentHeader,
     args.paymentResponse,
     args.channelId
@@ -378,9 +407,32 @@ export async function processX402BatchCorrection(args: {
   wallet: X402Wallet;
   paymentRequired: PaymentRequired;
   depositMicro: number;
+  channelId: string;
 }): Promise<boolean> {
-  const { scheme } = createScheme(args.wallet, args.depositMicro);
-  return scheme.processCorrectivePaymentRequired(args.paymentRequired);
+  // Match upstream's two corrective errors before inspecting the recorded terms.
+  const { error } = args.paymentRequired;
+  if (
+    error !== "invalid_batch_settlement_evm_cumulative_amount_mismatch" &&
+    error !== "invalid_batch_settlement_evm_cumulative_below_claimed"
+  ) {
+    return false;
+  }
+  const recorded = findX402Channel({ channelId: args.channelId });
+  if (!recorded) return false;
+  assertX402ChannelPayer(
+    recorded,
+    privateKeyToAccount(args.wallet.privateKey as `0x${string}`).address
+  );
+  const accepted = selectBatchRequirement(args.paymentRequired, recorded.network, recorded);
+  const { scheme } = createScheme(
+    args.wallet,
+    args.depositMicro,
+    recorded.network,
+    recorded.config.salt
+  );
+  const config = scheme.buildChannelConfig(accepted);
+  assertRecordedChannel(recorded, computeChannelId(config, accepted.network));
+  return scheme.processCorrectivePaymentRequired({ ...args.paymentRequired, accepts: [accepted] });
 }
 
 /** A cooperative refund, and the outstanding claim authority it proceeded through. */
@@ -405,12 +457,124 @@ export async function refundX402BatchChannel(args: X402RefundArgs): Promise<X402
 export interface X402RefundArgs {
   wallet: X402Wallet;
   endpoint: string;
+  identity?: AttestedDvmIdentity;
 
   callerPubkey: string;
 
   creditId: string;
   depositMicro: number;
   post: (paymentHeader?: string) => Promise<CreditOpResult>;
+}
+
+interface X402ChannelScope {
+  origin: string;
+  callerPubkey: string;
+  creditId: string;
+  identity?: AttestedDvmIdentity;
+}
+
+function exactChannelRecord(
+  channels: readonly StoredX402ChannelMetadata[],
+  { origin, callerPubkey, creditId }: X402ChannelScope
+): StoredX402ChannelMetadata | undefined {
+  const candidates = channels.filter(
+    (record) =>
+      record.callerPubkey === callerPubkey &&
+      record.creditId === creditId &&
+      normalizeEndpoint(record.endpoint) === origin
+  );
+  // A duplicate exact association cannot be resolved by restating its credit ID.
+  return onlyChannelRecord(candidates, "Use the channel ID for a timed on-chain withdrawal.");
+}
+
+function onlyChannelRecord(
+  candidates: readonly StoredX402ChannelMetadata[],
+  hint: string
+): StoredX402ChannelMetadata | undefined {
+  if (candidates.length > 1) {
+    const channelIds = candidates.map(({ channelId }) => channelId).sort();
+    throw new DvmError(
+      "x402_channel_ambiguous",
+      `More than one recorded x402 channel matches: ${channelIds.join(", ")}.`,
+      hint,
+      { channel_ids: channelIds }
+    );
+  }
+  return candidates[0];
+}
+
+function channelOwnerMatches(
+  record: StoredX402ChannelMetadata,
+  { origin, identity }: Pick<X402ChannelScope, "origin" | "identity">,
+  credits: readonly StoredCredit[]
+): boolean {
+  const recordedOrigin = normalizeEndpoint(record.endpoint);
+  let attestedOwner = false;
+  for (const credit of credits) {
+    const hasCreditId = credit.creditId === record.creditId ||
+      credit.siblingCredits?.some(({ creditId }) => creditId === record.creditId);
+    if (
+      !hasCreditId ||
+      credit.callerPubkey !== record.callerPubkey ||
+      !dvmLocationOrigins(credit).includes(recordedOrigin)
+    ) {
+      continue;
+    }
+    const owner = dvmLocationIdentity(credit);
+    if (!owner) continue;
+    if (
+      identity?.dvmId !== owner.dvmId ||
+      identity.builderPubkey.toLowerCase() !== owner.builderPubkey
+    ) {
+      return false;
+    }
+    attestedOwner = true;
+  }
+  return attestedOwner || recordedOrigin === origin;
+}
+
+function candidateSalts(args: {
+  network: string;
+  payer: string;
+  endpoint: string;
+  identity?: AttestedDvmIdentity;
+}): `0x${string}`[] {
+  return [
+    ...(args.identity ? [deriveX402ChannelSalt(args)] : []),
+    deriveX402ChannelSalt({ ...args, identity: undefined }),
+    deriveLegacyX402ChannelSalt(args),
+  ];
+}
+
+function findRecordedDrainChannel(
+  channels: readonly StoredX402ChannelMetadata[],
+  scope: X402ChannelScope,
+  account: ClientEvmSigner,
+  required: PaymentRequired
+): StoredX402ChannelMetadata | undefined {
+  const callerChannels = channels.filter(({ callerPubkey }) => callerPubkey === scope.callerPubkey);
+  if (callerChannels.length === 0) return undefined;
+  const credits = listCredits();
+  const candidates = callerChannels.filter((record) => {
+    const accepted = required.accepts.find(
+      (entry) => entry.scheme === X402_BATCH_SETTLEMENT_SCHEME && entry.network === record.network
+    );
+    if (!accepted || !channelOwnerMatches(record, scope, credits)) return false;
+    const salts = candidateSalts({
+      ...scope,
+      network: record.network,
+      payer: account.address,
+      endpoint: normalizeEndpoint(record.endpoint),
+    });
+    return salts.some((salt) => {
+      const scheme = new BatchSettlementEvmScheme(account, { salt });
+      return computeChannelId(scheme.buildChannelConfig(accepted), record.network) === record.channelId;
+    });
+  });
+  return onlyChannelRecord(
+    candidates,
+    "Drain using the credit ID at its recorded origin, or use the channel ID for a timed on-chain withdrawal."
+  );
 }
 
 async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402RefundOutcome> {
@@ -431,64 +595,72 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
     if (!required) throw err;
     initialRequired = required;
   }
-  // Follow the channel that was recorded when it opened, not the one today's
-  // config would derive. Both inputs to the derivation below are
-  // mutable after the fact — a reconnect mints a fresh payer, `x402-network`
-  // re-pins the chain — and the settlement contract shares one address across
-  // chains, so a derivation that has drifted reads a channel that never existed
-  // and answers (0, 0). That is indistinguishable from a channel the DVM has
-  // emptied, which is how an untouched balance came to be reported as gone.
-  //
-  // The two halves diverge on what following means. A payer that no longer
-  // matches is a dead end — only the recorded key can move the money — so it
-  // refuses. A chain that no longer matches is not: the payer key is the same
-  // key on either chain, and the only genuinely chain-bound pieces are which
-  // challenge row is selected and which endpoint the read goes to. So the drain
-  // follows the channel onto its own chain and a re-pin costs nothing, exactly
-  // as `wallet x402-network` already promises.
-  //
-  // The credit-scoped lookup is the precise one. Keep the fallback for records
-  // an older CLI relabelled after a refused cross-credit attempt: it is what the
-  // timed exit already does, and it can only reach a channel the same payer
-  // opened. The DVM challenge below still has to derive this exact channel.
+  const origin = normalizeEndpoint(args.endpoint);
+  const scope = { ...args, origin };
+  const channels = listX402Channels();
+  const account = privateKeyToAccount(args.wallet.privateKey as `0x${string}`);
   const recorded =
-    findX402Channel({
-      endpoint: args.endpoint,
-      callerPubkey: args.callerPubkey,
-      creditId: args.creditId,
-    }) ?? findX402Channel({ endpoint: args.endpoint, callerPubkey: args.callerPubkey });
-  if (recorded) {
-    assertX402ChannelPayer(
-      recorded,
-      privateKeyToAccount(args.wallet.privateKey as `0x${string}`).address
-    );
-  }
+    exactChannelRecord(channels, scope) ??
+    findRecordedDrainChannel(channels, scope, account, initialRequired);
+  if (recorded) assertX402ChannelPayer(recorded, account.address);
   const network = recorded?.network ?? args.wallet.network;
-  const { scheme, signer, rpc } = createScheme(
-    args.wallet,
-    args.depositMicro,
-    network,
-    recorded?.config.salt
-  );
   const accepted = selectBatchRequirement(initialRequired, network, recorded);
-  const config = scheme.buildChannelConfig(accepted);
-  const channelId = computeChannelId(config, accepted.network);
-  assertRecordedChannel(recorded, channelId);
-  const journalled = listPendingX402FundingsForChannel(channelId);
+  const chainScopedRequired = { ...initialRequired, accepts: [accepted] };
+  const salts = recorded
+    ? [recorded.config.salt]
+    : candidateSalts({ ...args, network, payer: account.address });
+  const candidates = Array.from(salts, (salt) => {
+    const client = createScheme(args.wallet, args.depositMicro, network, salt);
+    const config = client.scheme.buildChannelConfig(accepted) as StoredX402ChannelConfig;
+    return { ...client, config, channelId: computeChannelId(config, network) };
+  });
+  let selected = candidates[0];
+  const { rpc } = selected;
+  assertRecordedChannel(recorded, selected.channelId);
+  let journalled: PendingX402Funding[];
   let atRiskMicro: bigint;
   let refundProbe: BatchSettlementClientContext;
   // Only the chain read in this block can be broken by the endpoint; what
   // follows it is arithmetic and a local write, where naming the RPC scoping
   // would read as an explanation for a failure it had no part in.
-  let readingChain = true;
+  let readingChain = false;
   try {
-    const [balance, totalClaimed] = await readChannelBalanceAndTotalClaimed(signer, channelId);
-    readingChain = false;
-    if (balance <= totalClaimed) {
+    let balance = 0n;
+    let totalClaimed = 0n;
+    let funded = false;
+    for (const candidate of candidates) {
+      if (!recorded && findX402Channel({ channelId: candidate.channelId })) continue;
+      readingChain = true;
+      [balance, totalClaimed] = await readChannelBalanceAndTotalClaimed(
+        candidate.signer,
+        candidate.channelId
+      );
+      readingChain = false;
+      if (balance <= totalClaimed) continue;
+      selected = candidate;
+      funded = true;
+      if (!recorded) {
+        recordX402ChannelMetadata({
+          channelId: selected.channelId,
+          endpoint: origin,
+          callerPubkey: args.callerPubkey,
+          creditId: args.creditId,
+          network,
+          config: selected.config,
+          updatedAt: Date.now(),
+        });
+      }
+      break;
+    }
+    if (!funded) {
       throw new Error(
-        `the DVM has already claimed this channel's escrow (balance=${String(balance)}, totalClaimed=${String(totalClaimed)})`
+        recorded
+          ? `the DVM has already claimed this channel's escrow (balance=${String(balance)}, totalClaimed=${String(totalClaimed)})`
+          : "no funded x402 channel was found for this endpoint"
       );
     }
+    const { channelId } = selected;
+    journalled = listPendingX402FundingsForChannel(channelId);
     // A voucher the DVM has not acknowledged is claim authority it may still
     // exercise, and upstream persists nothing at signing time — so the local
     // channel record understates what this channel still owes and the journal
@@ -525,6 +697,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
   } catch (err) {
     throw x402RefundError(err, { network, rpc, endpointInPath: readingChain });
   }
+  const { channelId, scheme } = selected;
   let result: CreditOpResult | undefined;
   let responseHeader: string | undefined;
   // The DVM's own terminal answer to the last post, if it gave one. Whatever
@@ -548,7 +721,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       probePending = false;
       return new Response(JSON.stringify({ error: "payment_required" }), {
         status: 402,
-        headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(initialRequired) },
+        headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(chainScopedRequired) },
       });
     }
     try {
@@ -946,13 +1119,8 @@ async function reconcileLapsedRefusals(
 function createScheme(
   wallet: X402Wallet,
   depositMicro: number,
-  /**
-   * Chain this scheme acts on: the recorded channel's own on the drain path,
-   * which spans chains, and the wallet's pin everywhere else, which cannot.
-   */
-  network: string = wallet.network,
-  /** Salt recorded when the channel opened; absent when nothing is on record. */
-  recordedSalt?: `0x${string}`
+  network: string,
+  salt: `0x${string}`
 ): {
   scheme: BatchSettlementEvmScheme;
   signer: ClientEvmSigner;
@@ -984,12 +1152,6 @@ function createScheme(
   const account = privateKeyToAccount(wallet.privateKey as `0x${string}`);
   const signer = toClientEvmSigner(account, publicClient);
   const storage = new DvmX402ChannelStorage();
-  // Deriving is how a channel is *opened*; a channel that already exists is
-  // followed by its recorded salt instead, so the formula changing under a
-  // caller who is mid-channel cannot silently point them at a different one.
-  const salt =
-    recordedSalt ??
-    keccak256(toBytes(`dvmkit:x402-batch:${network}:${account.address.toLowerCase()}`));
   const scheme = new BatchSettlementEvmScheme(signer, {
     storage,
     salt,
@@ -1122,14 +1284,6 @@ function selectBatchRequirement(
     `The DVM offered no batch-settlement channel on the wallet's ${networkCopy} network.`,
     `This DVM does not take x402 channel funding on ${networkCopy}. Fund over another rail, or re-pin the connected x402 wallet to a chain this DVM settles ('dvm wallet x402-network <caip2>').`
   );
-}
-
-function normalizeEndpoint(endpoint: string): string {
-  try {
-    return new URL(endpoint).origin;
-  } catch {
-    return endpoint.replace(/\/+$/, "");
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

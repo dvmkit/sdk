@@ -621,9 +621,9 @@ export function listResumableX402Fundings(
 /**
  * Every unacknowledged signed voucher on one channel. Deliberately unscoped by
  * endpoint and caller pubkey: the channel tuple names neither, so one channel
- * is shared by every credit at a DVM, by two DVMs that share a payout address,
- * and by two caller identities on one EVM key. Anything reasoning about what a
- * channel still owes has to see all of them.
+ * can be shared by credits at the same DVM, by DVMs using the same legacy
+ * channel, and by caller identities using the same EVM key. Anything reasoning
+ * about what a channel still owes has to see all of them.
  */
 export function listPendingX402FundingsForChannel(channelId: string): PendingX402Funding[] {
   const canonical = canonicalChannelId(channelId);
@@ -874,7 +874,7 @@ function canonicalChannelId(value: string): `0x${string}` {
   return value.toLowerCase() as `0x${string}`;
 }
 
-function normalizeEndpoint(endpoint: string): string {
+export function normalizeEndpoint(endpoint: string): string {
   try {
     return new URL(endpoint).origin;
   } catch {

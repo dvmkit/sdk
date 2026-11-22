@@ -715,6 +715,11 @@ export {
 } from "../../lib/x402/channel-rpc";
 
 export {
+  deriveLegacyX402ChannelSalt,
+  deriveX402ChannelSalt
+} from "../../lib/x402/channel-salt";
+
+export {
   DvmX402ChannelStorage,
   acknowledgeX402ChannelOwner,
   clearPendingX402ExactFunding,
