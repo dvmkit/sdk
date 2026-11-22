@@ -959,7 +959,7 @@
         },
         "attachCreditMenu": {
           "stability": "experimental",
-          "signature": "a11bfec19cfef9fc4fb5a1bbd139ea6fe0a7ca0110a26d61ba98d62e1de32e97"
+          "signature": "260efbcbd9f2d63bbd2227213b3c9cf72412d82eb5b443c6a0454510fd9b001b"
         },
         "baselineContentExpiry": {
           "stability": "experimental",
@@ -975,7 +975,7 @@
         },
         "buildCreditMenu": {
           "stability": "experimental",
-          "signature": "a62d83bba216a50c5e6892d894beb08c56854a761076051725f9e55bce2e6044"
+          "signature": "6b2dbd0ba688328a18d8286200eac4f633a9baa8df9f39f0d6cf4c447614a7d5"
         },
         "BuildCreditMenuArgs": {
           "stability": "experimental",
@@ -1195,7 +1195,7 @@
         },
         "CreditMenu": {
           "stability": "experimental",
-          "signature": "625da2792ff9a2682bbc70dd29bb1aad552264ae822ff1b3576c89e8cf2a540d"
+          "signature": "762b6e7a784f5825775d6a5630d5f346f3a545b24eff56a9bd6fbbe20bcebc0d"
         },
         "CreditRequest": {
           "stability": "experimental",
@@ -1203,7 +1203,7 @@
         },
         "CreditRouteDeps": {
           "stability": "experimental",
-          "signature": "f8756d3791041ef3ab96e04a29de9e659d44f529f3d64923cae47add7a66daef"
+          "signature": "2f181ecd412dae58441deda7b8e8a7a96a9035f91745cedba9561178a0927d48"
         },
         "CreditSnapshot": {
           "stability": "experimental",
@@ -1215,7 +1215,7 @@
         },
         "CreditTerms": {
           "stability": "experimental",
-          "signature": "fa0cdabade22c45d61c72d981c5070bc00eda45e43359be66881c34275c63327"
+          "signature": "09d7174499dd0f791cd2cf64d3d4f71317b7be586c5b397693538989540e1910"
         },
         "DeclineOutcome": {
           "stability": "experimental",
@@ -1295,7 +1295,7 @@
         },
         "handleCreditRequest": {
           "stability": "experimental",
-          "signature": "80b414e97ac0bec05d692191b7bc3abe5388facacbccf82e1eae687255ea7b91"
+          "signature": "dac2c27e9b06879db5c36a2365d90cb4cab8ba7189c9a19be60875db0253e54c"
         },
         "hasInvalidRequestId": {
           "stability": "experimental",
