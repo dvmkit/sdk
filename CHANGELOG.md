@@ -26,6 +26,22 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 - New x402 credits derive per-DVM batch channels using the verified attested identity, or the endpoint origin when no verified identity is available. The attested identity keeps the channel ID stable across origins for identical payment terms. Each funding request has its own `fund_id`. Re-funding a drained legacy credit by explicitly using its old credit ID at the recorded origin keeps using the recorded legacy channel and network. The internal entry exports `deriveX402ChannelSalt` and `deriveLegacyX402ChannelSalt`. Batch correction requires the recorded channel ID.
 - Cooperative drain can follow an attested credit's channel across origins when the stored and requested identities match. When several fallback records qualify, drain using the credit ID at its recorded origin, or use the channel ID for a timed on-chain withdrawal. Automatic adoption of an unrecorded legacy channel assumes one DVM per origin. At a self-hosted origin serving several DVMs with identical payment terms, chain state alone cannot identify the owner. Drain with an explicit credit ID that has a known local channel record.
 
+## [0.45.0](https://github.com/dvmkit/sdk/compare/v0.44.2...v0.45.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **x402:** scope batch channel salts per DVM ([#224](https://github.com/dvmkit/sdk/issues/224))
+
+### Bug Fixes
+
+* **x402:** scope batch channel salts per DVM ([#224](https://github.com/dvmkit/sdk/issues/224)) ([f5436d8](https://github.com/dvmkit/sdk/commit/f5436d8216046292c00f111e9b8c18ed50ad3d8b))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.44.2 ([#225](https://github.com/dvmkit/sdk/issues/225)) ([457c9ad](https://github.com/dvmkit/sdk/commit/457c9adc49c5ad5c34195e4aa653879d237677bf))
+
 ## [0.44.2](https://github.com/dvmkit/sdk/compare/v0.44.1...v0.44.2) (2026-11-22)
 
 - A successful x402 cooperative refund with invalid channel state keeps the caller's pre-refund chain snapshot for reporting. The SDK marks it unreconciled and reads fresh chain state before sizing the next funding payment.
