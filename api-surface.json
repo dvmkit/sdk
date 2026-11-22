@@ -1,6 +1,6 @@
 {
   "package": "@dvmkit/sdk",
-  "version": "0.44.2",
+  "version": "0.45.0",
   "storeContracts": {
     "PostgresJobStore.getMessageReadState": {
       "behavior": "reads job ownership and content retention metadata, with active holds, without loading the transcript"
