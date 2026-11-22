@@ -156,9 +156,44 @@ export async function settleMandateAsk(args: {
   }
 }
 
+/** The verified transcript message identified by a committed payment for this ask. */
+function paidAskPaymentSql(jobId: string, requestSeq: string): string {
+  return `SELECT m.seq FROM job_messages m
+    WHERE m.job_id=${jobId} AND m.seq > ${requestSeq} AND m.status='verified'
+      AND m.data->>'from'='requester' AND m.data->>'type'='payment'
+      AND (EXISTS (SELECT 1 FROM credit_balance_payments b
+          WHERE b.job_id=m.job_id AND b.request_seq=${requestSeq} AND (b.response->>'seq')::bigint=m.seq)
+        OR EXISTS (SELECT 1 FROM job_payment_intents i
+          WHERE i.job_id=m.job_id AND i.seq=m.seq AND i.request_seq=${requestSeq} AND i.outcome='ask_paid'))
+    ORDER BY m.seq DESC LIMIT 1`;
+}
+
+export async function findPaidAskPayment(pool: Pool, jobId: string, requestSeq: number): Promise<number | undefined> {
+  const { rows: [payment] } = await pool.query<{ seq: number }>(paidAskPaymentSql("$1", "$2"), [jobId, requestSeq]);
+  return payment?.seq;
+}
+
+/** A verified legacy intent can describe a balance deposit, even if the funding names the draw. */
+export async function listLegacyRailAskPayments(pool: Pool, jobId: string, afterSeq = 0): Promise<{ seq: number; applied: boolean }[]> {
+  const { rows } = await pool.query<{ seq: number; applied: boolean }>(
+    `SELECT m.seq, COALESCE(j.pieces @> jsonb_build_array(jsonb_build_object('paidSeq', m.seq)), false) AS applied
+     FROM job_messages m
+     JOIN job_payment_intents i ON i.job_id=m.job_id AND i.seq=m.seq
+     JOIN jobs j ON j.id=m.job_id
+     WHERE m.job_id=$1 AND m.seq > $2 AND m.status='verified'
+       AND m.data->>'from'='requester' AND m.data->>'type'='payment'
+       AND i.request_seq IS NULL AND i.disposition='ask' AND i.outcome='verified'
+     ORDER BY m.seq DESC`, [jobId, afterSeq]);
+  return rows;
+}
+
+export async function findLegacyRailAskPayment(pool: Pool, jobId: string, requestSeq: number): Promise<number | undefined> {
+  const payments = await listLegacyRailAskPayments(pool, jobId, requestSeq);
+  return payments.find(payment => payment.applied)?.seq;
+}
+
 /**
- * Find quiet credit asks that could need settlement or resume. Without a mandate the sweep can
- * only resume, so require a committed balance payment for the latest ask. An answered prompt can
+ * Find quiet asks that could need settlement or resume. An answered prompt can
  * follow the ask while payment is still pending. A prompt after the committed payment supersedes
  * the paid wait.
  * An unanswered prompt can keep an already resumed job in `awaiting-input`, so skip those jobs
@@ -167,7 +202,7 @@ export async function settleMandateAsk(args: {
  * Oldest first; pass the last row back as `after` for the next page.
  */
 export async function findQuietCreditAsks(pool: Pool, args: {
-  dvmId: string; beforeMs: number; capabilities: string[]; limit: number;
+  dvmId: string; beforeMs: number; capabilities: string[]; limit: number; settleMandates: boolean;
   after?: { lastActivityAt: number; id: string };
 }): Promise<{ id: string; lastActivityAt: number; hasMandate: boolean }[]> {
   const { rows } = await pool.query<{ id: string; last_activity_at: string; has_mandate: boolean }>(
@@ -178,27 +213,23 @@ export async function findQuietCreditAsks(pool: Pool, args: {
          AND m.data->>'type'='payment-request'
        ORDER BY m.seq DESC LIMIT 1
      ) latest ON TRUE
-     LEFT JOIN credit_balance_payments b ON b.job_id=j.id AND b.request_seq=latest.seq
-     LEFT JOIN job_messages paid ON paid.job_id=j.id AND paid.seq=(b.response->>'seq')::bigint
-       AND paid.seq > latest.seq AND paid.status='verified'
-       AND paid.data->>'from'='requester' AND paid.data->>'type'='payment'
+     LEFT JOIN LATERAL (${paidAskPaymentSql("j.id", "latest.seq")}) paid ON TRUE
      WHERE j.status='awaiting-input' AND j.last_activity_at < $1
        AND (j.dvm_id IS NULL OR j.dvm_id=$2) AND j.capability = ANY($3::text[])
        AND ($5::bigint IS NULL OR (j.last_activity_at, j.id) > ($5::bigint, $6::text))
-       AND (j.mandate IS NOT NULL OR (
+       AND (($7::boolean AND j.mandate IS NOT NULL) OR (
             COALESCE(j.pending_payment_msats, 0) = 0 AND COALESCE(j.pending_payment_fiat_micro, 0) = 0
             AND paid.seq IS NOT NULL))
        AND NOT EXISTS (SELECT 1 FROM job_messages m WHERE m.job_id=j.id AND m.status='verified'
-            AND m.data->>'from'='provider' AND (
-              (m.data->>'type'='prompt' AND m.seq > COALESCE(paid.seq, latest.seq)) OR
-              (m.data->>'type' IN ('complete', 'cancel') AND m.seq > latest.seq)))
+            AND m.data->>'from'='provider' AND m.data->>'type'='prompt' AND m.seq > COALESCE(paid.seq, latest.seq))
        AND ((j.stop_requested AND j.pending_payment_msats > 0) OR NOT EXISTS (SELECT 1 FROM job_messages p WHERE p.job_id=j.id AND p.status='verified'
             AND p.data->>'from'='provider' AND p.data->>'type'='prompt'
             AND NOT EXISTS (SELECT 1 FROM job_messages r WHERE r.job_id=j.id AND r.status='verified' AND r.seq > p.seq
               AND r.data->>'from'='requester' AND r.data->>'type'='response'
               AND r.data->'content'->>'prompt_id' = p.data->'content'->>'id')))
      ORDER BY j.last_activity_at, j.id LIMIT $4`,
-    [args.beforeMs, args.dvmId, args.capabilities, args.limit, args.after?.lastActivityAt ?? null, args.after?.id ?? null]);
+    [args.beforeMs, args.dvmId, args.capabilities, args.limit, args.after?.lastActivityAt ?? null, args.after?.id ?? null,
+      args.settleMandates]);
   return rows.map((row) => ({ id: row.id, lastActivityAt: Number(row.last_activity_at), hasMandate: row.has_mandate }));
 }
 

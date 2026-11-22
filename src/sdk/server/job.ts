@@ -12,7 +12,7 @@ import { StepCache } from "../step-cache";
 import type { CapabilityChannel, FundingMethod, SDKJobContext } from "../types";
 import { askExpiryAtMs } from "./ask-expiry";
 import type { CreditSnapshot } from "./credit-ledger";
-import type { AppendOutgoingOptions, JobRecord, TopUpCapUnenforcedReason } from "./job-store";
+import type { AppendOutgoingOptions, JobRecord, OutgoingMessage, TopUpCapUnenforcedReason } from "./job-store";
 import type { JobPiece, JobSettlement, PieceEnding } from "./pieces";
 
 export interface PromptResolver {
@@ -240,6 +240,10 @@ export interface ServerJob {
    * so two synchronous `providerMessage` calls (e.g. `artifact` followed by
    * `complete`) can't race for the DB-side seq allocation.
    */
+  /** Host-managed terminal output stays private until its snapshot commits. */
+  deferTerminalOutput?: true;
+  terminalOutput?: OutgoingMessage;
+  adoptedTerminal?: true;
   messageAppender?: (msg: Message, opts?: AppendOutgoingOptions) => void;
   /**
    * Tail of the per-job appender chain. `wireMessageAppender` updates
@@ -254,6 +258,11 @@ export interface ServerJob {
   pendingPayment: PaymentResolver | null;
   /** When not null, indicates replay mode — prompt/payment scan message history for cached responses. */
   replayHighSeq: number | null;
+  replayKind?: "sleep";
+  sleepId?: string;
+  sleepGeneration?: number;
+  sleepPending?: boolean;
+  superseded?: boolean;
   /** Number of provider messages to suppress during replay. Cleared on handler error. */
   replayProviderSkip: number;
   /** Index of the next payment to match during replay (for multi-payment handlers). */
@@ -350,7 +359,7 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     terminalAtMs: record.terminalAtMs,
     callerWaitMs: record.callerWaitMs,
     awaitingInputAtMs: record.awaitingInputAtMs,
-    messages: [...record.messages],
+    messages: record.messages.filter(message => isTerminal(record.status) || !isTerminalMessage(message)),
     seq: record.seq,
     upfrontPayment: record.upfrontPayment,
     paidMsats: record.paidMsats,
@@ -398,6 +407,8 @@ export function fromJobRecord(record: JobRecord): ServerJob {
     pendingPrompts: new Map(),
     pendingPayment: null,
     replayHighSeq: null,
+    sleepId: record.sleepId,
+    sleepGeneration: record.sleepGeneration,
     replayProviderSkip: 0,
     replayPaymentIndex: 0,
     createdAt: record.createdAt,
@@ -451,6 +462,10 @@ export function providerMessage(
   }
   if (type === "prompt" || type === "payment-request") {
     content = { ...content, expires_at_ms: Date.now() + (job.idleTimeoutMs ?? 3600_000) };
+  }
+  if (job.deferTerminalOutput && (type === "cancel" || type === "complete")) {
+    job.terminalOutput = { from: "provider", timestamp: Math.floor(Date.now() / 1000), type, content };
+    return;
   }
   const msg = localMessage(job, "provider", type, content);
   // Tx A semantics: for payment-request messages, the pending amount
@@ -582,13 +597,19 @@ export function isTerminal(status: ServerJob["status"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
+/** Outcomes enter history through a terminal commit, never through incremental output. */
+export function isTerminalMessage(message: Pick<Message, "type">): boolean {
+  return message.type === "complete" || message.type === "cancel" || message.type === "decline";
+}
+
 export function isYieldMessage(msg: Message): boolean {
   return (
     msg.type === "prompt" ||
     msg.type === "payment-request" ||
     msg.type === "working" ||
     msg.type === "complete" ||
-    msg.type === "cancel"
+    msg.type === "cancel" ||
+    (msg.type === "decline" && msg.from === "requester")
   );
 }
 

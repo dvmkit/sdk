@@ -457,6 +457,8 @@ describe("mid-job requestPayment funds the credit and grows the draw", () => {
         const backing = new MemoryJobStore();
         // A custom store with no streaming surface: the arrival is decided from the in-memory job.
         const plain: JobStore = {
+          failReactivation: backing.failReactivation.bind(backing),
+          heartbeatJobExecutors: backing.heartbeatJobExecutors.bind(backing),
           get: (id) => backing.get(id), save: (record) => backing.save(record), delete: (id) => backing.delete(id),
           findJobByPaymentTxHash: (txHash) => backing.findJobByPaymentTxHash(txHash),
         };

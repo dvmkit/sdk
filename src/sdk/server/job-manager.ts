@@ -1,6 +1,8 @@
 import { callerDeadline, hasCallerDeadline } from "./job";
 import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { acquireFlyKeepalive } from "./fly-keepalive";
+import { retrySleepEnd } from "../sleep";
+
 import type { PaidJobCompletion, PaymentMode } from "./payment-mode";
 import type { DisposableCashuCommit } from "./disposable-cashu-store";
 import { randomBytes } from "node:crypto";
@@ -61,7 +63,7 @@ import {
   opaqueX402FundingId,
   x402ImplicitDrawReportId,
 } from "./funding";
-import { findQuietCreditAsks, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
+import { findQuietCreditAsks, listLegacyRailAskPayments, type MandateSettlement, reportMandateSkip, settleMandateAsk } from "./mandate-payment";
 import type { ServerJob } from "./job";
 import {
   abortJob,
@@ -69,7 +71,6 @@ import {
   holdJobHistory,
   isTerminal,
   JobCancelledError,
-  localMessage,
   providerMessage,
   releaseJobHistory,
   toJobRecord,
@@ -88,12 +89,15 @@ import {
   isReceiptIssuingStore,
   isStreamableJobStore,
   JobEndedError,
+  JobSupersededError,
+  TERMINAL_OUTPUT,
+  withTerminalOutput,
 } from "./job-store";
 import { MemoryJobStore } from "./memory-job-store";
 import { PostgresJobStore } from "./postgres-job-store";
 import type { MintHealthTracker } from "./mint-health-tracker";
 import type { MppxServer } from "./mpp-setup";
-import type { CreditFundingReport, PaymentInfo, VerifiedIncomingPayment } from "./payment";
+import type { CreditFundingReport, PaymentInfo, VerifiedIncomingPayment, VerifyIncomingSnapshot } from "./payment";
 import {
   applyPaymentInfoToJob,
   creditDepositPayload,
@@ -114,6 +118,7 @@ import {
   type BalanceLanding,
   type PaymentBalanceReason,
   type PaymentDisposition,
+  type RecordedPaymentArrival,
 } from "./payment-arrival";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { drawFundingReceiptFor } from "./funding-receipt";
@@ -564,6 +569,7 @@ export interface JobManagerOpts {
    * Resume an `awaiting-input` job with a paid ask and no local worker. The app supplies its
    * reactivation path.
    */
+  resumeSleepingJob?: (jobId: string, expectedActivityBefore: number) => Promise<void>;
   resumePaidAsk?: (jobId: string) => Promise<void>;
   /**
    * Grace period before the stale sweep settles a mandated ask or resumes a credit-paid ask.
@@ -577,7 +583,7 @@ type ResolvedInput<I extends ZodLike | undefined> = I extends ZodLike<infer O> ?
 type ReactivationWait = {
   askSeq: number;
   startedAtMs?: number;
-  lastPromptOrTerminalSeq?: number;
+  lastPromptSeq?: number;
 };
 
 /**
@@ -749,7 +755,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   /** How many times idle expiry has found a payment holding each job open. */
   private readonly idleIntentWaits = new WeakMap<ServerJob, number>();
   /** What each recorded payment arrival is for, decided under the job row lock. */
-  private readonly paymentDispositions = new WeakMap<ServerJob, Map<number | object, PaymentDisposition>>();
+  private readonly paymentArrivals = new WeakMap<ServerJob, Map<number, RecordedPaymentArrival>>();
 
   // Every local input resume holds this queue through its durable wait update.
   // A prompt response and a payment NOTIFY must not mistake each other for a
@@ -791,6 +797,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * {@link createMonotonicClock} for what it costs and where it is clamped.
    */
   private readonly monotonicNowMs = createMonotonicClock();
+  private warnedNonDurableSleep = false;
   private sweepInFlight = false;
   private mandateSweepInFlight = false;
   private orphanSweepInFlight = false;
@@ -1301,7 +1308,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // a NoMethodError leak out of onJob.
     const cap = this.getCapability(job.capability, job.channel);
     const onError = (err: unknown): void => {
-      if (isTerminal(job.status)) return;
+      if (job.superseded || isTerminal(job.status)) return;
       job.replayProviderSkip = 0; // stop suppressing so cancel message emits
       job.status = "failed";
       providerMessage(job, "cancel", {
@@ -1378,6 +1385,19 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   async dispatchMessage(job: ServerJob, type: MessageType, content: unknown): Promise<void> {
+    const store = this.jobStore;
+    if ((type === "cancel" || type === "decline") &&
+        isStreamableJobStore(store) && (type === "cancel" || store.declineJob)) {
+      const reason = (content as CancelContent | undefined)?.reason ?? (type === "decline" ? "Job declined" : "Job cancelled");
+      const ended = await afterPaymentIntents(() => type === "cancel"
+        ? store.cancelJob(job.id, reason)
+        : store.declineJob!(job.id, reason, undefined, true).then(outcome => outcome === "declined"));
+      if (ended) {
+        await this.signalStoredTerminal(job.id);
+        await this.finalizeStoredTerminal(job.id);
+      }
+      return;
+    }
     if (type !== "response" && type !== "payment") {
       return this.dispatchMessageNow(job, type, content);
     }
@@ -1416,31 +1436,35 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const askSeq = job.pendingPayment ? this.paymentAskSeqs.get(job.pendingPayment) : undefined;
     // A failed ask append cannot borrow satisfaction from the preceding ask.
     if (job.pendingPayment && this.opts.db && this.jobStore instanceof PostgresJobStore && askSeq === undefined) return false;
-    return this.claimInputForAsk(job.id, askSeq);
+    const claimed = await this.claimInputForAsk(job.id, askSeq, undefined, job.sleepGeneration ?? 0);
+    if (!claimed && (job.sleepGeneration !== undefined || job.sleepPending)) {
+      this.retireIfSuperseded(job, await this.jobStore.get(job.id));
+    }
+    return claimed;
   }
 
-  private async claimInputForAsk(jobId: string, askSeq: number | undefined, wait?: ReactivationWait): Promise<boolean> {
+  private async claimInputForAsk(jobId: string, askSeq: number | undefined, wait?: ReactivationWait, generation?: number): Promise<boolean> {
     if (!isStreamableJobStore(this.jobStore)) return true;
-    if (askSeq === undefined || !this.opts.db || !(this.jobStore instanceof PostgresJobStore)) return this.jobStore.claimForProcessing(jobId);
+    if (askSeq === undefined || !this.opts.db || !(this.jobStore instanceof PostgresJobStore)) return this.jobStore.claimForProcessing(jobId, generation);
     const tx = await this.opts.db.connect();
     try {
       await tx.query("BEGIN");
-      const { rows: [record] } = await tx.query<{ status: string; awaiting_input_at_ms: string | null }>(
-        "SELECT status, awaiting_input_at_ms FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
-      const { rows: [history] } = await tx.query<{ ask_seq: string | null; last_prompt_or_terminal_seq: string | null }>(
+      const { rows: [record] } = await tx.query<{ status: string; awaiting_input_at_ms: string | null; sleep_generation: number }>(
+        "SELECT status, awaiting_input_at_ms, sleep_generation FROM jobs WHERE id=$1 FOR UPDATE", [jobId]);
+      const { rows: [history] } = await tx.query<{ ask_seq: string | null; last_prompt_seq: string | null }>(
         `SELECT (SELECT seq FROM job_messages WHERE job_id=$1 AND status='verified'
                  AND data->>'from'='provider' AND data->>'type'='payment-request'
                  ORDER BY seq DESC LIMIT 1) AS ask_seq,
                 CASE WHEN $2::boolean THEN (SELECT seq FROM job_messages WHERE job_id=$1 AND status='verified'
-                 AND data->>'from'='provider' AND data->>'type' IN ('prompt', 'complete', 'cancel')
-                 ORDER BY seq DESC LIMIT 1) END AS last_prompt_or_terminal_seq`, [jobId, wait !== undefined]);
+                 AND data->>'from'='provider' AND data->>'type'='prompt'
+                 ORDER BY seq DESC LIMIT 1) END AS last_prompt_seq`, [jobId, wait !== undefined]);
       // A live worker can claim the payment and open a prompt between grace polls. Check the
       // original wait under the row lock, including its message boundary for same-tick yields.
       const startedAt = record?.awaiting_input_at_ms;
-      const lastPromptOrTerminal = history.last_prompt_or_terminal_seq;
+      const lastPrompt = history.last_prompt_seq;
       const sameWait = !wait || ((startedAt == null ? undefined : Number(startedAt)) === wait.startedAtMs &&
-        (lastPromptOrTerminal === null ? undefined : Number(lastPromptOrTerminal)) === wait.lastPromptOrTerminalSeq);
-      if (record?.status !== "awaiting-input" || history.ask_seq === null || Number(history.ask_seq) !== askSeq || !sameWait) {
+        (lastPrompt === null ? undefined : Number(lastPrompt)) === wait.lastPromptSeq);
+      if (record?.status !== "awaiting-input" || (generation !== undefined && record.sleep_generation !== generation) || history.ask_seq === null || Number(history.ask_seq) !== askSeq || !sameWait) {
         await tx.query("ROLLBACK");
         return false;
       }
@@ -1456,31 +1480,36 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     } finally { tx.release(); }
   }
 
-  /** Pay the job's open ask under its standing mandate; any failed limit leaves the ask open. */
-  private async payAskFromMandate(job: ServerJob, reportSkip = true): Promise<MandateSettlement | undefined> {
-    const ledger = this.opts.creditLedger;
-    if (!job.mandate || !this.opts.db || !(ledger instanceof CreditLedger) || this.opts.env.DVMKIT_BALANCE_PAYMENTS === "false") return;
+  private async payAskFromMandate(job: ServerJob): Promise<void> {
     await job.messageAppenderTail;
-    if (!job.pendingPayment || isTerminal(job.status)) return;
-    const settlement = await settleMandateAsk({ pool: this.opts.db, ledger, jobId: job.id, dvmId: this.opts.dvmId ?? "" });
-    if (settlement.outcome === "declined") {
-      if (isStreamableJobStore(this.jobStore)) await this.jobStore.declineJob?.(job.id, settlement.reason);
-      await this.finalizeStoredTerminal(job.id);
-      await this.adoptDurableTerminal(job);
+    if (!job.superseded && job.pendingPayment && !isTerminal(job.status)) {
+      await this.settleStandingAsk(job.id, true);
+    }
+  }
+
+  /** Pay an open ask or consume the caller's recorded stop, using the durable row. */
+  private async settleStandingAsk(jobId: string, reportSkip: boolean): Promise<MandateSettlement | undefined> {
+    const ledger = this.opts.creditLedger;
+    const store = this.jobStore;
+    if (!this.opts.db || !(ledger instanceof CreditLedger) || !(store instanceof PostgresJobStore) ||
+        this.opts.env.DVMKIT_BALANCE_PAYMENTS === "false") return;
+    const settlement = await settleMandateAsk({ pool: this.opts.db, ledger, jobId, dvmId: this.opts.dvmId ?? "" });
+    if (settlement.outcome === "declined" && await store.declineJob?.(jobId, settlement.reason) === "declined") {
+      await this.signalStoredTerminal(jobId);
+      await this.finalizeStoredTerminal(jobId);
     }
     if (reportSkip) reportMandateSkip(settlement);
     return settlement;
   }
 
   /**
-   * Recover unsettled mandated asks and credit payments whose worker stopped before resuming.
+   * Recover unsettled mandated asks and paid asks whose worker stopped before resuming.
    * After the grace period, wake the local resolver or let app reactivation claim the paid ask.
    */
   async sweepMandateAsks(nowMs = Date.now()): Promise<void> {
     const db = this.opts.db;
-    const ledger = this.opts.creditLedger;
-    if (!db || !(ledger instanceof CreditLedger) || !(this.jobStore instanceof PostgresJobStore) ||
-        this.opts.env.DVMKIT_BALANCE_PAYMENTS === "false" || this.mandateSweepInFlight) return;
+    if (!db || !(this.jobStore instanceof PostgresJobStore) || this.mandateSweepInFlight) return;
+    const settleMandates = this.opts.creditLedger instanceof CreditLedger && this.opts.env.DVMKIT_BALANCE_PAYMENTS !== "false";
     this.mandateSweepInFlight = true;
     try {
       const dvmId = this.opts.dvmId ?? "";
@@ -1488,31 +1517,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // Paged to the end: asks a limit keeps open stay oldest and would otherwise hide newer ones.
       let after: { lastActivityAt: number; id: string } | undefined;
       for (;;) {
-        const page = await findQuietCreditAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, after });
+        const page = await findQuietCreditAsks(db, { dvmId, capabilities: this.capabilityNames(), beforeMs, limit: 50, settleMandates, after });
         for (const { id: jobId, hasMandate } of page) {
           try {
-            const local = this._activeJobs.get(jobId);
-            if (!hasMandate) {
-              if (local) await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
-              else await this.opts.resumePaidAsk?.(jobId);
-              continue;
-            }
-            // Skips go unreported here: a failed limit usually stays failed, and this runs every tick.
-            const settlement = local
-              ? await this.payAskFromMandate(local, false)
-              : await settleMandateAsk({ pool: db, ledger, jobId, dvmId });
-            if (!local && settlement?.outcome === "declined") {
-              await this.jobStore.declineJob?.(jobId, settlement.reason);
-              await this.finalizeStoredTerminal(jobId);
-            }
-            if (local) {
-              // A settlement whose notification was missed wakes the resolver here.
-              if (settlement?.outcome !== "skipped") await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
-            } else if (settlement?.outcome === "paid" || settlement?.outcome === "none") {
-              // A signed payment also needs recovery if its worker died after commit. The resumer
-              // rechecks durable ask satisfaction and verified history before claiming execution.
-              await this.opts.resumePaidAsk?.(jobId);
-            }
+            // The durable row decides even while a local handler is between resume steps.
+            const settlement = settleMandates && hasMandate ? await this.settleStandingAsk(jobId, false) : undefined;
+            if (settlement?.outcome === "skipped" || settlement?.outcome === "declined") continue;
+            await db.query("SELECT pg_notify('job_messages', $1)", [jobId]);
+            // The resumer checks local ownership and the durable ask after the notification.
+            await this.opts.resumePaidAsk?.(jobId);
           } catch (err) {
             diagnosticConsole.error({ level: "mandate_ask_resume_failed", jobId, error_code: errorCodeOf(err) });
           }
@@ -1573,6 +1586,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async dispatchMessageNow(job: ServerJob, type: MessageType, content: unknown): Promise<void> {
+    if (job.superseded) return;
     const ctx = job.sdkCtx;
     const cap = this.getCapability(job.capability, job.channel);
 
@@ -1662,6 +1676,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       // into the same step: a cancelled job is attestable too, and a caller
       // who paid and then cancelled needs the evidence as much as one whose
       // job succeeded.
+      job.terminalOutput = {
+        from: "requester", type, timestamp: Math.floor(Date.now() / 1000), content: { reason },
+      };
       await this.finalizeTerminal(job);
       this.scheduleCleanup(job);
     } else if (cap?.onMessage && ctx) {
@@ -1684,6 +1701,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * subscriber's NOTIFY-driven fetch can see it).
    */
   async persistJob(job: ServerJob): Promise<void> {
+    if (job.superseded || job.adoptedTerminal) return;
     if (!isTerminal(job.status)) return this.persistSnapshot(job);
     let work = this.terminalSnapshots.get(job);
     if (!work) {
@@ -1717,8 +1735,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     await job.messageAppenderTail;
     while (!this.terminalFailures.has(job)) {
       try {
-        if (await this.adoptDurableTerminal(job)) return;
+        if (job.superseded || await this.adoptDurableTerminal(job)) return;
         await this.flushOutgoing(job);
+        if (job.superseded) return;
         await this.persistSnapshot(job, true);
         return;
       } catch (error) {
@@ -1740,10 +1759,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // A read-back/terminal CAS arbitrates an ambiguous snapshot COMMIT first.
     const reason = this.terminalFailures.get(job) ?? (job.status === "completed"
       ? "terminal_persistence_failed"
-      : (job.messages.findLast(m => m.type === "cancel")?.content as { reason?: string } | undefined)?.reason
+      : ((job.terminalOutput ?? job.messages.findLast(m => m.type === "cancel"))?.content as { reason?: string } | undefined)?.reason
         ?? job.summary ?? "terminal_persistence_failed");
     this.terminalFailures.set(job, reason);
+    job.terminalOutput = undefined;
     const durable = await this.jobStore.get(job.id);
+    if (this.retireIfSuperseded(job, durable)) return;
     if (durable && isTerminal(durable.status)) {
       const adopted = await this.adoptDurableTerminal(job);
       if (!adopted && durable.status !== "completed") await this.tryPersistAdoptedTerminalCost(job, 1);
@@ -1757,8 +1778,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const store = this.jobStore;
     if (isStreamableJobStore(store) && store.failJob) {
       const failJob = store.failJob.bind(store);
-      await afterPaymentIntents(() => failJob(job.id, reason));
+      try {
+        await afterPaymentIntents(() => failJob(job.id, reason, job.sleepGeneration ?? 0));
+      } catch (error) {
+        if (!(error instanceof JobSupersededError)) throw error;
+        this.retireSuperseded(job);
+        return;
+      }
       const saved = await store.get(job.id);
+      if (this.retireIfSuperseded(job, saved)) return;
       if (!saved || !isTerminal(saved.status)) throw new JobSnapshotPersistenceError("failure not committed");
       job.status = saved.status;
       job.summary = saved.summary;
@@ -1771,7 +1799,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       await this.tryPersistAdoptedTerminalCost(job, 1);
     } else {
       job.messages = job.messages.filter(m => m.type !== "complete");
-      localMessage(job, "provider", "cancel", { reason });
+      providerMessage(job, "cancel", { reason });
       await this.persistSnapshot(job, true);
     }
   }
@@ -1780,11 +1808,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (job.messageAppenderTail) {
       await job.messageAppenderTail.catch(() => undefined);
     }
-    if (await this.adoptDurableTerminal(job)) return;
+    if (await this.adoptDurableTerminal(job) || job.superseded) return;
     // An earlier yield can resume after completion across either await above.
     // Only the terminal funnel may serialize a terminal snapshot.
     if (isTerminal(job.status) && !terminalReady) return this.persistJob(job);
-    const record = toJobRecord(job);
+    let record = toJobRecord(job);
+    record.sleepGeneration = job.sleepGeneration ?? 0;
     if (isTerminal(job.status) && record.settlement === undefined) {
       // The built-in stores end the pieces from their own row and ignore these; a store that
       // saves the snapshot as given keeps the settlement the SDK froze for it.
@@ -1792,30 +1821,21 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       record.pieces = ended.pieces;
       record.settlement = ended.settlement;
     }
-    if (isTerminal(job.status) && isStreamableJobStore(this.jobStore)) {
-      // rebuild the terminal snapshot from the durable `job_messages`
-      // log so it carries DB-allocated seqs and every durably-recorded message
-      // including a caller message a *different* machine recorded via Tx B,
-      // which never entered this process's in-memory `job.messages` array. Two
-      // counters (in-memory `job.seq`, DB `next_seq`) only agree when one
-      // machine drives the whole job; the durable log is the single
-      // authoritative numbering. The appender tail is drained above, so the log
-      // is complete and is a superset of `job.messages` by content.
-      //
-      // Guard: if the durable read returns FEWER messages than the in-memory
-      // array — a rolled-back `appendOutgoing` (DB outage, already logged as
-      // `job_message_append_failed`) — keep the in-memory snapshot rather than
-      // wipe durably-absent messages. The snapshot read filters `status='verified'`
-      // independently of any pending-payment delivery cutoff,
-      // so accepted cross-machine caller messages are included and rejected ones
-      // stay out.
-      const durable = await this.jobStore.getMessages(job.id, 0, { includeHeld: true });
-      if (durable.length >= record.messages.length) {
-        record.messages = durable;
-        const highSeq = durable.length ? durable[durable.length - 1].seq : record.seq;
-        // Keep `jobs.seq` monotonic (save uses GREATEST) and realign
-        // `next_seq - 1` with the surviving array length for forensics.
-        record.seq = Math.max(record.seq, highSeq);
+    const output = job.terminalOutput;
+    if (output && isTerminal(record.status)) {
+      if (this.jobStore instanceof PostgresJobStore || this.jobStore instanceof MemoryJobStore) {
+        record = { ...record, [TERMINAL_OUTPUT]: output } as JobRecord;
+      } else {
+        const history = isStreamableJobStore(this.jobStore)
+          ? await this.jobStore.getMessages(job.id, 0, { includeHeld: true }) : record.messages;
+        record = withTerminalOutput(record, history.length >= record.messages.length ? history : record.messages, record.seq + 1, output);
+      }
+    } else if (isTerminal(record.status) && isStreamableJobStore(this.jobStore)) {
+      // A legacy terminal snapshot without staged output still carries verified input.
+      const history = await this.jobStore.getMessages(job.id, 0, { includeHeld: true });
+      if (history.length >= record.messages.length) {
+        record.messages = history;
+        record.seq = Math.max(record.seq, history.at(-1)?.seq ?? 0);
       }
     }
     try {
@@ -1825,10 +1845,26 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         await this.jobStore.save(record);
       }
     } catch (error) {
-      throw new JobSnapshotPersistenceError(error);
+      if (!(error instanceof JobSupersededError)) throw new JobSnapshotPersistenceError(error);
+      this.retireSuperseded(job);
+      return;
     }
     const saved = await this.jobStore.get(job.id);
+    if (this.retireIfSuperseded(job, saved)) return;
     if (saved) {
+      if (output && isTerminal(saved.status) && saved.status !== job.status) {
+        await this.adoptDurableTerminal(job);
+        return;
+      }
+      if (output && isTerminal(saved.status)) {
+        const committed = saved.messages.findLast(message => message.type === output.type && message.from === output.from);
+        job.messages = saved.messages;
+        job.seq = saved.seq;
+        job.terminalOutput = undefined;
+        if (committed && !isStreamableJobStore(this.jobStore)) {
+          for (const listener of job.listeners) listener(committed);
+        }
+      }
       job.timingKnown = saved.timingKnown;
       job.endedBy = saved.endedBy;
       job.terminalAtMs = saved.terminalAtMs;
@@ -1857,13 +1893,22 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * read and its write (the check-then-write it can still lose is covered by the
    * stores' terminal-sticky `save`, which keeps the row itself correct).
    */
+  /** Signal the current local handler after an authoritative store write. */
+  async signalStoredTerminal(jobId: string): Promise<void> {
+    const current = this._activeJobs.get(jobId);
+    if (current) await this.adoptDurableTerminal(current);
+  }
+
   private async adoptDurableTerminal(job: ServerJob): Promise<boolean> {
+    if (job.adoptedTerminal) return true;
     const counters = isStreamableJobStore(this.jobStore)
       ? await this.jobStore.getCounters(job.id).catch(() => undefined)
       : await this.jobStore.get(job.id).catch(() => undefined);
     if (!counters || !isTerminal(counters.status) || counters.status === job.status) return false;
     const durable = await this.jobStore.get(job.id);
     if (!durable) return false;
+    if (this.retireIfSuperseded(job, durable) || job.adoptedTerminal) return true;
+    job.adoptedTerminal = true;
 
     diagnosticConsole.warn(
       {
@@ -1874,6 +1919,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       }
     );
     job.status = durable.status;
+    job.terminalOutput = undefined;
     // Adopt the whole terminal row, not just its status. The stores' sticky
     // `save` admits a same-status re-save, so a `persistJob` after this point
     // would otherwise write `summary = NULL` over the caller's cancel reason.
@@ -1889,8 +1935,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // `summary`, so the caller's own words reach `ctx.signal.reason` and the
     // `onCancel` hook instead of a generic "Job cancelled". A
     // `completed` summary is the handler's completion text, not a reason.
-    const reason =
-      durable.status !== "completed" && durable.summary ? durable.summary : `Job ${durable.status}`;
+    const ending = durable.messages.findLast(message => message.type === "cancel" || message.type === "decline");
+    const reason = durable.status === "completed" ? "Job completed"
+      : durable.summary ?? (ending?.content as { reason?: string } | undefined)?.reason ?? `Job ${durable.status}`;
     for (const [, p] of job.pendingPrompts) p.reject(new JobCancelledError(reason));
     job.pendingPayment?.reject(new JobCancelledError(reason));
     job.pendingPrompts.clear();
@@ -1905,21 +1952,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // excluded because its normal completion path carries cost with revenue.
     const terminalCostPersisted =
       durable.status === "completed" ? true : await this.tryPersistAdoptedTerminalCost(job, 1);
-    // Materialise the terminal `cancel` the other machine wrote. The
-    // job stays in `activeJobs` for the cleanup window, and every local read
-    // path serves from memory — a GET returns `job.messages`, a fresh SSE stream
-    // replays it and closes on the yield, and an SSE stream opened *before* the
-    // cancel only closes when a yield reaches `job.listeners`. Without this, a
-    // caller whose poll happens to land on the handler's own machine can't see
-    // the cancel that every other machine serves from the durable log. Pushed
-    // locally rather than re-emitted: the row is already in the durable log
-    // (`terminateJob` wrote it in the same transaction as the status), and its
-    // `job_messages` rows may already have been swept by the terminal cleanup.
-    // `completed` is excluded — its durable terminal is a `complete`, not a
-    // `cancel`, and it can only be adopted from a machine that reactivated and
-    // finished the job itself.
-    if (durable.status !== "completed") {
-      localMessage(job, "provider", "cancel", { reason });
+    // Mirror the committed transcript. Streamable listeners read it from the
+    // store, and a single-machine store only publishes it here after commit.
+    job.messages = durable.messages;
+    job.seq = durable.seq;
+    if (ending && !isStreamableJobStore(this.jobStore)) {
+      for (const listener of job.listeners) listener(ending);
     }
     // Run the builder's cleanup hook on the machine that actually holds the
     // resources. Before the NOTIFY watch, `onCancel` only ever fired
@@ -1944,9 +1982,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // adopting it. Both read the committed row and both go through the store's
     // write-once persist, so the loser gets the winner's bytes rather than a
     // second signature.
-    void this.issueReceiptForStoredJob(job.id).then(() => this.reportTerminalJob(job.id));
+    // The writer reports the committed outcome. The adopter still repairs
+    // receipts and hands off any fresher cost it held locally.
+    void this.issueReceiptForStoredJob(job.id);
     this.scheduleCleanup(job);
-    if (durable.status !== "completed" && terminalCostPersisted) {
+    if (!job.superseded && durable.status !== "completed" && terminalCostPersisted) {
       await this.reportJobCost(job);
     }
     return true;
@@ -1995,7 +2035,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async retryTerminalCostHandoff(job: ServerJob, attempt: number): Promise<void> {
-    if (!(await this.tryPersistAdoptedTerminalCost(job, attempt))) return;
+    if (job.superseded || !(await this.tryPersistAdoptedTerminalCost(job, attempt)) || job.superseded) return;
     await this.reportJobCost(job);
     await this.reportTerminalJob(job.id);
   }
@@ -2016,6 +2056,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // merge cannot replace its reason, message log, or other terminal fields
     // with the handler owner's stale in-memory copy.
     const durable = await this.jobStore.get(job.id);
+    if (this.retireIfSuperseded(job, durable)) return;
     if (!durable || durable.status !== job.status) {
       throw new Error(`Terminal cost merge lost durable job ${job.id}`);
     }
@@ -2118,7 +2159,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     try {
       do {
         this.statusChecksQueued.delete(job.id);
-        if (isTerminal(job.status)) return;
+        if (job.superseded) return;
         if (await this.adoptDurableTerminal(job)) return;
       } while (this.statusChecksQueued.has(job.id));
     } catch (_err) {
@@ -2155,12 +2196,15 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    * `artifact`'s NOTIFY silently drops the artifact.
    */
   private wireMessageAppender(job: ServerJob): void {
+    job.deferTerminalOutput = true;
     if (!isStreamableJobStore(this.jobStore)) return;
     const jobId = job.id;
     job.messageAppender = (msg, opts) => {
       let queue = this.outgoingQueues.get(job);
       if (!queue) this.outgoingQueues.set(job, queue = []);
-      queue.push({ msg: structuredClone(msg), opts: { ...opts, appendId: randomBytes(16).toString("hex") } });
+      queue.push({ msg: structuredClone(msg), opts: {
+        ...opts, appendId: randomBytes(16).toString("hex"), sleepGeneration: job.sleepGeneration ?? 0,
+      } });
       const prev = job.messageAppenderTail ?? Promise.resolve();
       job.messageAppenderTail = prev.then(() => this.flushOutgoing(job)).catch(() => {
         diagnosticConsole.error({ level: "job_message_append_failed", jobId, localSeq: msg.seq });
@@ -2172,7 +2216,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const store = this.jobStore;
     if (!isStreamableJobStore(store)) return;
     const queue = this.outgoingQueues.get(job);
-    while (queue?.length) {
+    while (!job.superseded && queue?.length) {
       const entry = queue[0];
       // requestPayment installs its resolver after emitting the ask. Bind it
       // when the append starts, retaining that identity through every retry.
@@ -2184,6 +2228,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           from: msg.from, type: msg.type, timestamp: msg.timestamp, content: msg.content,
         }, opts);
       } catch (error) {
+        if (error instanceof JobSupersededError) {
+          this.retireSuperseded(job);
+          return;
+        }
         // Matched on the code as well, so a custom store's own refusal stops the queue too.
         if (!(error instanceof JobEndedError) && (error as { code?: unknown } | null)?.code !== "job_ended") throw error;
         // The job ended elsewhere before this ask was written. Nothing after it can be
@@ -2230,6 +2278,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // `providerMessage("cancel", …)` call would inject a phantom Tx A cancel
     // into the cross-machine stream.
     const current = await this.jobStore.get(job.id);
+    if (this.retireIfSuperseded(job, current)) return;
     if (current && isTerminal(current.status)) {
       const reason = `Job reached terminal status "${current.status}" elsewhere`;
       for (const [, p] of job.pendingPrompts) p.reject(new Error(reason));
@@ -2259,7 +2308,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (current && isStreamableJobStore(this.jobStore)) {
       let claimed: boolean;
       try {
-        claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled");
+        claimed = await this.jobStore.cancelStaleJob(job.id, current.lastActivityAt, "Job timed out (idle)", "cancelled",
+          { generation: job.sleepGeneration ?? 0, parked: false });
       } catch (error) {
         // A payment that arrived before expiry is still being verified; expire
         // after it resolves, which may also have paid the ask.
@@ -2273,7 +2323,8 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       this.idleIntentWaits.delete(job);
       if (claimed) await this.finalizeStoredTerminal(job.id);
       await this.adoptDurableTerminal(job);
-      if (!claimed && !isTerminal(job.status)) this.startIdleTimer(job, Date.now() + 1);
+      if (!claimed && !isTerminal(job.status) &&
+          !this.retireIfSuperseded(job, await this.jobStore.get(job.id))) this.startIdleTimer(job, Date.now() + 1);
       return;
     }
 
@@ -2402,20 +2453,24 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         ) {
           // Use the store write directly: the timer heartbeat may already be
           // in flight, in which case heartbeatActiveJobs() returns early.
-          await this.jobStore.heartbeatActiveJobs([record.id], Date.now());
-          diagnosticConsole.warn({
-            level: "stale_job_local_live_skipped",
-            ageMs: monoNow - record.lastActivityAt,
-          });
-          continue;
+          await this.heartbeatJobs([local], Date.now());
+          if (this._activeJobs.get(record.id) === local) {
+            diagnosticConsole.warn({ level: "stale_job_local_live_skipped", ageMs: monoNow - record.lastActivityAt });
+            continue;
+          }
         }
         let claimed: boolean;
         try {
+          if (!awaiting && record.sleepUntilMs !== undefined) {
+            await this.opts.resumeSleepingJob?.(record.id, expectedActivityBefore);
+            continue;
+          }
           claimed = await this.jobStore.cancelStaleJob(
             record.id,
             expectedActivityBefore,
             reason,
-            terminalStatus
+            terminalStatus,
+            { generation: record.sleepGeneration ?? 0, parked: record.sleepUntilMs !== undefined }
           );
         } catch (error) {
           // A payment being verified holds this job open; a later tick reaps it.
@@ -3115,22 +3170,62 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (this.heartbeatInFlight) return { beat: 0 };
     this.heartbeatInFlight = true;
     try {
-      const ids: string[] = [];
-      for (const job of this._activeJobs.values()) {
-        if (job.status === "processing" || job.status === "working") ids.push(job.id);
-      }
-      if (ids.length === 0) return { beat: 0 };
+      const jobs = [...this._activeJobs.values()].filter(
+        (job) => !job.superseded && (job.status === "processing" || job.status === "working")
+      );
       // Wall-clock epoch-ms, deliberately — this is a *stamp*, and every other
       // machine's sweep reads it. Floating it off this host's clock (
       // floats the reading side) would write a value only this process can
       // interpret. Same for the other stamps in this file: `createJob`'s
       // `createdAt`/`lastActivityAt`, `recordInboundPending`'s message
       // timestamp and its `lastActivityAt` bump.
-      await this.jobStore.heartbeatActiveJobs(ids, Date.now());
-      return { beat: ids.length };
+      return { beat: await this.heartbeatJobs(jobs, Date.now()) };
     } finally {
       this.heartbeatInFlight = false;
     }
+  }
+
+  private async heartbeatJobs(jobs: ServerJob[], now: number): Promise<number> {
+    const store = this.jobStore;
+    if (!jobs.length || !isStreamableJobStore(store)) return 0;
+    const refreshed = new Set(await store.heartbeatJobExecutors(
+      jobs.map((job) => ({ id: job.id, generation: job.sleepGeneration ?? 0 })), now
+    ));
+    // An update can also miss if an ask opened or the job ended. Only a
+    // generation change proves that a replacement owns this execution.
+    await Promise.all(jobs.filter((job) => !refreshed.has(job.id)).map(async (job) => {
+      const record = await store.get(job.id);
+      this.retireIfSuperseded(job, record);
+    }));
+    return refreshed.size;
+  }
+
+  private retireIfSuperseded(job: ServerJob, record: JobRecord | undefined): boolean {
+    if (record && (record.sleepGeneration ?? 0) !== (job.sleepGeneration ?? 0)) this.retireSuperseded(job);
+    return job.superseded === true;
+  }
+
+  private retireSuperseded(job: ServerJob): void {
+    if (job.superseded) return;
+    job.superseded = true;
+    job.messageAppender = undefined;
+    this.outgoingQueues.delete(job);
+    const reason = "Job superseded by a reactivation replay";
+    abortJob(job, reason);
+    for (const [, prompt] of job.pendingPrompts) prompt.reject(new JobCancelledError(reason));
+    job.pendingPrompts.clear();
+    job.pendingPayment?.reject(new JobCancelledError(reason));
+    job.pendingPayment = null;
+    if (this._activeJobs.get(job.id) !== job) return;
+    this.clearIdleTimer(job.id);
+    this.unwatchDurableStatus(job.id);
+    clearTimeout(this.cleanupTimers.get(job.id));
+    this.cleanupTimers.delete(job.id);
+    clearTimeout(this.terminalPersistenceRetries.get(job.id));
+    this.terminalPersistenceRetries.delete(job.id);
+    clearTimeout(this.terminalCostHandoffRetryTimers.get(job.id));
+    this.terminalCostHandoffRetryTimers.delete(job.id);
+    this._activeJobs.delete(job.id);
   }
 
   /**
@@ -3166,7 +3261,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         // Window elapsed; either we win the CAS (original worker absent) or a
         // just-woken original handler beat us to it (CAS returns false).
         if (scaffold && this._activeJobs.get(jobId) !== scaffold) return false;
-        return this.claimInputForAsk(jobId, wait?.askSeq, wait);
+        return this.claimInputForAsk(jobId, wait?.askSeq, wait, scaffold?.sleepGeneration ?? 0);
       }
       const record = await store.get(jobId);
       if (record?.status !== "awaiting-input") return false;
@@ -3193,16 +3288,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   ): Promise<number | null> {
     const timestamp = Math.floor(Date.now() / 1000);
     let txSeq: number | null = null;
-    let disposition: PaymentDisposition | undefined;
+    let arrival: RecordedPaymentArrival | undefined;
     if (msgType === "payment" && isStreamableJobStore(this.jobStore) && isPaymentArrivalStore(this.jobStore)) {
       // The arrival, its disposition and the intent that holds the job open
       // through verification commit under the job row lock, before any rail
       // is touched.
-      ({ seq: txSeq, disposition } = await this.jobStore.recordPaymentArrival(
+      arrival = await this.jobStore.recordPaymentArrival(
         job.id,
         { from: "requester", type: "payment", timestamp, content: msgContent },
         { arrivedAtMs: Date.now(), leaseMs: PAYMENT_INTENT_LEASE_MS }
-      ));
+      );
+      txSeq = arrival.seq;
     } else if (isStreamableJobStore(this.jobStore)) {
       txSeq = await this.jobStore.recordInbound(job.id, {
         from: "requester",
@@ -3226,10 +3322,10 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         this.pendingPaymentMessages.set(job, pending);
       }
       pending.set(txSeq ?? msgContent, message);
-      if (disposition) {
-        let dispositions = this.paymentDispositions.get(job);
-        if (!dispositions) this.paymentDispositions.set(job, dispositions = new Map());
-        dispositions.set(txSeq ?? msgContent, disposition);
+      if (arrival) {
+        let arrivals = this.paymentArrivals.get(job);
+        if (!arrivals) this.paymentArrivals.set(job, arrivals = new Map());
+        arrivals.set(arrival.seq, arrival);
       }
       holdJobHistory(job, message.seq);
     } else {
@@ -3329,10 +3425,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const job = fromJobRecord(record);
     const ask = record.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
     if (ask) {
-      const lastPromptOrTerminal = record.messages.findLast((message) => message.from === "provider" &&
-        (message.type === "prompt" || message.type === "complete" || message.type === "cancel"));
+      const lastPrompt = record.messages.findLast((message) => message.from === "provider" && message.type === "prompt");
       this.reactivationWaits.set(job, {
-        askSeq: ask.seq, startedAtMs: record.awaitingInputAtMs, lastPromptOrTerminalSeq: lastPromptOrTerminal?.seq,
+        askSeq: ask.seq, startedAtMs: record.awaitingInputAtMs, lastPromptSeq: lastPrompt?.seq,
       });
     }
     this._activeJobs.set(job.id, job);
@@ -3383,7 +3478,9 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     const message = pending?.get(key);
     // A store without arrival support, or a caller that never recorded the
     // arrival, decides from the in-memory job instead of the locked row.
-    const disposition = this.paymentDispositions.get(job)?.get(key) ?? decidePaymentDisposition({
+    const arrivals = this.paymentArrivals.get(job);
+    const arrival = inboundSeq === null ? undefined : arrivals?.get(inboundSeq);
+    const disposition = arrival?.disposition ?? decidePaymentDisposition({
       status: job.status,
       pendingPaymentMsats: job.pendingPaymentMsats,
       ask: job.messages?.findLast((m) => m.from === "provider" && m.type === "payment-request"),
@@ -3392,7 +3489,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     let accepted: Message | undefined;
     const pieceCredit = Promise.withResolvers<void>();
     try {
-      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, disposition, pieceCredit.promise, extra);
+      const outcome = await this.processPaymentAndCredit(job, body, inboundSeq, disposition, arrival?.snapshot ?? incomingPaymentSnapshot(job), pieceCredit.promise, extra);
       // A balance landing paid no ask; it stays out of history here as it does in the store.
       if (!outcome.error && !outcome.landedAsBalance && message && pending?.get(key) === message) {
         accepted = message;
@@ -3419,6 +3516,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     body: { type: MessageType; content: Record<string, unknown> },
     inboundSeq: number | null,
     disposition: PaymentDisposition,
+    snapshot: VerifyIncomingSnapshot,
     pieceCredit: Promise<void>,
     extra?: {
       lockPubkeys?: LockPubkey[];
@@ -3435,7 +3533,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     if (devAuto || devModeSkipsPaymentVerification(this.opts)) {
       const hadPendingPayment = job.pendingPaymentMsats !== undefined;
       // An unverified dev payment that arrived too late to pay the ask buys nothing.
-      const delta = landAsBalance ? 0 : job.pendingPaymentMsats ?? 0;
+      const delta = landAsBalance ? 0 : snapshot.pendingPaymentMsats ?? 0;
       if (inboundSeq !== null && isStreamableJobStore(this.jobStore)) {
         const credit: PaymentCreditDelta | null = delta
           ? { paidMsatsDelta: delta, clearPending: true }
@@ -3496,7 +3594,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
         paymentSeq: inboundSeq ?? undefined,
         creditTtlMs: this.opts.creditTtlMs,
       },
-      { ...incomingPaymentSnapshot(job), ...(landAsBalance && { landAsBalance }) }
+      { ...snapshot, ...(landAsBalance && { landAsBalance }) }
     );
 
     if (verifyResult.error) {
@@ -4088,10 +4186,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
       onStep: jobStore.saveStep ? async (record) => {
         for (let attempt = 0; ; attempt++) {
           try {
-            await jobStore.saveStep!(job.id, record);
+            await jobStore.saveStep!(job.id, record, job.sleepGeneration ?? 0);
             return;
-          } catch {
+          } catch (error) {
+            if (error instanceof JobSupersededError) {
+              // A caller terminal can also refuse the step without changing generation.
+              await this.adoptDurableTerminal(job);
+              if (!isTerminal(job.status)) this.retireSuperseded(job);
+              throw new JobCancelledError();
+            }
             if (attempt >= 2) {
+              if (record.id.startsWith("sleep:") && job.sleepPending) throw new Error("Failed to persist sleep step");
               diagnosticConsole.warn({ event: "step_persist_failed" });
               return;
             }
@@ -4099,12 +4204,37 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
           }
         }
       } : undefined,
+      ...(isStreamableJobStore(jobStore) && jobStore.beginSleep && jobStore.endSleep &&
+          jobStore.claimSleepingJob && jobStore.saveStep && jobStore.saveSleepSnapshot
+        ? {
+            onSleepYield: async () => {
+              // The normal appender absorbs errors so other progress can retry.
+              // Sleep must drain a durable prefix before recording its replay point.
+              const flushed = (job.messageAppenderTail ?? Promise.resolve()).then(() => this.flushOutgoing(job));
+              job.messageAppenderTail = flushed.catch(() => undefined);
+              await flushed;
+              if (job.superseded || isTerminal(job.status)) return false;
+              return jobStore.saveSleepSnapshot!(toJobRecord(job), job.sleepGeneration ?? 0, this.opts.dvmId);
+            },
+            beginSleep: (sleepId: string, wakeAtMs: number) =>
+              jobStore.beginSleep!(job.id, { sleepId, wakeAtMs, generation: job.sleepGeneration ?? 0 }),
+            endSleep: () => retrySleepEnd(
+              () => jobStore.endSleep!(job.id, job.sleepGeneration ?? 0), job.abort.signal
+            ),
+          }
+        : { beginSleep: () => {
+            if (!this.warnedNonDurableSleep) {
+              this.warnedNonDurableSleep = true;
+              diagnosticConsole.warn({ event: "sleep_not_durable" });
+            }
+            return Promise.resolve(true);
+          } }),
       onPaymentResume: () => retryJobSnapshot(() => this.persistJob(job)),
       subscribeNotifications: isStreamableJobStore(jobStore)
         ? (cb: () => void) => jobStore.subscribeNotifications(job.id, cb)
         : undefined,
       onAskOpen: job.mandate && this.opts.db && this.opts.creditLedger instanceof CreditLedger && jobStore instanceof PostgresJobStore
-        ? async () => { await this.payAskFromMandate(job); }
+        ? () => this.payAskFromMandate(job)
         : undefined,
       onReplayedAsk: (askSeq) => {
         if (job.pendingPayment) this.paymentAskSeqs.set(job.pendingPayment, askSeq);
@@ -4122,6 +4252,17 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
               [job.id, seq, amountMicro === undefined ? null : String(amountMicro), currency ?? null]);
             return rowCount === 1;
           }
+        : undefined,
+      acceptedRailPayment: this.opts.db && jobStore instanceof PostgresJobStore
+        ? async (seq) => {
+            const { rowCount } = await this.opts.db!.query(
+              "SELECT 1 FROM job_payment_intents WHERE job_id=$1 AND seq=$2 AND request_seq IS NOT NULL AND outcome='ask_paid'",
+              [job.id, seq]);
+            return rowCount === 1;
+          }
+        : undefined,
+      legacyRailAskPayments: job.mandate && this.opts.db && jobStore instanceof PostgresJobStore
+        ? () => listLegacyRailAskPayments(this.opts.db!, job.id)
         : undefined,
       getCounters: isStreamableJobStore(jobStore) ? async () => {
         // Do not interpret an unpersisted yield as a paid ask. A balance payment
@@ -4149,17 +4290,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
             });
           }
         : undefined,
-      onSuperseded: () => {
-        // a reactivation replay won the single-execution claim while
-        // this handler was suspended. Drop the local scaffold so a stale idle
-        // timer can't later fire `cancelJobIdle` and clobber the winner, and
-        // abort the parked handler so it stops doing paid work the
-        // winner is already redoing.
-        this.clearIdleTimer(job.id);
-        this.unwatchDurableStatus(job.id);
-        abortJob(job, "Job superseded by a reactivation replay");
-        this._activeJobs.delete(job.id);
-      },
+      onSuperseded: () => this.retireSuperseded(job),
     };
   }
 
@@ -4474,7 +4605,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
    */
   private async attachReceipt(job: ServerJob): Promise<void> {
     const record = await this.jobStore.get(job.id);
-    if (!record || !isTerminal(record.status)) return;
+    if (this.retireIfSuperseded(job, record) || !record || !isTerminal(record.status)) return;
     const receipt = await this.issueReceipt(record);
     if (receipt) job.receipt = receipt;
   }
@@ -4538,9 +4669,11 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   /** Commit the terminal snapshot before resolving money and signing its durable evidence. */
   private async finalizeTerminal(job: ServerJob): Promise<void> {
     await this.persistJob(job);
+    if (job.superseded) return;
     await this.attachReceipt(job);
     // Book off the committed row, as the stored-terminal path and recovery do.
     const record = await this.jobStore.get(job.id).catch(() => undefined);
+    if (this.retireIfSuperseded(job, record)) return;
     await this.bookRevenueOrReportCost(record && isTerminal(record.status) ? record : job);
     await this.reportTerminalJob(job.id);
   }
@@ -4656,6 +4789,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
   }
 
   private async handleJobTerminal(job: ServerJob): Promise<void> {
+    if (job.superseded) return;
     this.clearIdleTimer(job.id);
     // sign the receipt before the cleanup timer starts, so a caller
     // polling inside the 60s window is served from `activeJobs` with the
@@ -4666,10 +4800,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
     // revenue events — so it has to run before `bookRevenue`, not after.
     if (await this.adoptDurableTerminal(job)) return;
     const durable = await this.jobStore.get(job.id);
+    if (this.retireIfSuperseded(job, durable)) return;
     // Retry an uncommitted terminal before accounting, including cost handoff
     // after a failure committed without a successful acknowledgement/read-back.
     if (!durable || !isTerminal(durable.status) || this.terminalFailures.has(job)) await this.persistJob(job);
     await this.attachReceipt(job);
+    if (job.superseded) return;
     await this.bookRevenueOrReportCost(job);
     await this.reportTerminalJob(job.id);
     this.scheduleCleanup(job);
@@ -5176,6 +5312,7 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
   /** Schedule job removal from activeJobs after a delay so clients can still poll final status. */
   scheduleCleanup(job: ServerJob): void {
+    if (job.superseded) return;
     this.clearIdleTimer(job.id);
     // Every terminal path funnels through here, and a terminal job has nothing
     // left to adopt — drop the NOTIFY subscription now rather than 60s later.
@@ -5189,6 +5326,12 @@ export class JobManager<State, InputSchema extends ZodLike | undefined> {
 
   shutdown(): void {
     this.terminalPersistenceStopped = true;
+    for (const job of this._activeJobs.values()) {
+      if (job.sleepPending && !isTerminal(job.status)) {
+        job.superseded = true;
+        abortJob(job, "Worker shut down");
+      }
+    }
     for (const release of this.runningHandlerReleases) release();
     for (const [id] of this.idleTimers) {
       this.clearIdleTimer(id);

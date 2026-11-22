@@ -465,7 +465,7 @@ describe("status-aware watchdog + worker heartbeat", () => {
     await store.save(seedRecord({ id: "done", status: "completed", lastActivityAt: stale }));
 
     const now = Date.now();
-    await store.heartbeatActiveJobs(["proc", "work", "await", "done"], now);
+    await store.heartbeatJobExecutors(["proc", "work", "await", "done"].map(id => ({ id, generation: 0 })), now);
 
     expect((await store.get("proc"))?.lastActivityAt).toBe(now);
     expect((await store.get("work"))?.lastActivityAt).toBe(now);
@@ -483,7 +483,7 @@ describe("status-aware watchdog + worker heartbeat", () => {
 
     try {
       // Simulate the heartbeat firing for the live worker right before a sweep.
-      await store.heartbeatActiveJobs(["proc"], Date.now());
+      await store.heartbeatJobExecutors(["proc"].map(id => ({ id, generation: 0 })), Date.now());
       const { swept } = await jm.sweepStaleJobs();
       expect(swept).toBe(0);
       expect((await store.get("proc"))?.status).toBe("processing");
@@ -735,7 +735,7 @@ describe("JobManager stale-job sweeper clock guard", () => {
         // The live worker beats on the stepped clock, exactly as it would in
         // production — a low, post-step stamp. Full compensation would claim
         // it anyway; the half-window cap is what keeps it out of the sweep.
-        await store.heartbeatActiveJobs(["live"], Date.now());
+        await store.heartbeatJobExecutors(["live"].map(id => ({ id, generation: 0 })), Date.now());
         const { swept } = await jm.sweepStaleJobs();
         expect(swept).toBe(0);
         expect((await store.get("live"))?.status).toBe("processing");
@@ -789,7 +789,7 @@ describe("JobManager stale-job sweeper clock guard", () => {
       try {
         vi.setSystemTime(t0 - 50 * 60_000);
         // One beat ago on the stepped clock — a healthy worker.
-        await store.heartbeatActiveJobs(["live"], Date.now() - 30_000);
+        await store.heartbeatJobExecutors(["live"].map(id => ({ id, generation: 0 })), Date.now() - 30_000);
         const { swept } = await jm.sweepStaleJobs();
         expect(swept).toBe(0);
         expect((await store.get("live"))?.status).toBe("processing");

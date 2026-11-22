@@ -3659,7 +3659,7 @@ export function applyPaymentInfoToJob(job: ServerJob, info: VerifiedIncomingPaym
  * The job state {@link verifyIncomingPayment} reads, taken from the in-memory
  * job. Durable hosts pass the same fields read from the job row.
  */
-export function incomingPaymentSnapshot(job: ServerJob): VerifyIncomingSnapshot {
+export function incomingPaymentSnapshot(job: Pick<ServerJob, keyof VerifyIncomingSnapshot & keyof ServerJob | "messages">): VerifyIncomingSnapshot {
   return {
     pendingPaymentMsats: job.pendingPaymentMsats,
     pendingMppChallengeIds: job.pendingMppChallengeIds,
@@ -3680,7 +3680,7 @@ export function incomingPaymentSnapshot(job: ServerJob): VerifyIncomingSnapshot 
   };
 }
 
-function askFiatAmount(job: ServerJob): { amount: number; currency: string } | undefined {
+function askFiatAmount(job: Pick<ServerJob, "messages">): { amount: number; currency: string } | undefined {
   const ask = job.messages?.findLast((message) => message.from === "provider" && message.type === "payment-request");
   const fiat = (ask?.content as { fiat_amount?: { amount?: unknown; currency?: unknown } } | undefined)?.fiat_amount;
   return typeof fiat?.amount === "number" && typeof fiat.currency === "string"

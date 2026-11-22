@@ -43,7 +43,7 @@ describe("step persistence", () => {
     expect(cached).not.toHaveBeenCalled();
     expect(save).toHaveBeenCalledWith(job.id, {
       id: "reserve", value: "reservation", costs: [{ amount: 0.25, currency: "usd" }],
-    });
+    }, 0);
     write.resolve();
     expect(await step).toBe("reservation");
     await hit;

@@ -8,6 +8,7 @@ import { createNoopLogger } from "../logger";
 import { type Currency, validateCurrency } from "../pricing/index";
 import { createInstrumentedFetch } from "../server/instrumented-fetch";
 import { JobCancelledError } from "../server/job";
+import { absoluteWakeTime, checkSleepCancellation, displayWakeTime, relativeWakeTime, waitUntil } from "../sleep";
 import { StepCache } from "../step-cache";
 import { createStepRunner } from "../step-runner";
 import { MemoryKVStore } from "../store";
@@ -45,6 +46,8 @@ export interface TestContextOpts<State = Record<string, unknown>, Input = string
    * This in-memory simulation does not prove crash durability or exactly-once execution.
    */
   stepCache?: StepCache;
+  /** Advance immediately by default, or wait on the wall clock in real mode. */
+  sleep?: "real";
   /** Total msats paid so far. */
   paidMsats?: number;
   /** Initial per-job state (cloned to avoid test pollution). */
@@ -68,6 +71,7 @@ export interface TestJobContext<
 > extends SDKJobContext<State, Input> {
   /** All outbound messages sent during the handler. */
   readonly messages: RecordedMessage[];
+  readonly sleeps: { id: string; wake_at_ms: number }[];
   readonly completed: boolean;
   readonly failed: boolean;
   /** Whether fail() was called with `{ refund: true }`. */
@@ -98,6 +102,8 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
   opts?: TestContextOpts<State, Input>
 ): TestJobContext<State, Input> {
   const messages: RecordedMessage[] = [];
+  const sleeps: TestJobContext<State, Input>["sleeps"] = [];
+  let sleepPending = false;
   const abort = new AbortController();
   let cancelled = false;
   let completed = false;
@@ -118,6 +124,34 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
 
   const steps = createStepRunner(opts?.stepCache ?? new StepCache(), (cost) => ctx.cost(cost));
 
+  const guardSleep = (): void => {
+    if (sleepPending) throw new Error("Cannot open a job wait while a sleep is pending");
+  };
+  const sleep = async (id: string, wakeAt: number, hint?: string): Promise<void> => {
+    if (typeof id !== "string" || id.length === 0) throw new TypeError("Sleep ID must be a non-empty string");
+    if (completed || failed) throw new JobCancelledError();
+    checkSleepCancellation(abort.signal);
+    guardSleep();
+
+    sleepPending = true;
+    try {
+      const { wake_at_ms } = await steps.step(`sleep:${id}`, async () => ({ wake_at_ms: wakeAt }));
+      checkSleepCancellation(abort.signal);
+      sleeps.push({ id, wake_at_ms });
+      messages.push({
+        type: "working",
+        content: {
+          estimate_seconds: Math.ceil((wake_at_ms - Date.now()) / 1000),
+          hint: hint ?? `Waiting until ${displayWakeTime(wake_at_ms)}`,
+          wake_at_ms,
+        },
+      });
+      if (opts?.sleep === "real") await waitUntil(wake_at_ms, abort.signal);
+    } finally {
+      sleepPending = false;
+    }
+  };
+
   const ctx: TestJobContext<State, Input> = {
     jobId: opts?.jobId ?? "test-job-1",
     tags: opts?.tags ?? [],
@@ -127,6 +161,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
     auth: opts?.auth,
     paidMsats: opts?.paidMsats ?? 0,
 
+    sleeps,
     get messages() {
       return messages;
     },
@@ -168,6 +203,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
 
     prompt(id: string, text: string, promptOpts?: PromptOpts): Promise<ResponseContent> {
       if (cancelled) return Promise.reject(new JobCancelledError());
+      guardSleep();
       messages.push({
         type: "prompt",
         content: { id, text, ...promptOpts },
@@ -189,6 +225,7 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       payOpts?: SDKPaymentRequestOpts
     ): Promise<PaymentContent> {
       if (cancelled) return Promise.reject(new JobCancelledError());
+      guardSleep();
       messages.push({
         type: "payment-request",
         content: { amount, reason, ...payOpts },
@@ -204,6 +241,8 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       }
       return Promise.resolve(payment);
     },
+    sleep: async (id, durationMs, options) => sleep(id, relativeWakeTime(durationMs), options?.hint),
+    sleepUntil: async (id, at, options) => sleep(id, absoluteWakeTime(at), options?.hint),
     working(estimateSeconds?: number, hint?: string): void {
       if (cancelled) return;
       messages.push({
@@ -224,12 +263,14 @@ export function createTestContext<State = Record<string, unknown>, Input = strin
       // be resurrected by a handler that kept running.
       if (cancelled) return;
       completed = true;
+      if (sleepPending) abort.abort(new JobCancelledError("Job completed"));
       summary = s;
       messages.push({ type: "complete", content: { summary: s } });
     },
     fail(error: string, failOpts?: { refund?: boolean; callerFault?: boolean }): void {
       if (cancelled) return;
       failed = true;
+      if (sleepPending) abort.abort(new JobCancelledError("Job failed"));
       failError = error;
       if (failOpts?.refund) refundRequested = true;
       messages.push({

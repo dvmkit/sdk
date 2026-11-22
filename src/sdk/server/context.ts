@@ -1,9 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { msatsToUsdc } from "../../lib/payment-amounts";
-import type { MppxChallenge, PaymentContent, ResponseContent } from "../../lib/messages/types";
+import type { Message, MppxChallenge, PaymentContent, ResponseContent } from "../../lib/messages/types";
 import { buildPaymentRequiredV2 } from "../../lib/x402/spec";
 import type { X402Config } from "../../lib/x402/types";
+import { diagnosticConsole } from "../../observability/diagnostic-console";
 import { loggers } from "../../observability/loggers";
 import { createConsoleLogger } from "../logger";
 import type { Currency, FxFetcher, FxRateSnapshot } from "../pricing/index";
@@ -15,6 +16,7 @@ import {
   UnsupportedCurrencyError,
   validateCurrency,
 } from "../pricing/index";
+import { absoluteWakeTime, checkSleepCancellation, displayWakeTime, relativeWakeTime, waitUntil } from "../sleep";
 import type { StepRecord } from "../step-cache";
 import { createStepRunner } from "../step-runner";
 import type { JobCost, KVStore, PaymentMethod, SDKJobContext } from "../types";
@@ -24,7 +26,7 @@ import { deferredX402IntentId, pinAskFiat, resolveFxSnapshot } from "./funding";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import { instrumentKVStore } from "./instrumented-kv";
 import type { ServerJob } from "./job";
-import { AskAlreadyOpenError, isTerminal, JobCancelledError, providerMessage } from "./job";
+import { abortJob, AskAlreadyOpenError, hasOpenAsk, isTerminal, JobCancelledError, providerMessage } from "./job";
 import type { JobCounters } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
 import type { MppxServer } from "./mpp-setup";
@@ -67,6 +69,9 @@ export interface BuildContextOpts {
   onTerminal?: () => void | Promise<void>;
   /** Called at yield points (prompt, payment-request) and terminal states to persist job state. */
   onYield?: () => Promise<void>;
+  onSleepYield?: () => Promise<boolean>;
+  beginSleep?: (id: string, wakeAt: number) => Promise<boolean>;
+  endSleep?: () => Promise<boolean>;
   onCallerResume?: () => void;
   /** Persist a completed step before returning its value to the handler. */
   onStep?: (record: StepRecord) => Promise<void>;
@@ -119,6 +124,10 @@ export interface BuildContextOpts {
   onReplayedAsk?: (askSeq: number) => void;
   /** Durable acceptance of this cached balance payment for the replayed fiat ask. */
   acceptedBalancePayment?: (seq: number, amountMicro: number | undefined, currency: string | undefined) => Promise<boolean>;
+  /** Durable evidence that this rail payment satisfied its ask, even without a piece ledger. */
+  acceptedRailPayment?: (seq: number) => Promise<boolean>;
+  /** Applied and balance-only legacy rail intents, loaded once for payment replay. */
+  legacyRailAskPayments?: () => Promise<{ seq: number; applied: boolean }[]>;
   /**
    * Single-execution claim. Atomically flip the job
    * `awaiting-input → processing`, returning `true` only if this handler won.
@@ -213,6 +222,7 @@ export function buildContext(
   // rather than throws: a well-behaved handler racing the cancel shouldn't
   // crash the host.
   const terminated = (op: string): boolean => {
+    if (job.superseded) return true;
     if (!isTerminal(job.status)) return false;
     log.warn(`ctx.${op}() ignored — job already ${job.status}`, { op, status: job.status });
     return true;
@@ -229,6 +239,7 @@ export function buildContext(
   // Never rejects: each leg swallows its own failure, so an awaiting caller
   // resumes either way.
   const runTerminal = (): void => {
+    if (job.sleepPending) abortJob(job, `Job ${job.status}`);
     const chain = opts.onYield
       ? opts
           .onYield()
@@ -246,6 +257,7 @@ export function buildContext(
   // branch has moved past payment replay. Keep each prompt available once,
   // independently of that mutable replay cursor.
   let replayPrompts: ServerJob["messages"] | undefined;
+  let legacyRailPayments: Promise<Map<number, boolean>> | undefined;
   const captureReplayPrompts = (): void => {
     if (replayPrompts === undefined && job.replayHighSeq !== null) {
       replayPrompts = job.messages.filter((m) => m.from === "provider" && m.type === "prompt" && m.seq <= job.replayHighSeq!);
@@ -353,6 +365,70 @@ export function buildContext(
 
   const steps = createStepRunner(job.stepCache, declareCost, opts.onStep);
 
+  const guardSleep = (): void => {
+    if (job.sleepPending) throw new Error("Cannot open a job wait while a sleep is pending");
+  };
+  const sleep = async (id: string, wakeAt: number, hint?: string): Promise<void> => {
+    if (typeof id !== "string" || id.length === 0) throw new TypeError("Sleep ID must be a non-empty string");
+    if (terminated("sleep")) throw new JobCancelledError();
+    checkSleepCancellation(job.abort.signal);
+    guardSleep();
+    if (askInFlight || job.pendingPayment || job.pendingPrompts.size ||
+        (job.replayHighSeq === null && hasOpenAsk(job))) {
+      throw new Error("Cannot sleep while a payment ask or prompt is open");
+    }
+
+    job.sleepPending = true;
+    try {
+      const stepId = `sleep:${id}`;
+      const { wake_at_ms } = await steps.step(stepId, async () => ({ wake_at_ms: wakeAt }));
+      checkSleepCancellation(job.abort.signal);
+      const remaining = wake_at_ms - Date.now();
+      if (job.replayHighSeq === null || job.replayProviderSkip > 0) {
+        providerMessage(job, "working", {
+          estimate_seconds: Math.ceil(remaining / 1000),
+          hint: hint ?? `Waiting until ${displayWakeTime(wake_at_ms)}`,
+          wake_at_ms,
+        });
+      }
+      job.status = "working";
+      const current = job.replayKind === "sleep" && job.sleepId === stepId;
+      if (job.replayHighSeq !== null && !current) return;
+      if (current) {
+        if (job.replayProviderSkip > 0) {
+          diagnosticConsole.warn({
+            event: "replay_divergence",
+            job_id_hash: createHash("sha256").update(job.id).digest("hex"),
+            count: job.replayProviderSkip,
+          });
+        }
+        job.replayHighSeq = null;
+        job.replayProviderSkip = 0;
+        job.replayKind = undefined;
+      }
+
+      const fenced = (matched: boolean): void => {
+        if (!matched) {
+          opts.onSuperseded?.();
+          throw new JobCancelledError("Job sleep no longer owned by this executor");
+        }
+        checkSleepCancellation(job.abort.signal);
+      };
+
+      if (!current || remaining > 0) {
+        if (opts.onSleepYield) fenced(await opts.onSleepYield());
+        else await opts.onYield?.();
+        checkSleepCancellation(job.abort.signal);
+        if (opts.beginSleep) fenced(await opts.beginSleep(stepId, wake_at_ms));
+        await waitUntil(wake_at_ms, job.abort.signal);
+      }
+      if (opts.endSleep) fenced(await opts.endSleep());
+      job.sleepId = undefined;
+    } finally {
+      job.sleepPending = false;
+    }
+  };
+
   const ctx: SDKJobContext<unknown, unknown> = {
     jobId: job.id,
     tags: job.tags,
@@ -374,6 +450,11 @@ export function buildContext(
     },
     sendMessage: (type, content) => {
       if (terminated("sendMessage")) return;
+      if (type === "decline") throw new Error("Only the caller can decline a job");
+      if (job.deferTerminalOutput && (type === "complete" || type === "cancel")) {
+        throw new Error("Use ctx.complete or ctx.fail to end a job");
+      }
+      if (type === "prompt" || type === "payment-request") guardSleep();
       if ((type === "prompt" || type === "payment-request") && deferredX402IntentId(job.creditId)) {
         throw new Error(
           `ctx.sendMessage("${type}") is unavailable: this job was paid by an x402 authorization that settles only when it succeeds`
@@ -398,6 +479,7 @@ export function buildContext(
       if (terminated("prompt")) {
         return Promise.reject(new JobCancelledError(`Job already ${job.status}`));
       }
+      guardSleep();
       if (deferredX402IntentId(job.creditId)) {
         return Promise.reject(
           new Error("ctx.prompt is unavailable: this job was paid by an x402 authorization that settles only when it succeeds")
@@ -454,6 +536,45 @@ export function buildContext(
           "ctx.requestPayment is unavailable: this job was paid by an x402 authorization that settles only when it succeeds"
         );
       }
+      // Historical payments satisfy their original asks before any current FX,
+      // challenge generation or draw pricing is consulted.
+      const replayThrough = job.replayHighSeq;
+      const historicalPayments = replayThrough === null ? [] : job.messages.filter(
+        (m): m is Extract<Message, { type: "payment" }> => m.type === "payment" && m.from === "requester" && m.seq <= replayThrough
+      );
+      const legacyRail = opts.legacyRailAskPayments && historicalPayments.some(m => !m.content.credit)
+        ? await (legacyRailPayments ??= opts.legacyRailAskPayments()
+          .then(rows => new Map(rows.map(row => [row.seq, row.applied]))))
+        : undefined;
+      const payments = legacyRail ? historicalPayments.filter(m => legacyRail.get(m.seq) !== false) : historicalPayments;
+      const payment = payments[job.replayPaymentIndex];
+      if (payment) {
+        const balance = payment.content.credit;
+        const ask = balance && job.messages.find((m) => m.seq === balance.request_seq &&
+          m.seq < payment.seq && m.from === "provider" && m.type === "payment-request");
+        const originalCredit = ask && ask.type === "payment-request" ? ask.content.credit : undefined;
+        const accepted = balance
+          ? originalCredit && await opts.acceptedBalancePayment?.(payment.seq, originalCredit.amount_micro, originalCredit.currency)
+          : legacyRail?.get(payment.seq) === true || job.pieces?.some((piece) => piece.paidSeq === payment.seq) === true ||
+            job.messages.some((m) => m.from === "provider" && m.seq > payment.seq) ||
+            job.reactivationPaymentApplied === true || await opts.acceptedRailPayment?.(payment.seq);
+        if (!accepted) throw new Error("[internal_error] payment replay reached without credit");
+        job.replayPaymentIndex++;
+        job.pendingPaymentMsats = undefined;
+        job.pendingPaymentFiatMicro = undefined;
+        job.pendingPaymentFiatCurrency = undefined;
+        job.pendingMppChallengeIds = undefined;
+        job.pendingX402Nonce = undefined;
+        job.pendingX402AmountUsdcMicro = undefined;
+        job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
+        opts.onCallerResume?.();
+        return payment.content;
+      }
+      const latestPayment = payments.at(-1)?.seq ?? -1;
+      const replayedPaymentRequest = replayThrough === null ? undefined : job.messages.findLast(
+        (m) => m.from === "provider" && m.type === "payment-request" && m.seq <= replayThrough && m.seq > latestPayment
+      );
+      const originalAsk = replayedPaymentRequest?.type === "payment-request" ? replayedPaymentRequest.content : undefined;
       const finishedChargeMicro = payOpts?.finishedChargeMicro;
       let amountMsats: number;
       let fiatAmount: { amount: number; currency: Currency } | undefined;
@@ -461,7 +582,9 @@ export function buildContext(
       // ask's msats — no second fetch, no second failure door, and
       // the wire ask and the ledger pin can't disagree about the rate.
       let fxSnapshot: FxRateSnapshot | undefined;
-      if (typeof amount === "number") {
+      if (originalAsk) {
+        amountMsats = originalAsk.amount_msats;
+      } else if (typeof amount === "number") {
         amountMsats = amount;
       } else {
         // Fiat envelope. Validate the currency, preflight against
@@ -595,18 +718,7 @@ export function buildContext(
         return pinned;
       };
 
-      const replayedPaymentRequest = job.replayHighSeq !== null &&
-        job.replayPaymentIndex >= job.messages.filter((m) => m.from === "requester" && m.type === "payment").length
-        ? job.messages.findLast((m) => m.from === "provider" && m.type === "payment-request" && m.seq <= job.replayHighSeq! &&
-          m.seq > (job.messages.findLast((message) => message.from === "requester" && message.type === "payment")?.seq ?? -1))
-        : undefined;
-      const originalAsk = replayedPaymentRequest?.type === "payment-request" ? replayedPaymentRequest.content : undefined;
-      if (originalAsk) amountMsats = originalAsk.amount_msats;
-      // Every ask is new money. A replay re-walks asks the job already made: their pieces were
-      // finished when they were first written, so only an ask about to be written is checked.
-      const replayingPaidAsk = job.replayHighSeq !== null && job.replayPaymentIndex <
-        job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!).length;
-      if (!originalAsk && !replayingPaidAsk) checkFinishedCharge(runningPiece(job.pieces), finishedChargeMicro);
+      if (!originalAsk) checkFinishedCharge(runningPiece(job.pieces), finishedChargeMicro);
       const pendingFiat = originalAsk
         ? (originalAsk.credit ? { amountMicro: originalAsk.credit.amount_micro, currency: originalAsk.credit.currency } : undefined)
         : await pinAsk();
@@ -779,51 +891,10 @@ export function buildContext(
         );
       }
 
-      // Only recovered history can satisfy replay. A payment arriving after a
-      // replayed wait suspends is consumed by its live resolver, never again
-      // by the next requestPayment call.
-      // Replay: if this payment was already received, resolve immediately
-      // (positional match). The `payment-request` is NOT re-emitted here —
-      // it's already in history and the replay resolves from the cached
-      // `payment` message. This keeps the `replayProviderSkip` invariant
-      // simple: replay never re-emits a payment-request, so the skip budget
-      // (seeded in `runReactivation`) counts only the provider messages the
-      // replay *does* re-emit.
-      if (job.replayHighSeq !== null) {
-        const payments = job.messages.filter((m) => m.type === "payment" && m.from === "requester" && m.seq <= job.replayHighSeq!);
-        if (job.replayPaymentIndex < payments.length) {
-          const payment = payments[job.replayPaymentIndex];
-          job.replayPaymentIndex++;
-          // The caller must have credited the job before replay. A payment that bought a
-          // piece did, and so did one the handler already resumed past: the job's history
-          // holds provider output after it. Otherwise Tx C sets this one-way runtime marker
-          // after it clears the current ask. Do not use `job.status`: a cached prompt earlier
-          // in the same replay can set it back to `processing` even when this payment was
-          // left pending. Do not compare `paidMsats` to this ask: an explicit
-          // draw makes `paidMsats` a draw-derived rail slice while the ask is
-          // live-rate msats.
-          const balance = (payment.content as PaymentContent).credit;
-          const accepted = balance
-            ? await opts.acceptedBalancePayment?.(payment.seq, pendingFiat?.amountMicro, pendingFiat?.currency)
-            : job.pieces?.some((piece) => piece.paidSeq === payment.seq) === true ||
-              job.messages.some((m) => m.from === "provider" && m.seq > payment.seq) ||
-              job.reactivationPaymentApplied === true;
-          if (!accepted) throw new Error("[internal_error] payment replay reached without credit");
-          job.pendingPaymentMsats = undefined;
-          job.pendingPaymentFiatMicro = undefined;
-          job.pendingPaymentFiatCurrency = undefined;
-          job.pendingMppChallengeIds = undefined;
-          job.pendingX402Nonce = undefined;
-          job.pendingX402AmountUsdcMicro = undefined;
-          job.status = job.pendingPrompts.size > 0 ? "awaiting-input" : "processing";
-          opts.onCallerResume?.();
-          return payment.content as PaymentContent;
-        }
-        // A persisted unpaid ask may have concurrently replaying siblings.
-        if (!originalAsk) {
-          job.replayHighSeq = null;
-          job.replayProviderSkip = 0;
-        }
+      // A persisted unpaid ask may have concurrently replaying siblings.
+      if (job.replayHighSeq !== null && !originalAsk) {
+        job.replayHighSeq = null;
+        job.replayProviderSkip = 0;
       }
 
       // the cumulative total that caps this job's draw growth. The
@@ -1001,6 +1072,8 @@ export function buildContext(
       return p;
     },
 
+    sleep: async (id, durationMs, options) => sleep(id, relativeWakeTime(durationMs), options?.hint),
+    sleepUntil: async (id, at, options) => sleep(id, absoluteWakeTime(at), options?.hint),
     working: (estimateSeconds, hint) => {
       if (terminated("working")) return;
       const content: Record<string, unknown> = {};
@@ -1036,6 +1109,7 @@ export function buildContext(
           : { kind: "release" };
       job.status = "completed";
       job.summary = summary;
+      job.replayProviderSkip = 0;
       providerMessage(job, "complete", { summary });
       runTerminal();
     },
@@ -1047,13 +1121,17 @@ export function buildContext(
     fail: (error, failOpts) => {
       if (terminated("fail")) return;
       job.status = "failed";
+      job.replayProviderSkip = 0;
       providerMessage(job, "cancel", { reason: error, ...(failOpts?.callerFault === true && { caller_fault: true }) });
       runTerminal();
     },
 
     cost: declareCost,
 
-    step: steps.step,
+    step: async (id, fn) => {
+      if (job.superseded) throw new JobCancelledError();
+      return steps.step(id, fn);
+    },
 
     state: job.state as Record<string, unknown>,
     store: instrumentedStore,
@@ -1067,6 +1145,7 @@ export function buildContext(
   // while the first is still pricing its ask would otherwise overwrite it.
   const ask = ctx.requestPayment;
   ctx.requestPayment = (amount, reason, payOpts) => {
+    if (job.sleepPending) return Promise.reject(new Error("Cannot open a job wait while a sleep is pending"));
     if (!isTerminal(job.status) && (askInFlight || job.pendingPayment)) {
       return Promise.reject(new AskAlreadyOpenError(job.id));
     }

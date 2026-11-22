@@ -149,7 +149,7 @@ import { HostedSettlementReportObligations } from "./hosting-settlement-report-o
 import type { BuilderIdentity, OwnerDisplay } from "./host";
 import { createInstrumentedFetch } from "./instrumented-fetch";
 import type { ServerJob } from "./job";
-import { hasOpenAsk, isTerminal, isYieldMessage, localMessage, visibleJobMessages } from "./job";
+import { hasOpenAsk, isTerminal, isYieldMessage, visibleJobMessages } from "./job";
 import { jobCredentialGate } from "./job-credential";
 import {
   JobManager,
@@ -166,6 +166,7 @@ import type {
   JobStore,
   RequestIdClaim,
   RequestIdClaimResult,
+  StreamableJobStore,
 } from "./job-store";
 import { isStreamableJobStore } from "./job-store";
 import type { LightningReceive } from "./lightning-receive";
@@ -210,7 +211,9 @@ import {
   paymentIntentOpen,
   waitForPaymentIntents,
 } from "./payment-arrival";
+import { displayWakeTime } from "../sleep";
 import { acceptLatePayment } from "./late-payment";
+import { findLegacyRailAskPayment, findPaidAskPayment } from "./mandate-payment";
 import type { PayoutReporter } from "./payout-reporter";
 import type { ProcessedPaymentStore } from "./processed-payment-store";
 import { MemoryProcessedPaymentStore } from "./processed-payment-store";
@@ -1342,6 +1345,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       onJobRetentionSweepFailed: opts.onJobRetentionSweepFailed,
       onJobRetentionSweepRecovered: opts.onJobRetentionSweepRecovered,
       reactivationClaimGraceMs: opts.reactivationClaimGraceMs,
+      resumeSleepingJob: (jobId, cutoff) => this.resumeSleepingJob(this.jobManager, jobId, cutoff),
       resumePaidAsk: (jobId) => this.resumePaidAsk(this.jobManager, jobId),
     });
     this.app = new Hono<AppEnv>();
@@ -4804,7 +4808,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
   ): Promise<Message[]> {
     const gate = await this.outputGate(job);
     if (!gate) return messages;
-    return "terminalOnly" in gate ? messages.filter((m) => m.type === "cancel") : [];
+    return "terminalOnly" in gate ? messages.filter((m) => m.type === "cancel" || m.type === "decline") : [];
   }
 
   private async messageFields(job: { id: string; status: JobStatus; lastActivityAt: number; redactedAt?: number; creditId?: string }, messages: Message[]): Promise<Record<string, unknown>> {
@@ -4870,7 +4874,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       const record = await store.get(id);
       if (!record) return c.json({ error: "Job not found" }, 404);
       if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
-      const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+      const terminal = isTerminal(record.status);
       let filtered = record.messages.filter((m) => m.seq > after);
       if (isStreamableJobStore(store)) {
         const durable = await store.getMessages(id, after, { includeHeld: terminal });
@@ -5042,11 +5046,11 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!("redactedAt" in record && record.redactedAt !== undefined) && !(gate && "reason" in gate)) {
       const terminalOnly = gate !== undefined;
       const fromSnapshot = (history: Message[]) => history
-        .filter((message) => message.seq > after && (!terminalOnly || message.type === "cancel"))
+        .filter((message) => message.seq > after && (!terminalOnly || (message.type === "cancel" || message.type === "decline")))
         .sort((a, b) => a.seq - b.seq)
         .slice(0, readLimit);
       if (streamable) {
-        const terminal = isTerminal(record.status) || (job !== undefined && isTerminal(job.status));
+        const terminal = isTerminal(record.status);
         const options = {
           includeHeld: terminal, limit: readLimit,
           ...(terminalOnly && store instanceof PostgresJobStore ? { cancellationOnly: true } : {}),
@@ -5063,7 +5067,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
             }
             break;
           }
-          const releasable = terminalOnly ? batch.filter((message) => message.type === "cancel") : batch;
+          const releasable = terminalOnly ? batch.filter((message) => message.type === "cancel" || message.type === "decline") : batch;
           messages.push(...releasable.slice(0, readLimit - messages.length));
           if (!terminalOnly || messages.length === readLimit || batch.length < readLimit) break;
           cursor = batch[batch.length - 1].seq;
@@ -5131,7 +5135,8 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const decline = store.declineJob.bind(store);
     let outcome: Awaited<ReturnType<typeof decline>>;
     try {
-      outcome = await afterPaymentIntents(() => decline(id, reason), { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+      await waitForPaymentIntents(store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+      outcome = await afterPaymentIntents(() => decline(id, reason, undefined, true), { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
     } catch (error) {
       if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
       throw error;
@@ -5143,15 +5148,17 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return c.json({ seq: pending?.seq ?? 0, stop_requested: true,
         display: this.standingDeclineDisplay() }, 201);
     }
+    await jm.signalStoredTerminal(id);
     await jm.finalizeStoredTerminal(id);
     const ended = await store.get(id);
     return c.json({ seq: ended?.seq ?? 0 }, 201);
   }
 
-  private jobNotActiveResponse(c: Context<AppEnv>): Response {
+  private jobNotActiveResponse(c: Context<AppEnv>, status?: JobStatus): Response {
     return c.json(
       {
         error: "job_not_active",
+        ...(status !== undefined && { status }),
         message: "Job already reached a terminal status and no longer accepts messages.",
         hint: "The job is finished — fetch results with GET /v1/job/:id/messages.",
       },
@@ -5165,7 +5172,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     if (!jobCredential.presents(c.req)) return c.json(jobCredential.body(), 401);
     const id = c.req.param("id") ?? "";
     const jm = this.jobManager;
-    const activeJob = jm.activeJobs.get(id);
     const wire = await c.req.raw.clone().json().catch(() => undefined) as
       { type?: string; content?: Record<string, unknown> } | undefined;
     if (wire?.type === "payment" && wire.content && typeof wire.content === "object" && "credit" in wire.content) {
@@ -5187,7 +5193,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
           // Wake the existing claim/resume owner. A COMMIT acknowledgement may
           // arrive after NOTIFY has already advanced the handler to another ask.
           await this.opts.db.query("SELECT pg_notify('job_messages', $1)", [id]);
-          if (!activeJob) await this.resumePaidAsk(jm, id, (wire.content.credit as { request_seq: number }).request_seq);
+          await this.resumePaidAsk(jm, id, (wire.content.credit as { request_seq: number }).request_seq);
         } catch {
           // The accepted outcome is durable. A progress failure must never ask
           // the caller to spend again; a non-payment resume can recover it.
@@ -5201,113 +5207,35 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
     }
 
+    const store = jm.store;
+    if (isStreamableJobStore(store) && (wire?.type === "cancel" || (wire?.type === "decline" && store.declineJob))) {
+      const record = await store.get(id);
+      if (!record || !isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
+      const error = validateMessageContent(wire.type, wire.content ?? {}, this.opts.devMode === true);
+      if (error) return c.json({ error: "invalid_message", message: error }, 400);
+      const reason = typeof wire.content?.reason === "string" ? wire.content.reason : undefined;
+      return wire.type === "decline"
+        ? this.declineStoredJob(c, id, reason ?? "Job declined")
+        : this.cancelStoredJob(c, store, id, reason ?? "Job cancelled", true);
+    }
+
+    const activeJob = jm.activeJobs.get(id);
     // Money that reaches an ended job is never refused for arriving late: it
     // lands on credit as balance. Anything else still gets 409.
     const latePayable = wire?.type === "payment" && !!wire.content && typeof wire.content === "object" &&
       hasPaymentProof(wire.content);
-    if (activeJob) {
-      if (!isJobOwner(c, activeJob)) return c.json({ error: "Job not found" }, 404);
-      if (isTerminal(activeJob.status)) {
-        return latePayable ? this.acceptPaymentOnEndedJob(c, id) : this.jobNotActiveResponse(c);
-      }
+    if (activeJob) return this.handleLiveMessage(c, activeJob, latePayable);
 
-      const parsed = await this.requireJsonBody<{
-        type: MessageType;
-        content: Record<string, unknown>;
-      }>(c);
-      if ("error" in parsed) return parsed.error;
-      const body = parsed.body;
-      const contentErr = validateMessageContent(
-        body.type,
-        body.content,
-        this.opts.devMode === true
-      );
-      if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
-      const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
-      if (railRefusal) return railRefusal;
-      if (body.type === "decline" && activeJob.mandate &&
-          !activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob) &&
-          isStreamableJobStore(jm.store) && jm.store.declineJob) {
-        const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
-        return this.declineStoredJob(c, id, reason);
-      }
-      if (body.type === "decline") {
-        // A payment being verified commits first: it may pay the ask being declined.
-        try {
-          await waitForPaymentIntents(jm.store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
-        } catch (error) {
-          if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
-          throw error;
-        }
-        if (isTerminal(activeJob.status)) return this.jobNotActiveResponse(c);
-        if (!activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob)) {
-          if (activeJob.mandate && isStreamableJobStore(jm.store) && jm.store.declineJob) {
-            const reason = typeof body.content?.reason === "string" ? body.content.reason : "Job declined";
-            return this.declineStoredJob(c, id, reason);
-          }
-          return this.noOpenAskResponse(c);
-        }
-      }
-
-      const inboundSeq = await jm.recordInboundPending(activeJob, body.type, body.content);
-
-      const lockPubkeys = await this.resolveLockPubkeysForReceive();
-      let unappliedCredit: UnappliedCredit | undefined;
-      let drawFundingReceipt: DrawFundingReceipt | undefined;
-      if (body.type === "payment") {
-        const outcome = await jm.processPayment(activeJob, body, inboundSeq, {
-          lockPubkeys,
-          mintHealthTracker: this.mintHealthTracker,
-        });
-        // Not `as 402`: the branch also carries 500 (`payment_unapplied`) and
-        // 503 (the sick-mint short-circuit).
-        if (outcome.error)
-          return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
-        unappliedCredit = outcome.unappliedCredit;
-        drawFundingReceipt = outcome.drawFundingReceipt;
-        // Balance bought nothing, and a job a cancel ended while this payment
-        // verified has no handler left to pay: neither is dispatched.
-        if (outcome.landedAsBalance || isTerminal(activeJob.status)) {
-          return c.json({
-            seq: activeJob.messages[activeJob.messages.length - 1].seq,
-            ...(unappliedCredit && { credit: unappliedCredit }),
-            ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
-          }, 201);
-        }
-      } else {
-        // Non-payment inbound: flip status to verified so cross-machine
-        // SSE readers see the row.
-        await jm.markInboundVerified(activeJob.id, inboundSeq);
-      }
-
-      try {
-        await jm.dispatchMessage(activeJob, body.type, body.content);
-        await this.persistMessageSnapshot(jm, activeJob, body.type);
-      } catch (error) {
-        const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit, drawFundingReceipt);
-        if (response) return response;
-        throw error;
-      }
-      const lastMsg = activeJob.messages[activeJob.messages.length - 1];
-      // `credit` is present only when this payment funded a credit the
-      // job row didn't take — a concurrent free-then-paid top-up that lost the
-      // set-if-null bind. The payment succeeded; the money is simply the
-      // caller's balance rather than this job's. `draw_funding_receipt` is the
-      // signed fact a mid-job funding against the job's own draw leaves behind.
-      return c.json({
-        seq: lastMsg.seq,
-        ...(unappliedCredit && { credit: unappliedCredit }),
-        ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
-      }, 201);
+    const record = await store.get(id);
+    if (!record || !isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
+    // A rail arrival belongs to the durable job even when this deployment
+    // cannot run that capability.
+    if (latePayable && (isStreamableJobStore(store) || isTerminal(record.status))) {
+      return this.acceptDetachedRailPayment(c, record);
     }
-
-    const record = await jm.store.get(id);
-    if (!record) return c.json({ error: "Job not found" }, 404);
-    if (!isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
     if (isTerminal(record.status)) {
-      return latePayable ? this.acceptPaymentOnEndedJob(c, id, record) : this.jobNotActiveResponse(c);
+      return this.jobNotActiveResponse(c);
     }
-
     const parsed = await this.requireJsonBody<{
       type: MessageType;
       content: Record<string, unknown>;
@@ -5319,6 +5247,16 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return this.declineStoredJob(c, id, reason);
     }
 
+    if (record.sleepUntilMs !== undefined) {
+      const step = record.stepCache.find((entry) => entry.id === record.sleepId);
+      const wake = (step?.value as { wake_at_ms?: number } | undefined)?.wake_at_ms;
+      return c.json({
+        error: "job_sleeping",
+        display: `The job is waiting until ${displayWakeTime(wake ?? record.sleepUntilMs)}.`,
+        hint: "Decline or cancel to stop it; read new output with GET /v1/job/:id/messages?after=<seq>.",
+      }, 409);
+    }
+
     // Legacy missing capabilities and capabilities removed during execution cannot
     // reactivate. Fail the job and return structured 410 before content validation.
     if (!jm.hasCapability(record.capability, record.channel)) {
@@ -5326,12 +5264,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
         ? `Capability "${record.capability}" is no longer registered on this DVM`
         : "Job predates capability dispatch and cannot be resumed";
       try {
-        await afterPaymentIntents(() => jm.store.save({
-          ...record,
-          status: "failed",
-          summary,
-          lastActivityAt: Date.now(),
-        }), { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+        if (!await this.refuseStoredReactivation(record, summary)) return this.reactivationChanged(c);
       } catch (error) {
         const open = paymentIntentOpen(error);
         if (open) return this.paymentInProgressResponse(c);
@@ -5353,27 +5286,27 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     const railRefusal = this.unsignedJobRailRefusal(record, body);
     if (railRefusal) return railRefusal;
 
-    if (isStreamableJobStore(jm.store)) {
-      record.messages = await jm.store.getMessages(id, 0);
-      record.seq = Math.max(record.seq, ...record.messages.map((message) => message.seq));
-    }
+    const replay = await this.loadReactivationHistory(record);
+
+    // A sweep or another inbound can install the handler while the store reads above
+    // are in flight. Never replace it with a request-local recovery scaffold.
+    const current = jm.activeJobs.get(id);
+    if (current) return this.handleLiveMessage(c, current, latePayable);
 
     // Credit is committed before handler dispatch. Reactivation re-verifies persisted
     // auth without drift/replay checks; failed verification terminally refuses the job.
     let job: ServerJob;
     try {
-      ({ job } = jm.reactivateJob(record));
+      ({ job } = jm.reactivateJob(replay));
     } catch (err) {
       if (isSignedRequestError(err)) {
-        await jm.store
-          .save({
-            ...record,
-            status: "failed",
-            summary: "Persisted auth envelope failed signature re-verification on reactivation",
-            lastActivityAt: Date.now(),
-          })
-          .catch(() => undefined);
-        return buildAuthErrorResponse(c, err, this.publicOrigin);
+        try {
+          const refused = await this.refuseStoredReactivation(record, "Persisted auth envelope failed signature re-verification on reactivation");
+          return refused ? buildAuthErrorResponse(c, err, this.publicOrigin) : this.reactivationChanged(c);
+        } catch (error) {
+          if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+          throw error;
+        }
       }
       if (err instanceof ReactivationAuthSchemaError) {
         return c.json(
@@ -5422,7 +5355,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
     };
 
-    const deadline = callerDeadline(record, this.descriptor.idleTimeout * 1000);
+    const deadline = callerDeadline(replay, this.descriptor.idleTimeout * 1000);
     if (deadline !== undefined && Date.now() >= deadline) {
       await jm.cancelJobIdle(job);
       if (isTerminal(job.status)) {
@@ -5461,26 +5394,177 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     return c.json({ seq: lastMsg.seq, ...creditBlock }, 201);
   }
 
-  /** A paid message for an ended job: recorded, verified and landed as balance. */
-  private async acceptPaymentOnEndedJob(c: Context<AppEnv>, id: string, known?: JobRecord): Promise<Response> {
+  private async loadReactivationHistory(record: JobRecord): Promise<JobRecord> {
+    const store = this.jobManager.store;
+    if (!isStreamableJobStore(store)) return record;
+    const messages = await store.getMessages(record.id, 0, { includeHeld: true });
+    return { ...record, messages, seq: messages.reduce((max, message) => Math.max(max, message.seq), record.seq) };
+  }
+
+  private reactivationChanged(c: Context<AppEnv>): Response {
+    return c.json({ error: "job_changed", message: "The job changed during reactivation. Read its current status." }, 409);
+  }
+
+  private async refuseStoredReactivation(record: JobRecord, summary: string): Promise<boolean> {
+    const jm = this.jobManager;
+    const refused = await afterPaymentIntents(() => jm.store.failReactivation(record, summary),
+      { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+    if (refused) {
+      await jm.signalStoredTerminal(record.id);
+      await jm.finalizeStoredTerminal(record.id);
+    }
+    return refused;
+  }
+
+  private async handleLiveMessage(c: Context<AppEnv>, activeJob: ServerJob, latePayable: boolean): Promise<Response> {
+    const jm = this.jobManager;
+    const id = activeJob.id;
+    if (!isJobOwner(c, activeJob)) return c.json({ error: "Job not found" }, 404);
+    if (isTerminal(activeJob.status)) {
+      if (!latePayable) return this.jobNotActiveResponse(c);
+      const observed = await jm.store.get(id);
+      return observed ? this.acceptDetachedRailPayment(c, observed) : this.jobNotActiveResponse(c);
+    }
+
+    const parsed = await this.requireJsonBody<{
+      type: MessageType;
+      content: Record<string, unknown>;
+    }>(c);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const contentErr = validateMessageContent(
+      body.type,
+      body.content,
+      this.opts.devMode === true
+    );
+    if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
+    const railRefusal = this.unsignedJobRailRefusal(activeJob, body);
+    if (railRefusal) return railRefusal;
+    // Custom stores without an authoritative stop method use the single-handler
+    // snapshot path. Keep the caller's terminal event private there as well.
+    if (body.type === "cancel" || body.type === "decline") {
+      try {
+        await waitForPaymentIntents(jm.store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+      } catch (error) {
+        if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+        throw error;
+      }
+      if (isTerminal(activeJob.status)) return this.jobNotActiveResponse(c, activeJob.status);
+      if (body.type === "decline" && !activeJob.pendingPayment && activeJob.pendingPrompts.size === 0 && !hasOpenAsk(activeJob)) {
+        return this.noOpenAskResponse(c);
+      }
+      await jm.dispatchMessage(activeJob, body.type, body.content);
+      const result = await jm.store.get(id);
+      return result?.status === "cancelled" ? c.json({ seq: result.seq }, 201) : this.jobNotActiveResponse(c, result?.status);
+    }
+
+    const inboundSeq = await jm.recordInboundPending(activeJob, body.type, body.content);
+
+    const lockPubkeys = await this.resolveLockPubkeysForReceive();
+    let unappliedCredit: UnappliedCredit | undefined;
+    let drawFundingReceipt: DrawFundingReceipt | undefined;
+    if (body.type === "payment") {
+      const outcome = await jm.processPayment(activeJob, body, inboundSeq, {
+        lockPubkeys,
+        mintHealthTracker: this.mintHealthTracker,
+      });
+      // Not `as 402`: the branch also carries 500 (`payment_unapplied`) and
+      // 503 (the sick-mint short-circuit).
+      if (outcome.error)
+        return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
+      unappliedCredit = outcome.unappliedCredit;
+      drawFundingReceipt = outcome.drawFundingReceipt;
+      // Balance bought nothing, and a job a cancel ended while this payment
+      // verified has no handler left to pay: neither is dispatched.
+      if (outcome.landedAsBalance || isTerminal(activeJob.status)) {
+        return c.json({
+          seq: inboundSeq ?? activeJob.messages[activeJob.messages.length - 1].seq,
+          ...(unappliedCredit && { credit: unappliedCredit }),
+          ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+        }, 201);
+      }
+    } else {
+      // Non-payment inbound: flip status to verified so cross-machine
+      // SSE readers see the row.
+      await jm.markInboundVerified(activeJob.id, inboundSeq);
+    }
+
+    try {
+      await jm.dispatchMessage(activeJob, body.type, body.content);
+      await this.persistMessageSnapshot(jm, activeJob, body.type);
+    } catch (error) {
+      const response = this.postPaymentSnapshotFailure(c, error, activeJob, body.type, inboundSeq, unappliedCredit, drawFundingReceipt);
+      if (response) return response;
+      throw error;
+    }
+    const lastMsg = activeJob.messages[activeJob.messages.length - 1];
+    // `credit` is present only when this payment funded a credit the
+    // job row didn't take — a concurrent free-then-paid top-up that lost the
+    // set-if-null bind. The payment succeeded; the money is simply the
+    // caller's balance rather than this job's. `draw_funding_receipt` is the
+    // signed fact a mid-job funding against the job's own draw leaves behind.
+    return c.json({
+      seq: lastMsg.seq,
+      ...(unappliedCredit && { credit: unappliedCredit }),
+      ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+    }, 201);
+  }
+
+  /** Record and verify a rail arrival before trying to route it to a handler. */
+  private async acceptDetachedRailPayment(c: Context<AppEnv>, record: JobRecord): Promise<Response> {
     const parsed = await this.requireJsonBody<{ type: MessageType; content: Record<string, unknown> }>(c);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;
     const contentErr = validateMessageContent(body.type, body.content, this.opts.devMode === true);
     if (contentErr) return c.json({ error: "invalid_message", message: contentErr }, 400);
-    const record = known ?? await this.jobManager.store.get(id);
-    if (!record) return c.json({ error: "Job not found" }, 404);
-    // A redacted job keeps no history to record a payment against.
     if (record.redactedAt !== undefined) return this.jobNotActiveResponse(c);
     const railRefusal = this.unsignedJobRailRefusal(record, body);
     if (railRefusal) return railRefusal;
-    const result = await acceptLatePayment({
-      recorder: this.jobManager,
-      record,
-      content: body.content,
-      extra: { lockPubkeys: await this.resolveLockPubkeysForReceive(), mintHealthTracker: this.mintHealthTracker },
+
+    const jm = this.jobManager;
+    const { job: paymentJob, inboundSeq, outcome } = await acceptLatePayment({
+      recorder: jm, record, content: body.content,
+      receiveOptions: async () => ({ lockPubkeys: await this.resolveLockPubkeysForReceive(), mintHealthTracker: this.mintHealthTracker }),
     });
-    return c.json(result.body, result.status as ContentfulStatusCode);
+    if (outcome.error) return c.json(outcome.error.body, outcome.error.status as ContentfulStatusCode);
+    const { unappliedCredit, drawFundingReceipt } = outcome;
+    const store = jm.store;
+    if (!outcome.landedAsBalance && isStreamableJobStore(store) && jm.hasCapability(record.capability, record.channel)) {
+      const resume = await store.tryReactivationLock(record.id, async () => {
+        const fresh = await store.get(record.id);
+        if (!fresh || isTerminal(fresh.status) || fresh.sleepUntilMs !== undefined) return;
+        const replay = await this.loadReactivationHistory(fresh);
+        if (jm.activeJobs.has(record.id)) return;
+        let job: ServerJob;
+        try {
+          ({ job } = jm.reactivateJob(replay));
+        } catch (error) {
+          // Verification and credit are already durable. A host unable to
+          // re-verify the handler's input must leave the paid ask recoverable.
+          if (isSignedRequestError(error) || error instanceof ReactivationAuthSchemaError) return;
+          throw error;
+        }
+        job.reactivationPaymentApplied = paymentJob.reactivationPaymentApplied;
+        try {
+          await this.runReactivation(jm, job, body, fresh.status);
+        } catch (error) {
+          this.teardownReactivationScaffold(jm, job);
+          throw error;
+        }
+      }).catch(error => {
+        // The caller already paid. Return the ordinary durable-payment
+        // recovery response if an attempted snapshot failed.
+        const response = this.postPaymentSnapshotFailure(c, error, paymentJob, "payment", inboundSeq, unappliedCredit, drawFundingReceipt);
+        if (response) return response;
+        diagnosticConsole.error({ level: "rail_payment_resume_unavailable", job_id: record.id });
+      });
+      if (resume instanceof Response) return resume;
+    }
+    return c.json({
+      seq: inboundSeq ?? paymentJob.seq,
+      ...(unappliedCredit && { credit: unappliedCredit }),
+      ...(drawFundingReceipt && { draw_funding_receipt: drawFundingReceipt }),
+    }, 201);
   }
 
   private async persistMessageSnapshot(
@@ -5523,43 +5607,77 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     }, 503);
   }
 
+  private async resumeSleepingJob(jm: JobManager<State, InputSchema>, id: string, cutoff: number): Promise<void> {
+    if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
+    const store = jm.store;
+    await store.tryReactivationLock(id, async () => {
+      if (jm.activeJobs.has(id)) return;
+      const now = Date.now();
+      const claim = await store.claimSleepingJob?.(id, cutoff, now);
+      if (!claim) return;
+      if (claim.sleepResumes > 5) {
+        if (await store.cancelStaleJob(id, now, "worker_died_mid_job", "failed",
+          { generation: claim.sleepGeneration, parked: true })) {
+          await jm.finalizeStoredTerminal(id);
+        }
+        return;
+      }
+      const fresh = await store.get(id);
+      if (!fresh || isTerminal(fresh.status)) return;
+      fresh.messages = await store.getMessages(id, 0, { includeHeld: true });
+      fresh.seq = fresh.messages.reduce((seq, message) => Math.max(seq, message.seq), fresh.seq);
+      if (jm.activeJobs.has(id)) return;
+      const { job, sdkCtx } = jm.reactivateJob(fresh);
+      job.sleepGeneration = claim.sleepGeneration;
+      job.replayKind = "sleep";
+      this.startReplay(jm, job, sdkCtx);
+    });
+  }
+
+  /** Count messages the handler emits again. Payment asks replay from durable history. */
+  private startReplay(
+    jm: JobManager<State, InputSchema>,
+    job: ServerJob,
+    sdkCtx: NonNullable<ServerJob["sdkCtx"]>
+  ): void {
+    job.replayHighSeq = job.seq;
+    job.replayProviderSkip = job.messages.filter(
+      (m) => m.from === "provider" && m.type !== "payment-request"
+    ).length;
+    jm.runHandler(job, sdkCtx);
+  }
+
   /**
-   * Replay an `awaiting-input` job no worker here is running, once its open ask has been paid from
-   * balance. `requestSeq` names the ask the payment answered; a later ask means the job has moved
+   * Replay an `awaiting-input` job no worker here is running, once its open ask has been paid.
+   * `requestSeq` names the ask the payment answered; a later ask means the job has moved
    * on. The reactivation claim keeps a live worker elsewhere, or a concurrent resumer, from
    * running it twice.
    */
   private async resumePaidAsk(jm: JobManager<State, InputSchema>, id: string, requestSeq?: number): Promise<void> {
     if (jm.activeJobs.has(id) || !isStreamableJobStore(jm.store)) return;
     const store = jm.store;
+    const db = this.opts.db;
+    if (!db) return;
     const fresh = await store.get(id);
-    if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0) return;
+    if (fresh?.status !== "awaiting-input" || (fresh.pendingPaymentMsats ?? 0) > 0 ||
+        (fresh.pendingPaymentFiatMicro ?? 0) > 0) return;
     // Internal replay needs the committed payment even if an earlier verification still
     // holds back the public message stream.
     fresh.messages = await store.getMessages(id, 0, { includeHeld: true });
     fresh.seq = Math.max(fresh.seq, ...fresh.messages.map((message) => message.seq));
     const ask = fresh.messages.findLast((message) => message.from === "provider" && message.type === "payment-request");
     if (!ask || (requestSeq !== undefined && ask.seq !== requestSeq)) return;
-    let paymentSeq: number | undefined;
-    if (requestSeq === undefined) {
-      if (!this.opts.db) return;
-      const { rows: [accepted] } = await this.opts.db.query<{ response: { seq: number } }>(
-        "SELECT response FROM credit_balance_payments WHERE job_id=$1 AND request_seq=$2", [id, ask.seq]);
-      if (accepted) {
-        if ((fresh.pendingPaymentFiatMicro ?? 0) !== 0 || !Number.isSafeInteger(accepted.response.seq)) return;
-        paymentSeq = accepted.response.seq;
-      } else if (!fresh.mandate) {
-        return;
-      }
-      // The caller may have answered a concurrent prompt before paying. A prompt posted
-      // after the committed payment belongs to a later wait.
-      if (fresh.messages.some((message) => message.from === "provider" && (
-        (message.type === "prompt" && message.seq > (paymentSeq ?? ask.seq)) ||
-        ((message.type === "complete" || message.type === "cancel") && message.seq > ask.seq)
-      ))) return;
-    }
-    const payment = fresh.messages.findLast((message) => message.from === "requester" && message.type === "payment" &&
-      message.seq > ask.seq && (paymentSeq === undefined || message.seq === paymentSeq));
+    const exactPaymentSeq = await findPaidAskPayment(db, id, ask.seq);
+    // A later prompt supersedes the paid wait. Legacy rail intents did not identify the
+    // ask, so keep the old mandate recovery cutoff at the ask itself in that case.
+    if (fresh.messages.some((message) => message.from === "provider" &&
+      message.type === "prompt" && message.seq > (exactPaymentSeq ?? ask.seq))) return;
+    const paymentSeq = exactPaymentSeq ?? (requestSeq === undefined && fresh.mandate
+      ? await findLegacyRailAskPayment(db, id, ask.seq)
+      : undefined);
+    if (paymentSeq === undefined) return;
+    const payment = fresh.messages.find(message => message.seq === paymentSeq &&
+      message.from === "requester" && message.type === "payment");
     if (!payment) return;
     await store.tryReactivationLock(id, async () => {
       if (jm.activeJobs.has(id)) return;
@@ -5597,14 +5715,7 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       }
       const sdkCtx = job.sdkCtx;
       if (!sdkCtx) throw new Error(`runReactivation: job ${job.id} missing sdkCtx`);
-      job.replayHighSeq = job.seq;
-      // Count only provider messages replay will emit. Payment-request messages are
-      // resolved from cached payment/upfront credit before emission, so including
-      // them would consume a skip slot intended for a later artifact.
-      job.replayProviderSkip = job.messages.filter(
-        (m) => m.from === "provider" && m.type !== "payment-request"
-      ).length;
-      jm.runHandler(job, sdkCtx);
+      this.startReplay(jm, job, sdkCtx);
       await new Promise((resolve) => {
         setTimeout(resolve, 0);
       });
@@ -5631,12 +5742,34 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
     job.messageAppender = undefined;
   }
 
+  /** A caller can stop the current execution even if the request reaches a superseded worker. */
+  private async cancelStoredJob(
+    c: Context<AppEnv>, store: StreamableJobStore, id: string, reason: string, asMessage = false
+  ): Promise<Response> {
+    let cancelled: boolean;
+    try {
+      await waitForPaymentIntents(store, id, { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+      cancelled = await afterPaymentIntents(() => store.cancelJob(id, reason),
+        { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
+    } catch (error) {
+      if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
+      throw error;
+    }
+    if (!cancelled) {
+      const current = await store.get(id);
+      if (!current) return c.json({ error: "Job not found" }, 404);
+      return this.jobNotActiveResponse(c, current.status);
+    }
+    await this.jobManager.signalStoredTerminal(id);
+    await this.jobManager.finalizeStoredTerminal(id);
+    return asMessage ? c.json({ seq: (await store.get(id))?.seq ?? 0 }, 201) : c.json({ status: "cancelled" });
+  }
+
   private async handleDeleteJob(c: Context<AppEnv>): Promise<Response> {
     // no credential → 401 before any lookup (see `handleGetJob`).
     if (!jobCredential.presents(c.req)) return c.json(jobCredential.body(), 401);
     const id = c.req.param("id") ?? "";
     const jm = this.jobManager;
-    const job = jm.activeJobs.get(id);
 
     let reason: string | undefined;
     try {
@@ -5646,6 +5779,14 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       // no body is fine
     }
 
+    const store = jm.store;
+    if (isStreamableJobStore(store)) {
+      const record = await store.get(id);
+      if (!record || !isJobOwner(c, record)) return c.json({ error: "Job not found" }, 404);
+      return this.cancelStoredJob(c, store, id, reason ?? "Job cancelled");
+    }
+
+    const job = jm.activeJobs.get(id);
     if (!job) {
       const record = await jm.store.get(id);
       if (!record) return c.json({ error: "Job not found" }, 404);
@@ -5654,32 +5795,6 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
 
       if (isTerminal(record.status)) {
         return this.jobNotActiveResponse(c);
-      }
-
-      // Cancel in the store, atomically. The handler is running on
-      // another machine — `cancelJob` commits the terminal status, the `cancel`
-      // message, and the NOTIFY in one transaction, so that machine adopts the
-      // status and aborts `ctx.signal` within a round-trip instead of grinding
-      // through the provider call the caller just cancelled. A `false` return
-      // means someone else drove the job terminal between our read and the CAS.
-      const store = jm.store;
-      if (isStreamableJobStore(store)) {
-        // A payment being verified commits first: it pays the ask or lands as balance.
-        let cancelled: boolean;
-        try {
-          cancelled = await afterPaymentIntents(() => store.cancelJob(id, reason ?? "Job cancelled"),
-            { maxWaitMs: PAYMENT_INTENT_REQUEST_WAIT_MS });
-        } catch (error) {
-          if (paymentIntentOpen(error)) return this.paymentInProgressResponse(c);
-          throw error;
-        }
-        if (!cancelled) return this.jobNotActiveResponse(c);
-        // this machine wrote the terminal, so it issues the receipt.
-        // The handler's machine will try too when it adopts the status — the
-        // store's write-once persist makes whichever loses take the winner's
-        // bytes rather than sign a second time.
-        await jm.finalizeStoredTerminal(id);
-        return c.json({ status: "cancelled" });
       }
 
       // Non-streamable store: single-machine by construction (no cross-machine
@@ -5706,11 +5821,10 @@ class DVMServer<State, InputSchema extends ZodLike | undefined> {
       return this.jobNotActiveResponse(c);
     }
 
-    // Dispatch cancel through listener fan-out so an open SSE stream receives its
-    // yield event; persistence follows the normal dispatch path.
-    localMessage(job, "requester", "cancel", { reason });
     job.lastActivityAt = Date.now();
     await jm.dispatchMessage(job, "cancel", { reason });
+    const current = await store.get(id);
+    if (current?.status !== "cancelled") return this.jobNotActiveResponse(c, current?.status);
     return c.json({ status: "cancelled" });
   }
 }
@@ -6329,6 +6443,7 @@ function validateMessageContent(
   content: Record<string, unknown>,
   devMode: boolean
 ): string | null {
+  if (type === "complete") return "Only the provider can complete a job";
   if (type === "response") {
     if (typeof content.prompt_id !== "string")
       return "response message requires prompt_id (string)";

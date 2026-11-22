@@ -86,7 +86,9 @@ describe("JobManager.runHandler missing capability", () => {
       expect(job.pendingPrompts.size).toBe(0);
       expect(job.pendingPayment).toBeNull();
 
-      const lastMsg = job.messages.at(-1);
+      expect(job.messages).toEqual([]);
+      await job.terminalWork;
+      const lastMsg = (await store.get(job.id))?.messages.at(-1);
       expect(lastMsg?.type).toBe("cancel");
       expect((lastMsg?.content as { reason?: string }).reason).toMatch(
         /Unknown capability "deleted-cap" on descriptor "missing-cap-test"/

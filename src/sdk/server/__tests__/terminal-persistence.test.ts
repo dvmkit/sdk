@@ -135,6 +135,7 @@ describe("terminal result durability", () => {
       return committed;
     });
     ctx.cost({ amount: 0.025, currency: "usd" });
+    ctx.artifact({ data: "result" });
     ctx.complete("done");
     await vi.advanceTimersByTimeAsync(31_000);
     await job.terminalWork;
@@ -183,6 +184,7 @@ describe("terminal result durability", () => {
     vi.useFakeTimers();
     const { manager, job, store, ledger, ctx } = await setup();
     vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("append unavailable"));
+    ctx.artifact({ data: "result" });
     ctx.complete("done");
     await vi.advanceTimersByTimeAsync(0);
     await store.cancelJob(job.id, "caller stopped");
@@ -201,6 +203,7 @@ describe("terminal result durability", () => {
     const { job, store, ledger, ctx } = await setup();
     vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("append unavailable"));
     const fault = vi.spyOn(store, "failJob").mockRejectedValue(new Error("failure write unavailable"));
+    ctx.artifact({ data: "result" });
     ctx.complete("done");
     await vi.advanceTimersByTimeAsync(30_500);
     expect((await ledger.getDraw({ creditId: "credit", drawId: "draw" }))?.status).toBe("pending");
@@ -217,6 +220,7 @@ describe("terminal result durability", () => {
     vi.spyOn(store, "appendOutgoing").mockRejectedValue(new Error("append unavailable"));
     let reject!: (error: Error) => void;
     const fault = vi.spyOn(store, "failJob").mockImplementation(() => new Promise<boolean>((_resolve, fail) => { reject = fail; }));
+    ctx.artifact({ data: "result" });
     ctx.complete("done");
     await vi.advanceTimersByTimeAsync(30_000);
     manager.shutdown();

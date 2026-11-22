@@ -212,6 +212,10 @@ export interface SDKJobContext<State = Record<string, unknown>, Input = string> 
   ): Promise<PaymentContent>;
   /** Signal that processing will take a while. Handler continues running. */
   working(estimateSeconds?: number, hint?: string): void;
+  /** Wait for a duration. A unique ID fixes the wake time across handler replay. */
+  sleep(id: string, durationMs: number, opts?: { hint?: string }): Promise<void>;
+  /** Wait until a wall-clock time, expressed as a Date or epoch milliseconds. */
+  sleepUntil(id: string, at: Date | number, opts?: { hint?: string }): Promise<void>;
   /**
    * Emit a progress heartbeat with structured `percent_complete` and optional
    * `current_phase` / `hint`. Non-blocking and non-yield: the SSE stream stays
@@ -1049,7 +1053,8 @@ export interface DVMConfig<
   /**
    * Seconds a job may sit in `processing`/`working` with no SDK liveness
    * heartbeat before the stale-job watchdog declares its worker dead and marks
-   * it `failed`. The SDK heartbeats locally-active jobs every ~30s,
+   * it `failed` or adopts a durable sleep. Set to `0` to disable both.
+   * The SDK heartbeats locally-active jobs every ~30s,
    * so this bounds *crashed/OOM-killed-worker* detection — not legitimate
    * handler runtime, which the heartbeat keeps fresh regardless of how long it
    * runs. Distinct from `idleTimeout`, which governs the `awaiting-input`
@@ -1202,7 +1207,7 @@ export interface DVMDescriptor<
   readonly state: State;
   /** Seconds before an idle job is auto-cancelled. */
   readonly idleTimeout: number;
-  /** Seconds before a worker-stranded `processing`/`working` job is marked `failed`. Undefined → SDK default (5 min). */
+  /** Seconds before the watchdog reaps worker-stranded jobs or adopts durable sleeps. Default: 300. Set to 0 to disable both. */
   readonly processingWatchdog?: number;
   /** Days terminal job content is retained; `0` disables automatic redaction. */
   readonly jobRetentionDays: number;

@@ -1,6 +1,7 @@
 import type { Message } from "../../lib/messages/types";
 import { askExpired } from "./ask-expiry";
 import type { JobStatus } from "./job-store";
+import type { VerifyIncomingSnapshot } from "./payment";
 
 /**
  * How long a payment intent holds its job open. An intent is written when a
@@ -43,6 +44,8 @@ export type PaymentDisposition =
 export interface RecordedPaymentArrival {
   seq: number;
   disposition: PaymentDisposition;
+  /** Rail terms read under the same lock as the arrival. */
+  snapshot?: VerifyIncomingSnapshot;
 }
 
 /**

@@ -32,6 +32,9 @@ const ISSUER = new ReceiptIssuer({ secret: RECEIPT.secret, dvm: "receipt-test", 
 class PlainJobStore implements JobStore {
   private readonly inner = new MemoryJobStore();
 
+  failReactivation = this.inner.failReactivation.bind(this.inner);
+  heartbeatJobExecutors = this.inner.heartbeatJobExecutors.bind(this.inner);
+
   get(id: string): Promise<JobRecord | undefined> {
     return this.inner.get(id);
   }

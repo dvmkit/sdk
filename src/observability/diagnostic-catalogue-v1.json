@@ -543,7 +543,9 @@
     "card_refund_expiry_failed",
     "card_refund_sweep_failed",
     "card_refund_sweep_step_failed",
-    "tempo_charge_settled_on_retry"
+    "tempo_charge_settled_on_retry",
+    "replay_divergence",
+    "sleep_not_durable"
   ],
   "routeTemplates": [
     "/",
@@ -1000,7 +1002,8 @@
     "wait_for_selector",
     "wait_too_long",
     "wrong_content_type",
-    "x402_not_offered"
+    "x402_not_offered",
+    "job_sleeping"
   ],
   "datasets": [
     "platform",

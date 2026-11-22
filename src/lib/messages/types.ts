@@ -232,6 +232,7 @@ export interface CompleteContent {
 /** Provider signals it's busy — client should disconnect and check back later. */
 export interface WorkingContent {
   estimate_seconds?: number;
+  wake_at_ms?: number;
   hint?: string;
 }
 

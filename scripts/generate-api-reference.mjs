@@ -112,6 +112,30 @@ function render(sections) {
     }
     lines.push("");
   }
+  lines.push(
+    "## Durable waits",
+    "",
+    "Use `await ctx.sleep(id, durationMs, { hint })` or `await ctx.sleepUntil(id, at, { hint })` between polls. Give each sleep a unique ID within the job and reserve the `sleep:` step prefix for the SDK. The first execution caches the deadline. Pass finite milliseconds or a valid Date. A sleep cannot overlap another sleep, a prompt, or a payment ask. Cancellation rejects the wait with `JobCancelledError`.",
+    "",
+    "The job goes to `working`. Its working message includes `wake_at_ms` as epoch milliseconds. A stored sleeper refuses ordinary inbound messages with HTTP 409 and `job_sleeping`. Callers can still read the message stream, cancel, or send a standing decline where supported.",
+    "",
+    "Durability requires `PostgresJobStore`. Memory and custom stores without sleep persistence can wait in-process. For a container DVM on Fly, set `min_machines_running: 1` in `package.json#dvmkit` so a replacement Machine can adopt sleepers. The default watchdog adopts after roughly five minutes plus a sweep interval. Setting `processingWatchdog: 0` disables reaping and sleep adoption. Recovery covers time parked in a sleep. A restart while the handler is awake, such as during a poll, still fails the job.",
+    "",
+    "Replay runs `onJob` from the top with the **last persisted** `ctx.state`. Derive progress from loop indices and `ctx.step` results. Keep provider output, including text, artifacts, progress, and working messages, a deterministic function of the input and cached steps. The runtime suppresses repeated output by counting provider messages. A message conditional on an uncached outcome can shift that count and swallow new output. Paid asks and completed sleeps replay from history.",
+    "",
+    "The testing context resolves waits immediately and records `{ id, wake_at_ms }` in `ctx.sleeps`. Set `sleep: \"real\"` when creating the context to exercise timers.",
+    "",
+    "| Event | Outcome and charge |",
+    "| --- | --- |",
+    "| Worker stops while parked | A replacement resumes the saved wait. Charges stay the same. |",
+    "| Worker stops while awake, or six adoptions fail to re-park | Job fails with `worker_died_mid_job`. Finished pieces are charged and the active piece is released. |",
+    "| Handler throws or calls `ctx.fail` | Job fails. Finished pieces are charged and the active piece is released. |",
+    "| Caller deletes the job | Job is cancelled. Finished pieces and the active piece are charged. |",
+    "| Caller declines with a standing mandate | The current piece runs to its end. The next ask cancels the job and charges only finished pieces. |",
+    "| Ask expires | Job is cancelled and finished pieces are charged. |",
+    "| Handler calls `ctx.complete` | Job completes and every paid piece is charged. |",
+    ""
+  );
   return lines.join("\n");
 }
 

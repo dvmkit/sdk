@@ -23673,6 +23673,9 @@
         },
         {
           "module": "src/sdk/server/x402-shutdown-claim.ts"
+        },
+        {
+          "module": "src/sdk/sleep.ts"
         }
       ]
     },
@@ -24495,6 +24498,9 @@
         },
         {
           "module": "src/sdk/step-runner.ts"
+        },
+        {
+          "module": "src/sdk/sleep.ts"
         }
       ]
     },
@@ -27551,6 +27557,9 @@
         },
         {
           "module": "src/sdk/server/mandate-payment.ts"
+        },
+        {
+          "module": "src/sdk/sleep.ts"
         }
       ]
     },
@@ -28286,6 +28295,9 @@
         },
         {
           "module": "src/sdk/server/pieces.ts"
+        },
+        {
+          "module": "src/sdk/step-cache.ts"
         }
       ]
     },
@@ -35066,6 +35078,33 @@
       ]
     },
     {
+      "module": "src/sdk/sleep.ts",
+      "allocations": [
+        {
+          "decision": "retain",
+          "destination": "sdk",
+          "reason": "Server and handler tests share wake-time validation, cancellation, and timer behavior.",
+          "symbols": [
+            "absoluteWakeTime",
+            "checkSleepCancellation",
+            "displayWakeTime",
+            "relativeWakeTime",
+            "retrySleepEnd",
+            "waitUntil"
+          ],
+          "consumerEvidence": [
+            "supported:./server#createDVMHost",
+            "supported:./testing#createTestContext"
+          ]
+        }
+      ],
+      "dependencies": [
+        {
+          "module": "src/sdk/server/job.ts"
+        }
+      ]
+    },
+    {
       "module": "src/sdk/step-cache.ts",
       "allocations": [
         {
@@ -35315,6 +35354,9 @@
         },
         {
           "module": "src/sdk/step-runner.ts"
+        },
+        {
+          "module": "src/sdk/sleep.ts"
         }
       ]
     },

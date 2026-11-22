@@ -218,6 +218,8 @@ describe("signed case holds", () => {
     const store = new MemoryJobStore();
     await store.save(contentJob());
     const custom: JobStore = {
+      failReactivation: store.failReactivation.bind(store),
+      heartbeatJobExecutors: store.heartbeatJobExecutors.bind(store),
       get: store.get.bind(store), save: store.save.bind(store), delete: store.delete.bind(store),
       findJobByPaymentTxHash: store.findJobByPaymentTxHash.bind(store),
     };

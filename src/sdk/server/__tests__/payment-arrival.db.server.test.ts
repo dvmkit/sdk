@@ -24,7 +24,9 @@ import { CreditLedger, type CreditLedgerLike } from "../credit-ledger";
 import { createDisposableCashuStore } from "../disposable-cashu-store";
 import type { JobStore } from "../job-store";
 import { initLockPubkeyTable, seedLockPubkeyState } from "../lock-pubkey-store";
+import { findLegacyRailAskPayment } from "../mandate-payment";
 import { MemoryJobStore } from "../memory-job-store";
+import { MintHealthTracker } from "../mint-health-tracker";
 import { PostgresJobStore } from "../postgres-job-store";
 import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
@@ -94,12 +96,12 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
     await admin?.end();
   });
 
-  async function host(kind: Kind, gate: Gate = {}) {
+  async function host(kind: Kind, gate: Gate = {}, dvmId = `payment-arrival-${randomUUID()}`, omitMetered = false) {
     const dvm = configureDVM({
       name: "payment-arrival",
       idleTimeout: 60,
       capabilities: {
-        metered: {
+        ...(!omitMetered && { metered: {
           input: signedSchema,
           price: "$0.016",
           async onJob(ctx) {
@@ -108,6 +110,14 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
             await ctx.requestPayment({ amount: 0.016, currency: "usd" }, "second step");
             // Keeps the job live after the paid step, so a cancel still has a job to end.
             await ctx.prompt("continue", "Continue?");
+            ctx.complete("done");
+          },
+        } }),
+        sleeping: {
+          input: signedSchema,
+          price: "$0.016",
+          async onJob(ctx) {
+            await ctx.sleep("wait", 60_000);
             ctx.complete("done");
           },
         },
@@ -122,7 +132,6 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
       },
       auth: secp256k1Auth({ allowUnsignedPaid: true }),
     });
-    const dvmId = `payment-arrival-${randomUUID()}`;
     let ledger: CreditLedgerLike;
     let jobStore: JobStore;
     let storage: Record<string, unknown>;
@@ -140,9 +149,11 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
       jobStore = gated(new MemoryJobStore(), gate);
       storage = { disposableCashu: disposable.accumulator };
     }
+    const mintHealthTracker = new MintHealthTracker({ mints: [LOCAL_MINT_URL] });
+    await mintHealthTracker.runOnce();
     const { app, jobManager } = await createDVMServer(dvm, {
       env: {}, store: new MemoryKVStore(), jobStore, fxFetcher: fx, creditLedger: ledger,
-      cashuMode: "p2pk-accumulator", dvmId, lockPubkey: LOCK, mints: [LOCAL_MINT_URL], ...storage,
+      cashuMode: "p2pk-accumulator", dvmId, lockPubkey: LOCK, mints: [LOCAL_MINT_URL], mintHealthTracker, ...storage,
     });
     shutdowns.push(() => jobManager.shutdown());
     const request = async (path: string, init: { method?: string; body?: unknown; headers?: Record<string, string> } = {}): Promise<Response> =>
@@ -162,7 +173,7 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         await jobStore.save({ ...(await jobStore.get(jobId))!, ...binding });
       }
     };
-    return { request, ledger, jobStore, rebind, jobManager };
+    return { request, ledger, jobStore, rebind, jobManager, dvmId };
   }
 
   async function lockedProofs(count: number): Promise<Proof[][]> {
@@ -215,6 +226,16 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
       body: { type: "payment", content: { cashu_token: token(proofs), cashu_request_id: requestId } },
       headers: job.headers,
     });
+  }
+
+  async function seedMandate(job: Awaited<ReturnType<typeof awaitingAsk>>) {
+    await pool!.query("UPDATE jobs SET mandate=$2 WHERE id=$1", [job.jobId, {
+      credit_id: job.creditId,
+      draw_id: job.drawId,
+      max_total_micro: STEP_MICRO * 4,
+      max_ask_micro: STEP_MICRO - 1,
+      expires_at_ms: Date.now() + 60_000,
+    }]);
   }
 
   const kinds: Kind[] = RUN_DB ? ["memory", "postgres"] : ["memory"];
@@ -378,6 +399,179 @@ describe.skipIf(!live)("payments that arrive as a job ends", () => {
         expect([ended?.status, ended?.paidMsats, ended?.creditId]).toEqual(["cancelled", 0, undefined]);
         expect(await h.ledger.getDraw({ creditId: own, drawId: requestId })).toMatchObject({ status: "released" });
         expect(await h.ledger.get(own)).toMatchObject({ callerPubkey: CALLER, availableMicro: STEP_MICRO });
+      }, 30_000);
+
+      it("lands a rail payment on a stored sleeper as balance without leaving a scaffold", async () => {
+        const h = await host(kind);
+        const [upfront, extra] = await lockedProofs(2);
+        const data = createSignedRequestVerifier(signedSchema).signRequest(CALLER_KEY, { text: "go" });
+        const response = await h.request("/v1/job", {
+          body: { capability: "sleeping", data },
+          headers: { "X-Cashu": token(upfront!), "X-Cashu-Request-Id": randomUUID() },
+        });
+        expect(response.status).toBe(202);
+        const { job_id: jobId, job_token: tokenValue } = await response.json() as { job_id: string; job_token: string };
+        const headers = { "X-Job-Token": tokenValue };
+        await expect.poll(() => h.jobStore.get(jobId)).toMatchObject({ sleepId: "sleep:wait", status: "working" });
+        const record = (await h.jobStore.get(jobId))!;
+        const active = h.jobManager.activeJobs.get(jobId)!;
+        h.jobManager.activeJobs.delete(jobId);
+        try {
+          const requestId = randomUUID();
+          const paid = await pay(h, { jobId, headers }, extra!, requestId);
+          expect(paid.status, await paid.clone().text()).toBe(201);
+          expect(await paid.json()).toMatchObject({ credit: { credit_id: record.creditId, credited_micro: STEP_MICRO } });
+          expect(h.jobManager.activeJobs.has(jobId)).toBe(false);
+          expect(await h.ledger.getFunding({ creditId: record.creditId!, fundId: requestId }))
+            .toMatchObject({ amountMicro: STEP_MICRO });
+          expect(await h.jobStore.get(jobId)).toMatchObject({ sleepId: "sleep:wait", status: "working", paidMsats: STEP_MICRO });
+        } finally {
+          h.jobManager.activeJobs.set(jobId, active);
+        }
+      }, 30_000);
+
+      it.skipIf(kind !== "postgres")("records a valid rail payment even on a worker without that capability", async () => {
+        const first = await host(kind);
+        const [upfront, extra] = await lockedProofs(2);
+        const job = await awaitingAsk(first, upfront!, true);
+        const other = await host(kind, {}, first.dvmId, true);
+        const result = await pay(other, job, extra!, randomUUID());
+        expect(result.status, await result.clone().text()).toBe(201);
+        expect(await first.jobStore.get(job.jobId)).toMatchObject({ paidMsats: STEP_MICRO * 2 });
+      }, 30_000);
+
+      it.skipIf(kind !== "postgres").each([
+        { intent: "exact", legacy: false },
+        { intent: "legacy mandate", legacy: true },
+      ])("recovers rail payment routed across deployments after the owner stopped ($intent)", async ({ legacy }) => {
+        const owner = await host(kind);
+        const [upfront, extra] = await lockedProofs(2);
+        const job = await awaitingAsk(owner, upfront!, true);
+        owner.jobManager.shutdown();
+        await (owner.jobStore as PostgresJobStore).shutdownStreaming();
+        const wrongHost = await host(kind, {}, owner.dvmId, true);
+        const result = await pay(wrongHost, job, extra!, randomUUID());
+        expect(result.status, await result.clone().text()).toBe(201);
+        const { seq } = await result.json() as { seq: number };
+        expect(await owner.jobStore.get(job.jobId)).toMatchObject({ paidMsats: STEP_MICRO * 2, status: "awaiting-input" });
+        const accepted = await pool!.query("SELECT request_seq, outcome FROM job_payment_intents WHERE job_id=$1 AND seq=$2", [job.jobId, seq]);
+        expect(accepted.rows).toEqual([{ request_seq: job.ask.seq, outcome: "ask_paid" }]);
+        if (legacy) {
+          // Before the migration, rail verification stored the payment without the ask sequence.
+          await pool!.query("UPDATE job_payment_intents SET request_seq=NULL, outcome='verified' WHERE job_id=$1 AND seq=$2", [job.jobId, seq]);
+          await seedMandate(job);
+        }
+        const recovered = await host(kind, {}, owner.dvmId);
+        await recovered.jobManager.sweepMandateAsks(Date.now() + 60_000);
+        await expect.poll(() => recovered.jobStore.get(job.jobId)).toMatchObject({
+          status: "awaiting-input", pendingPaymentMsats: STEP_MICRO,
+        });
+        const response = await recovered.request(`/v1/job/${job.jobId}/messages`, { headers: job.headers });
+        const { messages } = await response.json() as { messages: Message[] };
+        expect(messages.filter(message => message.type === "payment-request")).toHaveLength(2);
+        expect(messages.filter(message => message.from === "requester" && message.type === "payment").map(message => message.seq)).toEqual([seq]);
+      }, 30_000);
+
+      it.skipIf(kind !== "postgres")("replays the legacy rail payment that bought the piece when a later payment only funded balance", async () => {
+        const owner = await host(kind);
+        const [upfront, appliedProofs, depositProofs] = await lockedProofs(3);
+        const job = await awaitingAsk(owner, upfront!, true);
+        owner.jobManager.shutdown();
+        await (owner.jobStore as PostgresJobStore).shutdownStreaming();
+
+        const firstArrival = Promise.withResolvers<void>();
+        const secondArrival = Promise.withResolvers<void>();
+        const releaseFirst = Promise.withResolvers<void>();
+        const releaseSecond = Promise.withResolvers<void>();
+        const first = await host(kind, { arrived: firstArrival.resolve, hold: releaseFirst.promise }, owner.dvmId, true);
+        const second = await host(kind, { arrived: secondArrival.resolve, hold: releaseSecond.promise }, owner.dvmId, true);
+        const firstRequest = pay(first, job, appliedProofs!, randomUUID());
+        let secondRequest: Promise<Response> | undefined;
+        const depositId = randomUUID();
+        try {
+          await Promise.race([firstArrival.promise, firstRequest]);
+          secondRequest = pay(second, job, depositProofs!, depositId);
+          await Promise.race([secondArrival.promise, secondRequest]);
+          // Both payments arrived during the ask. Only the first to grow the draw bought the piece.
+          releaseFirst.resolve();
+          const applied = await firstRequest;
+          expect(applied.status, await applied.clone().text()).toBe(201);
+          const { seq: paidSeq } = await applied.json() as { seq: number };
+          releaseSecond.resolve();
+          const deposit = await secondRequest;
+          expect(deposit.status, await deposit.clone().text()).toBe(201);
+          const { seq: depositSeq, credit } = await deposit.json() as { seq: number; credit: { credited_micro: number } };
+          expect(depositSeq).toBeGreaterThan(paidSeq);
+          expect(credit.credited_micro).toBe(STEP_MICRO);
+          expect(await owner.jobStore.get(job.jobId)).toMatchObject({
+            status: "awaiting-input", paidMsats: 2 * STEP_MICRO,
+            pieces: [{ paidSeq: 0 }, { paidSeq }],
+          });
+          const legacy = await pool!.query(`UPDATE job_payment_intents SET request_seq=NULL, outcome='verified'
+            WHERE job_id=$1 RETURNING seq, disposition`, [job.jobId]);
+          expect(legacy.rows).toEqual(expect.arrayContaining([
+            { seq: paidSeq, disposition: "ask" }, { seq: depositSeq, disposition: "ask" },
+          ]));
+          await seedMandate(job);
+
+          expect(await findLegacyRailAskPayment(pool!, job.jobId, job.ask.seq)).toBe(paidSeq);
+          expect(await findLegacyRailAskPayment(pool!, job.jobId, paidSeq)).toBeUndefined();
+          const recovered = await host(kind, {}, owner.dvmId);
+          await recovered.jobManager.sweepMandateAsks(Date.now() + 60_000);
+          await expect.poll(() => recovered.jobStore.get(job.jobId)).toMatchObject({
+            status: "awaiting-input", pendingPaymentMsats: STEP_MICRO, paidMsats: 2 * STEP_MICRO,
+          });
+          const { messages } = await (await recovered.request(`/v1/job/${job.jobId}/messages`, { headers: job.headers })).json() as { messages: Message[] };
+          expect(messages.filter(message => message.type === "payment-request")).toHaveLength(2);
+          expect(messages.filter(message => message.from === "requester" && message.type === "payment").map(message => message.seq))
+            .toEqual([paidSeq, depositSeq]);
+          expect(await recovered.ledger.getDraw({ creditId: job.creditId, drawId: job.drawId }))
+            .toMatchObject({ status: "pending", amountMicro: 2 * STEP_MICRO });
+        } finally {
+          releaseFirst.resolve();
+          releaseSecond.resolve();
+          await Promise.allSettled([firstRequest, secondRequest]);
+        }
+      }, 30_000);
+
+      it.skipIf(kind !== "postgres")("keeps the adopted handler when a rail payment already read the stored sleeper", async () => {
+        const original = await host(kind);
+        const [upfront, extra] = await lockedProofs(2);
+        const data = createSignedRequestVerifier(signedSchema).signRequest(CALLER_KEY, { text: "go" });
+        const response = await original.request("/v1/job", {
+          body: { capability: "sleeping", data },
+          headers: { "X-Cashu": token(upfront!), "X-Cashu-Request-Id": randomUUID() },
+        });
+        expect(response.status).toBe(202);
+        const { job_id: jobId, job_token: jobToken } = await response.json() as { job_id: string; job_token: string };
+        await expect.poll(() => original.jobStore.get(jobId)).toMatchObject({ sleepId: "sleep:wait" });
+        original.jobManager.shutdown();
+        const peer = await host(kind, {}, original.dvmId);
+        const get = peer.jobStore.get.bind(peer.jobStore);
+        const read = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const pause = vi.spyOn(peer.jobStore, "get").mockImplementationOnce(async (id) => {
+          const record = await get(id);
+          read.resolve();
+          await release.promise;
+          return record;
+        });
+        try {
+          const payment = pay(peer, { jobId, headers: { "X-Job-Token": jobToken } }, extra!, randomUUID());
+          await read.promise;
+          await pool!.query("UPDATE jobs SET last_activity_at=$2 WHERE id=$1", [jobId, Date.now() - 301_000]);
+          await peer.jobManager.sweepStaleJobs();
+          const adopted = peer.jobManager.activeJobs.get(jobId);
+          expect(adopted?.sleepGeneration).toBe(1);
+          release.resolve();
+          const paid = await payment;
+          expect(paid.status, await paid.clone().text()).toBe(201);
+          expect(await paid.json()).toMatchObject({ credit: { credited_micro: STEP_MICRO } });
+          expect(peer.jobManager.activeJobs.get(jobId)).toBe(adopted);
+        } finally {
+          pause.mockRestore();
+          release.resolve();
+        }
       }, 30_000);
 
       it("lands a payment that arrives after a cancel commits as balance", async () => {

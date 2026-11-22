@@ -281,3 +281,18 @@ export const chargeSettledOnRetry = {
     }),
   },
 };
+
+export const durableSleep = {
+  catalogue: {
+    ...chargeSettledOnRetry.catalogue,
+    events: [...chargeSettledOnRetry.catalogue.events, "replay_divergence", "sleep_not_durable"],
+    errorCodes: [...chargeSettledOnRetry.catalogue.errorCodes, "job_sleeping"],
+  },
+  rows: {
+    sleep: [
+      fields({ job_id_hash: hex, count: 2 }, { name: "replay_divergence", level: "warn" }),
+      fields({}, { name: "sleep_not_durable", level: "warn" }),
+      fields({ "error.code": "job_sleeping" }, { name: "dvm.request", level: "error" }),
+    ],
+  },
+};
