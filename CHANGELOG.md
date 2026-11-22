@@ -19,9 +19,21 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
-## Unreleased
+## [0.44.2](https://github.com/dvmkit/sdk/compare/v0.44.1...v0.44.2) (2026-11-22)
 
 - A successful x402 cooperative refund with invalid channel state keeps the caller's pre-refund chain snapshot for reporting. The SDK marks it unreconciled and reads fresh chain state before sizing the next funding payment.
+
+
+### Bug Fixes
+
+* **server:** report Lightning invoice repairs through the deposit override ([79e1f9f](https://github.com/dvmkit/sdk/commit/79e1f9f207a736bda2c006109d8c6dd322c5a704))
+* **server:** settle a Tempo charge on retry after an unconfirmed broadcast ([ceb1128](https://github.com/dvmkit/sdk/commit/ceb11286f17032e5e0e19001d5c05810f0e92634))
+* **x402:** preserve channel records after malformed refund state ([3362f4c](https://github.com/dvmkit/sdk/commit/3362f4c4723957faf138c548ab07e6a64c380013))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.44.1 ([#223](https://github.com/dvmkit/sdk/issues/223)) ([32654d8](https://github.com/dvmkit/sdk/commit/32654d85a9bd248b732dcb84d811728f98834d59))
 
 ## [0.44.1](https://github.com/dvmkit/sdk/compare/v0.44.0...v0.44.1) (2026-11-21)
 
