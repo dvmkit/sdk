@@ -114,6 +114,10 @@ export interface Quote {
 export interface CreditTerms {
   /** Signed balance payments on the job messages endpoint are supported. */
   balance_payment?: true;
+  /** Signed standing credit mandates on job submission are supported. */
+  standing_mandate?: true;
+  /** Null means no mandate duration ceiling. Absence gives no such guarantee. */
+  mandate_max_duration?: null;
   /** A mandated ask the provider will not pay carries `content.mandate_skipped`. Absent means unsupported. */
   mandate_skipped?: true;
   /**
@@ -213,6 +217,8 @@ export function parseCreditTerms(raw: unknown): CreditTerms | undefined {
 
   return {
     ...(credit.balance_payment === true && { balance_payment: true }),
+    ...(credit.standing_mandate === true && { standing_mandate: true }),
+    ...(credit.standing_mandate === true && credit.mandate_max_duration === null && { mandate_max_duration: null }),
     ...(credit.mandate_skipped === true && { mandate_skipped: true }),
     ...(credit.jit_refund_park === true && { jit_refund_park: true }),
     min_micro: credit.min_micro,

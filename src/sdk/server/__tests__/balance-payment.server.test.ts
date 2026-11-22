@@ -17,7 +17,7 @@ import { secp256k1Auth } from "../secp256k1-auth";
 import { createSignedRequestVerifier } from "../signed-request";
 
 const mandateFixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8")) as {
-  info_credit_fields: Record<string, true>;
+  info_credit_fields: Record<string, true | null>;
 };
 
 const schema = `sdk_balance_http_${randomUUID().replaceAll("-", "")}`;

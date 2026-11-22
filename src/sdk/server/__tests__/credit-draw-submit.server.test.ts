@@ -645,16 +645,19 @@ describe("a strict capability schema draws credit", () => {
 
 
 const mandateFixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/standing-mandate-v1.json", import.meta.url), "utf8"));
-const mandate = () => ({ ...mandateFixture.data_fields.mandate, expires_at_ms: Date.now() + 86_400_000 });
+const mandate = () => ({
+  ...mandateFixture.data_fields.mandate,
+  expires_at_ms: Date.now() + (mandateFixture.data_fields.mandate.expires_at_ms - mandateFixture.reference_now_ms),
+});
 
 describe("standing mandate admission", () => {
-  it("stores signed limits outside handler input and refuses signature tampering", async () => {
+  it.each([30, 365])("accepts a %i-day mandate and keeps signed limits outside handler input", async (days) => {
     const jobStore = new MemoryJobStore();
     const inputs: unknown[] = [];
     const { url, ledger } = await startServer(undefined, { jobStore, onInput: (input) => inputs.push(input) });
     await fundCredit(ledger, { creditId: "example-credit", callerPubkey: CALLER_PUBKEY,
       currency: "usd", amountMicro: 2_000_000, expiryMs: FUTURE_MS });
-    const limits = mandate();
+    const limits = { ...mandate(), expires_at_ms: Date.now() + days * 86_400_000 };
     const body = { capability: "do", data: signer.signRequest(PRIVKEY, {
       action: "go", ...mandateFixture.data_fields, mandate: limits }) };
     const tampered = structuredClone(body);
@@ -713,7 +716,7 @@ describe("standing mandate admission", () => {
     ["ask above total", () => ({ mandate: { ...mandate(), max_ask_micro: 2_000_000 } })],
     ["total below upfront", () => ({ mandate: { ...mandate(), max_total_micro: 99_999, max_ask_micro: 1 } })],
     ["expired", () => ({ mandate: { ...mandate(), expires_at_ms: Date.now() - 1 } })],
-    ["more than seven days", () => ({ mandate: { ...mandate(), expires_at_ms: Date.now() + 8 * 86_400_000 } })],
+    ["missing expiry", () => ({ mandate: { max_total_micro: 1100000, max_ask_micro: 550000 } })],
     ["extra key", () => ({ mandate: { ...mandate(), other: true } })],
     ["fractional total", () => ({ mandate: { ...mandate(), max_total_micro: 100_000.1 } })],
     ["fractional ask", () => ({ mandate: { ...mandate(), max_ask_micro: 1.1 } })],

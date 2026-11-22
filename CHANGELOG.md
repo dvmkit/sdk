@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Standing credit mandates now accept caller-chosen future expiries that older providers rejected. Providers advertise support with `credit.mandate_max_duration: null` on `/v1/info`.
+- Fix mandate settlement to roll back if the mandate expires while the provider clears the ask's skip marker.
+
+### Breaking API changes
+
+- The public `CreditTerms` interface from `@dvmkit/sdk/server` now declares `mandate_max_duration?: null`. Extensions that declare a numeric property with the same name must rename their custom property or adopt the SDK field's type. A value of `null` indicates support for caller-chosen mandate expiry without a duration ceiling.
+
 ## Upgrade details
 
 - New x402 fallback funding IDs use an opaque authorization digest if the facilitator confirms payment without a transaction hash. Existing funding IDs remain valid for replay and receipt recovery. Payer-limit errors omit the wallet address. The caller-facing settlement headers retain the optional `payer` for x402 compatibility.

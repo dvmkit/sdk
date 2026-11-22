@@ -138,9 +138,9 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   function post(url: string, body: unknown, token?: string) {
     return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Job-Token": token } : {}) }, body: JSON.stringify(body) });
   }
-  async function fund(creditId: string, amountMicro = 10_000) {
+  async function fund(creditId: string, amountMicro = 10_000, expiresInMs = 86_400_000) {
     await ledger.fund({ creditId, callerPubkey: pubkey, currency: "usd", amountMicro,
-      expiryMs: Date.now() + 86_400_000, basis: { rail: "cashu", paidMsats: Math.floor(amountMicro / 2) } });
+      expiryMs: Date.now() + expiresInMs, basis: { rail: "cashu", paidMsats: Math.floor(amountMicro / 2) } });
   }
   async function submit(url: string, opts: { creditId: string; drawId?: string; priced?: boolean; script: Script;
     maxTotal?: number; maxAsk?: number; expiresInMs?: number }) {
@@ -593,6 +593,29 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     expect(asks.filter((m) => "mandate_skipped" in m.content)).toEqual([]);
   }, 30_000);
 
+  it("pays an ask on day eight of a 15-day mandate", async () => {
+    const dayMs = 86_400_000;
+    const url = await server();
+    const creditId = "long-mandate";
+    await fund(creditId, 10_000, 15 * dayMs);
+    const job = await submit(url, { creditId, script: "late", maxTotal: ASK, expiresInMs: 15 * dayMs });
+    await gate(job.job_id).arrived;
+    const now = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + 8 * dayMs);
+    try {
+      gate(job.job_id).open();
+      await expect.poll(() => status(job.job_id), { timeout: 10_000 }).toBe("completed");
+      const ask = (await messages(job.job_id)).find((message) => message.type === "payment-request")!;
+      expect(await balancePayments(job.job_id)).toEqual([{
+        payment_id: documentedPaymentId(job.job_id, ask.seq), request_seq: String(ask.seq),
+      }]);
+      await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId }))
+        .toMatchObject({ status: "settled", amountMicro: ASK, jobId: job.job_id });
+    } finally {
+      clock.mockRestore();
+    }
+  }, 30_000);
+
   it.each([
     { reason: "mandate_expired", script: "late" as const, expiresInMs: 3_000 },
     { reason: "mandate_ask_cap", maxAsk: ASK - 1 },
@@ -911,6 +934,34 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       tx.release();
     }
   }, 30_000);
+
+  it("rolls back payment when the mandate expires during the skip marker update", async () => {
+    const creditId = "expiry-during-marker-update";
+    const { job, ask } = await strandedAsk(creditId);
+    await pool.query(
+      "UPDATE job_messages SET data = jsonb_set(data, '{content,mandate_skipped}', $3::jsonb) WHERE job_id=$1 AND seq=$2",
+      [job.job_id, ask.seq, JSON.stringify({ reason: "mandate_balance" })]);
+    const clock = vi.spyOn(Date, "now");
+    const restore = observeQueries((sql, params) => {
+      if (typeof sql === "string" && sql.startsWith("UPDATE job_messages SET data = data #-") &&
+          (params as unknown[])[0] === job.job_id) {
+        clock.mockReturnValue(job.expiresAtMs);
+      }
+    });
+    try {
+      expect(await settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id }))
+        .toEqual({ outcome: "skipped", requestSeq: ask.seq, reason: "mandate_expired" });
+    } finally {
+      restore();
+      clock.mockRestore();
+    }
+    expect(await balancePayments(job.job_id)).toEqual([]);
+    expect(await ledger.getDraw({ creditId, drawId: job.drawId })).toBeUndefined();
+    expect(await ledger.get(creditId)).toMatchObject({ balanceMicro: 10_000, availableMicro: 10_000 });
+    expect(await status(job.job_id)).toBe("awaiting-input");
+    expect((await messages(job.job_id)).find((message) => message.seq === ask.seq)?.content.mandate_skipped)
+      .toEqual({ reason: "mandate_expired" });
+  }, 15_000);
 
   it("settles a stranded ask and resumes the job from the sweep, with no caller message", async () => {
     const creditId = "sweep-unsettled";

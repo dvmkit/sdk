@@ -529,10 +529,20 @@ Custom card ledgers must supply `withCardRefundLock`, `saveCardDrainState`, and 
 ## Standing credit mandate
 
 A provider advertising `credit.standing_mandate: true` on `/v1/info` accepts an optional
-`mandate` in the signed `POST /v1/job` `data`, beside `credit_id` and `draw_id`:
+`mandate` in the signed `POST /v1/job` `data`, beside `credit_id` and `draw_id`.
 
-```json
-{"credit_id":"example-credit","draw_id":"example-draw","mandate":{"max_total_micro":1100000,"max_ask_micro":550000,"expires_at_ms":1795000000000}}
+Compute a future Unix timestamp when signing the request. This example authorizes asks for 30 days.
+
+```js
+const data = {
+  credit_id: "example-credit",
+  draw_id: "example-draw",
+  mandate: {
+    max_total_micro: 1_100_000,
+    max_ask_micro: 550_000,
+    expires_at_ms: Date.now() + 30 * 86_400_000,
+  },
+};
 ```
 
 The signature covers the original wire data, including all mandate fields. The mandate is
@@ -540,12 +550,17 @@ protocol metadata and never enters the capability handler's input, even if its s
 that key. The provider stores the accepted limits immutably with the job. Both amounts are
 positive safe integers in millionths of the credit currency. `max_total_micro` includes the
 upfront price and must cover it; `max_ask_micro` must not exceed the total. `expires_at_ms`
-is an integer timestamp in milliseconds, strictly in the future and at most seven days from
-acceptance. Only these three mandate keys are allowed, and both credit identifiers are required.
+is a required safe-integer Unix timestamp in milliseconds, strictly in the future. Only these
+three mandate keys are allowed, and both credit identifiers are required.
+
+Alongside `credit.standing_mandate: true`, `/v1/info` advertises
+`credit.mandate_max_duration: null` when the caller can choose any future expiry within the
+timestamp's range. Older providers may omit this field and reject a far expiry with
+`invalid_mandate`.
 
 HTTP 400 `invalid_mandate` with a caller-facing `message` refuses malformed limits, extra or
-missing keys, missing credit identifiers, an unsigned mandate, an expired or excessively distant
-expiry, or a total below the upfront. A zero-upfront mandate also gets this refusal for an
+missing keys, missing credit identifiers, an unsigned mandate, an expired mandate,
+or a total below the upfront. A zero-upfront mandate also gets this refusal for an
 unavailable reserved credit id, a currency mismatch, or a draw id already used by another job.
 These refusals create no job or credit draw. Zero-upfront mandates require existing credit owned
 by the signed caller in the job currency. Paid mandates use the existing upfront payment checks
@@ -559,9 +574,8 @@ another job must never pay from it: the first mandate-paid ask creates the job's
 ask whose intended draw already exists for another job stays open for ordinary payment. Custom job stores must persist
 `JobRecord.mandate` unchanged after creation; its public type is `StandingMandate` from
 `@dvmkit/sdk/server`. Existing credit ownership, currency, and signature checks still apply. The portable admission contract is
-`protocol-fixtures/standing-mandate-v1.json`; its timestamp is illustrative and callers must
-choose a fresh expiry. Older providers may strip unknown keys silently: callers must check the
-advertisement before relying on acceptance. Discovery uses the same durable-storage and rollout
+`protocol-fixtures/standing-mandate-v1.json`, which anchors its static timestamps to a reference clock. Older providers may strip unknown keys silently,
+so callers must check the advertisement before relying on acceptance. Discovery uses the same durable-storage and rollout
 gate as `credit.balance_payment`.
 
 

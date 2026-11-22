@@ -16,14 +16,15 @@ export const STRIPE_CREDIT_MIN_MICRO = 500_000;
 const STRIPE_CREDIT_DEFAULT_MIN_MICRO = 5_000_000;
 
 /**
- * Public, cacheable prepaid terms exclude caller IDs and balances. toCreditTerms explicitly
- * whitelists this shape so later caller-specific menu fields cannot leak into /v1/info.
+ * Public prepaid terms and capabilities advertised on `/v1/info`, including standing mandate support.
  */
 export interface CreditTerms {
   /** Signed balance payments on the job messages endpoint are supported. */
   balance_payment?: true;
   /** Signed standing credit mandates on job submission are supported. */
   standing_mandate?: true;
+  /** Null means no mandate duration ceiling. Absence gives no such guarantee. */
+  mandate_max_duration?: null;
   /**
    * A mandated ask the provider will not pay carries `content.mandate_skipped` with the reason.
    * Absent means unsupported; never infer it from a version.
@@ -367,7 +368,7 @@ export function attachCreditMenu(
 export function toCreditTerms(menu: CreditMenu): CreditTerms {
   return {
     ...(menu.balance_payment && { balance_payment: true }),
-    ...(menu.standing_mandate && { standing_mandate: true }),
+    ...(menu.standing_mandate && { standing_mandate: true, mandate_max_duration: null }),
     ...(menu.mandate_skipped && { mandate_skipped: true }),
     ...(menu.jit_refund_park && { jit_refund_park: true }),
     min_micro: menu.min_micro,

@@ -59,6 +59,15 @@ describe("parseCreditTerms", () => {
     expect(parseCreditTerms(TERMS)?.jit_refund_park).toBeUndefined();
   });
 
+  it("distinguishes uncapped standing mandates from older support", () => {
+    const standing = { ...TERMS, standing_mandate: true };
+    expect(parseCreditTerms(standing)).toEqual(standing);
+    const uncapped = { ...standing, mandate_max_duration: null };
+    expect(parseCreditTerms(uncapped)).toEqual(uncapped);
+    expect(parseCreditTerms({ ...standing, mandate_max_duration: 3600 })).toEqual(standing);
+    expect(parseCreditTerms({ ...TERMS, mandate_max_duration: null })).toEqual(TERMS);
+  });
+
   it("keeps caller echoes on quote and 402 menus", () => {
     const parsed = parseCreditMenu({ ...TERMS, credit_id: "credit-1", balance_micro: 200_000 });
     expect(parsed).toMatchObject({ credit_id: "credit-1", balance_micro: 200_000 });

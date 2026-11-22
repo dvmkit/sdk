@@ -59,10 +59,9 @@ function parseMandate(raw: unknown, creditId: unknown, drawId: unknown): Standin
   if ((m.max_ask_micro as number) > (m.max_total_micro as number)) {
     throw new InvalidMandateError("mandate.max_ask_micro must not exceed max_total_micro.");
   }
-  const now = Date.now();
   if (typeof m.expires_at_ms !== "number" || !Number.isSafeInteger(m.expires_at_ms) ||
-      m.expires_at_ms <= now || m.expires_at_ms > now + 7 * 86_400_000) {
-    throw new InvalidMandateError("mandate.expires_at_ms must be in the future and at most 7 days away.");
+      m.expires_at_ms <= Date.now()) {
+    throw new InvalidMandateError("mandate.expires_at_ms must be a safe integer in the future.");
   }
   return { credit_id: creditId, draw_id: drawId, max_total_micro: m.max_total_micro as number, max_ask_micro: m.max_ask_micro as number,
     expires_at_ms: m.expires_at_ms };
