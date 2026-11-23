@@ -44,7 +44,7 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### dvmctl and platform prerequisites
 
 - A platform that projects SDK diagnostics must admit the catalogue events `replay_divergence` and `sleep_not_durable` and the reason `job_sleeping`; until then they are stored as `diagnostic.unknown`.
-- dvmctl 0.20.1 runs `dev` and `serve` on its pinned SDK 0.40.0, so a handler that calls `ctx.sleep` cannot run under those commands until a dvmctl release pins this version.
+- dvmctl 0.20.1 runs `dev` and `serve` on its own pinned SDK 0.37.0, so a handler that calls `ctx.sleep` cannot run under those commands until a dvmctl release pins this version. A container deploy builds with the project's own SDK and needs no dvmctl change.
 
 
 ### ⚠ BREAKING CHANGES
