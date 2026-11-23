@@ -2,28 +2,6 @@
 
 ## Unreleased
 
-### Features
-
-- Standing credit mandates now accept caller-chosen future expiries that older providers rejected. Providers advertise support with `credit.mandate_max_duration: null` on `/v1/info`.
-- Fix mandate settlement to roll back if the mandate expires while the provider clears the ask's skip marker.
-- Add `ctx.sleep` and `ctx.sleepUntil` for durable waits, optional `working.wake_at_ms`, and sleep inspection in `createTestContext`.
-
-- Durable wait wire examples cover the additive wake timestamp and the stored-job refusal in `protocol-fixtures/durable-sleep-v1.json`.
-
-### Breaking changes
-
-- The public `CreditTerms` interface from `@dvmkit/sdk/server` now declares `mandate_max_duration?: null`. Extensions that declare a numeric property with the same name must rename their custom property or adopt the SDK field's type. A value of `null` indicates support for caller-chosen mandate expiry without a duration ceiling.
-
-- Existing builder handlers require no changes. Custom implementations of `SDKJobContext` must implement the two new methods.
-
-- Job store implementations must replace `heartbeatActiveJobs` with `heartbeatJobExecutors`, which compares the executor's sleep generation before refreshing activity. Implement `failReactivation` as a compare-and-set against the observed job snapshot and verified inbound progress. Use `ctx.complete` or `ctx.fail` for provider outcomes. Only callers can send `decline`.
-
-### Migrations
-
-- Postgres initialization adds `sleep_until_ms`, `sleep_id`, `sleep_generation`, and `sleep_resumes` to `jobs`. An older worker ignores these columns and reaps sleeping jobs as `worker_died_mid_job` after its watchdog window (five minutes by default), charging finished pieces.
-
-- Postgres initialization also adds nullable `job_payment_intents.request_seq` so recovery can match an accepted rail payment to its ask. Existing intents keep an unknown request sequence.
-
 ## Upgrade details
 
 - New x402 fallback funding IDs use an opaque authorization digest if the facilitator confirms payment without a transaction hash. Existing funding IDs remain valid for replay and receipt recovery. Payer-limit errors omit the wallet address. The caller-facing settlement headers retain the optional `payer` for x402 compatibility.
@@ -42,6 +20,47 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 ### Breaking changes
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
+
+## [0.46.0](https://github.com/dvmkit/sdk/compare/v0.45.0...v0.46.0) (2026-11-23)
+
+### Breaking API changes
+
+- The public `CreditTerms` interface from `@dvmkit/sdk/server` now declares `mandate_max_duration?: null`. Extensions that declare a numeric property with the same name must rename their custom property or adopt the SDK field's type. A value of `null` indicates support for caller-chosen mandate expiry without a duration ceiling.
+- `SDKJobContext` gains `sleep` and `sleepUntil`. Existing builder handlers require no changes; custom implementations of `SDKJobContext` must implement the two new methods.
+- Job store implementations must replace `heartbeatActiveJobs` with `heartbeatJobExecutors`, which compares the executor's sleep generation before refreshing activity. Implement `failReactivation` as a compare-and-set against the observed job snapshot and verified inbound progress. Use `ctx.complete` or `ctx.fail` for provider outcomes. Only callers can send `decline`.
+- Additive: standing credit mandates accept caller-chosen future expiries, advertised with `credit.mandate_max_duration: null` on `/v1/info`; `ctx.sleep` and `ctx.sleepUntil` provide durable waits, `/v1/job` reports optional `working.wake_at_ms`, and `createTestContext` can inspect sleeps. Wire examples are in `protocol-fixtures/durable-sleep-v1.json`.
+- Fixed: mandate settlement rolls back if the mandate expires while the provider clears the ask's skip marker.
+
+### Migrations
+
+- Postgres initialization adds `sleep_until_ms`, `sleep_id`, `sleep_generation`, and `sleep_resumes` to `jobs`. An older worker ignores these columns and reaps sleeping jobs as `worker_died_mid_job` after its watchdog window (five minutes by default), charging finished pieces. Do not run older workers against a store that holds sleeping jobs.
+- Postgres initialization also adds nullable `job_payment_intents.request_seq` so recovery can match an accepted rail payment to its ask. Existing intents keep an unknown request sequence.
+- Mandate jobs that are mid-run with rail payments recorded before this upgrade can, on replay, treat a later balance-only deposit as payment for their next ask. Let such jobs finish before upgrading. Payments recorded after the upgrade match their ask exactly.
+
+### Compatibility requirements
+
+- Node.js 22 or newer, unchanged. No dependency floor changes.
+
+### dvmctl and platform prerequisites
+
+- A platform that projects SDK diagnostics must admit the catalogue events `replay_divergence` and `sleep_not_durable` and the reason `job_sleeping`; until then they are stored as `diagnostic.unknown`.
+- dvmctl 0.20.1 runs `dev` and `serve` on its own pinned SDK 0.37.0, so a handler that calls `ctx.sleep` cannot run under those commands until a dvmctl release pins this version. A container deploy builds with the project's own SDK and needs no dvmctl change.
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk:** custom SDKJobContext implementations must add sleep and sleepUntil. Job stores must replace heartbeatActiveJobs with heartbeatJobExecutors and implement failReactivation as a compare-and-set. Postgres initialization adds sleep columns to jobs and a nullable request_seq to job_payment_intents.
+* **sdk:** the public CreditTerms interface from @dvmkit/sdk/server now declares mandate_max_duration?: null. Extensions declaring a numeric property with that name must rename it or adopt the SDK field's type.
+
+### Features
+
+* **sdk:** add durable job sleeps that survive restarts ([#230](https://github.com/dvmkit/sdk/issues/230)) ([ca95a64](https://github.com/dvmkit/sdk/commit/ca95a6409ce9a0daedda74a069c86b55a152b2ca))
+* **sdk:** let callers choose standing mandate expiry ([#228](https://github.com/dvmkit/sdk/issues/228)) ([ecf130d](https://github.com/dvmkit/sdk/commit/ecf130d9add5e74e00b9ddc46a34c87d8a25e057))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.45.0 ([#231](https://github.com/dvmkit/sdk/issues/231)) ([01763ad](https://github.com/dvmkit/sdk/commit/01763adbb78e29e670cb750f2ac4ff5dbf594099))
 
 ## [0.45.0](https://github.com/dvmkit/sdk/compare/v0.44.2...v0.45.0) (2026-11-22)
 
