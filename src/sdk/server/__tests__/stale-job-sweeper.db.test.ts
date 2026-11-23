@@ -186,7 +186,7 @@ describe.skipIf(!RUN)("status-aware stale-job sweeper (Postgres)", () => {
     await seedJob("hb-done", "completed", old);
 
     const beat = old + 10 * 60_000;
-    await store.heartbeatActiveJobs(["hb-proc", "hb-work", "hb-await", "hb-done"], beat);
+    await store.heartbeatJobExecutors(["hb-proc", "hb-work", "hb-await", "hb-done"].map(id => ({ id, generation: 0 })), beat);
 
     expect(await lastActivityOf("hb-proc")).toBe(beat);
     expect(await lastActivityOf("hb-work")).toBe(beat);

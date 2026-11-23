@@ -1,5 +1,6 @@
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import sleepFixture from "../../../../protocol-fixtures/durable-sleep-v1.json";
 
 import type { Message, MessageType } from "../../../lib/messages/types";
 import { configureDVM } from "../../configure";
@@ -88,6 +89,45 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
     expect(msgs).toHaveLength(2);
     expect(msgs[0].seq).toBeLessThan(msgs[1].seq);
     expect((msgs[0].content as { text: string }).text).toBe("hello");
+  });
+
+  it("refuses a reactivation failure when the observed Postgres row has changed", async () => {
+    const id = "reactivation-refusal";
+    await ensureJob(id);
+    const before = (await store.get(id))!;
+    await pool.query("UPDATE jobs SET state=$2 WHERE id=$1", [id, JSON.stringify({ phase: "new" })]);
+    expect(await store.failReactivation(before, "stale refusal")).toBe(false);
+    const current = (await store.get(id))!;
+    expect(current).toMatchObject({ status: "processing", state: { phase: "new" } });
+    expect(await store.failReactivation(current, "current refusal")).toBe(true);
+    expect(await store.getMessages(id, 0)).toMatchObject([{ type: "cancel", content: { reason: "current refusal" } }]);
+  });
+
+  it("refuses to fail after a verified response changed Postgres history", async () => {
+    const id = "verified-response";
+    await ensureJob(id);
+    const seq = await store.recordInbound(id, {
+      from: "requester", type: "response", timestamp: 2, content: { prompt_id: "step", text: "yes" },
+    });
+    const observed = (await store.get(id))!;
+    await store.verifyAndCredit(id, seq, null);
+    expect(await store.getMessages(id, 0)).toMatchObject([{ type: "response", seq }]);
+    const refused = await store.failReactivation(observed, "stale refusal");
+    expect([refused, (await store.get(id))?.status]).toEqual([false, "processing"]);
+  });
+
+  it("keeps an orphan incremental terminal out of a later terminal snapshot", async () => {
+    const id = "orphan-terminal";
+    const gap = sleepFixture.interrupted_terminal_gap;
+    await ensureJob(id);
+    const message = { seq: gap.dropped_seq, ...outgoing("cancel", { reason: "uncommitted" }) };
+    await pool.query("INSERT INTO job_messages (job_id, seq, data, status) VALUES ($1, $2, $3, 'verified')",
+      [id, message.seq, JSON.stringify(message)]);
+    await pool.query("UPDATE jobs SET next_seq=2 WHERE id=$1", [id]);
+    expect(await store.getMessages(id, gap.after, { includeHeld: true })).toEqual([]);
+    await store.cancelJob(id, "committed");
+    expect((await store.get(id))?.status).toBe(gap.status);
+    expect(await store.getMessages(id, gap.after)).toMatchObject(gap.messages);
   });
 
   it("pages terminal history in sequence order after deduplication", async () => {
@@ -444,13 +484,11 @@ describe.skipIf(!RUN)("cross-machine message streaming", () => {
           received.push(msg);
         });
 
-        // Real wiring: `reactivateJob` installs the chained appender on the
-        // job via `wireMessageAppender`. `providerMessage` then fires the
-        // appender exactly as `ctx.artifact()` / `ctx.complete()` do.
-        const { job } = jobManager.reactivateJob(record);
-        providerMessage(job, "artifact", { format: "text/markdown", content: `hello-${i}` });
-        providerMessage(job, "complete", { summary: "done" });
-        await job.messageAppenderTail;
+        // The real handler context drains the appender before committing its terminal snapshot.
+        const { job, sdkCtx } = jobManager.reactivateJob(record);
+        sdkCtx.artifact({ mime_type: "text/markdown", data: `hello-${i}` });
+        sdkCtx.complete("done");
+        await job.terminalWork;
 
         // Allow NOTIFY delivery + dispatch to settle.
         await new Promise((r) => setTimeout(r, 100));

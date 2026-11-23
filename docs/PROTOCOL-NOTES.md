@@ -32,6 +32,12 @@ The response includes `messages` in ascending sequence order, `next_after` and `
 
 JSON requests without `limit` keep the full history response after `after`, with no paging fields. SSE uses its existing stream contract and ignores `limit`. Custom streamable stores should honor the existing `getMessages` limit to bound each store read. No storage migration is required.
 
+## Durable sleeps
+
+A job parked by the builder remains `working`. Its provider message can include `wake_at_ms` as epoch milliseconds. An ordinary inbound message to a stored sleeper returns HTTP 409 with `job_sleeping`, a display with the wake time, and a hint for polling or stopping the job. [Portable working message and response](../protocol-fixtures/durable-sleep-v1.json)
+
+A request that attempts to reactivate a stored job can race with another worker taking ownership or accepting input. If the job has changed by the time the server tries to record a reactivation refusal, it returns HTTP 409 with `{"error":"job_changed","message":"The job changed during reactivation. Read its current status."}`. Read the job's current status and history before deciding whether to send another response.
+
 ## Payment method discovery
 
 An explicit `paymentMethods` list bounds `payment.methods` on `/v1/info` and `/v1/quote`, the top-level `x402` and `tempo` info blocks, and credit funding rails and terms on info, quotes, and unpaid job responses. Excluded x402 and Tempo blocks are omitted rather than emitted empty. Lightning remains an independent receive-only credit funding leg. The [portable example](../protocol-fixtures/payment-method-discovery-v1.json) describes an x402/Tempo-wired DVM restricted to Cashu.
@@ -506,7 +512,9 @@ The [portable fixture](../protocol-fixtures/capability-rates.json) carries the s
 
 ## Terminal reads and receipt recovery
 
-A streamed `complete` can precede durable finalization. Job status reads, submit responses, and request recovery responses wait for terminal work and receipt repair for up to two seconds, in addition to ordinary store and response-metadata reads. Terminal status and result fields come from the stored snapshot; an unfinished save leaves the last committed nonterminal state visible.
+SSE and JSON history expose a terminal message only after its transaction commits the terminal status, message, and piece outcomes. An unfinished commit leaves the last committed nonterminal state visible. Job status reads, submit responses, and request recovery responses wait for terminal work and receipt repair for up to two seconds, in addition to ordinary store and response-metadata reads.
+
+Handlers end a job with `ctx.complete` or `ctx.fail`, which commit provider `complete` or `cancel` respectively. `decline` is a caller-only terminal type, and `ctx.sendMessage` rejects it from a handler. A reader upgraded from an older SDK may see a sequence gap where an interrupted terminal frame was dropped. Use the sequence as a cursor and reconcile by rereading `GET /v1/job/:id` and the job's message history. [Portable terminal and recovery examples](../protocol-fixtures/durable-sleep-v1.json)
 
 Before settling a completed job's pending credit draw, the SDK drains outgoing messages in order and commits its terminal snapshot. Failed outgoing appends and terminal snapshot writes retry for up to 30 seconds, with 500 ms between failed attempts. An outstanding store operation must finish or time out before another attempt; the retry budget does not cancel an in-flight database transaction. Stable append identities prevent a lost acknowledgement from duplicating a message or payment-request counters. The built-in Postgres and memory stores retain append identities across terminal log cleanup. Custom streaming stores must honor `AppendOutgoingOptions.appendId` with the same durable deduplication semantics.
 

@@ -18,5 +18,10 @@
     "id": "chargeSettledOnRetry",
     "epoch": 1,
     "sha256": "345f19c67fa5588e8e7a90c17c6c3a1bb9241fd6d8f3abb28bfe920f2313c89f"
+  },
+  {
+    "id": "durableSleep",
+    "epoch": 1,
+    "sha256": "4b974dfdb69391697ae401a0ac890fb757d0e8aef2abe7e0c43adac1d660d5ac"
   }
 ]

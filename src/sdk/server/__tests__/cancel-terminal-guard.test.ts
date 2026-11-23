@@ -41,7 +41,7 @@ function buildManager(
 }
 
 /** Start a job whose handler blocks until `release()` resolves it. */
-function startJob(jm: ReturnType<typeof buildManager>, paid = false) {
+async function startJob(jm: ReturnType<typeof buildManager>, paid = false) {
   const job = jm.createJob(
     { input: "hello" },
     "requester-1",
@@ -52,6 +52,7 @@ function startJob(jm: ReturnType<typeof buildManager>, paid = false) {
     "test"
   );
   const ctx = jm.buildAndAttachContext(job, "hello");
+  await jm.persistJob(job);
   jm.runHandler(job, ctx as SDKJobContext<unknown, unknown>);
   return { job, ctx };
 }
@@ -76,7 +77,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await jm.dispatchMessage(job, "cancel", { reason: "probe" });
       await settle();
 
@@ -100,7 +101,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await jm.dispatchMessage(job, "cancel", { reason: "probe" });
 
       release();
@@ -108,15 +109,13 @@ describe("cancel is terminal", () => {
       await settle();
 
       expect(job.status).toBe("cancelled");
-      expect(job.summary).toBeUndefined();
+      expect(job.summary).toBe("probe");
       expect(job.messages.some((m) => m.type === "complete")).toBe(false);
       expect(job.messages.some((m) => m.type === "text" && m.content.text === "still going")).toBe(
         false
       );
 
-      // The store must agree — the DELETE route dispatches the cancel without
-      // persisting, so an unpersisted cancel would read back as `processing`
-      // and get swept to `failed`.
+      // The abort signal must reflect a committed terminal outcome.
       const record = await store.get(job.id);
       expect(record?.status).toBe("cancelled");
     } finally {
@@ -136,7 +135,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await jm.dispatchMessage(job, "cancel", { reason: "probe" });
 
       release();
@@ -168,7 +167,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await jm.dispatchMessage(job, "cancel", { reason: "probe" });
 
       release();
@@ -202,7 +201,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await settle();
       await jm.dispatchMessage(job, "cancel", { reason: "probe" });
       await settle();
@@ -239,7 +238,7 @@ describe("cancel is terminal", () => {
     );
 
     try {
-      const { job, ctx } = startJob(jm, true);
+      const { job, ctx } = await startJob(jm, true);
       await jm.persistJob(job);
 
       const record = await store.get(job.id);
@@ -270,7 +269,7 @@ describe("cancel is terminal", () => {
     });
 
     try {
-      const { job } = startJob(jm);
+      const { job } = await startJob(jm);
       await settle();
       expect(job.status).toBe("awaiting-input");
 

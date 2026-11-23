@@ -302,7 +302,7 @@ describe("Pattern A reactivation — payment credit", () => {
   // write a `cancel` provider message via Tx A, and persist `status='cancelled'`
   // clobbering whatever the lock-winner had committed in the meantime.
   // Seed the snapshot directly so no in-process orphan handler races the test.
-  it("tears down the in-memory scaffold when the reactivation lock is lost", async () => {
+  it("does not install a handler when the reactivation lock is lost", async () => {
     const jobStore = new MemoryJobStore();
 
     const descriptor = configureDVM({
@@ -347,13 +347,12 @@ describe("Pattern A reactivation — payment credit", () => {
       lastActivityAt: Date.now(),
     });
 
-    // Force lock-loss; Tx C still lands (runs before the lock attempt) and
-    // the lock-winner is expected to drive the reactivation. This machine
-    // must tear down the scaffold it built in `reactivateJob`.
+    // Force lock-loss after the payment transaction commits. Only the lock
+    // winner may install the reactivated handler.
     const lockSpy = vi
       .spyOn(jobStore, "tryReactivationLock")
       .mockResolvedValue({ acquired: false });
-    const clearIdleTimerSpy = vi.spyOn(jobManager, "clearIdleTimer");
+    const reactivateSpy = vi.spyOn(jobManager, "reactivateJob");
 
     const msgRes = await postJson(
       `${baseUrl}/v1/job/${job_id}/messages`,
@@ -366,9 +365,8 @@ describe("Pattern A reactivation — payment credit", () => {
     expect(msgRes.status).toBe(201);
     await tick();
 
-    // Scaffold gone: no orphan in activeJobs, idle timer was cleared.
     expect(jobManager.activeJobs.has(job_id)).toBe(false);
-    expect(clearIdleTimerSpy).toHaveBeenCalledWith(job_id);
+    expect(reactivateSpy).not.toHaveBeenCalled();
 
     // Lock-loser must not have persisted its in-memory snapshot. Status stays
     // `awaiting-input` (lock-winner is the only writer that should transition
@@ -382,7 +380,7 @@ describe("Pattern A reactivation — payment credit", () => {
     expect(verifiedMsgs.some((m) => m.type === "cancel")).toBe(false);
 
     lockSpy.mockRestore();
-    clearIdleTimerSpy.mockRestore();
+    reactivateSpy.mockRestore();
   });
 });
 

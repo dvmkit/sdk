@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import sleepFixture from "../../../../protocol-fixtures/durable-sleep-v1.json";
 import { verifyReceipt, type JobReceipt } from "../../../lib/receipt";
 import { servedApps } from "../../../test-support/served-app";
 import { configureDVM } from "../../configure";
@@ -77,6 +78,8 @@ describe("HTTP terminal read ordering", () => {
     }
     const owner = await start();
     const other = await start();
+    const abort = new AbortController();
+    let streamed: Promise<string | undefined> | undefined;
     try {
       const submitted = await fetch(`${owner}/v1/job`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -89,11 +92,20 @@ describe("HTTP terminal read ordering", () => {
       const headers = { "X-Job-Token": job.job_token };
       finish.resolve();
       await store.entered.promise;
-      const stream = await fetch(`${owner}/v1/job/${job.job_id}/messages`, {
+      let streamFinished = false;
+      streamed = fetch(`${owner}/v1/job/${job.job_id}/messages`, {
         headers: { ...headers, Accept: "text/event-stream" },
+        signal: abort.signal,
+      }).then(response => response.text()).then(text => {
+        streamFinished = true;
+        return text;
+      }).catch(error => {
+        if (!abort.signal.aborted) throw error;
+        return undefined;
       });
-      expect(await stream.text()).toContain('"type":"complete"');
-      expect((await store.get(job.job_id))?.status).toBe("processing");
+      const messages = await (await fetch(`${owner}/v1/job/${job.job_id}/messages`, { headers })).json();
+      expect(messages.messages).toEqual(sleepFixture.terminal_commit.before.messages);
+      expect((await store.get(job.job_id))?.status).toBe(sleepFixture.terminal_commit.before.status);
       if (paid) expect((await ledger.getDraw({ creditId: "example-credit", drawId: "example-draw" }))?.status).toBe("pending");
 
       const get = vi.spyOn(store, "get");
@@ -102,8 +114,9 @@ describe("HTTP terminal read ordering", () => {
         return await response.json() as Body;
       });
       await vi.waitFor(() => expect(get).toHaveBeenCalledWith(job.job_id));
-      // Let a premature response reach the caller while terminal save is still blocked.
+      // Give the live stream a chance to leak the staged completion.
       await new Promise(resolve => setTimeout(resolve, 50));
+      expect(streamFinished).toBe(false);
       if (cancel) {
         expect((await fetch(`${other}/v1/job/${job.job_id}`, { method: "DELETE", headers })).status).toBe(200);
       }
@@ -112,10 +125,15 @@ describe("HTTP terminal read ordering", () => {
       if (!cancel) expect(pendingElsewhere.receipt).toBeUndefined();
       store.gate.resolve();
       const completed = await pending;
+      const wire = await streamed;
+      expect(wire).toContain(cancel ? '"type":"cancel"' : '"type":"complete"');
+      if (cancel) expect(wire).not.toContain('"type":"complete"');
       expect(completed.status).toBe(cancel ? "cancelled" : "completed");
       expect(verifyReceipt(completed.receipt!)).toBe(true);
       expect(completed.receipt?.outcome).toBe(completed.status);
       if (!cancel) {
+        expect(completed.status).toBe(sleepFixture.terminal_commit.after.status);
+        expect((await store.getMessages(job.job_id, 0))).toMatchObject(sleepFixture.terminal_commit.after.messages);
         expect(completed.summary).toBe("delivered result");
         expect(completed.receipt?.result_hash).toBe(createHash("sha256")
           .update('{"artifact_hashes":[],"summary":"delivered result"}').digest("hex"));
@@ -142,6 +160,196 @@ describe("HTTP terminal read ordering", () => {
     } finally {
       finish.resolve();
       store.gate.resolve();
+      abort.abort();
+      await streamed?.catch(() => undefined);
     }
   });
 });
+
+it("keeps SSE open through an attempted raw provider decline", async () => {
+  const store = new MemoryJobStore();
+  const ready = deferred();
+  const emit = deferred();
+  const emitted = deferred();
+  const finish = deferred();
+  let rejection: unknown;
+  const server = await createDVMServer(configureDVM({
+    name: "raw-terminal-output", capabilities: { work: {
+      async onJob(ctx) {
+        ctx.text("ready");
+        ready.resolve();
+        await emit.promise;
+        try {
+          ctx.sendMessage("decline", { reason: "not a terminal outcome" });
+        } catch (error) {
+          rejection = error;
+        } finally {
+          emitted.resolve();
+        }
+        await finish.promise;
+        ctx.complete("actual end");
+      },
+    } },
+  }), { devMode: true, env: {}, store: new MemoryKVStore(), jobStore: store });
+  hosts.push(server);
+  const url = await servers.serve(server.app);
+  try {
+    const submitted = await fetch(`${url}/v1/job`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability: "work", input: "go" }),
+    });
+    expect(submitted.status).toBe(202);
+    const job = await submitted.json() as Body;
+    await ready.promise;
+    const response = await fetch(`${url}/v1/job/${job.job_id}/messages`, {
+      headers: { "X-Job-Token": job.job_token, Accept: "text/event-stream" },
+      signal: AbortSignal.timeout(4000),
+    });
+    let closed = false;
+    const wire = response.text().then(text => { closed = true; return text; });
+    emit.resolve();
+    await emitted.promise;
+    expect((await store.get(job.job_id))?.status).toBe("processing");
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const endedBeforeCommit = closed;
+    finish.resolve();
+    expect(await wire).toContain('"type":"complete"');
+    expect(endedBeforeCommit).toBe(false);
+    expect(rejection).toMatchObject({ message: sleepFixture.terminal_direction.provider_decline_error });
+    expect(await store.getMessages(job.job_id, 0)).not.toContainEqual(expect.objectContaining({ type: "decline" }));
+  } finally {
+    emit.resolve();
+    finish.resolve();
+  }
+});
+
+it("does not let a stale stored-reactivation refusal end an adopted sleeper", async () => {
+  const store = new MemoryJobStore();
+  const startSleep = deferred();
+  const owner = await createDVMServer(configureDVM({
+    name: "old-and-new-descriptors",
+    capabilities: { work: { async onJob(ctx) { await startSleep.promise; await ctx.sleep("park", 60_000); ctx.complete("done"); } } },
+  }), { devMode: true, env: {}, store: new MemoryKVStore(), jobStore: store });
+  const outdated = await createDVMServer(configureDVM({
+    name: "old-and-new-descriptors", capabilities: { unrelated: { onJob(ctx) { ctx.complete("done"); } } },
+  }), { devMode: true, env: {}, store: new MemoryKVStore(), jobStore: store });
+  hosts.push(owner, outdated);
+  const ownerUrl = await servers.serve(owner.app);
+  const outdatedUrl = await servers.serve(outdated.app);
+  const seen = deferred();
+  const continueRead = deferred();
+  try {
+    const submitted = await fetch(`${ownerUrl}/v1/job`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability: "work", input: "go" }),
+    });
+    expect(submitted.status).toBe(202);
+    const job = await submitted.json() as Body;
+    const read = store.get.bind(store);
+    const spy = vi.spyOn(store, "get").mockImplementationOnce(async id => {
+      const snapshot = await read(id);
+      seen.resolve();
+      await continueRead.promise;
+      return snapshot;
+    });
+    const incoming = fetch(`${outdatedUrl}/v1/job/${job.job_id}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Job-Token": job.job_token },
+      body: JSON.stringify({ type: "response", content: { prompt_id: "anything", text: "hello" } }),
+    });
+    await seen.promise;
+    spy.mockRestore();
+    startSleep.resolve();
+    await expect.poll(() => read(job.job_id)).toMatchObject({ status: "working", sleepId: "sleep:park", sleepGeneration: 0 });
+    expect(await store.claimSleepingJob(job.job_id, Date.now())).toMatchObject({ sleepGeneration: 1 });
+    continueRead.resolve();
+    const response = await incoming;
+    expect(await read(job.job_id)).toMatchObject({ status: "working", sleepGeneration: 1, sleepId: "sleep:park" });
+    expect(response.status).toBe(409);
+  } finally {
+    startSleep.resolve();
+    continueRead.resolve();
+  }
+});
+
+it("returns job_changed when the owner verified a caller response before a stale refusal", async () => {
+  const store = new MemoryJobStore();
+  const started = deferred();
+  const responded = deferred();
+  const finish = deferred();
+  const hold = deferred();
+  const observed = deferred();
+  const resume = deferred();
+  const owner = await createDVMServer(configureDVM({
+    name: "in-flight-response",
+    capabilities: { work: {
+      async onJob(ctx) {
+        ctx.sendMessage("prompt", { id: "one", text: "Proceed?" });
+        started.resolve();
+        await hold.promise;
+      },
+      async onResponse(ctx) {
+        responded.resolve();
+        await finish.promise;
+        ctx.complete("done");
+      },
+    } },
+  }), { devMode: true, env: {}, store: new MemoryKVStore(), jobStore: store });
+  const outdated = await createDVMServer(configureDVM({
+    name: "in-flight-response",
+    capabilities: { other: { onJob(ctx) { ctx.complete("done"); } } },
+  }), { devMode: true, env: {}, store: new MemoryKVStore(), jobStore: store });
+  hosts.push(owner, outdated);
+  const ownerURL = await servers.serve(owner.app);
+  const oldURL = await servers.serve(outdated.app);
+  const fixed = Date.now();
+  const saveResponse = store.recordInbound.bind(store);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(fixed);
+  const entered = deferred();
+  const verify = deferred();
+  const inbound = vi.spyOn(store, "recordInbound").mockImplementationOnce(async (...args) => {
+    const seq = await saveResponse(...args);
+    entered.resolve();
+    await verify.promise;
+    return seq;
+  });
+  try {
+    const submit = await fetch(`${ownerURL}/v1/job`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability: "work", input: "go" }),
+    });
+    expect(submit.status).toBe(202);
+    const job = await submit.json() as Body;
+    await started.promise;
+    const reply = (url: string) => fetch(`${url}/v1/job/${job.job_id}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Job-Token": job.job_token },
+      body: JSON.stringify({ type: "response", content: { prompt_id: "one", text: "yes" } }),
+    });
+    const good = reply(ownerURL);
+    await entered.promise;
+    const get = store.get.bind(store);
+    const pause = vi.spyOn(store, "get").mockImplementationOnce(async id => {
+      const row = await get(id);
+      observed.resolve();
+      await resume.promise;
+      return row;
+    });
+    const old = reply(oldURL);
+    await observed.promise;
+    pause.mockRestore();
+    verify.resolve();
+    await responded.promise;
+    expect(await store.getMessages(job.job_id, 0)).toEqual(expect.arrayContaining([expect.objectContaining({ type: "response" })]));
+    resume.resolve();
+    const result = await old;
+    const status = (await get(job.job_id))?.status;
+    finish.resolve();
+    await good;
+    expect(result.status).toBe(sleepFixture.job_changed.status);
+    expect(["awaiting-input", "processing"]).toContain(status);
+    expect(await result.json()).toEqual(sleepFixture.job_changed.body);
+  } finally {
+    clock.mockRestore();
+    inbound.mockRestore();
+    verify.resolve();
+    resume.resolve();
+    hold.resolve();
+    finish.resolve();
+  }
+}, 8_000);

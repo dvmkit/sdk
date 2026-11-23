@@ -17,6 +17,10 @@ export type JobStatus =
   | "working";
 
 export interface JobRecord {
+  sleepUntilMs?: number;
+  sleepId?: string;
+  sleepGeneration?: number;
+  sleepResumes?: number;
   id: string;
   tags: string[];
   /**
@@ -308,6 +312,8 @@ export interface PaymentCreditDelta {
 
 /** Atomic side effects applied with an outgoing provider message. */
 export interface AppendOutgoingOptions {
+  /** Executor generation expected when committing the append and its side effects. */
+  sleepGeneration?: number;
   /** Stable identity for retrying an append whose commit acknowledgement was lost. */
   appendId?: string;
   /** A suspending SDK prompt/payment yield; event-driven messages leave status unchanged. */
@@ -340,6 +346,14 @@ export class JobEndedError extends Error {
   constructor(readonly jobId: string) {
     super(`job ${jobId} has ended; it takes no further asks`);
     this.name = "JobEndedError";
+  }
+}
+
+/** The executor lost ownership before the store could apply its write. */
+export class JobSupersededError extends Error {
+  constructor() {
+    super("Job superseded by a reactivation replay");
+    this.name = "JobSupersededError";
   }
 }
 
@@ -500,7 +514,11 @@ export interface JobStore {
    * these records in later snapshots and reject missing, terminal or redacted jobs.
    * Stores without this method retain yield-time step persistence.
    */
-  saveStep?(jobId: string, record: StepRecord): Promise<void>;
+  saveStep?(jobId: string, record: StepRecord, sleepGeneration?: number): Promise<void>;
+  /** Fail only if the snapshot from get and its verified inbound progress are current. */
+  failReactivation(observed: JobRecord, reason: string): Promise<boolean>;
+  /** Refresh only owned processing or working rows and return the IDs updated. */
+  heartbeatJobExecutors(jobs: { id: string; generation: number }[], now: number): Promise<string[]>;
   save(record: JobRecord): Promise<void>;
   delete(id: string): Promise<void>;
 }
@@ -589,6 +607,12 @@ export function isReceiptIssuingStore(store: JobStore): store is JobStore & Rece
  * re-crediting.
  */
 export interface StreamableJobStore extends JobStore {
+  /** Persist a sleep yield only while the caller owns the generation. */
+  saveSleepSnapshot?(record: JobRecord, generation: number, dvmId?: string): Promise<boolean>;
+  beginSleep?(id: string, sleep: { sleepId: string; wakeAtMs: number; generation: number }): Promise<boolean>;
+  endSleep?(id: string, generation: number): Promise<boolean>;
+  claimSleepingJob?(id: string, expectedActivityBefore: number, now?: number):
+    Promise<{ sleepGeneration: number; sleepResumes: number } | undefined>;
   /**
    * Tx A — append an outgoing message and apply its immediate counter
    * consequence. Returns the server-allocated seq. The caller's `message`
@@ -663,7 +687,7 @@ export interface StreamableJobStore extends JobStore {
    * claimant is covered by the processing watchdog. A no-op returning `false`
    * for a job that is no longer `awaiting-input` (already claimed / terminal).
    */
-  claimForProcessing(jobId: string): Promise<boolean>;
+  claimForProcessing(jobId: string, sleepGeneration?: number): Promise<boolean>;
 
   /**
    * Run `fn` while holding a tx-scoped advisory lock keyed on the job id.
@@ -749,7 +773,8 @@ export interface StreamableJobStore extends JobStore {
     jobId: string,
     expectedActivityBefore: number,
     reason: string,
-    terminalStatus: "failed" | "cancelled"
+    terminalStatus: "failed" | "cancelled",
+    sleep?: { generation: number; parked: boolean }
   ): Promise<boolean>;
 
   /**
@@ -769,7 +794,7 @@ export interface StreamableJobStore extends JobStore {
   cancelJob(jobId: string, reason: string): Promise<boolean>;
 
   /** Atomically fail a nonterminal job with its final reason and durable message history. */
-  failJob?(jobId: string, reason: string): Promise<boolean>;
+  failJob?(jobId: string, reason: string, sleepGeneration?: number): Promise<boolean>;
 
   /**
    * End a job at the caller's decline of its open ask or prompt: `cancelled`, ended by the
@@ -777,17 +802,7 @@ export interface StreamableJobStore extends JobStore {
    * a mandated job with no open ask records `stop_requested` durably for its next ask.
    * Otherwise refuses with `no_open_ask` when nothing is open for the caller to decline.
    */
-  declineJob?(jobId: string, reason: string): Promise<DeclineOutcome>;
-
-  /**
-   * Bump `last_activity_at` to `now` (Unix ms) for the given jobs that are
-   * still in `processing`/`working`. Called on a
-   * tick by the `JobManager` for its locally-active jobs so a live worker's
-   * row stays fresh and the processing watchdog only fires when the process
-   * has actually died. A no-op for rows that have since gone terminal or
-   * `awaiting-input` (the SQL `WHERE` guards the status).
-   */
-  heartbeatActiveJobs(jobIds: string[], now: number): Promise<void>;
+  declineJob?(jobId: string, reason: string, sleepGeneration?: number, requesterMessage?: boolean): Promise<DeclineOutcome>;
 
   /** Acquire the dedicated LISTEN connection. Call once at startup. */
   initStreaming(): Promise<void>;
@@ -805,6 +820,17 @@ export interface OutgoingMessage {
   type: MessageType;
   timestamp: number;
   content: Record<string, unknown> | object;
+}
+
+/** Staged terminal output travels with the host's snapshot to the built-in stores. */
+export const TERMINAL_OUTPUT = Symbol("terminal output");
+export type TerminalSnapshot = JobRecord & { [TERMINAL_OUTPUT]?: OutgoingMessage };
+
+export function withTerminalOutput(
+  record: JobRecord, history: Message[], nextSeq: number, output: OutgoingMessage
+): JobRecord {
+  const seq = Math.max(nextSeq, (history.at(-1)?.seq ?? 0) + 1);
+  return { ...record, messages: [...history, { ...output, seq } as Message], seq };
 }
 
 /**

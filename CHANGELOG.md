@@ -2,12 +2,27 @@
 
 ## Unreleased
 
+### Features
+
 - Standing credit mandates now accept caller-chosen future expiries that older providers rejected. Providers advertise support with `credit.mandate_max_duration: null` on `/v1/info`.
 - Fix mandate settlement to roll back if the mandate expires while the provider clears the ask's skip marker.
+- Add `ctx.sleep` and `ctx.sleepUntil` for durable waits, optional `working.wake_at_ms`, and sleep inspection in `createTestContext`.
 
-### Breaking API changes
+- Durable wait wire examples cover the additive wake timestamp and the stored-job refusal in `protocol-fixtures/durable-sleep-v1.json`.
+
+### Breaking changes
 
 - The public `CreditTerms` interface from `@dvmkit/sdk/server` now declares `mandate_max_duration?: null`. Extensions that declare a numeric property with the same name must rename their custom property or adopt the SDK field's type. A value of `null` indicates support for caller-chosen mandate expiry without a duration ceiling.
+
+- Existing builder handlers require no changes. Custom implementations of `SDKJobContext` must implement the two new methods.
+
+- Job store implementations must replace `heartbeatActiveJobs` with `heartbeatJobExecutors`, which compares the executor's sleep generation before refreshing activity. Implement `failReactivation` as a compare-and-set against the observed job snapshot and verified inbound progress. Use `ctx.complete` or `ctx.fail` for provider outcomes. Only callers can send `decline`.
+
+### Migrations
+
+- Postgres initialization adds `sleep_until_ms`, `sleep_id`, `sleep_generation`, and `sleep_resumes` to `jobs`. An older worker ignores these columns and reaps sleeping jobs as `worker_died_mid_job` after its watchdog window (five minutes by default), charging finished pieces.
+
+- Postgres initialization also adds nullable `job_payment_intents.request_seq` so recovery can match an accepted rail payment to its ask. Existing intents keep an unknown request sequence.
 
 ## Upgrade details
 

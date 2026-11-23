@@ -188,6 +188,7 @@ it.each(["snapshot", "empty-durable"])("stops serializing an oversized %s fallba
   const store: JobStore = kind === "empty-durable" ? new MemoryJobStore() : {
     get: async () => job, findJobByPaymentTxHash: async () => undefined,
     save: async () => undefined, delete: async () => undefined,
+    failReactivation: async () => false, heartbeatJobExecutors: async () => [],
   };
   expect(await inlineResultMessages(store, job)).toBeUndefined();
   expect(tailContent).not.toHaveBeenCalled();
@@ -201,6 +202,7 @@ it.each(["snapshot", "empty-durable"])("preserves positive-sequence messages in 
   const store: JobStore = kind === "empty-durable" ? new MemoryJobStore() : {
     get: async () => job, findJobByPaymentTxHash: async () => undefined,
     save: async () => undefined, delete: async () => undefined,
+    failReactivation: async () => false, heartbeatJobExecutors: async () => [],
   };
   expect(await inlineResultMessages(store, job)).toEqual(messages.slice(1));
 });

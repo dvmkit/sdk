@@ -31,11 +31,15 @@ const fixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/s
   mandate_payment: { message: { from: string; type: string; content: { credit: Record<string, unknown> } };
     payment_id: { prefix: string; vector: { job_id: string; request_seq: number; preimage: string; payment_id: string } } };
 };
+const sleepFixture = JSON.parse(readFileSync(new URL("../../../../protocol-fixtures/durable-sleep-v1.json", import.meta.url), "utf8")) as {
+  working: { from: string; type: string; content: { estimate_seconds: number; hint: string; wake_at_ms: number } };
+  stored_response: { status: number; body: { error: string; display: string; hint: string } };
+};
 // The documented derivation, so a caller can name the payment for an ask without reading it back.
 const documentedPaymentId = (jobId: string, requestSeq: number) =>
   fixture.mandate_payment.payment_id.prefix + createHash("sha256").update(JSON.stringify(["mandate", jobId, requestSeq])).digest("hex");
 
-type Script = "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt" | "stop" | "stop-prompt" | "progress" | "concurrent-prompt";
+type Script = "rate-sleep" | "zombie-watch" | "watch" | "mixed-sleep" | "sleep-then-ask" | "one" | "two" | "late" | "prompt" | "hold" | "asked-mid-prompt" | "stop" | "stop-prompt" | "progress" | "concurrent-prompt";
 
 it("derives the published payment_id vector byte for byte", () => {
   const { prefix, vector } = fixture.mandate_payment.payment_id;
@@ -49,6 +53,9 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
   let pool: Pool;
   let ledger: CreditLedger;
   const completions = new Map<string, number>();
+  const polls = new Map<string, number[]>();
+  const completedAt = new Map<string, number>();
+  const interruptedSleeps = new Map<string, string[]>();
   // A `late` job asks only once the test opens its gate, so the test sets the scene without racing a clock.
   const gates = new Map<string, { opened: Promise<void>; open: () => void; arrived: Promise<void>; arrive: () => void }>();
   const gate = (jobId: string) => {
@@ -91,14 +98,67 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
     await dropSchemas(schema);
   });
 
-  async function server(opts: { onCancel?: () => Promise<void>; balancePayments?: boolean } = {}) {
-    const host = createDVMHost({ pool, port: 0, env: {
+  async function server(opts: { onCancel?: () => Promise<void>; balancePayments?: boolean; btcUsd?: number; sleepMs?: number; waitBeforePark?: boolean } = {}) {
+    const host = createDVMHost({ pool, port: 0,
+      ...(opts.btcUsd !== undefined && { fx: {
+        supportedCurrencies: () => ["usd"],
+        fetch: async () => ({ rates: { usd: opts.btcUsd! }, as_of: new Date().toISOString() }),
+      } }),
+      env: {
       ...attestationEnv(attestation), ...(opts.balancePayments === false ? { DVMKIT_BALANCE_PAYMENTS: "false" } : {}),
     } });
     hosts.push(host);
     const input = z.object({ action: z.string(), pubkey: z.string(), signature: z.string(), timestamp: z.number(), nonce: z.string() });
     const onJob = async (ctx: SDKJobContext<Record<string, unknown>, unknown>) => {
       const script = (ctx.input as { action: Script }).action;
+      if (script === "rate-sleep" || script === "watch" || script === "zombie-watch" || script === "mixed-sleep" || script === "sleep-then-ask") {
+        const sleep = async (id: string, ms: number) => {
+          try {
+            await ctx.sleep(id, ms);
+          } catch (err) {
+            const caught = interruptedSleeps.get(ctx.jobId) ?? [];
+            caught.push((err as Error).name);
+            interruptedSleeps.set(ctx.jobId, caught);
+            throw err;
+          }
+        };
+        if (script === "rate-sleep") {
+          await ctx.requestPayment(2000, "next period");
+          await sleep("rated", 60_000);
+        } else if (script === "sleep-then-ask") {
+          await sleep("first", 0);
+          await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next period");
+        } else {
+          ctx.text("watch started");
+          for (let i = 0; i < 4; i++) {
+            const match = await ctx.step(`poll:${i}`, async () => {
+              const runs = polls.get(ctx.jobId) ?? [];
+              runs.push(i);
+              polls.set(ctx.jobId, runs);
+              return `match ${i}`;
+            });
+            ctx.artifact({ data: match });
+            if (i < 3) {
+              await ctx.requestPayment({ amount: 0.001, currency: "usd" }, "next period");
+              if (i === 1 && opts.waitBeforePark) {
+                const waiting = gate(ctx.jobId);
+                waiting.arrive();
+                await waiting.opened;
+              }
+              await sleep(`period:${i}`, i === (script === "mixed-sleep" ? 2 : 1) ? opts.sleepMs ?? 2000 : 0);
+              if (script === "zombie-watch" && i === 1) {
+                const hold = gate(ctx.jobId);
+                hold.arrive();
+                await hold.opened;
+              }
+            }
+          }
+        }
+        completedAt.set(ctx.jobId, Date.now());
+        completions.set(ctx.jobId, (completions.get(ctx.jobId) ?? 0) + 1);
+        ctx.complete("done");
+        return;
+      }
       if (script === "late") {
         const hold = gate(ctx.jobId);
         hold.arrive();
@@ -358,6 +418,540 @@ describe.skipIf(!process.env.DATABASE_URL)("standing mandate pays asks through p
       resumeSpy.mockRestore();
       intentSpy?.mockRestore();
     }
+  }, 30_000);
+
+  async function parked(jobId: string, sleepId: string) {
+    const read = async () => (await pool.query<{ sleep_id: string; sleep_until_ms: string }>(
+      "SELECT sleep_id, sleep_until_ms FROM jobs WHERE id=$1", [jobId])).rows[0];
+    await expect.poll(read).toMatchObject({ sleep_id: sleepId, sleep_until_ms: expect.any(String) });
+    return Number((await read()).sleep_until_ms);
+  }
+
+  async function ageWorker(jobId: string) {
+    await pool.query("UPDATE jobs SET last_activity_at=$2 WHERE id=$1", [jobId, Date.now() - 301_000]);
+  }
+
+  it.each(["mixed-sleep", "watch"] as const)(
+    "adopts %s at the cached wake time with no duplicate messages or charges", async (script) => {
+      const url = await server();
+      const creditId = script;
+      await fund(creditId);
+      const job = await submit(url, { creditId, priced: true, script, maxTotal: (script === "mixed-sleep" ? 3 : 4) * ASK });
+      if (script === "mixed-sleep") {
+        await expect.poll(() => balancePayments(job.job_id)).toHaveLength(2);
+        const ask = await openAsk(job.job_id);
+        const paid = await post(`${url}/v1/job/${job.job_id}/messages`, signedPayment(job, ask.seq, creditId, job.drawId), job.job_token);
+        expect(paid.status, await paid.clone().text()).toBe(201);
+      }
+      const currentSleep = script === "watch" ? "sleep:period:1" : "sleep:period:2";
+      const wake = await parked(job.job_id, currentSleep);
+      const history = await messages(job.job_id);
+      const sampleIso = new Date(sleepFixture.working.content.wake_at_ms).toISOString();
+      const actualIso = new Date(wake).toISOString();
+      const working = history.findLast((m) => m.type === "working");
+      expect(working).toMatchObject({
+        ...sleepFixture.working,
+        content: {
+          ...sleepFixture.working.content,
+          hint: sleepFixture.working.content.hint.replace(sampleIso, actualIso),
+          wake_at_ms: wake,
+        },
+      });
+      const restarted = await server();
+      await hosts[0].shutdown();
+
+      const response = await post(`${restarted}/v1/job/${job.job_id}/messages`,
+        { type: "response", content: { prompt_id: "unopened", text: "answer" } }, job.job_token);
+      expect(response.status).toBe(sleepFixture.stored_response.status);
+      expect(await response.json()).toEqual({
+        ...sleepFixture.stored_response.body,
+        display: sleepFixture.stored_response.body.display.replace(sampleIso, actualIso),
+      });
+      const replacement = latestManager();
+      expect(replacement.activeJobs.has(job.job_id)).toBe(false);
+
+      const wallNow = Date.now.bind(Date);
+      const offset = wake - 750 - wallNow();
+      const shifted = vi.spyOn(Date, "now").mockImplementation(() => wallNow() + offset);
+      try {
+        await ageWorker(job.job_id);
+        await replacement.sweepStaleJobs();
+        await expect.poll(async () => (await pool.query(
+          "SELECT sleep_generation, sleep_resumes, sleep_until_ms FROM jobs WHERE id=$1", [job.job_id])).rows[0])
+          .toEqual({ sleep_generation: 1, sleep_resumes: 0, sleep_until_ms: String(wake) });
+        await expect.poll(() => status(job.job_id), { timeout: 6000 }).toBe("completed");
+        expect(completedAt.get(job.job_id)).toBeGreaterThanOrEqual(wake);
+        expect(completedAt.get(job.job_id)).toBeLessThan(wake + 800);
+      } finally {
+        shifted.mockRestore();
+      }
+      expect(interruptedSleeps.get(job.job_id)).toEqual(["JobCancelledError"]);
+      expect(completions.get(job.job_id)).toBe(1);
+      expect(polls.get(job.job_id)).toEqual([0, 1, 2, 3]);
+
+      const transcript = await messages(job.job_id);
+      expect(transcript.slice(0, history.length)).toEqual(history);
+      expect(transcript.slice(history.length).every((message) => message.seq > history.at(-1)!.seq)).toBe(true);
+      expect(transcript.filter((m) => m.type === "artifact").map((m) => m.content.data))
+        .toEqual(["match 0", "match 1", "match 2", "match 3"]);
+      expect(transcript.filter((m) => m.type === "text")).toHaveLength(1);
+      expect(transcript.filter((m) => m.type === "working")).toHaveLength(3);
+      expect(transcript.filter((m) => m.type === "payment-request")).toHaveLength(3);
+      const payments = transcript.filter((m) => m.type === "payment" && m.from === "requester");
+      expect(payments.map((m) => (m.content.credit as { mandate?: boolean }).mandate === true))
+        .toEqual(script === "watch" ? [true, true, true] : [true, true, false]);
+      expect(await balancePayments(job.job_id)).toHaveLength(3);
+      await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId }))
+        .toMatchObject({ status: "settled", amountMicro: 4 * ASK });
+      expect((await ledger.get(creditId))?.balanceMicro).toBe(10_000 - 4 * ASK);
+    }, 30_000
+  );
+
+  it("replays a paid numeric ask at its verified denomination after the FX rate changes", async () => {
+    const url = await server({ btcUsd: 100_000 });
+    const creditId = "sleep-fx";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "rate-sleep", maxTotal: 4000, maxAsk: 2000 });
+    const wake = await parked(job.job_id, "sleep:rated");
+    const ask = (await messages(job.job_id)).find((m) => m.type === "payment-request");
+    expect(ask?.content.credit).toEqual({ amount_micro: 2000, currency: "usd" });
+    await hosts[0].shutdown();
+    await server({ btcUsd: 50_000 });
+    const wallNow = Date.now.bind(Date);
+    const offset = wake - wallNow() + 1;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => wallNow() + offset);
+    try {
+      await ageWorker(job.job_id);
+      await latestManager().sweepStaleJobs();
+      await expect.poll(() => status(job.job_id)).toBe("completed");
+      expect(await balancePayments(job.job_id)).toHaveLength(1);
+      await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId }))
+        .toMatchObject({ status: "settled", amountMicro: 3000 });
+    } finally {
+      clock.mockRestore();
+    }
+  }, 30_000);
+
+  it("does not write a re-park snapshot after a newer executor reaches an ask", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const creditId = "sleep-entry-fence";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    await hosts[0].shutdown();
+    await server({ sleepMs: 60_000 });
+    const first = latestManager();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let paused = false;
+    const restore = observeQueries(async (sql, params) => {
+      if (!paused && typeof sql === "string" && sql.startsWith("SELECT status, pieces") &&
+          sql.includes("FOR UPDATE") && (params as unknown[])?.[0] === job.job_id) {
+        paused = true;
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    try {
+      await ageWorker(job.job_id);
+      await first.sweepStaleJobs();
+      await entered.promise;
+      // Model the replacement winning adoption, ending that sleep, and persisting its next wait.
+      await server();
+      const winner = latestManager().store;
+      if (!isStreamableJobStore(winner) || !winner.claimSleepingJob || !winner.endSleep) throw new Error("sleep store required");
+      await ageWorker(job.job_id);
+      const claim = await winner.claimSleepingJob(job.job_id, Date.now() - 300_000);
+      expect(claim?.sleepGeneration).toBe(2);
+      expect(await winner.endSleep(job.job_id, 2)).toBe(true);
+      const record = (await winner.get(job.job_id))!;
+      await winner.save({ ...record, status: "awaiting-input", state: { phase: "next ask" } });
+      release.resolve();
+      await expect.poll(() => first.activeJobs.has(job.job_id)).toBe(false);
+      expect(await winner.get(job.job_id)).toMatchObject({ status: "awaiting-input", state: { phase: "next ask" } });
+    } finally {
+      release.resolve();
+      restore();
+    }
+  }, 30_000);
+
+  it("cannot fail a replacement when the stale replay's historical payment lookup fails", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const creditId = "sleep-terminal-fence";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    await hosts[0].shutdown();
+    await server();
+    const staleManager = latestManager();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let paused = false;
+    const restore = observeQueries(async (sql, params) => {
+      if (!paused && typeof sql === "string" && sql.includes("SELECT 1 FROM credit_balance_payments p") &&
+          sql.includes("JOIN job_messages a") && (params as unknown[])?.[0] === job.job_id) {
+        paused = true;
+        entered.resolve();
+        await release.promise;
+        throw new Error("Historical payment lookup was interrupted");
+      }
+    });
+    try {
+      await ageWorker(job.job_id);
+      await staleManager.sweepStaleJobs();
+      await entered.promise;
+      const stale = staleManager.activeJobs.get(job.job_id)!;
+      expect(stale.sleepGeneration).toBe(1);
+
+      await server();
+      const replacement = latestManager();
+      await ageWorker(job.job_id);
+      await replacement.sweepStaleJobs();
+      await expect.poll(() => replacement.store.get(job.job_id))
+        .toMatchObject({ status: "working", sleepGeneration: 2, sleepResumes: 0 });
+
+      const before = await messages(job.job_id);
+      const original = (await replacement.store.get(job.job_id))!;
+      release.resolve();
+      await expect.poll(() => Boolean(stale.terminalWork)).toBe(true);
+      await stale.terminalWork;
+
+      expect(await replacement.store.get(job.job_id)).toMatchObject({
+        status: "working", sleepGeneration: 2, sleepId: original.sleepId,
+        lastActivityAt: original.lastActivityAt, pieces: original.pieces, settlement: original.settlement,
+      });
+      expect(await messages(job.job_id)).toEqual(before);
+      expect(await ledger.getDraw({ creditId, drawId: job.drawId }))
+        .toMatchObject({ status: "pending", amountMicro: 3 * ASK });
+      expect(staleManager.activeJobs.has(job.job_id)).toBe(false);
+      expect(stale.abort.signal.aborted).toBe(true);
+    } finally {
+      release.resolve();
+      restore();
+    }
+  }, 30_000);
+
+  it("cannot leave a provider cancel from an old generation on the replacement's parked job", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const creditId = "sleep-terminal-append-gap";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    const transcript = await messages(job.job_id);
+    await hosts[0].shutdown();
+    await server();
+    const old = latestManager();
+    const snapshot = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let failed = false;
+    let paused = false;
+    const restore = observeQueries(async (sql, params) => {
+      if (typeof sql !== "string" || (params as unknown[])?.[0] !== job.job_id) return;
+      if (!failed && sql.includes("SELECT 1 FROM credit_balance_payments p") && sql.includes("JOIN job_messages a")) {
+        failed = true;
+        throw new Error("The original connection dropped");
+      }
+      if (failed && !paused && sql.startsWith("SELECT status, pieces, sleep_generation FROM jobs WHERE id=$1 FOR UPDATE")) {
+        paused = true;
+        snapshot.resolve();
+        await release.promise;
+      }
+    });
+    try {
+      await ageWorker(job.job_id);
+      await old.sweepStaleJobs();
+      await snapshot.promise;
+      const stale = old.activeJobs.get(job.job_id)!;
+      expect(stale.sleepGeneration).toBe(1);
+      expect(await status(job.job_id)).toBe("working");
+
+      const replacementUrl = await server({ sleepMs: 60_000 });
+      const replacement = latestManager();
+      await ageWorker(job.job_id);
+      await replacement.sweepStaleJobs();
+      await expect.poll(() => replacement.store.get(job.job_id))
+        .toMatchObject({ status: "working", sleepGeneration: 2, sleepResumes: 0 });
+      release.resolve();
+      await stale.terminalWork;
+      expect(await replacement.store.get(job.job_id))
+        .toMatchObject({ status: "working", sleepGeneration: 2, settlement: undefined });
+      expect(await ledger.getDraw({ creditId, drawId: job.drawId })).toMatchObject({ status: "pending", amountMicro: 3 * ASK });
+      const afterSeq = transcript.at(-1)!.seq;
+      const signal = AbortSignal.timeout(1000);
+      try {
+        const stream = await fetch(`${replacementUrl}/v1/job/${job.job_id}/messages?after=${afterSeq}`, {
+          headers: { "X-Job-Token": job.job_token, Accept: "text/event-stream" },
+          signal,
+        });
+        expect(await stream.body!.getReader().read()).toMatchObject({ done: true });
+      } catch (error) {
+        // A live stream may stay open with no events. An initial SSE frame fails this assertion.
+        expect(signal.aborted && ["AbortError", "TimeoutError"].includes((error as Error).name)).toBe(true);
+      }
+      expect(await messages(job.job_id)).toEqual(transcript);
+    } finally {
+      release.resolve();
+      restore();
+    }
+  }, 30_000);
+
+  it("hides terminal output left by an interrupted pre-upgrade append", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const creditId = "sleep-legacy-false-terminal";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    const before = await messages(job.job_id);
+    const seq = before.at(-1)!.seq + 1;
+    await pool.query(`INSERT INTO job_messages(job_id, seq, data, status) VALUES($1, $2, $3, 'verified')`, [
+      job.job_id, seq, JSON.stringify({
+        seq, from: "provider", type: "cancel", content: { reason: "lost worker" }, timestamp: Math.floor(Date.now() / 1000),
+      }),
+    ]);
+    await pool.query("UPDATE jobs SET next_seq=$2 WHERE id=$1", [job.job_id, seq + 1]);
+    const read = await fetch(`${url}/v1/job/${job.job_id}/messages?after=${seq - 1}`, { headers: { "X-Job-Token": job.job_token } });
+    expect(await status(job.job_id)).toBe("working");
+    expect(await read.json()).toMatchObject({ messages: [] });
+  }, 30_000);
+
+  it("retires a stale heartbeat without refreshing the replacement generation", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const old = latestManager();
+    const creditId = "sleep-heartbeat-fence";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    await server();
+    const replacement = latestManager();
+    await ageWorker(job.job_id);
+    await replacement.sweepStaleJobs();
+    await expect.poll(async () => (await replacement.store.get(job.job_id))?.sleepResumes).toBe(0);
+    await hosts[1].shutdown();
+    await ageWorker(job.job_id);
+    const activity = (await old.store.get(job.job_id))!.lastActivityAt;
+    await old.heartbeatActiveJobs();
+    expect((await old.store.get(job.job_id))?.lastActivityAt).toBe(activity);
+    expect(old.activeJobs.has(job.job_id)).toBe(false);
+    await server();
+    await latestManager().sweepStaleJobs();
+    expect(latestManager().activeJobs.get(job.job_id)?.sleepGeneration).toBe(2);
+  }, 30_000);
+
+  it.each([
+    { alreadyPaid: false, orphanCancel: false },
+    { alreadyPaid: true, orphanCancel: false },
+    { alreadyPaid: true, orphanCancel: true },
+  ])("replays an ask after an earlier sleep (already paid=$alreadyPaid, orphan cancel=$orphanCancel)", async ({ alreadyPaid, orphanCancel }) => {
+    const url = await server();
+    const creditId = `after-sleep-${alreadyPaid}-${orphanCancel}`;
+    await fund(creditId);
+    const failure = failSettlements();
+    let job: Awaited<ReturnType<typeof submit>>;
+    try {
+      job = await submit(url, { creditId, script: "sleep-then-ask", maxTotal: ASK });
+      await openAsk(job.job_id);
+      await expect.poll(failure.failed).toBeGreaterThan(0);
+      await hosts[0].shutdown();
+    } finally {
+      failure.restore();
+    }
+    if (alreadyPaid) {
+      expect(await settleMandateAsk({ pool, ledger, jobId: job.job_id, dvmId: audience.dvm_id }))
+        .toMatchObject({ outcome: "paid" });
+      expect(await status(job.job_id)).toBe("awaiting-input");
+    }
+    const ask = (await messages(job.job_id)).find((m) => m.type === "payment-request")!;
+    if (orphanCancel) {
+      const seq = (await messages(job.job_id)).at(-1)!.seq + 1;
+      await pool.query("INSERT INTO job_messages(job_id, seq, data, status) VALUES($1, $2, $3, 'verified')", [
+        job.job_id, seq, JSON.stringify({ seq, from: "provider", type: "cancel", content: { reason: "lost worker" }, timestamp: 1 }),
+      ]);
+      await pool.query("UPDATE jobs SET next_seq=$2 WHERE id=$1", [job.job_id, seq + 1]);
+    }
+    await server();
+    await latestManager().sweepMandateAsks(afterGrace());
+    await expectPaidOnceAndDone(job, creditId, ask.seq);
+    const history = await messages(job.job_id);
+    expect(history.filter((m) => m.type === "working")).toHaveLength(1);
+    expect(history.filter((m) => m.type === "payment-request")).toHaveLength(1);
+    expect(history.filter((m) => m.type === "cancel")).toEqual([]);
+  }, 30_000);
+
+  it.each(["cancel", "decline"] as const)("settles the paid pieces after a remote %s during sleep", async (action) => {
+    const url = await server();
+    const creditId = `sleep-${action}`;
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    const receiver = await server();
+    const response = action === "decline" ? await decline(receiver, job) :
+      await fetch(`${receiver}/v1/job/${job.job_id}`, { method: "DELETE", headers: { "X-Job-Token": job.job_token } });
+    expect(response.status, await response.clone().text()).toBe(action === "decline" ? 201 : 200);
+    if (action === "decline") {
+      expect(await response.json()).toMatchObject({ stop_requested: true });
+      expect(await status(job.job_id)).toBe("working");
+    }
+    await expect.poll(() => status(job.job_id), { timeout: 5000 }).toBe("cancelled");
+    expect(interruptedSleeps.get(job.job_id)).toEqual(action === "cancel" ? ["JobCancelledError"] : undefined);
+    expect(await balancePayments(job.job_id)).toHaveLength(2);
+    await expect.poll(() => ledger.getDraw({ creditId, drawId: job.drawId }))
+      .toMatchObject({ status: "settled", amountMicro: 3 * ASK });
+    const row = (await pool.query("SELECT pieces FROM jobs WHERE id=$1", [job.job_id])).rows[0];
+    expect(row.pieces).toHaveLength(3);
+    expect(completions.get(job.job_id)).toBeUndefined();
+  }, 30_000);
+
+  it("honors a caller DELETE received by the superseded sleeping worker", async () => {
+    const url = await server({ sleepMs: 60_000 });
+    const original = latestManager();
+    const creditId = "sleep-cancel-stale-worker";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+
+    await server();
+    const replacement = latestManager();
+    await ageWorker(job.job_id);
+    await replacement.sweepStaleJobs();
+    await expect.poll(() => replacement.store.get(job.job_id))
+      .toMatchObject({ status: "working", sleepGeneration: 1, sleepResumes: 0 });
+    expect(original.activeJobs.has(job.job_id)).toBe(true);
+
+    const response = await fetch(`${url}/v1/job/${job.job_id}`, {
+      method: "DELETE", headers: { "X-Job-Token": job.job_token },
+    });
+    expect(response.status).toBe(200);
+    expect(await replacement.store.get(job.job_id))
+      .toMatchObject({ status: "cancelled", sleepGeneration: 1, endedBy: "caller" });
+    expect(await ledger.getDraw({ creditId, drawId: job.drawId }))
+      .toMatchObject({ status: "settled", amountMicro: 3 * ASK });
+    await expect.poll(() => original.activeJobs.has(job.job_id)).toBe(false);
+    await expect.poll(() => replacement.activeJobs.get(job.job_id)?.abort.signal.aborted).toBe(true);
+  }, 30_000);
+
+  it("honors a caller DELETE that began before the worker parked and lost ownership", async () => {
+    const url = await server({ sleepMs: 60_000, waitBeforePark: true });
+    const original = latestManager();
+    const creditId = "sleep-cancel-race";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await gate(job.job_id).arrived;
+    const store = original.store;
+    if (!("openPaymentIntentUntil" in store)) throw new Error("payment arrival store required");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const pause = vi.spyOn(store as import("../postgres-job-store").PostgresJobStore, "openPaymentIntentUntil")
+      .mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return undefined;
+      });
+    try {
+      const cancel = fetch(`${url}/v1/job/${job.job_id}`, { method: "DELETE", headers: { "X-Job-Token": job.job_token } });
+      await entered.promise;
+      gate(job.job_id).open();
+      await parked(job.job_id, "sleep:period:1");
+      await server();
+      const replacement = latestManager();
+      await ageWorker(job.job_id);
+      await replacement.sweepStaleJobs();
+      await expect.poll(() => replacement.store.get(job.job_id))
+        .toMatchObject({ status: "working", sleepGeneration: 1, sleepResumes: 0 });
+
+      release.resolve();
+      const response = await cancel;
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status: "cancelled" });
+      expect(await replacement.store.get(job.job_id)).toMatchObject({ status: "cancelled", sleepGeneration: 1 });
+    } finally {
+      pause.mockRestore();
+      gate(job.job_id).open();
+      release.resolve();
+    }
+  }, 30_000);
+
+  it("fences a paused executor when it reaches wake after a replacement claims its sleep", async () => {
+    const url = await server();
+    const first = latestManager();
+    const creditId = "sleep-zombie";
+    await fund(creditId);
+    const job = await submit(url, { creditId, priced: true, script: "zombie-watch", maxTotal: 4 * ASK });
+    await parked(job.job_id, "sleep:period:1");
+    const original = first.activeJobs.get(job.job_id);
+    await server();
+    const replacement = latestManager();
+
+    // Pause the old executor at wake and keep the replacement live until fencing is checked.
+    const store = first.store;
+    if (!isStreamableJobStore(store) || !store.endSleep) throw new Error("sleep store required");
+    const end = store.endSleep.bind(store);
+    const wake = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const pause = vi.spyOn(store, "endSleep").mockImplementation(async (id, generation) => {
+      if (id === job.job_id && generation === 0) {
+        wake.resolve();
+        await release.promise;
+      }
+      return end(id, generation);
+    });
+    const heartbeat = vi.spyOn(first, "heartbeatActiveJobs").mockResolvedValue({ beat: 0 });
+    const sweep = vi.spyOn(first, "sweepStaleJobs").mockResolvedValue({ swept: 0 });
+    try {
+      await wake.promise;
+      await ageWorker(job.job_id);
+      await replacement.sweepStaleJobs();
+      await gate(job.job_id).arrived;
+      expect(await status(job.job_id)).toBe("working");
+      const before = await messages(job.job_id);
+      release.resolve();
+      await expect.poll(() => interruptedSleeps.get(job.job_id)).toEqual(["JobCancelledError"]);
+      expect(first.activeJobs.get(job.job_id)).not.toBe(original);
+      expect(await messages(job.job_id)).toEqual(before);
+      gate(job.job_id).open();
+      await expect.poll(() => status(job.job_id), { timeout: 5000 }).toBe("completed");
+      expect(completions.get(job.job_id)).toBe(1);
+    } finally {
+      release.resolve();
+      gate(job.job_id).open();
+      pause.mockRestore();
+      heartbeat.mockRestore();
+      sweep.mockRestore();
+    }
+  }, 30_000);
+
+  it("fails a sleep after six claims without a successful re-park and still reaps awake jobs", async () => {
+    const url = await server();
+    const creditId = "sleep-crash-loop";
+    await fund(creditId);
+    const sleeper = await submit(url, { creditId, priced: true, script: "watch", maxTotal: 4 * ASK });
+    await parked(sleeper.job_id, "sleep:period:1");
+    const awake = await submit(url, { creditId: "awake", script: "late" });
+    await gate(awake.job_id).arrived;
+    await pool.query("UPDATE jobs SET status='working' WHERE id=$1", [awake.job_id]);
+    await hosts[0].shutdown();
+
+    await server();
+    const replacement = latestManager();
+    const store = replacement.store;
+    if (!isStreamableJobStore(store) || !store.claimSleepingJob) throw new Error("sleep store required");
+    // Commit the claim of each failed boot, leaving the real replay unstarted as if the worker crashed.
+    for (let i = 1; i <= 5; i++) {
+      await ageWorker(sleeper.job_id);
+      const now = Date.now();
+      expect(await store.tryReactivationLock(sleeper.job_id,
+        () => store.claimSleepingJob!(sleeper.job_id, now - 300_000, now)))
+        .toEqual({ acquired: true, result: { sleepGeneration: i, sleepResumes: i } });
+    }
+    await ageWorker(sleeper.job_id);
+    await ageWorker(awake.job_id);
+    await replacement.sweepStaleJobs();
+    for (const job of [sleeper, awake]) {
+      expect(await store.get(job.job_id)).toMatchObject({ status: "failed", summary: "worker_died_mid_job" });
+      expect(replacement.activeJobs.has(job.job_id)).toBe(false);
+    }
+    expect(await store.get(sleeper.job_id)).toMatchObject({ sleepGeneration: 6, sleepResumes: 6 });
+    expect(await ledger.getDraw({ creditId, drawId: sleeper.drawId }))
+      .toMatchObject({ status: "settled", amountMicro: 2 * ASK });
   }, 30_000);
 
   it("records an idempotent standing decline and charges only finished work at the next ask", async () => {

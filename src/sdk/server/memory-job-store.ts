@@ -1,9 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import { callerDeadline, hasCallerDeadline } from "./job";
 import { applyContentHoldMutation, ContentHoldError, type ContentHoldHistory, type ContentHoldMutation } from "./content-retention";
 import type { Message } from "../../lib/messages/types";
+import type { StepRecord } from "../step-cache";
 import type { JobReceipt } from "../../lib/receipt";
-import { hasOpenAsk, isTerminal } from "./job";
-import { JobEndedError } from "./job-store";
+import { hasOpenAsk, isTerminal, isTerminalMessage } from "./job";
+import { JobEndedError, JobSupersededError, TERMINAL_OUTPUT, withTerminalOutput } from "./job-store";
 import type {
   AppendOutgoingOptions,
   DeclineOutcome,
@@ -11,6 +13,7 @@ import type {
   JobRecord,
   JobRetentionCursor,
   OutgoingMessage,
+  TerminalSnapshot,
   PaymentCreditDelta,
   ReceiptIssuingStore,
   RequestIdClaim,
@@ -20,6 +23,7 @@ import type {
   VerifyAndCreditResult,
 } from "./job-store";
 import { accumulateAskedTopUp } from "./job-store";
+import { incomingPaymentSnapshot } from "./payment";
 import { appendPiece, endPieces, finishRunningPiece, type PieceEnding, terminalEnding } from "./pieces";
 import {
   decidePaymentDisposition,
@@ -27,6 +31,9 @@ import {
   type PaymentArrivalStore,
   type RecordedPaymentArrival,
 } from "./payment-arrival";
+
+const SLEEP_SNAPSHOT = Symbol("sleep snapshot");
+type MemorySleepSnapshot = JobRecord & { [SLEEP_SNAPSHOT]?: true };
 
 interface StoredMessage {
   message: Message;
@@ -56,6 +63,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
   private contentHolds = new Map<string, ContentHoldHistory>();
   private paymentIntents = new Map<string, Map<number, PaymentIntent>>();
   private data = new Map<string, JobRecord>();
+  private verifiedInboundVersions = new Map<string, symbol>();
+  private observedInboundVersions = new WeakMap<JobRecord, symbol | undefined>();
   private messages = new Map<string, StoredMessage[]>();
   private nextSeq = new Map<string, number>();
   private outgoingAppends = new Map<string, Map<string, number>>();
@@ -68,7 +77,10 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
 
   get(id: string): Promise<JobRecord | undefined> {
     const record = this.data.get(id);
-    return Promise.resolve(record ? structuredClone(record) : undefined);
+    if (!record) return Promise.resolve(undefined);
+    const observed = structuredClone(record);
+    this.observedInboundVersions.set(observed, this.verifiedInboundVersions.get(id));
+    return Promise.resolve(observed);
   }
 
   findJobByPaymentTxHash(txHash: string): Promise<JobRecord | undefined> {
@@ -129,6 +141,18 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return Promise.resolve();
   }
 
+  async saveStep(id: string, step: StepRecord, sleepGeneration?: number): Promise<void> {
+    const record = this.data.get(id);
+    if (sleepGeneration !== undefined && (!record || isTerminal(record.status) || record.redactedAt !== undefined ||
+        (record.sleepGeneration ?? 0) !== sleepGeneration)) throw new JobSupersededError();
+    if (!record || isTerminal(record.status) || record.redactedAt !== undefined) {
+      throw new Error("Step persistence requires a live job");
+    }
+    if (!record.stepCache.some((cached) => cached.id === step.id)) {
+      record.stepCache.push(structuredClone(step));
+    }
+  }
+
   save(record: JobRecord): Promise<void> {
     // terminal is terminal — mirrors `PostgresJobStore.save`'s
     // ON CONFLICT guard. A handler still running on another machine (the cancel
@@ -136,6 +160,14 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     // `completed`. Re-saving the same terminal status is allowed (idempotent
     // re-persist of the same outcome).
     const existing = this.data.get(record.id);
+    if (record.sleepGeneration !== undefined &&
+        (existing?.sleepGeneration ?? 0) !== record.sleepGeneration) {
+      return Promise.reject(new JobSupersededError());
+    }
+    if ((record as MemorySleepSnapshot)[SLEEP_SNAPSHOT] &&
+        (!existing || (existing.status !== "processing" && existing.status !== "working"))) {
+      return Promise.reject(new JobSupersededError());
+    }
     if (!existing && record.requestId && record.requesterPubkey) {
       for (const prior of this.data.values()) {
         if (
@@ -157,6 +189,12 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
       const until = this.openIntentUntil(record.id, Date.now());
       if (until !== undefined) return Promise.reject(new PaymentIntentOpenError(record.id, until));
     }
+    const output = (record as TerminalSnapshot)[TERMINAL_OUTPUT];
+    if (output && isTerminal(record.status)) {
+      if (existing && isTerminal(existing.status)) return Promise.resolve();
+      const history = this.visibleMessages(record.id, 0, true);
+      record = withTerminalOutput(record, history.length ? history : record.messages.filter(message => !isTerminalMessage(message)), this.nextSeq.get(record.id) ?? 1, output);
+    }
     // `receipt` and `receiptSeq` are owned by `saveReceipt` /
     // `claimReceiptSeq`, never by the snapshot path — mirrors the Postgres
     // store, whose `save` statement simply doesn't list those columns. Without
@@ -165,7 +203,14 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     const { receivedProofs: _legacyProofs, ...jobFields } = record as JobRecord & { receivedProofs?: unknown };
     const snapshot = structuredClone(jobFields);
     delete snapshot.pieceEnding;
+    snapshot.sleepUntilMs = existing?.sleepUntilMs;
+    snapshot.sleepId = existing?.sleepId;
+    snapshot.sleepGeneration = existing?.sleepGeneration ?? 0;
+    snapshot.sleepResumes = existing?.sleepResumes ?? 0;
     if (existing) {
+      const steps = new Map(snapshot.stepCache.map((step) => [step.id, step]));
+      for (const step of existing.stepCache) steps.set(step.id, structuredClone(step));
+      snapshot.stepCache = [...steps.values()];
       snapshot.createdAt = existing.createdAt;
       snapshot.mandate = structuredClone(existing.mandate);
       snapshot.stopRequested = existing.stopRequested;
@@ -200,6 +245,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     this.contentHolds.delete(id);
     this.paymentIntents.delete(id);
     this.data.delete(id);
+    this.verifiedInboundVersions.delete(id);
     this.outgoingAppends.delete(id);
     this.messages.delete(id);
     this.nextSeq.delete(id);
@@ -304,6 +350,15 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     if (!record || record.redactedAt !== undefined) {
       return Promise.reject(new Error(`appendOutgoing: job ${jobId} not found`));
     }
+    if (opts?.sleepGeneration !== undefined && (record.sleepGeneration ?? 0) !== opts.sleepGeneration) {
+      return Promise.reject(new JobSupersededError());
+    }
+    if (opts?.sleepGeneration !== undefined && isTerminal(record.status)) {
+      return Promise.reject(new JobEndedError(jobId));
+    }
+    if (isTerminalMessage(message)) {
+      return Promise.reject(new Error("Provider terminal messages require a terminal snapshot"));
+    }
     const prior = opts?.appendId ? this.outgoingAppends.get(jobId)?.get(opts.appendId) : undefined;
     if (prior !== undefined) return Promise.resolve(prior);
     if ((message.type === "payment-request" || message.type === "prompt") && isTerminal(record.status)) {
@@ -400,7 +455,9 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     if (!intents) this.paymentIntents.set(jobId, intents = new Map());
     intents.set(seq, { leaseExpiresAtMs: opts.arrivedAtMs + opts.leaseMs, resolved: false });
     this.fireNotifyOnly(jobId);
-    return Promise.resolve({ seq, disposition });
+    return Promise.resolve({ seq, disposition, snapshot: incomingPaymentSnapshot({
+      ...record, messages: ask ? [ask] : [],
+    }) });
   }
 
   openPaymentIntentUntil(jobId: string, nowMs: number): Promise<number | undefined> {
@@ -429,6 +486,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     // An ended job takes no payment and no credit binding; the caller lands the money as balance.
     const refused = credit !== null && isTerminal(record.status);
     stored.status = opts?.landedAsBalance || refused ? "balance" : "verified";
+    if (stored.status === "verified") this.verifiedInboundVersions.set(jobId, Symbol());
     if (credit && !refused) {
       record.paidMsats += credit.paidMsatsDelta;
       // the pinned fiat ask dies with the msat ask it denominates. A
@@ -500,6 +558,63 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return Promise.resolve();
   }
 
+  async saveSleepSnapshot(record: JobRecord, generation: number): Promise<boolean> {
+    const existing = this.data.get(record.id);
+    if (!existing || existing.sleepGeneration !== generation ||
+        (existing.status !== "processing" && existing.status !== "working")) return false;
+    try {
+      const snapshot: MemorySleepSnapshot = { ...record, sleepGeneration: generation, [SLEEP_SNAPSHOT]: true };
+      await this.save(snapshot);
+      return true;
+    } catch (error) {
+      if (error instanceof JobSupersededError) return false;
+      throw error;
+    }
+  }
+
+  async heartbeatJobExecutors(jobs: { id: string; generation: number }[], now: number): Promise<string[]> {
+    const refreshed: string[] = [];
+    for (const { id, generation } of jobs) {
+      const existing = this.data.get(id);
+      if (existing && existing.sleepGeneration === generation &&
+          (existing.status === "processing" || existing.status === "working")) {
+        existing.lastActivityAt = now;
+        refreshed.push(id);
+      }
+    }
+    return refreshed;
+  }
+
+  async beginSleep(id: string, sleep: { sleepId: string; wakeAtMs: number; generation: number }): Promise<boolean> {
+    const record = this.data.get(id);
+    if (!record || (record.status !== "processing" && record.status !== "working") ||
+        record.sleepGeneration !== sleep.generation) return false;
+    record.sleepUntilMs = sleep.wakeAtMs;
+    record.sleepId = sleep.sleepId;
+    record.sleepResumes = 0;
+    return true;
+  }
+
+  async endSleep(id: string, generation: number): Promise<boolean> {
+    const record = this.data.get(id);
+    if (!record || (record.status !== "processing" && record.status !== "working") ||
+        record.sleepGeneration !== generation) return false;
+    delete record.sleepUntilMs;
+    delete record.sleepId;
+    return true;
+  }
+
+  async claimSleepingJob(id: string, expectedActivityBefore: number, now = Date.now()):
+    Promise<{ sleepGeneration: number; sleepResumes: number } | undefined> {
+    const record = this.data.get(id);
+    if (!record || (record.status !== "processing" && record.status !== "working") ||
+        record.sleepUntilMs === undefined || record.lastActivityAt > expectedActivityBefore) return;
+    record.lastActivityAt = now;
+    const sleepGeneration = record.sleepGeneration = (record.sleepGeneration ?? 0) + 1;
+    const sleepResumes = record.sleepResumes = (record.sleepResumes ?? 0) + 1;
+    return { sleepGeneration, sleepResumes };
+  }
+
   findStaleJobs(
     processingThresholdMs: number,
     awaitingThresholdMs: number,
@@ -523,23 +638,15 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return Promise.resolve(matches.slice(0, limit));
   }
 
-  heartbeatActiveJobs(jobIds: string[], now: number): Promise<void> {
-    for (const id of jobIds) {
-      const record = this.data.get(id);
-      if (record && (record.status === "processing" || record.status === "working")) {
-        record.lastActivityAt = now;
-      }
-    }
-    return Promise.resolve();
-  }
-
   async cancelStaleJob(
     jobId: string,
     expectedActivityBefore: number,
     reason: string,
-    terminalStatus: "failed" | "cancelled"
+    terminalStatus: "failed" | "cancelled",
+    sleep?: { generation: number; parked: boolean }
   ): Promise<boolean> {
-    return (await this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore, { kind: "release" })) === "ended";
+    return (await this.terminateJob(jobId, reason, terminalStatus, expectedActivityBefore,
+      { kind: "release" }, { sleepGeneration: sleep?.generation, parked: sleep?.parked })) === "ended";
   }
 
   /** A caller's cancel stops the piece in progress and charges it. */
@@ -547,12 +654,18 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return (await this.terminateJob(jobId, reason, "cancelled", null, { kind: "stop" })) === "ended";
   }
 
-  async failJob(jobId: string, reason: string): Promise<boolean> {
-    return (await this.terminateJob(jobId, reason, "failed", null, { kind: "release" })) === "ended";
+  async failReactivation(observed: JobRecord, reason: string): Promise<boolean> {
+    return (await this.terminateJob(observed.id, reason, "failed", null, { kind: "release" },
+      { reactivation: observed })) === "ended";
   }
 
-  async declineJob(jobId: string, reason: string): Promise<DeclineOutcome> {
-    const outcome = await this.terminateJob(jobId, reason, "cancelled", null, { kind: "release" }, true);
+  async failJob(jobId: string, reason: string, sleepGeneration?: number): Promise<boolean> {
+    return (await this.terminateJob(jobId, reason, "failed", null, { kind: "release" },
+      { sleepGeneration })) === "ended";
+  }
+
+  async declineJob(jobId: string, reason: string, sleepGeneration?: number, requesterMessage = false): Promise<DeclineOutcome> {
+    const outcome = await this.terminateJob(jobId, reason, "cancelled", null, { kind: "release" }, { requireOpenAsk: true, sleepGeneration, requesterMessage });
     return outcome === "ended" ? "declined" : outcome;
   }
 
@@ -563,9 +676,10 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     return Promise.resolve(snapshotCounters(record));
   }
 
-  claimForProcessing(jobId: string): Promise<boolean> {
+  claimForProcessing(jobId: string, sleepGeneration?: number): Promise<boolean> {
     const record = this.data.get(jobId);
-    if (record?.status !== "awaiting-input") return Promise.resolve(false);
+    if (record?.status !== "awaiting-input" ||
+        (sleepGeneration !== undefined && (record.sleepGeneration ?? 0) !== sleepGeneration)) return Promise.resolve(false);
     applyTiming(record, structuredClone(record), Date.now(), "processing");
     record.status = "processing";
     if (!isTerminal(record.status)) record.lastActivityAt = Date.now();
@@ -657,7 +771,7 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     terminalStatus: "failed" | "cancelled",
     expectedActivityBefore: number | null,
     ending: PieceEnding,
-    requireOpenAsk = false
+    options: { requireOpenAsk?: boolean; sleepGeneration?: number; parked?: boolean; requesterMessage?: boolean; reactivation?: JobRecord } = {}
   ): Promise<"ended" | "stop_requested" | "not_active" | "no_open_ask"> {
     const record = this.data.get(jobId);
     if (!record) return Promise.resolve("not_active");
@@ -666,41 +780,52 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
         record.status === "working" ||
         record.status === "awaiting-input") &&
       (expectedActivityBefore === null || record.lastActivityAt <= expectedActivityBefore);
-    if (!eligible) return Promise.resolve("not_active");
+    const observed = options.reactivation;
+    if (!eligible || (observed && (!this.observedInboundVersions.has(observed) ||
+        this.observedInboundVersions.get(observed) !== this.verifiedInboundVersions.get(jobId) ||
+        !isDeepStrictEqual(record, observed)))) {
+      return Promise.resolve("not_active");
+    }
+    if (options.sleepGeneration !== undefined && (record.sleepGeneration ?? 0) !== options.sleepGeneration) {
+      return expectedActivityBefore === null ? Promise.reject(new JobSupersededError()) : Promise.resolve("not_active");
+    }
+    if (options.parked !== undefined && options.parked !== (record.sleepUntilMs !== undefined)) {
+      return Promise.resolve("not_active");
+    }
     const until = this.openIntentUntil(jobId, Date.now());
     if (until !== undefined) return Promise.reject(new PaymentIntentOpenError(jobId, until));
-    const messages = this.messagesFor(jobId).filter((entry) => entry.status === "verified").map((entry) => entry.message);
-    const terminalMessages = messages.length ? messages : record.messages;
+    const messages = this.messagesFor(jobId).filter(entry => entry.status === "verified" && !isTerminalMessage(entry.message)).map(entry => entry.message);
+    const terminalMessages = messages.length ? messages : record.messages.filter(message => !isTerminalMessage(message));
     if (expectedActivityBefore !== null) {
       const deadline = callerDeadline({ ...record, messages: terminalMessages });
       const awaiting = deadline !== undefined || (record.status === "awaiting-input" && !hasCallerDeadline(terminalMessages));
       if ((terminalStatus === "cancelled") !== awaiting || (deadline !== undefined && Date.now() < deadline)) return Promise.resolve("not_active");
     }
-    if (requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
+    if (options.requireOpenAsk && !hasOpenAsk({ ...record, messages: terminalMessages })) {
       if (!record.mandate) return Promise.resolve("no_open_ask");
       record.stopRequested = true;
       return Promise.resolve("stop_requested");
     }
     const seq = this.allocateSeq(jobId);
-    const cancelMsg: Message = {
+    const terminalMessage: Message = {
       seq,
-      from: "provider",
+      from: options.requesterMessage ? "requester" : "provider",
       timestamp: Math.floor(Date.now() / 1000),
-      type: "cancel",
+      type: options.requesterMessage ? "decline" : "cancel",
       content: { reason },
     } as Message;
     // Insert the cancel row before clearing — mirrors the Postgres impl's
     // ordering so any subscribeMessages listener still hanging on the
     // snapshot sees the cancel via the live stream before terminal cleanup.
-    this.messagesFor(jobId).push({ message: cancelMsg, status: "verified" });
+    this.messagesFor(jobId).push({ message: terminalMessage, status: "verified" });
     record.endedBy = terminalStatus === "cancelled" ? "caller" : "provider";
     const ended = endPieces(record.pieces, ending);
     record.pieces = ended.pieces;
     record.settlement = ended.settlement;
     applyTiming(record, structuredClone(record), Date.now(), terminalStatus);
     record.status = terminalStatus;
-    record.summary = record.summary ?? reason;
-    record.messages = [...terminalMessages, cancelMsg];
+    if (!options.requesterMessage) record.summary ??= reason;
+    record.messages = [...terminalMessages, terminalMessage];
     record.seq = seq;
     record.lastActivityAt = Date.now();
     this.notify(jobId);
@@ -752,10 +877,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
     const stored = this.messagesFor(jobId);
     const record = this.data.get(jobId);
     const terminal = record && isTerminal(record.status);
-    const terminalMessage = stored.some(entry => entry.status === "verified" && entry.message.from === "provider" &&
-      (entry.message.type === "complete" || entry.message.type === "cancel"));
     let boundary = Infinity;
-    if (!includeHeld && !terminal && !terminalMessage) {
+    if (!includeHeld && !terminal) {
       for (const entry of stored) {
         if (entry.status === "pending-verification" && entry.message.type === "payment") {
           boundary = Math.min(boundary, entry.message.seq);
@@ -775,7 +898,8 @@ export class MemoryJobStore implements StreamableJobStore, ReceiptIssuingStore, 
       for (const message of record.messages) if (message.seq > afterSeq) retain(message);
     }
     for (const entry of stored) {
-      if (entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary) {
+      if (entry.status === "verified" && entry.message.seq > afterSeq && entry.message.seq < boundary &&
+          (!isTerminalMessage(entry.message) || (terminal && record.messages.some(message => isDeepStrictEqual(message, entry.message))))) {
         retain(entry.message);
       }
     }

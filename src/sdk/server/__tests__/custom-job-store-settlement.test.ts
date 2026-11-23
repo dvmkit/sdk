@@ -22,6 +22,8 @@ const X402: X402Config = { facilitator: "https://example.com/facilitator", netwo
 /** The smallest store a builder can write: rows kept exactly as the SDK hands them over. */
 class VerbatimJobStore implements JobStore {
   rows = new Map<string, JobRecord>();
+  async failReactivation() { return false; }
+  async heartbeatJobExecutors() { return []; }
   get(id: string) { return Promise.resolve(structuredClone(this.rows.get(id))); }
   save(record: JobRecord) { this.rows.set(record.id, structuredClone(record)); return Promise.resolve(); }
   delete(id: string) { this.rows.delete(id); return Promise.resolve(); }

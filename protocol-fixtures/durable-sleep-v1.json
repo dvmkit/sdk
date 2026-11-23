@@ -1,0 +1,44 @@
+{
+  "working": {
+    "from": "provider",
+    "type": "working",
+    "content": {
+      "estimate_seconds": 2,
+      "hint": "Waiting until 2030-01-01T00:00:00.000Z",
+      "wake_at_ms": 1893456000000
+    }
+  },
+  "stored_response": {
+    "status": 409,
+    "body": {
+      "error": "job_sleeping",
+      "display": "The job is waiting until 2030-01-01T00:00:00.000Z.",
+      "hint": "Decline or cancel to stop it; read new output with GET /v1/job/:id/messages?after=<seq>."
+    }
+  },
+  "job_changed": {
+    "status": 409,
+    "body": {
+      "error": "job_changed",
+      "message": "The job changed during reactivation. Read its current status."
+    }
+  },
+  "terminal_commit": {
+    "before": { "status": "processing", "messages": [] },
+    "after": {
+      "status": "completed",
+      "messages": [{ "seq": 1, "from": "provider", "type": "complete", "content": { "summary": "delivered result" } }]
+    }
+  },
+  "terminal_direction": {
+    "provider": ["complete", "cancel"],
+    "requester_only": ["decline"],
+    "provider_decline_error": "Only the caller can decline a job"
+  },
+  "interrupted_terminal_gap": {
+    "after": 0,
+    "dropped_seq": 1,
+    "status": "cancelled",
+    "messages": [{ "seq": 2, "from": "provider", "type": "cancel", "content": { "reason": "committed" } }]
+  }
+}

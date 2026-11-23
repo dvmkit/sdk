@@ -22,6 +22,8 @@ describe("JSON message pages", () => {
   it.each(["streamable", "snapshot"])("reconstructs a %s transcript using returned cursors", async mode => {
     const backing = new MemoryJobStore();
     const store: JobStore = mode === "streamable" ? backing : {
+      failReactivation: backing.failReactivation.bind(backing),
+      heartbeatJobExecutors: backing.heartbeatJobExecutors.bind(backing),
       get: backing.get.bind(backing),
       save: backing.save.bind(backing),
       delete: backing.delete.bind(backing),

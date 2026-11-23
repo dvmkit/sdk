@@ -123,7 +123,7 @@ describe("inbound payment history", () => {
     }
   });
 
-  it("publishes completion while an earlier payment remains unresolved, and commits it after", async () => {
+  it("publishes completion only after the earlier payment and the terminal snapshot commit", async () => {
     const jobStore = new MemoryJobStore();
     const { app, jobManager } = await createDVMServer(configureDVM({
       name: "complete-payment-history", capability: "test", onJob: async () => undefined,
@@ -156,16 +156,15 @@ describe("inbound payment history", () => {
       job.listeners.add(message => seen.push(message.type));
       providerMessage(job, "text", { text: "Final output" });
       job.sdkCtx!.complete("done");
-      expect(seen).toEqual(["text", "complete"]);
+      expect(seen).toEqual([]);
       const history = await app.request(`/v1/job/${job_id}/messages`, { headers: { "X-Job-Token": job_token } });
-      expect((await history.json() as { messages: { type: string }[] }).messages.map(message => message.type))
-        .toEqual(["text", "complete"]);
-      expect((await streamed).split("\n").filter(line => line.startsWith("data:"))
-        .map(line => (JSON.parse(line.slice(5).trim()) as { type: string }).type)).toEqual(["text", "complete"]);
-      // The payment's intent holds the durable terminal write until it resolves.
-      expect((await jobStore.get(job_id))?.status).not.toBe("completed");
+      expect((await history.json() as { messages: { type: string }[] }).messages).toEqual([]);
+      expect((await jobStore.get(job_id))?.status).toBe("processing");
+
       expect((await jobManager.processPayment(job, payment, seq)).error).toBeUndefined();
       await job.terminalWork;
+      expect((await streamed).split("\n").filter(line => line.startsWith("data:"))
+        .map(line => (JSON.parse(line.slice(5).trim()) as { type: string }).type)).toEqual(["text", "complete"]);
       expect((await jobStore.get(job_id))?.status).toBe("completed");
     } finally {
       await reader?.cancel();
@@ -269,6 +268,8 @@ describe("inbound payment history", () => {
   it.each([true, false])("publishes only accepted payments with streamable=%s", async (streamable) => {
     const backing = new MemoryJobStore();
     const store: JobStore = streamable ? backing : {
+      failReactivation: backing.failReactivation.bind(backing),
+      heartbeatJobExecutors: backing.heartbeatJobExecutors.bind(backing),
       get: backing.get.bind(backing),
       save: backing.save.bind(backing),
       delete: backing.delete.bind(backing),

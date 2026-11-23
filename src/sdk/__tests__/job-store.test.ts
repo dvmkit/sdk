@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Message } from "../../lib/messages/types";
 import type { ServerJob } from "../server/job";
@@ -127,8 +127,12 @@ describe("toJobRecord / fromJobRecord", () => {
     expect(restored.replayHighSeq).toBeNull();
   });
 
-  it("preserves messages through round-trip", () => {
+  it.each([
+    { status: "completed", types: ["text", "complete"] },
+    { status: "processing", types: ["text"] },
+  ] as const)("restores only committed terminal messages from a $status snapshot", ({ status, types }) => {
     const job = makeJob({
+      status,
       messages: [
         {
           seq: 1,
@@ -150,9 +154,7 @@ describe("toJobRecord / fromJobRecord", () => {
 
     const record = toJobRecord(job);
     const restored = fromJobRecord(record);
-    expect(restored.messages).toHaveLength(2);
-    expect(restored.messages[0].type).toBe("text");
-    expect(restored.messages[1].type).toBe("complete");
+    expect(restored.messages.map(message => message.type)).toEqual(types);
   });
 });
 
@@ -414,4 +416,22 @@ describe("providerMessage messageAppender", () => {
     expect(appended).toHaveLength(0);
     expect(job.messages).toHaveLength(0);
   });
+});
+
+it("refuses to fail after an inbound response verifies in the same clock tick", async () => {
+  const store = new MemoryJobStore();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(2000);
+  try {
+    await store.save(makeRecord({ status: "awaiting-input" }));
+    const seq = await store.recordInbound("job-abc-1", {
+      from: "requester", type: "response", timestamp: 2, content: { prompt_id: "step", text: "yes" },
+    });
+    const observed = (await store.get("job-abc-1"))!;
+    await store.verifyAndCredit("job-abc-1", seq, null);
+    expect(await store.getMessages("job-abc-1", 0)).toMatchObject([{ type: "response", seq }]);
+    const refused = await store.failReactivation(observed, "stale refusal");
+    expect([refused, (await store.get("job-abc-1"))?.status]).toEqual([false, "awaiting-input"]);
+  } finally {
+    clock.mockRestore();
+  }
 });
