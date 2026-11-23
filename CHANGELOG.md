@@ -43,6 +43,24 @@ The Tempo close-report routes below shipped in `0.10.0`. The completed-draw refu
 
 - The public `CreditLedgerLike` interface now requires `refundDraw`. This is a breaking change for custom credit stores: implement transactional refund accounting and report enqueue before using this interface with the new SDK. The provided memory ledger remains development-only and cannot serve the admin refund route.
 
+## [0.46.0](https://github.com/dvmkit/sdk/compare/v0.45.0...v0.46.0) (2026-11-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sdk:** custom SDKJobContext implementations must add sleep and sleepUntil. Job stores must replace heartbeatActiveJobs with heartbeatJobExecutors and implement failReactivation as a compare-and-set. Postgres initialization adds sleep columns to jobs and a nullable request_seq to job_payment_intents.
+* **sdk:** the public CreditTerms interface from @dvmkit/sdk/server now declares mandate_max_duration?: null. Extensions declaring a numeric property with that name must rename it or adopt the SDK field's type.
+
+### Features
+
+* **sdk:** add durable job sleeps that survive restarts ([#230](https://github.com/dvmkit/sdk/issues/230)) ([ca95a64](https://github.com/dvmkit/sdk/commit/ca95a6409ce9a0daedda74a069c86b55a152b2ca))
+* **sdk:** let callers choose standing mandate expiry ([#228](https://github.com/dvmkit/sdk/issues/228)) ([ecf130d](https://github.com/dvmkit/sdk/commit/ecf130d9add5e74e00b9ddc46a34c87d8a25e057))
+
+
+### Miscellaneous Chores
+
+* roll API baseline to v0.45.0 ([#231](https://github.com/dvmkit/sdk/issues/231)) ([01763ad](https://github.com/dvmkit/sdk/commit/01763adbb78e29e670cb750f2ac4ff5dbf594099))
+
 ## [0.45.0](https://github.com/dvmkit/sdk/compare/v0.44.2...v0.45.0) (2026-11-22)
 
 ### Breaking changes
