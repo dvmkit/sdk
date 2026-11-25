@@ -348,6 +348,18 @@ export class DvmX402ChannelStorage implements ClientChannelStorage {
     });
   }
 
+  /** Capture one record under the channel lock, before adopting or probing it. */
+  snapshotForRefund(key: string): () => void {
+    const id = canonicalChannelId(key);
+    const original = loadFile().channels[id];
+    return () => {
+      const file = loadFile();
+      if (original === undefined) delete file.channels[id];
+      else file.channels[id] = original;
+      saveFile(file);
+    };
+  }
+
   /**
    * Set the signing cursor at the observed chain floor for a refund probe or
    * its funding refresh. Keep the signed voucher evidence because the refund

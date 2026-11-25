@@ -697,6 +697,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
   let journalled: PendingX402Funding[];
   let atRiskMicro: bigint;
   let refundProbe: BatchSettlementClientContext;
+  let restoreRefundRecord: () => void;
   // Only the chain read in this block can be broken by the endpoint; what
   // follows it is arithmetic and a local write, where naming the RPC scoping
   // would read as an explanation for a failure it had no part in.
@@ -716,17 +717,6 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       if (balance <= totalClaimed) continue;
       selected = candidate;
       funded = true;
-      if (!recorded) {
-        recordX402ChannelMetadata({
-          channelId: selected.channelId,
-          endpoint: origin,
-          callerPubkey: args.callerPubkey,
-          creditId: args.creditId,
-          network,
-          config: selected.config,
-          updatedAt: Date.now(),
-        });
-      }
       break;
     }
     if (!funded) {
@@ -736,7 +726,20 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
           : "no funded x402 channel was found for this endpoint"
       );
     }
-    const { channelId } = selected;
+    const { channelId, scheme } = selected;
+    const storage = storageForScheme(scheme);
+    restoreRefundRecord = storage.snapshotForRefund(channelId);
+    if (!recorded) {
+      recordX402ChannelMetadata({
+        channelId,
+        endpoint: origin,
+        callerPubkey: args.callerPubkey,
+        creditId: args.creditId,
+        network,
+        config: selected.config,
+        updatedAt: Date.now(),
+      });
+    }
     journalled = listPendingX402FundingsForChannel(channelId);
     // A voucher the DVM has not acknowledged is claim authority it may still
     // exercise, and upstream persists nothing at signing time — so the local
@@ -753,7 +756,6 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
     // would reach the caller — and whatever agent relays it — as a nonsense
     // USDC amount. An unreadable authorization puts the whole balance at risk.
     atRiskMicro = (reserved > balance ? balance : reserved) - totalClaimed;
-    const storage = new DvmX402ChannelStorage();
     refundProbe = {
       balance: balance.toString(),
       totalClaimed: totalClaimed.toString(),
@@ -775,6 +777,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
     throw x402RefundError(err, { network, rpc, endpointInPath: readingChain });
   }
   const { channelId, scheme } = selected;
+  const refundChannel = { channelId, network, endpoint: recorded?.endpoint ?? origin };
   let result: CreditOpResult | undefined;
   let responseHeader: string | undefined;
   // The DVM's own terminal answer to the last post, if it gave one. Whatever
@@ -789,6 +792,7 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
   // earlier attempt can't outlive the correction that cleared it: upstream
   // retries the refund once after a recoverable 402.
   let dvmRefusal: DvmError | undefined;
+  let retryMismatch: DvmError | undefined;
   const responseStorage = storageForScheme(scheme);
   let clearRefundAnswer: (() => void) | undefined;
   let probePending = true;
@@ -830,9 +834,20 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       const required = x402RequiredFromError(err);
       dvmRefusal = isTerminalDvmRefusal(err, required) ? err : undefined;
       if (required) {
+        let offer: PaymentRequirements;
+        try {
+          offer = selectRecordedBatchRequirement(required, refundChannel, scheme, "mismatch");
+        } catch (error) {
+          if (error instanceof DvmError && error.code === "x402_channel_mismatch") {
+            retryMismatch = error;
+          }
+          throw error;
+        }
         return new Response(JSON.stringify({ error: err.code }), {
           status: 402,
-          headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(required) },
+          headers: {
+            "PAYMENT-REQUIRED": encodePaymentRequiredHeader({ ...required, accepts: [offer] }),
+          },
         });
       }
       throw err;
@@ -844,6 +859,10 @@ async function refundX402BatchChannelLocked(args: X402RefundArgs): Promise<X402R
       fetch: adaptedFetch,
     });
   } catch (err) {
+    if (retryMismatch) {
+      restoreRefundRecord();
+      throw retryMismatch;
+    }
     // A record the DVM gave us outlives whatever upstream makes of the envelope
     // it arrived in. The clearest way there is a drain that flipped
     // to `sent` between the header-less probe and this signed post — a
@@ -1126,17 +1145,19 @@ function assertRecordedChannel(
 }
 
 function channelTermsChanged(
-  recorded: StoredX402ChannelMetadata,
-  derived: `0x${string}`
+  recorded: Pick<StoredX402ChannelMetadata, "channelId" | "endpoint" | "network">,
+  derived?: `0x${string}`
 ): DvmError {
   return new DvmError(
     "x402_channel_mismatch",
-    `${recorded.endpoint} now offers channel terms that do not describe the channel this credit funded — its settlement address, authorizer, token or withdraw delay has changed since ${recorded.channelId} was opened.`,
+    derived === undefined
+      ? `${recorded.endpoint} offered no batch-settlement terms matching the recorded channel ${recorded.channelId} on ${x402NetworkLabel(recorded.network)}.`
+      : `${recorded.endpoint} now offers channel terms that do not describe the channel this credit funded — its settlement address, authorizer, token or withdraw delay has changed since ${recorded.channelId} was opened.`,
     `The recorded channel's balance is untouched, but the DVM can no longer be asked to return it cooperatively. Recover it on-chain: 'dvm wallet x402-withdraw-initiate --channel-id ${recorded.channelId}', then finalize after the delay.`,
     {
       anchor: "x402_channel_terms_changed",
       channel_id: recorded.channelId,
-      derived_channel_id: derived,
+      ...(derived !== undefined ? { derived_channel_id: derived } : {}),
       endpoint: recorded.endpoint,
       network: recorded.network,
     },
@@ -1339,7 +1360,7 @@ function selectBatchRequirement(
   required: PaymentRequired,
   network: string,
   /** The channel this operation is closing, when one is on record. */
-  recorded?: StoredX402ChannelMetadata
+  recorded?: Pick<StoredX402ChannelMetadata, "channelId" | "endpoint" | "network">
 ): PaymentRequirements {
   const accepted = required.accepts.find(
     (entry) => entry.scheme === X402_BATCH_SETTLEMENT_SCHEME && entry.network === network
@@ -1374,19 +1395,27 @@ function selectBatchRequirement(
  */
 function selectRecordedBatchRequirement(
   required: PaymentRequired,
-  recorded: StoredX402ChannelMetadata,
-  scheme: BatchSettlementEvmScheme
+  recorded: Pick<StoredX402ChannelMetadata, "channelId" | "endpoint" | "network">,
+  scheme: BatchSettlementEvmScheme,
+  missingOffer: "not_offered" | "mismatch" = "not_offered"
 ): PaymentRequirements {
   let derived: `0x${string}` | undefined;
-  for (const entry of required.accepts) {
-    if (entry.scheme !== X402_BATCH_SETTLEMENT_SCHEME || entry.network !== recorded.network) {
+  for (const entry of Array.isArray(required.accepts) ? required.accepts : []) {
+    if (entry?.scheme !== X402_BATCH_SETTLEMENT_SCHEME || entry.network !== recorded.network) {
       continue;
     }
-    const channelId = computeChannelId(scheme.buildChannelConfig(entry), entry.network);
-    if (sameChannelId(channelId, recorded.channelId)) return entry;
-    derived ??= channelId;
+    try {
+      const channelId = computeChannelId(scheme.buildChannelConfig(entry), entry.network);
+      if (sameChannelId(channelId, recorded.channelId)) return entry;
+      derived ??= channelId;
+    } catch (error) {
+      // A malformed retry row cannot describe the channel. A later row still can.
+      if (missingOffer !== "mismatch") throw error;
+    }
   }
-  if (derived === undefined) return selectBatchRequirement(required, recorded.network, recorded);
+  if (derived === undefined && missingOffer === "not_offered") {
+    return selectBatchRequirement(required, recorded.network, recorded);
+  }
   throw channelTermsChanged(recorded, derived);
 }
 

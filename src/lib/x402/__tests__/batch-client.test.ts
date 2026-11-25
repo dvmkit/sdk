@@ -8,12 +8,12 @@ import {
   encodePaymentResponseHeader,
   encodePaymentSignatureHeader,
 } from "@x402/core/http";
-import type { PaymentRequired } from "@x402/core/types";
+import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { BatchSettlementEvmScheme, computeChannelId } from "@x402/evm/batch-settlement/client";
 import { encodeAbiParameters, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import * as chains from "viem/chains";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type { DvmError } from "../../errors";
 import type { AttestedDvmIdentity } from "../../receipt-verify";
@@ -1350,6 +1350,7 @@ describe("x402 batch client", () => {
         },
       }),
     };
+    corrective.accepts.unshift({ ...corrective.accepts[0], payTo: account.address });
     const drained = {
       op: "drain" as const,
       drain: {
@@ -1416,6 +1417,80 @@ describe("x402 batch client", () => {
     });
     await expect(new store.DvmX402ChannelStorage().get(channelId)).resolves.toBeUndefined();
     expect(store.x402ChannelBalanceUnreconciledAt(channelId)).toBeUndefined();
+  });
+
+  it.each<{ field: string; offer: Partial<PaymentRequirements>; adopt?: true }>([
+    { field: "payTo", offer: { payTo: "0x4444444444444444444444444444444444444444" } },
+    {
+      field: "receiverAuthorizer",
+      offer: { extra: { receiverAuthorizer: "0x4444444444444444444444444444444444444444" } },
+    },
+    { field: "asset", offer: { asset: "0x5555555555555555555555555555555555555555" } },
+    { field: "network", offer: { network: "eip155:8453" } },
+    { field: "withdrawDelay", offer: { extra: { withdrawDelay: 172_800 } } },
+    { field: "scheme", offer: { scheme: "exact" } },
+    {
+      field: "payTo after adoption",
+      offer: { payTo: "0x4444444444444444444444444444444444444444" },
+      adopt: true,
+    },
+  ])("refuses a corrective refund challenge with changed $field", async ({ offer, adopt }) => {
+    const channelFile = inMemoryRefundChannelFile();
+    const { key, account, channelId, network, required, record } = await refundFixture();
+    const original = adopt ? undefined : {
+      metadata: record(),
+      context: { chargedCumulativeAmount: "150000", balance: "210000", totalClaimed: "5000" },
+      acknowledgedCumulativeAmount: "160000",
+      unreconciledBalanceAt: 123,
+      refundProbeNeedsRefresh: true,
+    };
+    channelFile.seed(original ? { [channelId]: original } : {});
+    const { DvmX402ChannelStorage } = await import("../channel-store");
+    const get = vi.spyOn(DvmX402ChannelStorage.prototype, "get");
+    const set = vi.spyOn(DvmX402ChannelStorage.prototype, "set");
+    const remove = vi.spyOn(DvmX402ChannelStorage.prototype, "delete");
+    const readContract = vi.fn().mockResolvedValue([200_000n, 10_000n]);
+    viemClientMock.create.mockReturnValue({ readContract });
+    const { DvmError } = await import("../../errors");
+    const initial = required.accepts[0];
+    const corrective: PaymentRequired = {
+      ...required,
+      error: "invalid_batch_settlement_evm_cumulative_below_claimed",
+      accepts: [{ ...initial, ...offer, extra: { ...initial.extra, ...offer.extra } }],
+    };
+    const post = vi.fn<(header?: string) => Promise<never>>()
+      .mockRejectedValueOnce(new DvmError("payment_required", "Refund approval required.", undefined, {
+        x402_payment_required: required,
+      }))
+      .mockRejectedValueOnce(new DvmError("payment_invalid", "Refund correction required.", undefined, {
+        x402_payment_required: corrective,
+      }));
+    const batch = await import("../batch-client");
+
+    await expect(batch.refundX402BatchChannel({
+      wallet: { privateKey: key, address: account.address, network },
+      endpoint: "https://dvm.example",
+      callerPubkey: CALLER_PUBKEY,
+      creditId: CREDIT_ID,
+      depositMicro: 200_000,
+      post,
+    })).rejects.toMatchObject({
+      code: "x402_channel_mismatch",
+      data: { channel_id: channelId, network },
+      hint: expect.stringContaining("x402-withdraw-initiate"),
+    });
+
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "").payload).toMatchObject({
+      type: "refund",
+      voucher: { channelId, maxClaimableAmount: "10000" },
+    });
+    expect(readContract.mock.calls.map(([request]) => request.args)).toEqual([[channelId]]);
+    expect(get.mock.calls).toEqual([[channelId]]);
+    expect(set).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    const channels = channelFile.channels();
+    expect(channels).toEqual(original ? { [channelId]: original } : {});
   });
 
   // viem writes its own `URL:` line into the message, and
@@ -3101,6 +3176,39 @@ function refundResponse(args: {
         },
       },
     }),
+  };
+}
+
+/** Keep store serialization in play while capturing the persisted records in memory. */
+function inMemoryRefundChannelFile() {
+  const path = join(dir, "x402-channels.json");
+  const temporary = path + "." + String(process.pid) + ".tmp";
+  let content = JSON.stringify({ version: 1, channels: {}, pending: [], exact: [] });
+  let pending = "";
+  // The real lock still has a file to acquire.
+  writeFileSync(path, "");
+  vi.doMock("node:fs", async (importOriginal) => {
+    const fs = await importOriginal<typeof import("node:fs")>();
+    return {
+      ...fs,
+      readFileSync: (...args: Parameters<typeof fs.readFileSync>) =>
+        args[0] === path ? content : fs.readFileSync(...args),
+      writeFileSync: (...args: Parameters<typeof fs.writeFileSync>) => {
+        if (args[0] === temporary) pending = String(args[1]);
+        else fs.writeFileSync(...args);
+      },
+      renameSync: (...args: Parameters<typeof fs.renameSync>) => {
+        if (args[0] === temporary && args[1] === path) content = pending;
+        else fs.renameSync(...args);
+      },
+    };
+  });
+  onTestFinished(() => vi.doUnmock("node:fs"));
+  return {
+    seed: (channels: Record<string, unknown>) => {
+      content = JSON.stringify({ version: 1, channels, pending: [], exact: [] });
+    },
+    channels: () => JSON.parse(content).channels as Record<string, unknown>,
   };
 }
 
