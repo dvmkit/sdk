@@ -2458,6 +2458,242 @@ describe("x402 batch client", () => {
     });
   });
 
+  describe("binds a drain to the requested credit's channel", () => {
+    const identity = { dvmId: "dvm-1", builderPubkey: "ab".repeat(32) };
+    const newReceiver = `0x${"44".repeat(20)}` as const;
+    type Offers = PaymentRequired["accepts"];
+
+    /** One DVM's terms before and after it changed its payout address. */
+    async function payoutChange() {
+      const fixture = await refundFixture();
+      const { account, config, network, required } = fixture;
+      const salt = deriveX402ChannelSalt({
+        network, payer: account.address, endpoint: "https://dvm.example", identity,
+      });
+      const oldConfig = { ...config, salt };
+      const newConfig = { ...oldConfig, receiver: newReceiver };
+      const oldOffer = required.accepts[0];
+      return {
+        ...fixture,
+        oldConfig,
+        newConfig,
+        oldOffer,
+        newOffer: { ...oldOffer, payTo: newReceiver },
+        oldChannelId: computeChannelId(oldConfig, network),
+        newChannelId: computeChannelId(newConfig, network),
+        wallet: { privateKey: fixture.key, address: account.address, network },
+      };
+    }
+
+    /** A drain post whose header-less probe is answered by a challenge offering `accepts`. */
+    async function drainPost(
+      required: PaymentRequired,
+      accepts: Offers,
+      answer?: ReturnType<typeof refundResponse>
+    ) {
+      const { DvmError } = await import("../../errors");
+      const post = vi.fn<(header?: string) => Promise<ReturnType<typeof refundResponse>>>()
+        .mockRejectedValueOnce(new DvmError("payment_required", "Refund approval required.", undefined, {
+          x402_payment_required: { ...required, accepts },
+        }));
+      if (answer) post.mockResolvedValueOnce(answer);
+      return post;
+    }
+
+    /**
+     * A legacy credit funded at its origin under the old payout, and a sibling
+     * credit of the same attested DVM funded at an alias under the new one.
+     */
+    async function legacyCreditAtAlias() {
+      const f = await payoutChange();
+      f.record({ channelId: f.oldChannelId, config: f.oldConfig, creditId: "credit-legacy" });
+      f.record({
+        channelId: f.newChannelId, config: f.newConfig, creditId: "credit-new", endpoint: "https://alias.example",
+      });
+      await recordChannelCredit({
+        endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: "credit-legacy", identity,
+      });
+      await recordChannelCredit({
+        endpoint: "https://alias.example", callerPubkey: CALLER_PUBKEY, creditId: "credit-new", identity,
+      });
+      const store = await import("../channel-store");
+      const storage = new store.DvmX402ChannelStorage();
+      await storage.set(f.newChannelId, { balance: "150000", totalClaimed: "0", chargedCumulativeAmount: "50000" });
+      const siblingBefore = await storage.get(f.newChannelId);
+      const readContract = vi.fn().mockResolvedValue([200_000n, 0n]);
+      viemClientMock.create.mockReturnValue({ readContract });
+      const batch = await import("../batch-client");
+      const drain = (post: Awaited<ReturnType<typeof drainPost>>) => batch.refundX402BatchChannel({
+        wallet: f.wallet,
+        endpoint: "https://alias.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: "credit-legacy",
+        identity,
+        depositMicro: 200_000,
+        post,
+      });
+      const siblingAfter = () => storage.get(f.newChannelId);
+      return { f, readContract, drain, siblingBefore, siblingAfter };
+    }
+
+    it("refuses on the legacy credit's changed channel instead of draining its sibling's", async () => {
+      const { f, readContract, drain, siblingBefore, siblingAfter } = await legacyCreditAtAlias();
+      const post = await drainPost(f.required, [f.newOffer]);
+
+      const failure = await catchRefusal(drain(post));
+
+      expect(failure).toMatchObject({
+        code: "x402_channel_mismatch",
+        data: { anchor: "x402_channel_terms_changed", channel_id: f.oldChannelId },
+      });
+      expect(failure.hint).toContain(`x402-withdraw-initiate --channel-id ${f.oldChannelId}`);
+      expect(post.mock.calls).toEqual([[]]);
+      expect(readContract).not.toHaveBeenCalled();
+      await expect(siblingAfter()).resolves.toEqual(siblingBefore);
+    });
+
+    it("follows the legacy credit's channel through the old offer listed after the new one", async () => {
+      const { f, drain, siblingBefore, siblingAfter } = await legacyCreditAtAlias();
+      const post = await drainPost(f.required, [f.newOffer, f.oldOffer], refundResponse({
+        channelId: f.oldChannelId, network: f.network, payer: f.account.address, amount: "200000",
+      }));
+
+      await drain(post);
+
+      const signed = decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "");
+      expect(signed.payload).toMatchObject({ type: "refund", voucher: { channelId: f.oldChannelId } });
+      expect(signed.accepted.payTo).toBe(f.oldOffer.payTo);
+      await expect(siblingAfter()).resolves.toEqual(siblingBefore);
+    });
+
+    it.each([
+      { recordedCreditLive: false, signs: true },
+      { recordedCreditLive: true, signs: false },
+    ])("shares another credit's channel only when that credit is no longer live (%j)", async (row) => {
+      const f = await payoutChange();
+      // Funding writes one record per channel, so the later credit has none.
+      f.record({ channelId: f.oldChannelId, config: f.oldConfig, creditId: "credit-earlier" });
+      await recordChannelCredit({
+        endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: "credit-earlier", identity,
+        expired: !row.recordedCreditLive,
+      });
+      await recordChannelCredit({
+        endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID, identity,
+      });
+      const store = await import("../channel-store");
+      const storage = new store.DvmX402ChannelStorage();
+      await storage.set(f.oldChannelId, { balance: "150000", totalClaimed: "0", chargedCumulativeAmount: "50000" });
+      const sharedBefore = await storage.get(f.oldChannelId);
+      const metadataBefore = store.listX402Channels();
+      const readContract = vi.fn(({ args: [id] }: { args: [string] }) =>
+        Promise.resolve(id === f.oldChannelId ? [200_000n, 0n] : [0n, 0n])
+      );
+      viemClientMock.create.mockReturnValue({ readContract });
+      const post = await drainPost(f.required, [f.oldOffer], refundResponse({
+        channelId: f.oldChannelId, network: f.network, payer: f.account.address, amount: "200000",
+      }));
+      const batch = await import("../batch-client");
+      const drain = batch.refundX402BatchChannel({
+        wallet: f.wallet,
+        endpoint: "https://dvm.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        identity,
+        depositMicro: 200_000,
+        post,
+      });
+
+      if (row.signs) {
+        await drain;
+        expect(decodePaymentSignatureHeader(post.mock.calls[1]?.[0] ?? "").payload).toMatchObject({
+          type: "refund", voucher: { channelId: f.oldChannelId },
+        });
+        return;
+      }
+      await expect(drain).rejects.toMatchObject({ code: "x402_refund_failed" });
+      expect(post.mock.calls).toEqual([[]]);
+      expect(readContract.mock.calls.map(([read]) => read.args[0])).not.toContain(f.oldChannelId);
+      await expect(storage.get(f.oldChannelId)).resolves.toEqual(sharedBefore);
+      expect(store.listX402Channels()).toEqual(metadataBefore);
+    });
+
+    it("funds, corrects and validates a recorded channel listed after newer terms", async () => {
+      const f = await payoutChange();
+      const recorded = f.record();
+      const offers = [{ ...f.oldOffer, payTo: newReceiver }, f.oldOffer];
+      const readContract = vi.fn().mockResolvedValue([0n, 0n]);
+      viemClientMock.create.mockReturnValue({ readContract });
+      const batch = await import("../batch-client");
+      const challenge = (accepts: Offers) => ({ ...f.required, accepts });
+
+      const payment = await batch.createX402BatchPayment({
+        wallet: f.wallet,
+        paymentRequired: challenge(offers.map((offer) => ({ ...offer, amount: "5000" }))),
+        endpoint: "https://dvm.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        depositMicro: 200_000,
+      });
+      expect(decodePaymentSignatureHeader(payment.paymentHeader)).toMatchObject({
+        accepted: { payTo: f.oldOffer.payTo },
+        payload: { voucher: { channelId: f.channelId } },
+      });
+
+      const describes = (accepts: Offers) => () => batch.assertX402RequirementDescribesChannel({
+        wallet: f.wallet, paymentRequired: challenge(accepts), recorded, depositMicro: 200_000,
+      });
+      expect(describes(offers)).not.toThrow();
+      expect(describes(offers.slice(0, 1))).toThrowError(
+        expect.objectContaining({ code: "x402_channel_mismatch", data: expect.objectContaining({ channel_id: f.channelId }) })
+      );
+
+      readContract.mockResolvedValue([500_000n, 12_000n]);
+      await expect(batch.processX402BatchCorrection({
+        wallet: f.wallet,
+        depositMicro: 200_000,
+        channelId: f.channelId,
+        paymentRequired: { ...challenge(offers), error: "invalid_batch_settlement_evm_cumulative_below_claimed" },
+      })).resolves.toBe(true);
+      await expect(new (await import("../channel-store")).DvmX402ChannelStorage().get(f.channelId))
+        .resolves.toMatchObject({ chargedCumulativeAmount: "12000" });
+    });
+
+    it("refuses when the requested credit has its own record at two proven origins", async () => {
+      const { account, config, network, required, record } = await refundFixture();
+      const saltInputs = { network, payer: account.address, endpoint: "https://dvm.example" };
+      const attested = { ...config, salt: deriveX402ChannelSalt({ ...saltInputs, identity }) };
+      const legacy = { ...config, salt: deriveLegacyX402ChannelSalt(saltInputs) };
+      const channelIds = [computeChannelId(attested, network), computeChannelId(legacy, network)];
+      record({ channelId: channelIds[0], config: attested });
+      record({ channelId: channelIds[1], config: legacy, endpoint: "https://alias.example" });
+      for (const endpoint of ["https://dvm.example", "https://alias.example"]) {
+        await recordChannelCredit({ endpoint, callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID, identity });
+      }
+      const readContract = vi.fn();
+      viemClientMock.create.mockReturnValue({ readContract });
+      const post = await drainPost(required, required.accepts);
+      const batch = await import("../batch-client");
+
+      const failure = await catchRefusal(batch.refundX402BatchChannel({
+        wallet: { privateKey: `0x${"11".repeat(32)}`, address: account.address, network },
+        endpoint: "https://dvm.example",
+        callerPubkey: CALLER_PUBKEY,
+        creditId: CREDIT_ID,
+        identity,
+        depositMicro: 200_000,
+        post,
+      }));
+
+      expect(failure).toMatchObject({
+        code: "x402_channel_ambiguous",
+        data: { channel_ids: [...channelIds].sort() },
+        hint: "Use the channel ID for a timed on-chain withdrawal.",
+      });
+      expect(post.mock.calls).toEqual([[]]);
+      expect(readContract).not.toHaveBeenCalled();
+    });
+  });
+
   /**
    * The stored `balance` is a running local sum, and exactly one
    * write advances it on this side's own authority: the replay acknowledgement,
@@ -2956,15 +3192,18 @@ async function recordChannelCredit(args: {
   callerPubkey: string;
   creditId: string;
   identity: AttestedDvmIdentity;
+  /** An expired credit is tracked at the DVM but no longer live. */
+  expired?: boolean;
 }) {
   const { recordFundResponse } = await import("../../credit-store");
+  const { expired = false, ...located } = args;
   recordFundResponse({
-    ...args,
+    ...located,
     targetMicro: 200_000,
     credit: {
       credit_id: args.creditId, currency: "USD", balance_micro: 200_000,
-      remaining_micro: 200_000, expiry_ms: Date.now() + 60_000,
-      expired: false, drainable: true, ledger_seq: 1,
+      remaining_micro: 200_000, expiry_ms: Date.now() + (expired ? -60_000 : 60_000),
+      expired, drainable: true, ledger_seq: 1,
     },
   });
 }

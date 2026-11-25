@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed: a cooperative x402 drain now follows the requested credit's own recorded channel, including one recorded at another origin of the same attested DVM. If the DVM's terms no longer derive that channel, the drain refuses with `x402_channel_mismatch` and timed-withdrawal guidance before signing or reading anything. It no longer signs a refund voucher for, or resets the local cursor of, a sibling credit's channel. A credit without its own record still drains through a channel it shares with an earlier credit of that DVM, unless the local credit store tracks that earlier credit as live. Two own records across verified origins raise `x402_channel_ambiguous`.
+- Fixed: funding, corrective re-signing, `assertX402RequirementDescribesChannel` and the drain pick the batch offer that derives the recorded channel, wherever it appears in the challenge. Before, a DVM that listed a new payout offer ahead of the recorded one caused a refused top-up. `x402_batch_not_offered` still applies when the channel's chain is not offered, and `x402_channel_mismatch` when no offer on it derives the channel.
+
 ## Upgrade details
 
 - New x402 fallback funding IDs use an opaque authorization digest if the facilitator confirms payment without a transaction hash. Existing funding IDs remain valid for replay and receipt recovery. Payer-limit errors omit the wallet address. The caller-facing settlement headers retain the optional `payer` for x402 compatibility.
