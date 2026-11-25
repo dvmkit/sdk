@@ -382,6 +382,9 @@ describe("x402 batch client", () => {
         if (owner === "same" || owner === "alias" || owner === "different" || owner === "exactDifferent") {
           await recordChannelCredit({
             ...recorded, identity: owner === "same" || owner === "alias" ? identity : other,
+            // The DVM binds a channel to one credit, so another credit's channel is
+            // shared with the requested one only once that credit is no longer live.
+            expired: recorded.creditId !== CREDIT_ID,
           });
         }
       }
@@ -2567,8 +2570,10 @@ describe("x402 batch client", () => {
     });
 
     it.each([
-      { recordedCreditLive: false, signs: true },
-      { recordedCreditLive: true, signs: false },
+      { recordedCreditLive: false, requestedTracked: true, signs: true },
+      { recordedCreditLive: true, requestedTracked: true, signs: false },
+      // Liveness comes from every row, not only rows that list the requested credit.
+      { recordedCreditLive: true, requestedTracked: false, signs: false },
     ])("shares another credit's channel only when that credit is no longer live (%j)", async (row) => {
       const f = await payoutChange();
       // Funding writes one record per channel, so the later credit has none.
@@ -2577,9 +2582,11 @@ describe("x402 batch client", () => {
         endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: "credit-earlier", identity,
         expired: !row.recordedCreditLive,
       });
-      await recordChannelCredit({
-        endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID, identity,
-      });
+      if (row.requestedTracked) {
+        await recordChannelCredit({
+          endpoint: "https://dvm.example", callerPubkey: CALLER_PUBKEY, creditId: CREDIT_ID, identity,
+        });
+      }
       const store = await import("../channel-store");
       const storage = new store.DvmX402ChannelStorage();
       await storage.set(f.oldChannelId, { balance: "150000", totalClaimed: "0", chargedCumulativeAmount: "50000" });

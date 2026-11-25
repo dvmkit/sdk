@@ -570,24 +570,19 @@ function ownDrainChannelRecord(
 }
 
 /**
- * Other credits the store holding the requested credit still tracks as live.
- * The DVM binds a channel to exactly one credit, so a channel recorded for one
- * of these cannot be the one backing the requested credit.
+ * Every other credit the caller's store tracks as live, in any row. The DVM
+ * binds a channel to exactly one credit, so a channel recorded for one of these
+ * cannot be the one backing the requested credit. Rows that never mention the
+ * requested credit count too: it may be absent from the local store.
  */
-function liveSiblingCreditIds(
+function liveOtherCreditIds(
   credits: readonly StoredCredit[],
   { callerPubkey, creditId }: Pick<X402ChannelScope, "callerPubkey" | "creditId">,
   now = Date.now()
 ): Set<string> {
   const live = new Set<string>();
   for (const credit of credits) {
-    if (
-      credit.callerPubkey !== callerPubkey ||
-      (credit.creditId !== creditId &&
-        !credit.siblingCredits?.some((sibling) => sibling.creditId === creditId))
-    ) {
-      continue;
-    }
+    if (credit.callerPubkey !== callerPubkey) continue;
     if (credit.status === "active" && credit.expiryMs > now) live.add(credit.creditId);
     for (const sibling of credit.siblingCredits ?? []) {
       if (sibling.status !== "unbacked" && !sibling.expired && sibling.expiryMs > now) {
@@ -603,7 +598,9 @@ function liveSiblingCreditIds(
  * A channel the requested credit can share when it has no record of its own:
  * funding writes one record per channel, so a later credit of the same DVM
  * under the same terms reaches it only through the record an earlier credit
- * wrote. Returns the offer that derives it.
+ * wrote. The DVM binds a channel to one credit, so a record whose credit the
+ * store still tracks as live is never shared; a stale local view refuses rather
+ * than drains. Returns the offer that derives the channel.
  */
 function findSharedDrainChannel(
   channels: readonly StoredX402ChannelMetadata[],
@@ -614,10 +611,10 @@ function findSharedDrainChannel(
 ): { record: StoredX402ChannelMetadata; accepted: PaymentRequirements } | undefined {
   const callerChannels = channels.filter(({ callerPubkey }) => callerPubkey === scope.callerPubkey);
   if (callerChannels.length === 0) return undefined;
-  const liveSiblings = liveSiblingCreditIds(credits, scope);
+  const liveOthers = liveOtherCreditIds(credits, scope);
   const candidates: { record: StoredX402ChannelMetadata; accepted: PaymentRequirements }[] = [];
   for (const record of callerChannels) {
-    if (liveSiblings.has(record.creditId) || !channelOwnerMatches(record, scope, credits)) continue;
+    if (liveOthers.has(record.creditId) || !channelOwnerMatches(record, scope, credits)) continue;
     const salts = candidateSalts({
       ...scope,
       network: record.network,
