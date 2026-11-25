@@ -833,7 +833,7 @@ export function createDVMHost(opts: DVMHostOpts = {}): DVMHost {
     // Imported unconditionally, because the warm-up below applies to an
     // injected fetcher too — the host is the only place that knows every
     // mounted descriptor, so it is the only place that can decide to prime one.
-    const { createFxFetcher, resolveFxSourceFromEnv, warmFxSnapshot } = await import("../pricing");
+    const { createFxFetcher, resolveFxSourceFromEnv, warmFxSnapshot } = await import("../pricing/index");
     // resolve `DVMKIT_FX_SOURCE` through `resolveFxSourceFromEnv` so the
     // platform-injected `"platform"` magic string becomes an authenticated
     // `PlatformFxSource` instead of being treated as a literal URL. Passing it raw

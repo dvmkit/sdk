@@ -1,4 +1,4 @@
-import { canonicaliseForSigning, type JsonValue } from "./cast-auth";
+import { canonicaliseForSigning, type JsonValue } from "./cast-auth/index";
 
 /** Auth identifier advertised by DVMs using audience-bound caller proofs. */
 export const SIGNED_REQUEST_AUTH_ID = "secp256k1-schnorr-v2" as const;

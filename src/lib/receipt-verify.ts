@@ -6,7 +6,7 @@
  */
 
 import { type AttestationPayload, verifyAttestation } from "./builder-identity";
-import type { JsonValue } from "./cast-auth";
+import type { JsonValue } from "./cast-auth/index";
 import {
   computeResultHash,
   type DrawFundingReceipt,
