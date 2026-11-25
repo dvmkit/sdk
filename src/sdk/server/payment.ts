@@ -1480,7 +1480,7 @@ async function verifyUpfrontPaymentInScope(
           x402Requirements,
         });
       }
-      const { verifyX402Payment } = await import("../../lib/x402");
+      const { verifyX402Payment } = await import("../../lib/x402/index");
       const receipt = await withPaymentStage("verifier_broadcast", () => verifyX402Payment(
         x402Payment,
         x402Config,
@@ -3205,7 +3205,7 @@ async function verifyIncomingPaymentInScope(
           };
         }
       }
-      const { verifyX402Payment } = await import("../../lib/x402");
+      const { verifyX402Payment } = await import("../../lib/x402/index");
       const receipt = await withPaymentStage("verifier_broadcast", () => verifyX402Payment(
         body.content.x402_payment as string,
         opts.x402Config!,

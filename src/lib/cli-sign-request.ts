@@ -1,6 +1,6 @@
 import { schnorr } from "@noble/curves/secp256k1.js";
 
-import { canonicaliseForSigning, type JsonValue } from "./cast-auth";
+import { canonicaliseForSigning, type JsonValue } from "./cast-auth/index";
 import {
   canonicalSignedRequestStatement,
   type SignedRequestDomain,

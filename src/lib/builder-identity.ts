@@ -15,7 +15,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 
 import { BUILDER_CONFIG_DIR, BUILDER_KEY_FILE } from "../defaults";
 import { loadIdentityPubkey, setIdentityPubkey } from "./builder-store";
-import { canonicaliseForSigning, type JsonValue } from "./cast-auth";
+import { canonicaliseForSigning, type JsonValue } from "./cast-auth/index";
 import { DvmError } from "./errors";
 
 /**

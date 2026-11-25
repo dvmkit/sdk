@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { canonicaliseForSigning, type JsonValue } from "../cast-auth";
+import { canonicaliseForSigning, type JsonValue } from "../cast-auth/index";
 import type { JobPolicy } from "../submission-policy";
 import type { PendingSubmissionContext } from "./store";
 

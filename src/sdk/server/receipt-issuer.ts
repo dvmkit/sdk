@@ -1,4 +1,4 @@
-import type { JsonValue } from "../../lib/cast-auth";
+import type { JsonValue } from "../../lib/cast-auth/index";
 import type {
   DrainReceipt,
   DrainReceiptEvent,
